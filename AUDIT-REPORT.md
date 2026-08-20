@@ -1040,3 +1040,29 @@ thrashing, mostly on other tenants' work. Re-running exactly those five classes 
 **BUILD SUCCESSFUL in 2m 23s**, 0 failures. No timeout was raised and no test was retried, quarantined
 or weakened; the diagnosis was that the measurement was wrong, not the code, and the fix was to measure
 again rather than to move a threshold until the number went green.
+
+## 13. Published
+
+The source is on `main` as one commit on top of the repository's existing initial commit — nothing in
+the remote history was rewritten or force-pushed. 144 files, 32,062 lines. The release APK is attached
+to the `v1.0.0` release rather than committed; `*.apk` is git-ignored, as are the local toolchains
+(5.3 GB), the Gradle caches, `app/build`, and this host's scratch and verification logs.
+
+What is deliberately **not** in the history, verified against the staged set before the commit was
+created: `keystore.properties`, the keystore itself, any `.jks`, `local.properties`, and the
+per-machine agent settings. The staged tree was also scanned for the two signing passwords by value —
+no file contained either — and for token-shaped strings, of which there were none. The remote URL in
+`.git/config` carries no credentials: the push authenticated through a `GIT_ASKPASS` helper that was
+mode-600, outside the repository, and shredded immediately afterwards, so the token never reached a
+command line (`/proc/<pid>/cmdline` is world-readable on this shared host) nor any committed file.
+
+`app/src/test/resources/keys/` is in the history on purpose: two throwaway Ed25519 fixtures the key
+parser is tested against. They authorise nothing — the public half is in no `authorized_keys` on this
+machine and the tests only ever offer them to the MINA SSHD server the suite starts on loopback — and
+`README.md` says so next to them, because a private key in a repository should never be ambiguous.
+
+One thing found while publishing, worth stating plainly: git on this host had
+`credential.helper = store` configured globally, and `~/.git-credentials` held a GitHub token in
+plaintext at mode 664 — group-readable on a box shared with other tenants. That file was shredded. The
+helper is still configured, so the next push that authenticates will write another one; a token used
+here should be treated as disclosed and rotated.
