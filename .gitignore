@@ -1,0 +1,30 @@
+# Local toolchains downloaded for offline project verification
+.tools/
+
+# Android and Gradle generated files
+.gradle/
+**/build/
+local.properties
+
+# IDE metadata
+.idea/
+*.iml
+
+# Release signing material (never commit keystores or passwords)
+keystore.properties
+keystore/
+*.jks
+*.keystore
+
+# Build scratch and verification logs from this host (TMPDIR is redirected here because /tmp is a
+# shared tmpfs on the build box)
+.tmp-build/
+.tmp-emulator/
+.kotlin/
+
+# Built artifacts: the release APK is published on the GitHub release, not carried in the tree
+*.apk
+*.aab
+
+# Local agent settings (per-machine permission grants)
+.claude/settings.local.json

@@ -1,0 +1,52 @@
+<resources>
+    <string name="app_name">Eclipse SSH</string>
+    <string name="widget_description">Quick launch Eclipse SSH sessions and transfers</string>
+    <string name="widget_subtitle">Tap to open terminals &amp; SFTP</string>
+    <string name="widget_open_description">Open Eclipse SSH</string>
+    <string name="service_description">Keeps SSH sessions and SFTP transfers running in the background.</string>
+
+    <!-- Notification channels -->
+    <string name="channel_sessions">Active sessions</string>
+    <string name="channel_sessions_desc">Ongoing SSH sessions, port forwards and transfers</string>
+    <string name="channel_transfers">Transfer progress</string>
+    <string name="channel_transfers_desc">Progress and results of SFTP uploads and downloads</string>
+    <string name="channel_alerts">Alerts</string>
+    <string name="channel_alerts_desc">Disconnects, host key changes and failed transfers</string>
+
+    <!-- Notification content -->
+    <string name="notif_action_disconnect">Disconnect all</string>
+    <string name="notif_action_reconnect">Reconnect</string>
+
+    <!-- Foreground-service time limit (Android 15 caps dataSync services at 6h/24h) -->
+    <string name="notif_timeout_title">Background sessions paused</string>
+    <string name="notif_timeout_body">Android limits background syncing to six hours a day. Your SSH sessions were closed cleanly — open Eclipse SSH to reconnect.</string>
+
+    <!-- Restore-after-restart prompt (Android 12+ forbids starting this service from the background) -->
+    <string name="notif_restore_title">Reconnect your sessions</string>
+    <string name="notif_restore_body">Eclipse SSH cannot reconnect on its own after a restart. Tap to restore your sessions and resume transfers.</string>
+
+    <!--
+        System biometric sheet. These are the app's only user-facing strings that Android itself
+        draws, so they cannot be Compose literals like the in-app text is: BiometricPrompt is handed
+        finished CharSequences. See BiometricUnlocker.
+
+        The rest of this file's screen text was a second, stale copy of what the composables say.
+        Twenty of those entries were unreferenced and most had drifted from the wording actually on
+        screen: "Accept and save" against a button reading "Trust and connect", a lock subtitle about
+        an encrypted vault against a screen that asks for a PIN. Wiring those up would have silently
+        rewritten the UI, and keeping them left a trap for whoever wired them up next, so they were
+        removed instead. The in-app text is still English literals in the composables; localising it
+        is a separate change that has to touch every call site, not something to fake with resources
+        nothing reads.
+    -->
+    <string name="lock_biometric_title">Unlock Eclipse SSH</string>
+    <string name="lock_biometric_subtitle">Use your biometric or device credential</string>
+    <string name="lock_biometric_subtitle_no_credential">Use your fingerprint or face to continue</string>
+    <string name="lock_use_pin">Use PIN</string>
+    <string name="lock_auth_failed">Authentication failed</string>
+    <string name="lock_biometric_unavailable">Biometric prompt unavailable</string>
+    <string name="lock_biometric_no_hardware">This device has no biometric sensor</string>
+    <string name="lock_biometric_hw_unavailable">The biometric sensor is busy or unavailable</string>
+    <string name="lock_biometric_none_enrolled">No fingerprint or face is enrolled on this device</string>
+    <string name="lock_biometric_update_required">A security update is required before biometrics can be used</string>
+</resources>

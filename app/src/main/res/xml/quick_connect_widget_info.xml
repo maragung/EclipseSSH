@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  previewLayout renders the real layout in the widget picker, but only from API 31. Below that the
+  picker falls back to previewImage, so both are declared: API 28-30 gets the launcher icon instead
+  of a blank tile, API 31+ gets the live preview. tools:targetApi records that the newer attribute
+  is deliberately above minSdk rather than an oversight.
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:description="@string/widget_description"
+    android:initialLayout="@layout/quick_connect_widget"
+    android:minHeight="72dp"
+    android:minWidth="180dp"
+    android:previewImage="@mipmap/ic_launcher"
+    android:previewLayout="@layout/quick_connect_widget"
+    android:resizeMode="horizontal|vertical"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen"
+    tools:targetApi="s" />

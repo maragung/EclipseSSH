@@ -1,0 +1,177 @@
+package dev.eclipse.ssh.data.settings
+
+import androidx.datastore.preferences.core.mutablePreferencesOf
+import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
+import dev.eclipse.ssh.data.model.TerminalTheme
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.runTest
+import org.junit.FixMethodOrder
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.junit.runners.MethodSorters
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
+
+/**
+ * DataStore persistence for the settings a vault backup restores. Every field the backup
+ * carries needs a setter that actually writes it — a missing one silently drops the value on
+ * import, which is how `reconnectBaseSeconds` used to be lost.
+ *
+ * `preferencesDataStore` caches one store per delegate for the whole classloader, so the
+ * store outlives each test method here. Names are numbered and the order fixed so the
+ * pristine-defaults check runs before anything writes to it.
+ */
+@RunWith(RobolectricTestRunner::class)
+@FixMethodOrder(MethodSorters.NAME_ASCENDING)
+@Config(sdk = [35])
+class SettingsRepositoryTest {
+
+    private val repository get() = SettingsRepository(RuntimeEnvironment.getApplication())
+
+    @Test
+    fun `01 defaults are returned before anything is written`() = runTest {
+        val settings = repository.settings.first()
+
+        assertThat(settings.biometricUnlock).isTrue()
+        assertThat(settings.darkTheme).isTrue()
+        assertThat(settings.clearClipboardAfterSeconds).isEqualTo(30)
+        assertThat(settings.keepAliveSeconds).isEqualTo(30)
+        assertThat(settings.reconnectBaseSeconds).isEqualTo(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+        assertThat(settings.terminalFontSize).isEqualTo(13)
+        assertThat(settings.pinEnabled).isFalse()
+        assertThat(settings.legacyAlgorithms).isFalse()
+        assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.DARK.name)
+        // Off unless asked for: FLAG_SECURE blocks the user's own screenshots too.
+        assertThat(settings.blockScreenshots).isFalse()
+    }
+
+    @Test
+    fun `02 every backup carried setting survives a write and read`() = runTest {
+        val repo = repository
+        repo.setBiometricUnlock(false)
+        repo.setDarkTheme(false)
+        repo.setClipboardSeconds(90)
+        repo.setKeepAliveSeconds(15)
+        repo.setReconnectBaseSeconds(12)
+        repo.setTerminalFontSize(18)
+        repo.setLegacyAlgorithms(true)
+        repo.setTerminalTheme(TerminalTheme.entries.last().name)
+        repo.setBlockScreenshots(true)
+
+        val settings = repo.settings.first()
+
+        assertThat(settings.biometricUnlock).isFalse()
+        assertThat(settings.darkTheme).isFalse()
+        assertThat(settings.clearClipboardAfterSeconds).isEqualTo(90)
+        assertThat(settings.keepAliveSeconds).isEqualTo(15)
+        assertThat(settings.reconnectBaseSeconds).isEqualTo(12)
+        assertThat(settings.terminalFontSize).isEqualTo(18)
+        assertThat(settings.legacyAlgorithms).isTrue()
+        assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
+        assertThat(settings.blockScreenshots).isTrue()
+    }
+
+    @Test
+    fun `03 reconnect base delay is clamped so the service cannot busy spin`() = runTest {
+        val repo = repository
+
+        repo.setReconnectBaseSeconds(0)
+        assertThat(repo.settings.first().reconnectBaseSeconds)
+            .isEqualTo(SettingsRepository.MIN_RECONNECT_BASE_SECONDS)
+
+        repo.setReconnectBaseSeconds(-42)
+        assertThat(repo.settings.first().reconnectBaseSeconds)
+            .isEqualTo(SettingsRepository.MIN_RECONNECT_BASE_SECONDS)
+
+        repo.setReconnectBaseSeconds(Int.MAX_VALUE)
+        assertThat(repo.settings.first().reconnectBaseSeconds)
+            .isEqualTo(SettingsRepository.MAX_RECONNECT_BASE_SECONDS)
+    }
+
+    @Test
+    fun `04 a PIN verifies only against the value that was set`() = runTest {
+        val repo = repository
+
+        repo.setPin("246813")
+
+        assertThat(repo.settings.first().pinEnabled).isTrue()
+        assertThat(repo.verifyPin("246813")).isTrue()
+        assertThat(repo.verifyPin("246812")).isFalse()
+        assertThat(repo.verifyPin("")).isFalse()
+    }
+
+    @Test
+    fun `05 clearing the PIN disables the lock and rejects the old value`() = runTest {
+        val repo = repository
+        repo.setPin("135791")
+
+        repo.clearPin()
+
+        assertThat(repo.settings.first().pinEnabled).isFalse()
+        assertThat(repo.verifyPin("135791")).isFalse()
+    }
+
+    @Test
+    fun `06 verifying a PIN that was never set fails instead of throwing`() = runTest {
+        assertThat(repository.verifyPin("000000")).isFalse()
+    }
+
+    /**
+     * Every delay the settings screen offers stores as itself.
+     *
+     * [SettingsRepository.setReconnectBaseSeconds] clamps, so a choice outside
+     * MIN..MAX would be quietly changed on the way in and the screen would redraw showing a value
+     * the user never picked — the kind of mismatch that only shows up at the edges of the list, which
+     * is exactly where an added or edited choice lands.
+     */
+    @Test
+    fun `07 every reconnect delay the UI offers round-trips unchanged`() = runTest {
+        val repo = repository
+
+        SettingsRepository.RECONNECT_BASE_CHOICES.forEach { choice ->
+            repo.setReconnectBaseSeconds(choice)
+            assertWithMessage("the settings screen offers %s seconds", choice)
+                .that(repo.settings.first().reconnectBaseSeconds)
+                .isEqualTo(choice)
+        }
+
+        // Non-empty and containing the default, so the screen always has the current value to
+        // highlight; an empty or default-less list would render a dialog with nothing selected.
+        assertThat(SettingsRepository.RECONNECT_BASE_CHOICES)
+            .contains(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+
+        // Left as the default so this class's write does not leak into a sibling class through the
+        // classloader-shared DataStore.
+        repo.setReconnectBaseSeconds(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+    }
+
+    /**
+     * `pinEnabled` gates the whole app, and `verifyPin` can only fail without a hash, so the flag
+     * without its hash is an install nobody can get into: every PIN is rejected and the biometric
+     * button needs both the setting on and something enrolled. `setPin` writes the pair together, so
+     * the preferences are built by hand here — no public setter can produce this combination, which
+     * is the reason the mapping is a separate function.
+     */
+    @Test
+    fun `08 a pin flag left behind without its hash does not lock the app`() {
+        val orphanedFlag = mutablePreferencesOf(Keys.pinEnabled to true)
+
+        assertWithMessage("pin_enabled with no pin_hash would reject every PIN")
+            .that(settingsFrom(orphanedFlag).pinEnabled)
+            .isFalse()
+
+        // The genuine pair still enables it, so the guard has not disabled the feature.
+        val stored = mutablePreferencesOf(
+            Keys.pinEnabled to true,
+            Keys.pinHash to "hash",
+            Keys.pinSalt to "salt",
+        )
+        assertThat(settingsFrom(stored).pinEnabled).isTrue()
+
+        // And a hash with the flag off stays off: clearPin removes the hash and writes false, but a
+        // half-applied clear must not leave the lock screen up either.
+        assertThat(settingsFrom(mutablePreferencesOf(Keys.pinHash to "hash")).pinEnabled).isFalse()
+    }
+}
