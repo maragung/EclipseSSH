@@ -28,6 +28,14 @@ or by listing the APK Signing Block IDs, where `0x7109871a` (v2) and `0xf05368c0
 present. v1 is off deliberately and v4 needs an `.idsig` nothing in this pipeline consumes; see the
 `signingConfigs` comment in `app/build.gradle.kts`.
 
+A CI run without the signing secrets prints the mirror image — `v2: true, v3: false` — for a different
+reason. That APK is signed with the debug key, and the explicit `enableV3Signing = true` lives on the
+release `signingConfig`, so the fallback carries AGP's defaults instead. It installs on everything the
+app supports (v2 covers API 24 up, `minSdk` is 28) and the debug key is never rotated, so v3 buys it
+nothing. Both readings are why the workflow only asserts the v2 *and* v3 blocks when
+`steps.signing.outputs.signed` is `true`: with a real key their absence is a defect worth failing on,
+and without one it is expected.
+
 ## Why there is no emulator step
 
 `connectedAndroidTest` needs a device. GitHub's `ubuntu-latest` runners are nested VMs without KVM,
