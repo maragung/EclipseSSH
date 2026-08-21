@@ -261,16 +261,16 @@ dependencies {
     implementation(libs.androidx.splashscreen)
     implementation(libs.androidx.documentfile)
     implementation(libs.androidx.biometric)
-    implementation(libs.androidx.window)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
-    implementation(libs.androidx.compose.material3.window.size)
     implementation(libs.androidx.compose.material.icons.extended)
-    implementation(libs.androidx.navigation.compose)
+    // Debug-only, and deliberately kept with no @Preview in the tree: this is what makes the
+    // Compose hierarchy visible to Android Studio's Layout Inspector. Its ui-tooling-preview
+    // sibling used to be declared as `implementation`, which shipped the preview annotations in
+    // the release APK for nothing; it arrives here transitively when a preview is added back.
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 
@@ -283,6 +283,15 @@ dependencies {
 
     implementation(libs.hilt.android)
     implementation(libs.hilt.navigation.compose)
+    // Nothing here imports androidx.navigation - there is no NavHost in the app, the single
+    // Activity switches screens on its own state. It is in the graph regardless, because
+    // hilt-navigation-compose (which is where `hiltViewModel` comes from) depends on it, and the
+    // version *it* asks for is 2.5.1. Stated as a constraint rather than as an `implementation`:
+    // the version needs pinning forward, but declaring a dependency this module never imports
+    // would tell the next reader that some screen navigates through it.
+    constraints {
+        implementation(libs.androidx.navigation.compose)
+    }
     implementation(libs.hilt.work)
     ksp(libs.hilt.compiler)
     ksp(libs.hilt.ext.compiler)

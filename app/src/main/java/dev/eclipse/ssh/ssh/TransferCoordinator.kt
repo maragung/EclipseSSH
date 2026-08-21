@@ -79,12 +79,18 @@ class TransferCoordinator @Inject constructor(
      * Continues an interrupted download. [existingBytes] must be the destination's real length —
      * [TransferItem.transferredBytes] is throttled and lags behind, so appending from it would
      * duplicate bytes into the file.
+     *
+     * Required rather than defaulted for exactly that reason. It used to default to
+     * `item.transferredBytes`, which is the one value the sentence above forbids: the contract was
+     * stated in prose and then undermined by the signature, so a caller that trusted the default got
+     * a corrupted file and no warning from anywhere. Every caller measures the partial file itself
+     * (`localDocumentLength`), and now the compiler is what keeps it that way.
      */
     fun resumeDownload(
         item: TransferItem,
         sftp: SftpClient,
         destination: OutputStream,
-        existingBytes: Long = item.transferredBytes,
+        existingBytes: Long,
         ownsSftp: Boolean = true,
     ) {
         launchTransfer(item, if (ownsSftp) sftp else null, destination) {

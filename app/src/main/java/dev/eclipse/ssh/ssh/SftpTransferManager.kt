@@ -38,6 +38,15 @@ class SftpTransferManager @Inject constructor() {
         source.use { copy(it, sftp.write(remotePath), totalBytes, onProgress) }
     }
 
+    /**
+     * Downloads [remotePath] into [destination].
+     *
+     * `destination.use` even though [copy] closes it as well, for the same reason [upload] wraps its
+     * source: `sftp.read` throws for a file that has been deleted or made unreadable since the
+     * transfer was queued, and on that path [copy] is never entered, so the caller's
+     * `ContentResolver` descriptor stayed open. One leaked descriptor per failed download, on the
+     * path the retry ladder walks most often. Closing twice is a no-op.
+     */
     suspend fun download(
         sftp: SftpClient,
         remotePath: String,
@@ -45,7 +54,7 @@ class SftpTransferManager @Inject constructor() {
         onProgress: suspend (bytes: Long, total: Long?) -> Unit = { _, _ -> },
     ) = withContext(Dispatchers.IO) {
         val total = runCatching { sftp.stat(remotePath).size }.getOrNull()
-        copy(sftp.read(remotePath), destination, total, onProgress)
+        destination.use { target -> copy(sftp.read(remotePath), target, total, onProgress) }
     }
 
     suspend fun resumeDownload(
@@ -169,12 +178,15 @@ class SftpTransferManager @Inject constructor() {
         output: OutputStream,
         totalBytes: Long?,
         onProgress: suspend (bytes: Long, total: Long?) -> Unit,
-        initialBytes: Long = 0,
     ) = withContext(Dispatchers.IO) {
         input.use { source ->
             output.use { target ->
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                var copied = initialBytes
+                // Always from zero: this is the whole-file path. Resuming from an offset is
+                // resumeUpload/resumeDownload, which position their own handles and never come
+                // through here - an `initialBytes` parameter lived here for that case and no caller
+                // could reach it, so a reader could believe this function knew how to resume.
+                var copied = 0L
                 while (true) {
                     coroutineContext.ensureActive()
                     val count = source.read(buffer)

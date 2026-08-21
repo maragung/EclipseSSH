@@ -27,21 +27,27 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import org.apache.sshd.client.ClientBuilder
+import org.apache.sshd.client.ClientFactoryManager
 import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.config.hosts.HostConfigEntry
 import org.apache.sshd.common.AttributeRepository
+import org.apache.sshd.common.PropertyResolver
 import org.apache.sshd.common.util.net.SshdSocketAddress
 import org.apache.sshd.common.NamedResource
 import org.apache.sshd.common.OptionalFeature
 import org.apache.sshd.client.auth.keyboard.UserInteraction
 import org.apache.sshd.common.cipher.BuiltinCiphers
+import org.apache.sshd.common.io.IoSession
+import org.apache.sshd.core.CoreModuleProperties
 import org.apache.sshd.common.kex.BuiltinDHFactories
 import org.apache.sshd.common.kex.KeyExchangeFactory
 import org.apache.sshd.common.mac.BuiltinMacs
-import org.apache.sshd.common.session.SessionHeartbeatController.HeartbeatType
+import org.apache.sshd.common.session.helpers.CurrentService
 import org.apache.sshd.common.signature.BuiltinSignatures
 import org.apache.sshd.client.keyverifier.ServerKeyVerifier
 import org.apache.sshd.client.session.ClientSession
+import org.apache.sshd.client.session.ClientSessionImpl
+import org.apache.sshd.client.session.SessionFactory
 import org.apache.sshd.sftp.client.SftpClient
 import org.apache.sshd.sftp.client.SftpClientFactory
 
@@ -77,7 +83,26 @@ class SshConnectionManager @Inject constructor(
             store = knownHosts,
             tunnelledTarget = ::tunnelledTargetFor,
         ) { challenge -> _hostKeyChallenges.tryEmit(challenge) }
-        setSessionHeartbeat(HeartbeatType.IGNORE, Duration.ofSeconds(30))
+        // Every session this client creates is a [LivenessClientSession], which is the only way the
+        // host's own keep-alive interval can reach the heartbeat at all: see [armHeartbeat].
+        sessionFactory = LivenessSessionFactory(this)
+        // The fallback for a session that reaches construction without a liveness attribute, and the
+        // value the client-level resolver hands to any session that asks. [connect] keeps it in step
+        // with the global setting.
+        armHeartbeat(this, DEFAULT_KEEP_ALIVE_SECONDS)
+        // Nagle off. This is the difference between a terminal that feels connected and one that does
+        // not, and Apache MINA leaves it on: `CoreModuleProperties.TCP_NODELAY` defaults to false, so
+        // every keystroke this app sent was a small segment held by the kernel until the previous
+        // one was acknowledged. Paired with the peer's delayed ACK that is the classic ~40 ms of
+        // interactive lag, worst exactly where it is most visible - single characters typed into a
+        // shell, and the cursor-key traffic of `vim` and `htop`. Every SSH client sets this; MINA
+        // simply does not do it for you.
+        CoreModuleProperties.TCP_NODELAY.set(this, true)
+        // TCP-level keepalive as a backstop under the SSH heartbeat below. The heartbeat notices a
+        // peer that is still answering TCP but has stopped answering SSH; this notices a socket whose
+        // other end has gone away entirely, including the case where no SSH heartbeat is due for
+        // minutes. MINA defaults this to false as well.
+        CoreModuleProperties.SOCKET_KEEPALIVE.set(this, true)
     }
 
     @Volatile private var started = false
@@ -203,27 +228,46 @@ class SshConnectionManager @Inject constructor(
         val tunnelled = jumpHost
             ?.let { TunnelledTarget(profile.username, profile.host, profile.port) }
             ?.also(tunnelledTargets::add)
+        /*
+         * Resolved before the dial, because the heartbeat cannot be configured after it.
+         *
+         * A host's own interval wins over the global one when it sets one: a host behind an aggressive
+         * NAT needs a shorter heartbeat than the default, and one on a metered link a longer one.
+         */
+        val globalKeepAlive = runCatching { settingsRepository.settings.first().keepAliveSeconds }
+            .getOrDefault(DEFAULT_KEEP_ALIVE_SECONDS)
+            .coerceIn(KEEP_ALIVE_RANGE.first, KEEP_ALIVE_RANGE.last)
+        val keepAlive = (profile.keepAliveSeconds ?: globalKeepAlive)
+            .coerceIn(KEEP_ALIVE_RANGE.first, KEEP_ALIVE_RANGE.last)
+        // Keeps the client-level fallback tracking the user's global preference rather than a
+        // constant, for the one session that is built without a socket to carry the attribute: the
+        // far end of a jump-host tunnel. Two connects can interleave here, and it does not matter -
+        // every value written is a valid interval and it is only ever a fallback.
+        armHeartbeat(client, globalKeepAlive)
+        /*
+         * The connection context, which is how per-host configuration reaches session construction.
+         *
+         * MINA attaches this repository to the [IoSession] before handing it to the session factory,
+         * so it is readable from [LivenessClientSession] at the one moment the heartbeat can still be
+         * armed. The proxy configurations travel the same way and are read by [ProxyAwareConnector].
+         */
+        val context = AttributeRepository.ofAttributesMap(
+            buildMap<AttributeRepository.AttributeKey<*>, Any> {
+                put(LIVENESS_KEY, keepAlive)
+                when (profile.proxyType) {
+                    ProxyType.SOCKS5 -> put(SocksProxyConfig.KEY, socksProxyConfig(profile, timeout))
+                    ProxyType.HTTP_CONNECT -> put(HttpProxyConfig.KEY, httpProxyConfig(profile, timeout))
+                    else -> Unit
+                }
+            },
+        )
         val session = try {
             when {
-                profile.proxyType == ProxyType.SOCKS5 -> {
-                    val context = AttributeRepository.ofKeyValuePair(
-                        SocksProxyConfig.KEY,
-                        socksProxyConfig(profile, timeout),
-                    )
-                    client.connect(profile.username, profile.host, profile.port, context, null)
-                }
-                profile.proxyType == ProxyType.HTTP_CONNECT -> {
-                    val context = AttributeRepository.ofKeyValuePair(
-                        HttpProxyConfig.KEY,
-                        httpProxyConfig(profile, timeout),
-                    )
-                    client.connect(profile.username, profile.host, profile.port, context, null)
-                }
                 jumpHost != null -> {
                     val entry = HostConfigEntry(profile.host, profile.host, profile.port, profile.username, jumpHost)
-                    client.connect(entry, null, null)
+                    client.connect(entry, context, null)
                 }
-                else -> client.connect(profile.username, profile.host, profile.port)
+                else -> client.connect(profile.username, profile.host, profile.port, context, null)
             }.verify(timeout, TimeUnit.SECONDS)
                 .session
         } finally {
@@ -241,15 +285,9 @@ class SshConnectionManager @Inject constructor(
                 })
             }
             keyPair?.let(session::addPublicKeyIdentity)
-            // Apply the configured keep-alive (SSH IGNORE heartbeat) so idle sessions
-            // survive NAT timeouts and Wi-Fi → mobile-data transitions.
-            // The host's own interval wins over the global one when it sets it; a host behind an
-            // aggressive NAT needs a shorter heartbeat than the default and a metered link a longer one.
-            val keepAlive = (
-                profile.keepAliveSeconds
-                    ?: runCatching { settingsRepository.settings.first().keepAliveSeconds }.getOrDefault(30)
-                ).coerceIn(KEEP_ALIVE_RANGE.first, KEEP_ALIVE_RANGE.last)
-            session.setSessionHeartbeat(HeartbeatType.IGNORE, Duration.ofSeconds(keepAlive.toLong()))
+            // The heartbeat itself was armed at construction (see [armHeartbeat]); this is only its
+            // backstop, and it is the one liveness property MINA will still read after the fact.
+            configureIdleTimeout(session, keepAlive)
             session.auth().verify(timeout, TimeUnit.SECONDS)
             session
         } catch (error: Throwable) {
@@ -354,6 +392,27 @@ class SshConnectionManager @Inject constructor(
      */
     private fun <T> List<T>.supported(): List<T> where T : OptionalFeature = filter { it.isSupported }
 
+    /**
+     * Sets the idle timeout that backs up the heartbeat armed in [armHeartbeat].
+     *
+     * MINA's default idle timeout is exactly ten minutes and [KEEP_ALIVE_RANGE] allows a keep-alive of
+     * exactly ten minutes. Those two race, and the user who lost is the one who deliberately chose the
+     * longest interval to save battery on a metered link: their idle session was dropped by the
+     * client's own timer at almost the moment the heartbeat that would have kept it alive was due.
+     * Anchoring it to three heartbeat intervals plus a minute keeps a real backstop - the session
+     * still goes away if the heartbeat itself stops running - while making it impossible for the
+     * backstop to fire before the heartbeat does.
+     *
+     * Unlike the heartbeat properties this one can be set on a live session, because MINA re-reads it
+     * on every idle check rather than caching it in a field at construction.
+     */
+    private fun configureIdleTimeout(session: ClientSession, keepAliveSeconds: Int) {
+        CoreModuleProperties.IDLE_TIMEOUT.set(
+            session,
+            Duration.ofSeconds(keepAliveSeconds.toLong() * HEARTBEAT_NO_REPLY_MAX + IDLE_TIMEOUT_MARGIN_SECONDS),
+        )
+    }
+
     private fun ensureStarted() {
         if (!started) synchronized(this) {
             if (!started) {
@@ -370,6 +429,15 @@ class SshConnectionManager @Inject constructor(
                 started = false
             }
         }
+    }
+
+    private companion object {
+
+        /** Keep-alive interval used when neither the host nor the settings have an opinion. */
+        const val DEFAULT_KEEP_ALIVE_SECONDS = 30
+
+        /** Slack between the last heartbeat that could arrive and the idle timeout firing. */
+        const val IDLE_TIMEOUT_MARGIN_SECONDS = 60L
     }
 }
 
@@ -572,4 +640,100 @@ internal class KnownHostsVerifier(
             return "SHA256:" + Base64.getEncoder().withoutPadding().encodeToString(digest)
         }
     }
+}
+
+/**
+ * The global-request name used for the SSH-level keep-alive.
+ *
+ * `keepalive@openssh.com` rather than Apache MINA's own `keepalive@sshd.apache.org`: both are
+ * answered — an unknown request with `want-reply` gets `SSH_MSG_REQUEST_FAILURE`, which is the
+ * proof of life this needs — but the OpenSSH name is the one servers, bastions and audit logs
+ * recognise, and a name a middlebox has seen before is one less thing to be filtered.
+ */
+private const val KEEPALIVE_REQUEST = "keepalive@openssh.com"
+
+/** Missed keep-alive replies tolerated before the session is closed, as `ServerAliveCountMax`. */
+private const val HEARTBEAT_NO_REPLY_MAX = 3
+
+/**
+ * The host's keep-alive interval, in seconds, as carried on the connection context.
+ *
+ * MINA copies the [AttributeRepository] passed to `connect` onto the [IoSession] before the session
+ * factory ever sees it, which makes it the one channel that reaches session construction.
+ */
+private val LIVENESS_KEY = AttributeRepository.AttributeKey<Int>()
+
+/**
+ * Arms the SSH keep-alive that both holds a NAT mapping open and detects a peer that has stopped
+ * answering.
+ *
+ * The heartbeat used to be `HeartbeatType.IGNORE`, which sends `SSH_MSG_IGNORE` and expects nothing
+ * back. That keeps a NAT mapping warm, which is what it was added for, but it cannot detect a dead
+ * peer: nothing about it fails when the packets stop arriving anywhere. The failure that produced was
+ * the ugliest kind - a session that stays CONNECTED in the UI forever after the network moved
+ * underneath it (a NAT rebind, a Wi-Fi to mobile handover, a sleeping upstream router), with the user
+ * typing into a shell that is not there and no error ever appearing. Nothing reconnected, because as
+ * far as the app was concerned nothing had gone wrong.
+ *
+ * Switching it to `HeartbeatType.RESERVED` through `setSessionHeartbeat` looked like the fix and was
+ * not one. That call writes `CommonModuleProperties.SESSION_HEARTBEAT_TYPE` and
+ * `SESSION_HEARTBEAT_INTERVAL`, which only `AbstractConnectionService` reads - and that generic
+ * implementation supports `IGNORE` and throws `NullPointerException: No customized heartbeat handler
+ * registered` for anything else. `ClientConnectionService`, the service a client session actually
+ * runs, reads [CoreModuleProperties.HEARTBEAT_INTERVAL], [CoreModuleProperties.HEARTBEAT_REQUEST] and
+ * [CoreModuleProperties.HEARTBEAT_NO_REPLY_MAX] instead, and only falls back to the generic heartbeat
+ * when that interval is unset. So the app had a heartbeat that scheduled nothing.
+ *
+ * What is set here is a `keepalive@openssh.com` global request with `want-reply`, which is what
+ * OpenSSH's own `ServerAliveInterval` sends. MINA counts the requests that have gone unanswered and
+ * closes the session once the count passes the limit, and a close is an event the app can act on: the
+ * terminal collector sees it and starts a bounded, backed-off reconnect. RFC 4254 requires a server to
+ * answer an unknown global request with `SSH_MSG_REQUEST_FAILURE` when a reply was asked for, and a
+ * failure reply is still a reply - it proves the peer is alive and resets the counter - so this works
+ * against servers that have never heard of the request name.
+ *
+ * Three missed replies before giving up, mirroring `ServerAliveCountMax`, so a single dropped packet
+ * or one long garbage-collection pause on the server cannot end a working session.
+ *
+ * `HEARTBEAT_REPLY_WAIT` is deliberately not set: it is deprecated, and `configureMaxNoReply` ignores
+ * it entirely whenever `HEARTBEAT_NO_REPLY_MAX` is set explicitly, as it is here.
+ */
+private fun armHeartbeat(resolver: PropertyResolver, keepAliveSeconds: Int) {
+    CoreModuleProperties.HEARTBEAT_INTERVAL.set(resolver, Duration.ofSeconds(keepAliveSeconds.toLong()))
+    CoreModuleProperties.HEARTBEAT_REQUEST.set(resolver, KEEPALIVE_REQUEST)
+    CoreModuleProperties.HEARTBEAT_NO_REPLY_MAX.set(resolver, HEARTBEAT_NO_REPLY_MAX)
+}
+
+/**
+ * A client session that arms its heartbeat while it is still being constructed.
+ *
+ * This exists because of *when* `ClientConnectionService` reads its configuration. MINA builds both
+ * services - userauth and connection - inside `AbstractSession`'s constructor, by way of
+ * `initializeCurrentService`, and the connection service copies the three heartbeat properties into
+ * `final` fields there and then. By the time `connect` holds a `ClientSession` the values are already
+ * fixed, so setting them on the session at that point configures nothing at all: the session silently
+ * keeps whatever the client-level resolver happened to hold. That is not a detail worth working around
+ * in the caller, because it is invisible - every property reads back exactly as it was written.
+ *
+ * Overriding [initializeCurrentService] puts the per-host interval on the session's own resolver one
+ * step before the service is built, which is the last moment it can matter.
+ */
+private class LivenessClientSession(
+    manager: ClientFactoryManager,
+    ioSession: IoSession,
+) : ClientSessionImpl(manager, ioSession) {
+
+    override fun initializeCurrentService(): CurrentService {
+        // Runs from the superclass constructor, so nothing declared by this class is initialised yet -
+        // hence the attribute lookup rather than a constructor parameter.
+        val context = getIoSession().getAttribute(AttributeRepository::class.java) as? AttributeRepository
+        context?.getAttribute(LIVENESS_KEY)?.let { armHeartbeat(this, it) }
+        return super.initializeCurrentService()
+    }
+}
+
+/** Makes [LivenessClientSession] the session every connection gets. */
+private class LivenessSessionFactory(client: ClientFactoryManager) : SessionFactory(client) {
+    override fun doCreateSession(ioSession: IoSession): ClientSessionImpl =
+        LivenessClientSession(getClient(), ioSession)
 }

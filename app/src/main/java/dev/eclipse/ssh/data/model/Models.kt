@@ -29,7 +29,7 @@ data class HostProfile(
      */
     val connectTimeoutSeconds: Int = DEFAULT_CONNECT_TIMEOUT_SECONDS,
     /**
-     * Per-host keep-alive (SSH IGNORE heartbeat) in seconds, or null to follow
+     * Per-host keep-alive (SSH keepalive request) in seconds, or null to follow
      * [AppSettings.keepAliveSeconds]. A host behind an aggressive NAT needs a shorter interval than
      * the global default, and a metered link needs a longer one.
      */

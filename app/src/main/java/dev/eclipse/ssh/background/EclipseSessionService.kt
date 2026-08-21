@@ -17,11 +17,12 @@ import dev.eclipse.ssh.MainActivity
 import dev.eclipse.ssh.R
 import dev.eclipse.ssh.data.HostRepository
 import dev.eclipse.ssh.data.TransferRepository
+import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.ssh.SshConnectionManager
 import dev.eclipse.ssh.ssh.SshKeyLoader
-import java.util.concurrent.ConcurrentHashMap
+import dev.eclipse.ssh.ssh.SshSessionStore
 import javax.inject.Inject
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineScope
@@ -42,13 +43,13 @@ class EclipseSessionService : LifecycleService() {
     @Inject lateinit var sessionRegistry: SessionRegistry
     @Inject lateinit var hostRepository: HostRepository
     @Inject lateinit var sshConnectionManager: SshConnectionManager
+    @Inject lateinit var sessionStore: SshSessionStore
     @Inject lateinit var transferRestorer: TransferRestorer
     @Inject lateinit var transferRepository: TransferRepository
     @Inject lateinit var settingsRepository: SettingsRepository
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val restoreMutex = Mutex()
-    private val restoredSessions = ConcurrentHashMap<String, org.apache.sshd.client.session.ClientSession>()
     private var sessionText = ""
     private var transferCount = 0
     private var transferPercent = 0
@@ -142,12 +143,15 @@ class EclipseSessionService : LifecycleService() {
         // Loop instead of recursing so endless reconnect attempts (e.g. a host that
         // stays unreachable for days) can never grow the coroutine call stack.
         while (coroutineContext.isActive) {
-            // Drop sessions the server has closed, otherwise a dropped session stays in the
-            // map forever and the host is never reconnected — the service's whole purpose.
-            restoredSessions.entries.removeAll { (_, session) -> !session.isOpen }
             val activeIds = sessionRegistry.activeHostIds.first()
-            val hosts = hostRepository.hosts.first().filter { it.id in activeIds }
-            val pending = hosts.filterNot { restoredSessions.containsKey(it.id) }
+            val hosts = hostRepository.hosts.first()
+            // [SshSessionStore.isLive] answers for the whole app, not just for this service, and that
+            // is the point: the same registry entry is written the moment the *UI* authenticates a
+            // host, so a service that could only see its own sessions dialled a second one to the
+            // account the user had just connected — every single time Connect was tapped, because
+            // tapping Connect is also what starts this service. It prunes dead entries as it goes, so
+            // a session that has since dropped is still restored here.
+            val pending = hostsNeedingRestore(hosts, activeIds) { sessionStore.isLive(it) }
             var connected = 0
             pending.forEach { host ->
                 val password = sessionRegistry.credential(host.id)
@@ -167,7 +171,11 @@ class EclipseSessionService : LifecycleService() {
                     null
                 }
                 if (session != null) {
-                    restoredSessions[host.id] = session
+                    // Into the shared store, so the UI adopts this session instead of dialling its own
+                    // when it comes back — which is what makes a session survive process death.
+                    sessionStore.sessions.put(host.id, session)?.let { previous ->
+                        if (previous !== session) runCatching { previous.close(false) }
+                    }
                     connected++
                     val resumed = runCatching { transferRestorer.resumeForHost(host.id, session) }.getOrDefault(0)
                     if (resumed > 0) updateNotification("Resuming $resumed transfer(s) for ${host.name}")
@@ -190,7 +198,7 @@ class EclipseSessionService : LifecycleService() {
                 }
             } else {
                 reconnectAttempts = 0
-                val live = restoredSessions.size
+                val live = sessionStore.liveHostIds().size
                 updateNotification(if (live == 0) "$attemptReason · no sessions restored" else "$live SSH session(s) active")
                 return@withLock
             }
@@ -208,10 +216,8 @@ class EclipseSessionService : LifecycleService() {
         return base + Random.nextLong(0, base / 2 + 1)
     }
 
-    private fun closeSessions() {
-        restoredSessions.values.forEach { runCatching { it.close(false) } }
-        restoredSessions.clear()
-    }
+    /** Only for the notification's Stop action, which is the user saying "close my sessions". */
+    private fun closeSessions() = sessionStore.closeAll()
 
     override fun onDestroy() {
         if (::connectivityManager.isInitialized) {
@@ -221,11 +227,13 @@ class EclipseSessionService : LifecycleService() {
         // After the scope, so the cancellation is what ends a sleeping backoff rather than a closed
         // channel; awaitReconnectWindow treats the latter as "wait the whole window".
         reconnectWake.close()
-        closeSessions()
-        // Deliberately does NOT call sshConnectionManager.close(): the SshClient is an
-        // application-scoped singleton shared with the UI, and stopping it here tore down
-        // every interactive terminal/SFTP session the moment the service was recycled.
-        // Only the sessions this service opened itself are closed, above.
+        // Deliberately closes nothing. The SshClient is an application-scoped singleton shared with
+        // the UI, so stopping it here tore down every interactive terminal and SFTP session the moment
+        // the service was recycled — and now that sessions live in [SshSessionStore] rather than in a
+        // map owned by this service, closing "its own" sessions would do exactly the same damage: the
+        // session the user is typing into is the same object. A session ends when the user closes its
+        // tab or taps Stop, or when the process dies and the kernel closes the socket. The service
+        // being recycled is none of those.
         runCatching { (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID) }
         super.onDestroy()
     }
@@ -340,3 +348,23 @@ class EclipseSessionService : LifecycleService() {
         private const val REQUEST_RESTORE = 3
     }
 }
+
+/**
+ * The hosts a restore pass should dial: registered as active, and not already connected.
+ *
+ * A free function because it is the one part of the pass with a decision in it, and because a
+ * `Service` is close to untestable in a JVM suite — the bug this replaced (the service dialling a
+ * second session to a host the UI had just connected) was invisible precisely because it lived inside
+ * one. `isLive` is passed in rather than read from a field so a test can state the app's session state
+ * exactly, including the case that matters: an id that is *registered* and *already connected*.
+ *
+ * @param hosts every saved profile.
+ * @param activeIds the ids [dev.eclipse.ssh.background.SessionRegistry] has credentials registered
+ *   for, which is the app's definition of "the user wants this session up".
+ * @param isLive whether the app already holds a usable session for an id.
+ */
+internal fun hostsNeedingRestore(
+    hosts: List<HostProfile>,
+    activeIds: Set<String>,
+    isLive: (String) -> Boolean,
+): List<HostProfile> = hosts.filter { it.id in activeIds && !isLive(it.id) }

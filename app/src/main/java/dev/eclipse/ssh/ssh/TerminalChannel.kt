@@ -5,6 +5,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.Charset
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
 import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import kotlinx.coroutines.CompletableDeferred
@@ -14,6 +15,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.sshd.client.channel.ClientChannel
 import org.apache.sshd.client.channel.PtyCapableChannelSession
+import org.apache.sshd.common.session.Session
+import org.apache.sshd.common.session.SessionListener
 
 /**
  * One interactive shell channel: a pty on the remote host, its output as bytes and its input as
@@ -55,6 +58,17 @@ class TerminalChannel(
     private val outputEvents = MutableSharedFlow<ByteArray>(replay = REPLAY_CHUNKS, extraBufferCapacity = BUFFERED_CHUNKS)
     val output: SharedFlow<ByteArray> = outputEvents
 
+    private val droppedChunkCount = AtomicLong()
+
+    /**
+     * How many output chunks were discarded because nothing drained [output] in time.
+     *
+     * Always zero in a healthy session. Exposed so the session that owns this channel can tell the
+     * user their transcript has a hole in it rather than leaving them to wonder why a line never
+     * appeared; see `MainViewModel.launchTerminalCollector`.
+     */
+    val droppedChunks: Long get() = droppedChunkCount.get()
+
     /**
      * Completes when this channel is finished, carrying the shell's exit status if it sent one.
      *
@@ -69,6 +83,36 @@ class TerminalChannel(
      * fires a close future immediately when the channel is already closed.
      */
     private val closed = CompletableDeferred<Int?>()
+
+    /**
+     * Finishes [closed] when the transport under this channel dies, rather than when the channel is
+     * closed politely.
+     *
+     * The channel's own close future is not enough, and the case it misses is the one that matters
+     * most. When a network drops silently - a phone leaving Wi-Fi, a NAT dropping the flow, a server
+     * losing power - the keep-alive is what notices, and MINA reacts by closing the session
+     * *gracefully*: it wants to send `SSH_MSG_CHANNEL_CLOSE` and wait for the peer's answer. Over a
+     * socket that no longer delivers anything, that answer never comes, so the channel's close future
+     * never fires. [awaitClosed] then waits forever on a session whose transport has already been
+     * declared dead, the tab keeps presenting itself as connected, and the auto-reconnect that
+     * `shouldAutoReconnect` would have started never gets the chance.
+     *
+     * [SessionListener.sessionException] is the earliest honest signal: MINA raises it the moment the
+     * heartbeat gives up, before it attempts any teardown. [SessionListener.sessionClosed] covers the
+     * orderly endings - a server-side disconnect, or the app closing the session under a channel that
+     * is still open. Either way the exit status is whatever the shell managed to report, which for a
+     * dropped transport is `null` - exactly what the reconnect decision reads as "went away on its
+     * own" rather than "the user typed exit".
+     */
+    private val transportDeath = object : SessionListener {
+        override fun sessionException(session: Session, t: Throwable) = markClosed()
+
+        override fun sessionClosed(session: Session) = markClosed()
+    }
+
+    private fun markClosed() {
+        closed.complete(channel.exitStatus)
+    }
 
     /** Suspends until the channel closes, returning the remote exit status when one was reported. */
     suspend fun awaitClosed(): Int? = closed.await()
@@ -89,6 +133,10 @@ class TerminalChannel(
         // Registered after the open so a failed open reports itself as a failed open, through the
         // exception, rather than as a session that came up and immediately ended.
         channel.addCloseFutureListener { closed.complete(channel.exitStatus) }
+        channel.session.addSessionListener(transportDeath)
+        // Closes the gap between the open completing and the listener being in place: a session that
+        // ended inside that window has already fired every event it is going to fire.
+        if (!channel.session.isOpen) markClosed()
     }
 
     /**
@@ -124,7 +172,16 @@ class TerminalChannel(
 
     override fun close() {
         runCatching { input.close() }
-        runCatching { channel.close(false) }
+        // Removed explicitly: one session is shared by every tab pointing at that host, so a listener
+        // left behind here would outlive its channel and accumulate one entry per terminal the user
+        // ever opened.
+        runCatching { channel.session.removeSessionListener(transportDeath) }
+        // Graceful while the transport is alive, so the shell sees EOF on stdin and the server can
+        // reap the pty; immediate once it is not, because a graceful close waits for a
+        // `SSH_MSG_CHANNEL_CLOSE` reply that a dead socket will never deliver, and waiting for it
+        // pins this channel's buffers and window state for the life of the process.
+        val transportAlive = runCatching { channel.session.isOpen }.getOrDefault(false)
+        runCatching { channel.close(!transportAlive) }
         // Belt and braces for the case where the channel never opened, so nothing is left awaiting a
         // close future that was never registered.
         closed.complete(null)
@@ -161,7 +218,18 @@ class TerminalChannel(
      */
     private fun publish(chunk: ByteArray) {
         if (outputEvents.tryEmit(chunk)) return
-        runBlocking { withTimeoutOrNull(PUBLISH_WAIT_MS) { outputEvents.emit(chunk) } }
+        val delivered = runBlocking {
+            withTimeoutOrNull(PUBLISH_WAIT_MS) {
+                outputEvents.emit(chunk)
+                true
+            }
+        } ?: false
+        // Counted, because the one thing worse than dropping output is dropping it in silence. The
+        // display cannot be made whole again from here — the bytes are gone and the emulator's state
+        // depends on having seen them — so the honest thing is to be able to say so, which is what
+        // [droppedChunks] is for. Reaching this at all means nothing drained [output] for
+        // [PUBLISH_WAIT_MS], which is a fault in whoever owns the collector rather than a busy screen.
+        if (!delivered) droppedChunkCount.incrementAndGet()
     }
 
     /**
@@ -240,6 +308,15 @@ class TerminalChannel(
         /** Headroom for a burst, so the common case never has to block the pump thread. */
         const val BUFFERED_CHUNKS = 256
 
-        const val PUBLISH_WAIT_MS = 2_000L
+        /**
+         * How long the pump thread waits for a collector before giving up on a chunk.
+         *
+         * Ten seconds rather than two. The collector drains into an unbounded channel on
+         * `Dispatchers.Default` and does no I/O, so the only way to spend even one second here is a
+         * dispatcher that is genuinely wedged — and the cost of being wrong in the short direction is
+         * corrupted terminal state, while the cost of being wrong in the long direction is one pump
+         * thread pausing a session nobody is reading.
+         */
+        const val PUBLISH_WAIT_MS = 10_000L
     }
 }

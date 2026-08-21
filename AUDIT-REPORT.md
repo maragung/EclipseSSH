@@ -1066,3 +1066,157 @@ One thing found while publishing, worth stating plainly: git on this host had
 plaintext at mode 664 — group-readable on a box shared with other tenants. That file was shredded. The
 helper is still configured, so the next push that authenticates will write another one; a token used
 here should be treated as disclosed and rotated.
+
+## 14. Connection stability and a genuinely interactive terminal
+
+The brief for this pass was narrow and demanding: sessions that do not drop or reconnect without cause,
+a terminal that types like a native one, and a reconnect that only fires on a real disconnection. Four
+defects were found, and the first two were the reason a dropped session could sit on screen looking
+alive indefinitely.
+
+### 14.1 The keep-alive was never on the wire
+
+`SshConnectionManager` set `HEARTBEAT_INTERVAL`, `HEARTBEAT_REQUEST` and `HEARTBEAT_NO_REPLY_MAX` on
+the **session**, immediately after `client.connect(...)` returned. Nothing sent a keep-alive.
+
+Apache MINA copies those three properties into `final` fields of `ClientConnectionService` when that
+service is constructed — and `javap` on 2.14.0 shows where that happens: `AbstractSession`'s
+constructor calls `initializeCurrentService()`, and `ClientSessionImpl$Services`' constructor builds
+both the userauth service and the connection service from there. The connection service therefore
+exists before `client.connect(...)` has even returned to the caller. Every value set on the session
+afterwards configured nothing at all; the session ran with the client-level default, and a host
+configured for a 5-second keep-alive got 30 seconds — or, before that, no heartbeat, because the code
+had been setting the `SESSION_HEARTBEAT_*` pair that a *server* reads.
+
+The fix is a `SessionFactory` on the client that produces a `LivenessClientSession`, which overrides
+`initializeCurrentService()` and arms the heartbeat *before* delegating to the superclass. The per-host
+interval reaches it through the connect context: `client.connect` already carries an
+`AttributeRepository` to the connector, MINA's `Nio2Connector` attaches it to the `IoSession` before
+the session is created, and the app's own proxy connectors do the same — so the attribute is readable
+from inside that constructor, which is the only place a per-host value can still be applied.
+
+`HEARTBEAT_REPLY_WAIT` was removed rather than kept: `configureMaxNoReply()` returns
+`HEARTBEAT_NO_REPLY_MAX` outright whenever it is set explicitly, so the deprecated property was dead
+configuration that only produced a deprecation warning.
+
+The regression test does not read the property back — that is what made the old assertion pass against
+a heartbeat that never fired. A counting global-request handler is installed on the in-process SSHD
+server, and the test asserts the *server* saw at least two `keepalive@openssh.com` requests inside
+three intervals. Returning `Result.Unsupported` keeps the handler transparent: MINA continues down its
+handler list and still answers with `REQUEST_FAILURE`, which is a reply, which is what the client's
+outstanding-heartbeat counter needs.
+
+### 14.2 A dead transport never reached the terminal
+
+With the heartbeat working, the second half of the problem appeared: MINA noticed the dead peer in
+about 20 seconds and closed the session — and the tab still said CONNECTED.
+
+`TerminalChannel` learned about closure from exactly one place, `channel.addCloseFutureListener`. When
+a network drops silently, MINA closes the session *gracefully*: it wants to send
+`SSH_MSG_CHANNEL_CLOSE` and wait for the peer's answer. Over a socket that no longer delivers
+anything, that answer never comes, the channel's close future never fires, `awaitClosed()` waits
+forever, and the auto-reconnect ladder — which is bounded, backed off, jittered and offline-aware, and
+was working correctly — never got the chance to run.
+
+`TerminalChannel` now also watches its own transport, through a `SessionListener` that completes the
+same one-shot signal on `sessionException` (the earliest honest signal: MINA raises it the moment the
+heartbeat gives up, before any teardown) and on `sessionClosed` (the orderly endings). The exit status
+carried is whatever the shell managed to report, which for a dropped transport is `null` — exactly what
+`shouldAutoReconnect(null, tabIsOpen = true)` reads as "went away on its own" rather than "the user
+typed `exit`". Two smaller things came with it: the listener is removed in `close()`, because one
+session is shared by every tab on that host and a listener left behind would accumulate one entry per
+terminal ever opened; and `close()` now closes the channel *immediately* rather than gracefully when
+the transport is already gone, since waiting for a reply that cannot arrive only pins the channel's
+buffers for the life of the process.
+
+The test froze a relay in front of the server and waited for the terminal to report itself closed. It
+timed out at 122 seconds before this change. It now passes in 20.7 seconds, under the session's own
+idle timeout, which the test asserts.
+
+### 14.3 SFTP
+
+The resume paths were already careful — absolute-offset reads and writes, the offset taken from the
+file's real length rather than the throttled progress counter, `skip` verified rather than trusted. The
+audit found three things around them:
+
+- `download()` leaked the caller's `ContentResolver` descriptor whenever `sftp.read` threw, which is
+  what happens for a file deleted or made unreadable while the transfer sat queued — one descriptor per
+  failed download, on the path the retry ladder walks most often. `upload()` already guarded this; the
+  download path now does too.
+- `TransferCoordinator.resumeDownload` defaulted `existingBytes` to `item.transferredBytes` — the one
+  value its own KDoc says must never be used, because the counter is throttled and appending from it
+  duplicates bytes into the file. The contract was stated in prose and undermined by the signature. It
+  is a required parameter now; both callers already measured the partial file themselves.
+- `copy()` carried an `initialBytes` parameter no caller could reach, which made the whole-file path
+  look as though it knew how to resume.
+
+### 14.4 Typing latency, and not reconnecting for no reason
+
+Verified rather than changed, since these were already right: `TCP_NODELAY` and `SO_KEEPALIVE` are set
+on the socket (asserted against the kernel in `SessionStabilityTest`); keystrokes are written on the
+calling thread into an unbounded queue that MINA's pump drains, so they cannot be reordered by a
+dispatcher and cannot block on the network; sessions, ptys and scrollback buffers live in
+`SshSessionStore` for the life of the process, so navigation, rotation and the foreground service
+adopt the existing session instead of dialling a second one; and the pty is resized through
+`sendWindowChange` on every layout change, clamped to the display's own limits.
+
+### 14.5 Dependencies removed
+
+`androidx.window`, `material3-window-size-class` and `ui-tooling-preview` had zero references in
+`app/src` — no imports, no `@Preview`, nothing in any XML — and were dropped along with their version
+catalog entries. `ui-tooling` itself stays as a `debugImplementation`, because that is what makes the
+Compose tree visible to the Layout Inspector.
+
+`navigation-compose` was the interesting one: also unreferenced, but removing it broke the build. It
+had been acting as a version pin — `hilt-navigation-compose`, where `hiltViewModel` comes from, depends
+on `navigation-compose:2.5.1`, and the direct declaration was silently upgrading it. It is now a
+`constraints { }` entry, which keeps the version pinned forward without claiming that some screen
+navigates through it.
+
+### 14.6 One test assertion removed, and why that is not weakening the suite
+
+`SessionStabilityTest` asserted `HEARTBEAT_REPLY_WAIT.getRequired(session).seconds >= 15`. MINA's own
+default for that property is five minutes, so the assertion held whether or not the app set anything —
+and, per 14.1, the library ignores the property entirely once `HEARTBEAT_NO_REPLY_MAX` is set. It
+proved nothing, and it was the last source of a deprecation warning in the build. What replaced it is a
+comment saying so, next to the test that measures the real behaviour at the server. The other eleven
+tests in the class are unchanged and one was added.
+
+### 14.7 Verification
+
+Everything below ran on this host, pinned to two cores at `nice 10`:
+
+| Check | Result |
+| --- | --- |
+| `testDebugUnitTest` | 603 tests, 0 failures, 238 s |
+| `testReleaseUnitTest` | 603 tests, 0 failures, 242 s |
+| `lintRelease` | **No issues found** |
+| `assembleDebug` + `assembleRelease` | BUILD SUCCESSFUL in 25m 49s |
+| `apksigner verify` | Verifies · 1 signer · `CN=Eclipse SSH` · SHA-256 `a75a6fc4…42921e` |
+| APK signing block | `0x7109871a` (v2) and `0xf05368c0` (v3) both present |
+
+The release APK is 5,641,932 bytes, 2,738 bytes smaller than before the dependency removal — R8 was
+already stripping those libraries from the release build, so the honest figure is "no meaningful size
+change". The gain is in the debug build and in having four fewer direct dependencies to keep current.
+
+Two of the twelve stability tests are the ones that matter for this pass, and both were failing or
+false-passing before it:
+
+- `the client really sends answerable keepalives at the configured interval` — 10.7 s, asserted at the
+  server rather than by reading the property back.
+- `a transport that silently stops delivering is noticed closed and offered for reconnect` — 20.7 s,
+  previously a 122-second timeout.
+
+The remaining ten cover the rest of the brief: Nagle off and `SO_KEEPALIVE` on at the socket, a
+keystroke reaching the shell with no newline, a paste longer than the buffer arriving whole and in
+order, a colour pty and a resize arriving as a window change, a shell the user ends reporting a status
+so nothing reconnects it, a live session being adopted instead of a second login, two hosts up at once
+with one closing cleanly, one session surviving however often the screen reopens its channel, and
+repeated connect/disconnect leaving nothing behind.
+
+Not verifiable here, and unchanged from §8: anything needing a real device. This host has no KVM and
+the guest kills `system_server`, so `connectedAndroidTest` cannot run — which is also why CI compiles
+the instrumentation suite rather than executing it. Screen lock/unlock and a physical network switch
+are in that category; the decision logic underneath them is covered by `SessionRestoreDecisionTest` and
+`AutoReconnectDecisionTest`, and `NetworkMonitor` is what wakes a sleeping backoff when an interface
+comes up.

@@ -1,0 +1,144 @@
+name: CI
+
+# Every push to main and every pull request: lint, the full unit and integration
+# suites, the instrumentation sources, and both APKs as downloadable artifacts.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's answer irrelevant, and
+# these runners are metered.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the Gradle daemon out of the picture: one run, one JVM, no state to go stale.
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+
+jobs:
+  verify:
+    name: Lint, tests and APKs
+    runs-on: ubuntu-latest
+    # The Robolectric suites run the app's real SSH stack against an in-process MINA
+    # SSHD server, twice (debug and release variants), on a two-core runner.
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Caches ~/.gradle (dependencies and the build cache) and reports what it
+      # restored. Writes are limited to main so a pull request cannot poison the
+      # cache the default branch reads.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      # Robolectric fetches the android-all jar for the compile SDK on first use and
+      # puts it in ~/.m2, which the Gradle cache above does not cover. Without this
+      # every run downloads ~100 MB before the first test executes.
+      - name: Cache Robolectric runtime jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
+          restore-keys: robolectric-${{ runner.os }}-
+
+      # Optional: with these two secrets set, the release APK is signed with the real
+      # key. Without them the build falls back to the debug key and says so - CI stays
+      # green either way, and the repository never carries signing material.
+      - name: Restore release signing material
+        id: signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PROPERTIES" ]; then
+            mkdir -p keystore
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > keystore/eclipse-release.jks
+            printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > keystore.properties
+            chmod 600 keystore/eclipse-release.jks keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets set: the release APK will carry the debug key." >&2
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Lint (release variant)
+        run: ./gradlew --stacktrace lintRelease
+
+      # The project's integration tests live in src/test: they drive the real
+      # SshConnectionManager, TerminalChannel and SFTP client against a local MINA
+      # SSHD server on a loopback port, so they need no emulator and no external host.
+      - name: Unit and integration tests
+        run: ./gradlew --stacktrace testDebugUnitTest testReleaseUnitTest
+
+      # No emulator here (see docs/ci.md), but the instrumentation sources must keep
+      # compiling or they rot silently.
+      - name: Compile instrumentation tests
+        run: ./gradlew --stacktrace assembleDebugAndroidTest
+
+      - name: Assemble APKs
+        run: ./gradlew --stacktrace assembleDebug assembleRelease
+
+      - name: Verify the release APK signature
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -1)"
+          APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
+          echo "Verifying $APK"
+          "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            # The release key is configured for v2 + v3 and nothing else; a build that
+            # silently drops v3 could never rotate the key for installed copies.
+            "$APKSIGNER" verify --verbose --min-sdk-version 28 "$APK" | tee /tmp/sigs.txt
+            grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sigs.txt
+            grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
+          fi
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eclipse-ssh-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eclipse-ssh-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      # The reports are what a red run is diagnosed from, so they are uploaded even
+      # (especially) when a step above failed.
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            app/build/reports/**
+            app/build/test-results/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Signing material must not survive into any later step or a cached workspace.
+      - name: Shred signing material
+        if: always()
+        run: |
+          rm -f keystore.properties
+          rm -rf keystore
