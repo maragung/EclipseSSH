@@ -1032,6 +1032,9 @@ One chain, on an otherwise idle box, pinned to two of four cores with `nice -n 1
 | `app-release.apk` | 5,644,670 bytes (5.38 MB), signed **v2 and v3** (`apksigner verify --min-sdk-version 24` reports both true; the APK signing block carries blocks `0x7109871a` and `0xf05368c0`) |
 | `app-debug-androidTest.apk` | 5,676,609 bytes, built (it needs a device to run; see section 8) |
 
+Those counts are this pass's, kept as the record of it. The connection-stability work in section 14
+added tests, so the current figures — 603 per variant — are in 14.7.
+
 The first attempt at this chain took 32m 9s and returned 3 failures in the release variant and 4 in
 debug. All seven were timeouts (90 s, 120 s, 180 s), and the sets did not match between variants. That
 asymmetry is the tell: a real regression fails identically in both. `vmstat` during the run showed

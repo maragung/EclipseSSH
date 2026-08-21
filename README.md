@@ -71,7 +71,7 @@ is 28).
 
 ## Tests
 
-The suite is 579 JVM/Robolectric tests and runs offline: the SSH and SFTP integration tests start a
+The suite is 603 JVM/Robolectric tests and runs offline: the SSH and SFTP integration tests start a
 real Apache MINA SSHD server on a loopback port inside the test JVM, so nothing external is contacted
 and no public or shared SSH account is involved.
 
@@ -80,6 +80,18 @@ and no public or shared SSH account is involved.
 data, they authorise nothing anywhere, and they must never be reused as real credentials.
 
 `app/src/androidTest/` holds instrumentation tests, which need a device or emulator.
+
+## Continuous integration
+
+Every push and pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml): release lint,
+both unit-test variants, a compile of the instrumentation sources, both APKs, and a signature check.
+The debug and release APKs are uploaded as build artifacts, and the test and lint reports are uploaded
+even when a step fails, because that is what a red run is diagnosed from.
+
+Signing in CI is optional. Set the repository secrets `RELEASE_KEYSTORE_BASE64` and
+`RELEASE_KEYSTORE_PROPERTIES` to sign for real; without them the release APK is built with the debug
+key and says so. [`docs/ci.md`](docs/ci.md) covers the workflow step by step, including why the
+emulator suite is compiled but not executed and how to read the signature output.
 
 ## Report
 
