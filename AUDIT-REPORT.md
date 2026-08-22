@@ -1,6 +1,7 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 1 / versionName 1.0.0 · minSdk 28, target/compileSdk 35
+`dev.eclipse.ssh` · versionCode 3 / versionName 1.0.2 · minSdk 28, target/compileSdk 35
+The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Kotlin 2.1.20 · AGP 8.9.1 · Gradle 8.11.1 · JDK 17 · Compose BOM 2025.04.01 · Hilt 2.56.1 · Room 2.7.1 · Apache MINA SSHD 2.14.0
 
 ---
