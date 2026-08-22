@@ -1,6 +1,6 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 3 / versionName 1.0.2 · minSdk 28, target/compileSdk 35
+`dev.eclipse.ssh` · versionCode 4 / versionName 1.0.3 · minSdk 28, target/compileSdk 35
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the current count is 0 errors and 51 warnings, and §16.2 says which are new and which are not.
 Kotlin 2.1.20 · AGP 8.9.1 · Gradle 8.11.1 · JDK 17 · Compose BOM 2025.04.01 · Hilt 2.56.1 · Room 2.7.1 · Apache MINA SSHD 2.14.0
@@ -1585,3 +1585,18 @@ the exact sequences those programs use: in-place repaint, the alternate screen w
 `DECSTBM` with `ESC D` and `ESC M`, `DECCKM` arrows, 256-colour and true-colour SGR, and rewriting a row
 without an erase. The 10-minute idle case is likewise tested as four keep-alive periods against a server
 that counts the keep-alives it received, rather than by waiting ten minutes.
+
+## 18. Releasing 1.0.3
+
+`versionCode` 3 → 4, `versionName` 1.0.2 → 1.0.3, carrying section 17's terminal work: history that
+survives a resize instead of being truncated, a keyboard connected to the shell the moment the session is
+ready, Return that executes a command whichever route the keyboard sends it by, and a dropped transport
+that is offered for reconnect instead of being mistaken for a deliberate close.
+
+A new number rather than a rebuild of 1.0.2. The v1.0.2 tag already points at a different tree, and two
+different APKs under one version cannot both be the release — an installed 1.0.2 would also refuse to
+upgrade to another 1.0.2, since Android compares `versionCode`.
+
+Built the same way as 1.0.2: GitHub Actions assembles from the tagged commit on `main` and this host does
+nothing but sign, so the artifact is a build of what is published rather than of a working tree. The
+signing key never leaves the host and never enters the repository or the workflow.
