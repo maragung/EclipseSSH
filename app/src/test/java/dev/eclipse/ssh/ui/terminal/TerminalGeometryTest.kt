@@ -15,9 +15,6 @@ import org.junit.Test
 class TerminalGeometryTest {
     private val cell = TerminalCellMetrics(width = 10f, height = 20f, baseline = 15f)
 
-    /** One percent of a dp count is a float multiplication, so the dp it produces is not exact. */
-    private val TOLERANCE = 0.001f
-
     @Test
     fun `a window that divides evenly leaves no gap to distribute`() {
         val grid = cell.gridIn(widthPx = 200f, heightPx = 400f)
@@ -111,5 +108,10 @@ class TerminalGeometryTest {
     fun `an unmeasured window yields no padding rather than a negative one`() {
         // Compose throws on a negative padding, and a configuration can report zero before layout.
         assertThat(terminalTextInset(0, 0)).isEqualTo(0.dp)
+    }
+
+    private companion object {
+        /** One percent of a dp count is a float multiplication, so the dp it produces is not exact. */
+        const val TOLERANCE = 0.001f
     }
 }
