@@ -17,7 +17,9 @@ grouped, tagged, favourited, searched, duplicated, and imported from `~/.ssh/con
 
 **Terminal.** Full-screen after login, VT/ANSI parsing with scrollback, selection and copy, an on-screen
 key row (arrows, Ctrl, Tab, Esc, function keys) that follows the mode the remote program set, font size
-and theme, snippets, and a session list in the Terminal tab for switching between open sessions.
+and theme, snippets, and a session list in the Terminal tab for switching between open sessions. The
+grid is centred in its window and framed by a margin of one percent of the screen, so the text fills
+the display on a phone and a tablet alike.
 Reconnect uses bounded exponential backoff; a foreground service keeps sessions alive in the
 background.
 

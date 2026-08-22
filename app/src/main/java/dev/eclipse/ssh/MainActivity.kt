@@ -80,6 +80,7 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -135,6 +136,7 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -221,6 +223,7 @@ import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
 import dev.eclipse.ssh.ui.terminal.rememberTerminalCellMetrics
 import dev.eclipse.ssh.ui.terminal.rememberTerminalLatches
+import dev.eclipse.ssh.ui.terminal.terminalTextInset
 import dev.eclipse.ssh.terminal.TerminalExportRenderer
 import dev.eclipse.ssh.security.BiometricUnlocker
 import dev.eclipse.ssh.security.SecureClipboard
@@ -1156,18 +1159,6 @@ private fun EclipseWorkspace(
             stats = state.serverStats[host.id],
             credentials = state.savedCredentials[host.id] ?: StoredCredentials(),
             onDismiss = { showHostDetails = null },
-            onConnect = {
-                showHostDetails = null
-                showAuthHost = host
-            },
-            onEdit = {
-                showHostDetails = null
-                showEditHost = host
-            },
-            onDelete = {
-                showHostDetails = null
-                pendingDeleteHost = host
-            },
             onToggleFavorite = { viewModel.saveHost(host.copy(isFavorite = !host.isFavorite)) },
             onExportAccount = {
                 showHostDetails = null
@@ -1677,7 +1668,11 @@ private fun HostCard(
                     }
                     Text("${host.username}@${host.host}:${host.port}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                IconButton(onClick = { onDetails(host) }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Open ${host.name}") }
+                // The arrow is the way into everything about this host that is not an action on it:
+                // the saved configuration, what the last connection learned about the server, and the
+                // export of the account. Named for that, because "Open" described a screen this app
+                // does not have and told a screen reader nothing about what the tap would do.
+                IconButton(onClick = { onDetails(host) }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Details and export for ${host.name}") }
                 Box {
                     IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "More actions for ${host.name}") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
@@ -1806,6 +1801,14 @@ private fun TerminalScreen(
     val keyboard = LocalSoftwareKeyboardController.current
     val textStyle = remember(fontSize) { TextStyle(fontFamily = FontFamily.Monospace, fontSize = fontSize.sp) }
     val metrics = rememberTerminalCellMetrics(textStyle)
+    // Measured against the screen rather than against this box, deliberately. The box loses height to
+    // the software keyboard, and a margin derived from it would shrink every time the keyboard opened -
+    // the text would step towards the top edge as the user typed. The screen does not change under an
+    // IME, so the gap stays where the user last saw it. See [terminalTextInset].
+    val configuration = LocalConfiguration.current
+    val textInset = remember(configuration.screenWidthDp, configuration.screenHeightDp) {
+        terminalTextInset(configuration.screenWidthDp, configuration.screenHeightDp)
+    }
     val showKeyboard = {
         focusRequester.requestFocus()
         keyboard?.show()
@@ -1863,7 +1866,12 @@ private fun TerminalScreen(
                         color = termFg,
                         fontFamily = FontFamily.Monospace,
                         fontSize = fontSize.sp,
-                        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
+                            // The same gap as the live grid, so switching between the two does not
+                            // move the text.
+                            .padding(textInset),
                     )
                 }
             } else {
@@ -1873,7 +1881,7 @@ private fun TerminalScreen(
                     background = termBg,
                     foreground = termFg,
                     metrics = metrics,
-                    modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp, vertical = 4.dp),
+                    modifier = Modifier.fillMaxSize().padding(textInset),
                     selection = selection,
                     onSelectionChange = { selection = it },
                     onSelectionFinished = { finished ->
@@ -4331,9 +4339,6 @@ private fun HostDetailsSheet(
     stats: ServerStats?,
     credentials: StoredCredentials,
     onDismiss: () -> Unit,
-    onConnect: () -> Unit,
-    onEdit: () -> Unit,
-    onDelete: () -> Unit,
     onToggleFavorite: () -> Unit,
     onExportAccount: () -> Unit,
     onForgetCredentials: () -> Unit,
@@ -4357,14 +4362,17 @@ private fun HostDetailsSheet(
             // the answer to the question this line exists to answer, and leaving the row out when the
             // answer is "nothing" makes its absence indistinguishable from the app not tracking it.
             DetailLine("Credentials", credentials.describe())
+            // Only what the card's own menu does not already offer. Connect, Edit and Remove are one
+            // tap away on every row through the kebab, and having them here as well meant two paths to
+            // each with different labels for the same act - "Delete" against "Remove" - and a sheet
+            // whose row of five buttons had to be scrolled sideways to reach the last of them. What is
+            // left is what only this sheet can do: the favourite flag, dropping the saved secrets, and
+            // the export.
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = onToggleFavorite) { Text(if (host.isFavorite) "Unfavorite" else "Favorite") }
-                OutlinedButton(onClick = onExportAccount) { Text("Export account") }
-                OutlinedButton(onClick = onEdit) { Text("Edit") }
                 if (!credentials.isEmpty) {
                     OutlinedButton(onClick = onForgetCredentials) { Text("Forget credentials") }
                 }
-                TextButton(onClick = onDelete) { Text("Delete", color = MaterialTheme.colorScheme.error) }
             }
             Spacer(Modifier.height(18.dp))
             Text("Monitoring".uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.2.sp)
@@ -4377,7 +4385,9 @@ private fun HostDetailsSheet(
                 DetailLine("Disk /", "${stats.diskUsed} / ${stats.diskTotal}")
                 TextButton(onClick = onRefreshStats) { Text("Refresh stats") }
             }
-            Spacer(Modifier.height(18.dp)); Button(onClick = onConnect, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Wifi, null); Spacer(Modifier.width(8.dp)); Text("Connect securely") }
+            // The export is the one action this sheet is the home of, so it gets the emphasis the
+            // Connect button used to have here. Connecting is what the card's menu is for.
+            Spacer(Modifier.height(18.dp)); Button(onClick = onExportAccount, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Upload, null); Spacer(Modifier.width(8.dp)); Text("Export account") }
         }
     }
 }

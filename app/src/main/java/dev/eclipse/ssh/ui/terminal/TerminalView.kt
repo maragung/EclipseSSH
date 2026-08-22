@@ -21,6 +21,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -32,6 +33,8 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
 import dev.eclipse.ssh.terminal.TerminalCell
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalSelection
@@ -52,7 +55,35 @@ import kotlin.math.roundToInt
 data class TerminalCellMetrics(val width: Float, val height: Float, val baseline: Float) {
     fun columnsIn(pixels: Float): Int = if (width <= 0f) 0 else floor(pixels / width).toInt()
     fun rowsIn(pixels: Float): Int = if (height <= 0f) 0 else floor(pixels / height).toInt()
+
+    /**
+     * The grid that fits in [widthPx] x [heightPx], and the corner to start drawing it from.
+     *
+     * A cell is rarely a whole number of pixels and a window is never an exact multiple of one, so a
+     * remainder is unavoidable: at 13sp on a 1080-pixel phone it is up to a column across and a whole
+     * row down. Drawn from the origin, every pixel of that remainder collects along the right edge and
+     * under the last line, which is what made the text look pushed into the corner of its own window -
+     * a gutter three times the intended margin on one side and the intended margin on the other, with
+     * nothing on screen to say it was rounding rather than layout. Splitting it puts half on each side,
+     * so the grid sits centred and the margin the caller asked for is the margin that appears.
+     *
+     * Bounded below at zero because a window narrower than one cell still has to report one column -
+     * the pty cannot be told it has none - and that makes the remainder negative.
+     */
+    fun gridIn(widthPx: Float, heightPx: Float): TerminalGrid {
+        val columns = columnsIn(widthPx).coerceAtLeast(1)
+        val rows = rowsIn(heightPx).coerceAtLeast(1)
+        return TerminalGrid(
+            columns = columns,
+            rows = rows,
+            originX = ((widthPx - columns * width) / 2f).coerceAtLeast(0f),
+            originY = ((heightPx - rows * height) / 2f).coerceAtLeast(0f),
+        )
+    }
 }
+
+/** How many cells fit in a window, and the offset that centres them in it. */
+data class TerminalGrid(val columns: Int, val rows: Int, val originX: Float, val originY: Float)
 
 /** Remembers the cell metrics for [style], measuring a run of glyphs rather than a single one. */
 @Composable
@@ -67,6 +98,31 @@ fun rememberTerminalCellMetrics(style: TextStyle, measurer: TextMeasurer = remem
     }
 
 private const val MEASURE_RUN = "MMMMMMMMMMMMMMMMMMMM"
+
+/**
+ * The gap between the terminal text and the edges of the window it is drawn in: one percent of the
+ * screen, on all four sides.
+ *
+ * Proportional to the screen, because the pair of fixed values it replaces could not be. 8dp either
+ * side was 4.4% of a 360dp phone and 1.5% of a tablet, so the same constant was a wide gutter on the
+ * device with the fewest columns to spare and a hairline on the one with the most - on a phone it spent
+ * nearly two columns of a 46-column window on blank space. The vertical 4dp was the opposite mistake,
+ * thin enough that the last line's descenders ran into the key row below it.
+ *
+ * One percent of the *shorter* edge, and the same value on every side, so the frame is even. Measured
+ * per axis instead, a phone would get 3.6dp across and 8dp down - a gap that looks like a mistake
+ * rather than a margin, and one that spends the dimension the terminal has least of: the tab strip and
+ * the key row already take a fixed bite out of the height, and 1% of the long edge is where the
+ * percentage costs a whole row of output.
+ *
+ * [screenWidthDp] and [screenHeightDp] come from the window configuration, which reports 0 for a window
+ * that has not been measured yet; the floor keeps that from becoming a negative padding, which Compose
+ * rejects at runtime.
+ */
+fun terminalTextInset(screenWidthDp: Int, screenHeightDp: Int): Dp =
+    (minOf(screenWidthDp, screenHeightDp) * TEXT_INSET_FRACTION).dp.coerceAtLeast(0.dp)
+
+private const val TEXT_INSET_FRACTION = 0.01f
 
 /**
  * Draws a [TerminalFrame] and turns touches into terminal input.
@@ -118,11 +174,11 @@ fun TerminalView(
     BoxWithConstraints(modifier.background(background)) {
         val widthPx = with(density) { maxWidth.toPx() }
         val heightPx = with(density) { maxHeight.toPx() }
-        val columns = metrics.columnsIn(widthPx).coerceAtLeast(1)
-        val rows = metrics.rowsIn(heightPx).coerceAtLeast(1)
+        val grid = remember(metrics, widthPx, heightPx) { metrics.gridIn(widthPx, heightPx) }
+        val origin = remember(grid) { Offset(grid.originX, grid.originY) }
         // Reported on every size change, including the one the software keyboard causes: the pty has
         // to know the window it is drawing into or a full-screen program wraps its own status line.
-        LaunchedEffect(columns, rows) { viewportChange(columns, rows) }
+        LaunchedEffect(grid.columns, grid.rows) { viewportChange(grid.columns, grid.rows) }
 
         // Fractional lines are accumulated because a drag of a few pixels is less than one row and
         // would otherwise be discarded, making a slow scroll feel dead.
@@ -139,24 +195,24 @@ fun TerminalView(
             Modifier
                 .fillMaxSize()
                 .scrollable(scrollState, Orientation.Vertical, reverseDirection = true)
-                .pointerInput(metrics) {
+                .pointerInput(metrics, origin) {
                     detectTapGestures(
                         onTap = { tap() },
                         onLongPress = { position ->
-                            val (line, column) = position.toCell(currentFrame, metrics)
+                            val (line, column) = position.toCell(currentFrame, metrics, origin)
                             longPress(line, column)
                         },
                     )
                 }
-                .pointerInput(metrics) {
+                .pointerInput(metrics, origin) {
                     var anchor: TerminalSelection? = null
                     detectDragGestures(
                         onDragStart = { position ->
-                            val (line, column) = position.toCell(currentFrame, metrics)
+                            val (line, column) = position.toCell(currentFrame, metrics, origin)
                             anchor = TerminalSelection.at(line, column).also(selectionCallback)
                         },
                         onDrag = { change, _ ->
-                            val (line, column) = change.position.toCell(currentFrame, metrics)
+                            val (line, column) = change.position.toCell(currentFrame, metrics, origin)
                             anchor = anchor?.movedTo(line, column)?.also(selectionCallback)
                         },
                         onDragEnd = { anchor?.let(selectionFinished) },
@@ -164,26 +220,37 @@ fun TerminalView(
                     )
                 }
                 .drawBehind {
-                    drawFrame(
-                        frame = currentFrame,
-                        measurer = measurer,
-                        style = style,
-                        foreground = foreground,
-                        background = background,
-                        metrics = metrics,
-                        selection = selection,
-                        selectionColour = selectionColour,
-                        cursorColour = cursorColour,
-                    )
+                    // Translated rather than drawn from the corner, so the half-cell that does not
+                    // divide evenly is shared between the two edges - see [TerminalCellMetrics.gridIn].
+                    translate(grid.originX, grid.originY) {
+                        drawFrame(
+                            frame = currentFrame,
+                            measurer = measurer,
+                            style = style,
+                            foreground = foreground,
+                            background = background,
+                            metrics = metrics,
+                            maxRows = grid.rows,
+                            selection = selection,
+                            selectionColour = selectionColour,
+                            cursorColour = cursorColour,
+                        )
+                    }
                 },
         )
     }
 }
 
-/** Maps a touch to an absolute buffer coordinate, clamped to the frame it landed on. */
-private fun Offset.toCell(frame: TerminalFrame, metrics: TerminalCellMetrics): Pair<Int, Int> {
-    val row = if (metrics.height <= 0f) 0 else floor(y / metrics.height).toInt()
-    val column = if (metrics.width <= 0f) 0 else floor(x / metrics.width).toInt()
+/**
+ * Maps a touch to an absolute buffer coordinate, clamped to the frame it landed on.
+ *
+ * [origin] is where the grid actually starts, which is not the corner of the view: without subtracting
+ * it, a tap near the left edge selects the character to its left and a long press picks the wrong word,
+ * because the pixels the grid was shifted by are counted as part of the first cell.
+ */
+private fun Offset.toCell(frame: TerminalFrame, metrics: TerminalCellMetrics, origin: Offset): Pair<Int, Int> {
+    val row = if (metrics.height <= 0f) 0 else floor((y - origin.y) / metrics.height).toInt()
+    val column = if (metrics.width <= 0f) 0 else floor((x - origin.x) / metrics.width).toInt()
     val boundedRow = row.coerceIn(0, (frame.lines.size - 1).coerceAtLeast(0))
     return (frame.firstLine + boundedRow) to column.coerceAtLeast(0)
 }
@@ -203,6 +270,7 @@ private fun DrawScope.drawFrame(
     foreground: Color,
     background: Color,
     metrics: TerminalCellMetrics,
+    maxRows: Int,
     selection: TerminalSelection?,
     selectionColour: Color,
     cursorColour: Color,
@@ -212,8 +280,11 @@ private fun DrawScope.drawFrame(
     if (cellWidth <= 0f || cellHeight <= 0f) return
 
     frame.lines.forEachIndexed { row, line ->
+        // Bounded by the grid rather than by `size.height`: a draw modifier does not clip, and the
+        // translate that centres the grid moves the bottom row past the height this scope reports, so
+        // a height test would let a partial row paint into the margin below it.
+        if (row >= maxRows) return@forEachIndexed
         val top = row * cellHeight
-        if (top > size.height) return@forEachIndexed
         val absoluteLine = frame.firstLine + row
         // Trailing empty cells are skipped, but only the ones that are truly empty: a blank with a
         // background set is a painted cell, which is how a highlighted selection bar or a status
@@ -260,7 +331,7 @@ private fun DrawScope.drawFrame(
         }
     }
 
-    if (frame.cursorVisible && frame.cursorRow in frame.lines.indices) {
+    if (frame.cursorVisible && frame.cursorRow in frame.lines.indices && frame.cursorRow < maxRows) {
         // A hollow block, so the character underneath stays legible - a filled one hides whatever the
         // cursor is on, which on a phone is exactly the character the user is trying to check.
         val left = frame.cursorColumn * cellWidth

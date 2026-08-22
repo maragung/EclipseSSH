@@ -318,6 +318,42 @@ class HostAndThemeUiRobolectricTest {
         compose.onNodeWithText("Connect").assertIsDisplayed()
     }
 
+    /**
+     * The arrow opens what only the sheet has: the saved configuration and the export.
+     *
+     * Both halves are the requested split. The sheet used to repeat Connect, Edit and Delete - three of
+     * its five buttons - which the kebab beside the very same arrow already offers, so the negative
+     * assertions are the ones that keep the duplication from creeping back. What it must still carry is
+     * everything the menu has nowhere to put: the detail lines, the favourite flag, and the export that
+     * this arrow is now named for.
+     */
+    @Test
+    fun theArrowOpensDetailsAndExportAndLeavesTheMenuActionsToTheMenu() {
+        val host = addHost("Detailed", hostname = "details.example.test", username = "reader", port = 2022)
+
+        compose.onNodeWithContentDescription("Details and export for ${host.name}").performClick()
+        pumpUntil(describe = { "the details sheet never composed" }) {
+            compose.onAllNodesWithText("Export account").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // The detail half: what is saved about this host, and what the vault holds for it.
+        listOf("Authentication", "Fingerprint", "Credentials", "Route").forEach { label ->
+            assertWithMessage("the sheet no longer shows $label")
+                .that(compose.onAllNodesWithText(label).fetchSemanticsNodes()).isNotEmpty()
+        }
+        // The export half, and the two actions that have no home in the kebab.
+        assertThat(compose.onAllNodesWithText("Export account").fetchSemanticsNodes()).isNotEmpty()
+        assertThat(compose.onAllNodesWithText("Favorite").fetchSemanticsNodes()).isNotEmpty()
+
+        // And none of what the kebab already does. "Connect securely" rather than "Connect": the
+        // sheet's button carried that label, and matching the short form would also match the menu
+        // item behind it.
+        listOf("Connect securely", "Edit", "Delete").forEach { duplicate ->
+            assertWithMessage("$duplicate is back in the sheet, where the kebab already offers it")
+                .that(compose.onAllNodesWithText(duplicate).fetchSemanticsNodes()).isEmpty()
+        }
+    }
+
     // ---------------------------------------------------------------- driving the app
 
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]

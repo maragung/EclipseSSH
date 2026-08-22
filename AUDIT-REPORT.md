@@ -1223,3 +1223,88 @@ the instrumentation suite rather than executing it. Screen lock/unlock and a phy
 are in that category; the decision logic underneath them is covered by `SessionRestoreDecisionTest` and
 `AutoReconnectDecisionTest`, and `NetworkMonitor` is what wakes a sleeping backoff when an interface
 comes up.
+
+## 15. Giving the terminal text the screen, and giving the host card's arrow a job
+
+Two requests in one sentence: the terminal text was not using the screen well and wanted a margin of
+one percent of the screen on all four sides, and the arrow on a host card should open details and
+export, because every other action already lives in the card's kebab menu.
+
+### 15.1 The text was losing a column and a row to arithmetic, not to padding
+
+The obvious suspect was the padding, and it was half the story. `TerminalView` was drawn inside
+`padding(horizontal = 8.dp, vertical = 4.dp)`, and the transcript pane inside `padding(12.dp)`. A fixed
+8dp is 4.4% of a 360dp phone per side and 1.5% of a 1280dp tablet: the same constant was a wide gutter
+on the device with the fewest columns to spare and a hairline on the one with the most. On a phone at
+the default font it cost close to two columns of a 46-column window.
+
+The second cause was not padding at all. `columnsIn`/`rowsIn` divide the window by the cell size and
+`floor` the result, because a partial column cannot hold a character - so between one and one-cell-minus
+-one pixel of width, and the same of height, is always left over. Every one of those pixels was landing
+on the right and bottom edges, because the grid was drawn from the origin. Vertically that is up to a
+whole line of dead space under the last row, which reads exactly like the text being pushed off-centre.
+
+`TerminalCellMetrics.gridIn` now returns the columns, the rows, **and** the origin the grid should be
+drawn at, with the remainder halved between the two opposite edges:
+
+```kotlin
+originX = ((widthPx - columns * width) / 2f).coerceAtLeast(0f)
+```
+
+The remainder has to be computed from the same fractional `width` the column count came from. Rounding
+the advance first and subtracting the rounded value mis-splits the gap by most of a column, which is
+why the origin is derived inside the same function rather than by the caller.
+
+Translating the grid introduced a hazard worth naming, because it is the kind that only shows up on
+some screens: a Compose *draw* modifier does not clip. With the grid shifted down by `originY`, the row
+loop's old `if (top > size.height) return` guard no longer stopped at the last fully visible row, so a
+partial row could paint into the new bottom margin. `drawFrame` now takes `maxRows` and bounds the loop
+and the cursor on the row count the grid actually reports.
+
+### 15.2 One percent, and which one percent
+
+`terminalTextInset(screenWidthDp, screenHeightDp)` returns one value: 1% of the **shorter** screen edge,
+applied to all four sides. On a 360×800dp phone that is 3.6dp everywhere - a gain of 4.4dp per side
+horizontally against the old 8dp, and near-neutral vertically against the old 4dp.
+
+The literal reading of "1% of the screen" is per axis, and it was implemented that way first and then
+changed. Per axis, that same phone gets 3.6dp across and 8.0dp down: visibly uneven, and *double* the
+vertical padding it replaces, on the axis the terminal has least of - the tab strip and the on-screen
+key row already take a fixed bite out of the height, and 1% of the long edge is where the percentage
+starts costing a whole row of output. That fights the other half of the request. Switching to the
+shorter edge is a one-line change in either direction if the per-axis reading is preferred.
+
+The margin is measured against the *screen*, not against the box the terminal is laid out in. The box
+loses height to the software keyboard, so a margin derived from it would shrink every time the IME
+opened and the text would visibly step towards the top edge as the user typed.
+
+Two other candidate fixes were rejected rather than left untried. `includeFontPadding` is already
+`false` by default in Compose BOM 2025.04.01, so there was nothing to reclaim there. Forcing a tighter
+`lineHeight` than the font's own would gain a pixel or two per row and clip descenders and box-drawing
+glyphs on some fonts, which is a rendering bug traded for a margin.
+
+`TerminalGeometryTest` covers the arithmetic as a plain JVM test - no device, no font, no Compose tree:
+the even-division case, the uneven split, a fractional advance, a window smaller than one cell,
+unmeasured metrics (the divide-by-zero path), the inset value, its scaling against a tablet, its
+invariance under rotation, and the zero-configuration case that would otherwise produce a negative
+padding and throw at runtime.
+
+### 15.3 The arrow now does something the menu does not
+
+The chevron on a host card opened a details sheet whose buttons were Connect, Edit, Delete, Favourite
+and Forget credentials - four of which are also in the card's kebab menu, and one of which (Connect) is
+what tapping the card body already does. The arrow was a second route to actions that had one.
+
+The sheet keeps everything that is *information* - authentication, fingerprint, stored-credential state,
+route through proxy or jump host - and its actions are now Favourite/Unfavourite, Forget credentials
+when there is something to forget, and **Export account** as the primary button. Export was the one
+action with no home in the menu, which is what made the arrow worth keeping. Connect, Edit and Delete
+were removed from the sheet only, not from the app: they remain in the kebab menu, and tapping the card
+still connects. The arrow's content description is now "Details and export for <host>" so the screen
+reader says what it does.
+
+A Robolectric test asserts the split from the outside: it clicks the arrow, waits for the sheet, and
+requires the information rows and Export account and Favourite to be present *and* Connect/Edit/Delete
+to be absent - so the two routes cannot silently converge again. It also settled an open question about
+the harness: a `ModalBottomSheet` composes into the same window and is directly assertable, unlike an
+`AlertDialog`, which still has to be checked through `ShadowDialog`.
