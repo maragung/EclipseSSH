@@ -8,6 +8,7 @@ import dev.eclipse.ssh.data.model.PORT_RANGE
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.io.Closeable
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.security.KeyPair
 import java.security.MessageDigest
@@ -31,6 +32,7 @@ import org.apache.sshd.client.ClientFactoryManager
 import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.config.hosts.HostConfigEntry
 import org.apache.sshd.common.AttributeRepository
+import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.PropertyResolver
 import org.apache.sshd.common.util.net.SshdSocketAddress
 import org.apache.sshd.common.NamedResource
@@ -198,11 +200,23 @@ class SshConnectionManager @Inject constructor(
             .singleOrNull()
     }
 
+    /**
+     * Dials [profile] and returns an authenticated session, reporting each phase as it is entered.
+     *
+     * [onPhase] exists because the two halves of connecting fail for different reasons, take different
+     * lengths of time, and call for different things to be said to the user - and from outside this
+     * function they were indistinguishable. A host that answers its socket immediately and then spends
+     * fifteen seconds in a PAM stack, an LDAP lookup or a hardware token prompt spent all of it under
+     * one word, "Connecting…", which is the shape of a hang. It is called from this coroutine, at most
+     * once per phase, in order; the caller is expected to do nothing slow in it.
+     */
     suspend fun connect(
         profile: HostProfile,
         password: String? = null,
         keyPair: KeyPair? = null,
+        onPhase: (SshConnectPhase) -> Unit = {},
     ): ClientSession = withContext(Dispatchers.IO) {
+        onPhase(SshConnectPhase.HANDSHAKE)
         ensureStarted()
         applyLegacyAlgorithmsIfEnabled()
         // Clamped rather than trusted: the profile can also arrive from an imported vault backup or a
@@ -274,6 +288,9 @@ class SshConnectionManager @Inject constructor(
             // The underlying client owns the socket; this is the only thing this frame owns.
             tunnelled?.let(tunnelledTargets::remove)
         }
+        // The transport is up and the key exchange is done; everything from here is the server
+        // deciding whether to let this user in.
+        onPhase(SshConnectPhase.AUTHENTICATE)
         try {
             password?.takeIf(String::isNotEmpty)?.let { secret ->
                 session.addPasswordIdentity(secret)
@@ -298,8 +315,67 @@ class SshConnectionManager @Inject constructor(
         }
     }
 
-    suspend fun openTerminal(session: ClientSession): TerminalChannel = withContext(Dispatchers.IO) {
-        TerminalChannel(session.createShellChannel()).also { it.open() }
+    /**
+     * Opens an interactive shell on [session], sized [columns]x[rows] when the caller knows the size.
+     *
+     * The caller normally does know it: a session being reconnected is replacing a pty whose geometry
+     * the user's screen already decided. Passing it here rather than resizing afterwards is what makes
+     * a reconnected `htop` come back at the size it left.
+     */
+    suspend fun openTerminal(
+        session: ClientSession,
+        columns: Int? = null,
+        rows: Int? = null,
+    ): TerminalChannel = withContext(Dispatchers.IO) {
+        val channel = TerminalChannel(session.createShellChannel())
+        if (columns != null && rows != null) channel.open(columns, rows) else channel.open()
+        channel
+    }
+
+    /**
+     * Asks [session] whether it is still there, and waits [timeoutSeconds] for the answer.
+     *
+     * This is what a network migration needs and what a heartbeat cannot give it. Switching from Wi-Fi
+     * to mobile data invalidates the socket's source address, so the TCP connection is dead - but
+     * nothing says so: no FIN arrives, no error is raised, `isOpen` stays true, and the app's own
+     * heartbeat only concludes anything after [CoreModuleProperties.HEARTBEAT_NO_REPLY_MAX]
+     * consecutive unanswered keepalives, which at the default interval is a minute and a half. For that
+     * minute and a half the terminal looks connected and silently swallows every keystroke, which is
+     * the single most-reported symptom of "SSH keeps disconnecting" in this app.
+     *
+     * The probe is OpenSSH's own `keepalive@openssh.com` global request, and the reply that matters is
+     * *any* reply:
+     *
+     *  - a `SSH_MSG_REQUEST_SUCCESS` returns the payload buffer;
+     *  - a `SSH_MSG_REQUEST_FAILURE` - what OpenSSH actually sends, since it implements no such global
+     *    request - makes MINA return `null`, which is still proof the far end is listening;
+     *  - a timeout or an I/O error is the only negative answer.
+     *
+     * So a server that says "no" counts as alive, and only silence counts as dead. That asymmetry is
+     * deliberate: the cost of a false positive is a session the app kills while it was working, which
+     * is the bug this exists to fix rather than a fix for it.
+     */
+    suspend fun probeLiveness(
+        session: ClientSession,
+        timeoutSeconds: Long = LIVENESS_PROBE_SECONDS,
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (!session.isOpen) return@withContext false
+        try {
+            val request = KEEPALIVE_REQUEST
+            // The shape AbstractSession.request expects: the command byte, the request name, and a
+            // want-reply flag it re-reads out of the buffer to decide whether to wait for anything.
+            // Four bytes for the string's length prefix and one for the boolean; the hint only sizes
+            // the initial allocation, so being a byte out costs a grow, not correctness.
+            val buffer = session.createBuffer(SshConstants.SSH_MSG_GLOBAL_REQUEST, request.length + Integer.BYTES + 1)
+            buffer.putString(request)
+            buffer.putBoolean(true)
+            session.request(request, buffer, Duration.ofSeconds(timeoutSeconds))
+            true
+        } catch (error: IOException) {
+            // SocketTimeoutException (no reply in time) and InterruptedIOException are both IOExceptions,
+            // and all of them mean the same thing here: nothing came back.
+            false
+        }
     }
 
     suspend fun openSftp(session: ClientSession): SftpClient = withContext(Dispatchers.IO) {
@@ -654,6 +730,15 @@ private const val KEEPALIVE_REQUEST = "keepalive@openssh.com"
 
 /** Missed keep-alive replies tolerated before the session is closed, as `ServerAliveCountMax`. */
 private const val HEARTBEAT_NO_REPLY_MAX = 3
+
+/**
+ * How long [SshConnectionManager.probeLiveness] waits for a reply.
+ *
+ * Long enough that a congested mobile link is not mistaken for a dead one - a keepalive round trip on
+ * a bad 3G connection can take seconds - and short enough that the alternative, waiting out three
+ * missed heartbeats at the configured interval, is not what decides how fast a session recovers.
+ */
+private const val LIVENESS_PROBE_SECONDS = 6L
 
 /**
  * The host's keep-alive interval, in seconds, as carried on the connection context.

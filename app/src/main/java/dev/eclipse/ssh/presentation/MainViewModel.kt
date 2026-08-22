@@ -28,6 +28,7 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
+import dev.eclipse.ssh.data.model.isLive
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.Snippet
@@ -38,7 +39,15 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.connectFailureIsFinal
+import dev.eclipse.ssh.ssh.SessionDiagnostics
+import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
+import dev.eclipse.ssh.ssh.SessionEnd
+import dev.eclipse.ssh.ssh.SessionEvent
+import dev.eclipse.ssh.ssh.SessionLivenessProbe
+import dev.eclipse.ssh.ssh.SshConnectPhase
+import dev.eclipse.ssh.ssh.isFault
 import dev.eclipse.ssh.ssh.describeConnectFailure
+import dev.eclipse.ssh.ssh.describeSessionEnd
 import dev.eclipse.ssh.ssh.describeSftpFailure
 import dev.eclipse.ssh.ssh.fallbackHome
 import dev.eclipse.ssh.ssh.joinRemote
@@ -86,11 +95,13 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.sshd.client.session.ClientSession
 import org.apache.sshd.sftp.client.SftpClient
 
@@ -109,6 +120,8 @@ class MainViewModel @Inject constructor(
     private val portForwardingManager: PortForwardingManager,
     private val secureClipboard: SecureClipboard,
     private val credentialStore: HostCredentialStore,
+    private val diagnostics: SessionDiagnostics,
+    private val livenessProbe: SessionLivenessProbe,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     private val query = MutableStateFlow("")
@@ -216,6 +229,22 @@ class MainViewModel @Inject constructor(
     private val reconnectAttempts = ConcurrentHashMap<String, Int>()
 
     /**
+     * The viewport size each host's terminal was last measured at, carried into the next pty it opens.
+     *
+     * Kept here rather than on the channel because the channel is the thing that gets replaced: the
+     * size belongs to the user's screen, which a reconnect does not change. See [resizeTerminal].
+     */
+    private val ptySizes = ConcurrentHashMap<String, Pair<Int, Int>>()
+
+    /**
+     * When each live session's shell came up, on the monotonic clock, for the "up=" field in the
+     * diagnostics. Wall-clock time would report nonsense across a suspend or a clock change, and how
+     * long a session survived is precisely the number that distinguishes an idle-timeout from a flaky
+     * link.
+     */
+    private val connectedAt = ConcurrentHashMap<String, Long>()
+
+    /**
      * Cuts a reconnect backoff short the moment the platform reports a usable network.
      *
      * Conflated, and fed from [NetworkMonitor] rather than collected inline, because the signal has to
@@ -303,8 +332,8 @@ class MainViewModel @Inject constructor(
         )
     }
 
-    private val terminalState = combine(terminalOutput, commandHistory) { output, history ->
-        TerminalState(output = output, history = history)
+    private val terminalState = combine(terminalOutput, commandHistory, diagnostics.events) { output, history, events ->
+        TerminalState(output = output, history = history, diagnostics = events)
     }
 
     private val remoteState = combine(remoteFiles, remotePath) { files, path ->
@@ -320,6 +349,7 @@ class MainViewModel @Inject constructor(
             transfers = activeTransfers,
             terminalOutput = terminal.output,
             commandHistory = terminal.history,
+            diagnostics = terminal.diagnostics,
             remoteFiles = remote.files,
             remotePath = remote.path,
             localFiles = local.files,
@@ -344,6 +374,10 @@ class MainViewModel @Inject constructor(
             }
         }
         knownHostsState.value = sshConnectionManager.knownHosts()
+        // Idempotent, and started from here as well as from the service because either can be the only
+        // one alive: the service is not running before the first connection, and it is the UI that is
+        // in front when the user walks out of Wi-Fi range with a shell open.
+        livenessProbe.start()
         sshConnectionManager.hostKeyChallenges
             .onEach { challenge -> hostKeyChallenge.value = challenge }
             .launchIn(viewModelScope)
@@ -392,6 +426,13 @@ class MainViewModel @Inject constructor(
                         lastError = null,
                     )
                 }
+                diagnostics.record(
+                    hostId,
+                    SessionEvent.ADOPTED,
+                    state = SessionConnectionState.CONNECTED,
+                    detail = "view model recreated",
+                    pty = "${terminal.ptyColumns}x${terminal.ptyRows}",
+                )
                 terminalJobs.remove(hostId)?.cancelAndJoin()
                 terminalJobs[hostId] = launchTerminalCollector(hostId, terminal, buffer)
                 publishTerminalFrame(hostId, buffer)
@@ -402,27 +443,50 @@ class MainViewModel @Inject constructor(
     fun setQuery(value: String) { query.value = value }
     fun selectHost(host: HostProfile) { selectedHostId.value = host.id }
 
-    fun connect(host: HostProfile, password: String? = null, keyPair: KeyPair? = null, keyBytes: ByteArray? = null, keyPassphrase: String? = null) {
+    fun connect(
+        host: HostProfile,
+        password: String? = null,
+        keyPair: KeyPair? = null,
+        keyBytes: ByteArray? = null,
+        keyPassphrase: String? = null,
+        resuming: Boolean = false,
+    ) {
         selectedHostId.value = host.id
         pendingConnection = PendingConnection(host, password, keyPair, keyBytes, keyPassphrase)
+        // A reconnect stays RECONNECTING for the whole attempt, keeping the sentence the ladder wrote
+        // ("attempt 2 of 5"). Overwriting it with CONNECTING each time round would tell the user the
+        // app had started something new, when what is happening is that it has not given up yet.
         updateTab(host.id) { existing ->
             (existing ?: SessionTab(hostId = host.id, title = host.name)).copy(
-                state = SessionConnectionState.CONNECTING,
-                lastError = null,
+                state = if (resuming) SessionConnectionState.RECONNECTING else SessionConnectionState.CONNECTING,
+                lastError = if (resuming) existing?.lastError else null,
             )
         }
+        diagnostics.record(
+            host.id,
+            if (resuming) SessionEvent.RECONNECT_ATTEMPT else SessionEvent.CONNECT_REQUESTED,
+            state = if (resuming) SessionConnectionState.RECONNECTING else SessionConnectionState.CONNECTING,
+            network = networkMonitor.describe(),
+            attempt = reconnectAttempts[host.id]?.takeIf { resuming },
+        )
         // Replace any attempt still running for this host so a double tap cannot leave an
         // orphaned session behind.
         connectJobs.remove(host.id)?.cancel()
         // A user asking to connect now outranks a backoff waiting to do it later, and leaving the
-        // waiter alive would let it fire a second connect on top of this one.
-        reconnectJobs.remove(host.id)?.cancel()
+        // waiter alive would let it fire a second connect on top of this one. Not when this *is* the
+        // ladder's own attempt: cancelling the job that is running this code would kill the attempt.
+        if (!resuming) {
+            reconnectJobs.remove(host.id)?.let { waiting ->
+                waiting.cancel()
+                diagnostics.record(host.id, SessionEvent.RECONNECT_CANCELLED, detail = "connect requested")
+            }
+        }
         val job = viewModelScope.launch {
             // Anything the caller supplied wins; the profile's saved credentials only fill the gaps.
             // That order matters: a password typed into the auth prompt has to beat the one saved on
             // the host, or a rotated server password could not be used at all without editing the
             // profile first.
-            val resolved = resolveCredentials(host, password, keyPair, keyBytes, keyPassphrase)
+            val resolved = resolveCredentials(host, password, keyPair, keyBytes, keyPassphrase, resuming)
             // Everything from here to the shell being on screen happens under this host's dial gate,
             // which is what stops two dials to the same account existing at once. The service's
             // restore pass takes the same gate, so the pass that used to run concurrently with this
@@ -433,13 +497,16 @@ class MainViewModel @Inject constructor(
                 // for it is one to use, not one to duplicate. Adopting also keeps the scrollback: the
                 // buffer, the pty and the socket are all still the ones the user was looking at.
                 sessionStore.adoptable(host.id)?.let { (_, existing) ->
+                    diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CONNECTED)
                     attachTerminal(host, existing, resolved)
                     return@dialing
                 }
                 var lastError: Throwable? = null
                 for (attempt in 0 until MAX_CONNECT_ATTEMPTS) {
                     try {
-                        val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair)
+                        val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair) { phase ->
+                            onConnectPhase(host.id, phase, resuming, attempt)
+                        }
                         // The tab may have been closed (or the host deleted) while the handshake
                         // was in flight. Honour that instead of resurrecting the tab — and tear
                         // the new session down so it does not leak. Dereferencing the missing tab
@@ -448,7 +515,8 @@ class MainViewModel @Inject constructor(
                             runCatching { session.close(false) }
                             return@dialing
                         }
-                        val terminal = sshConnectionManager.openTerminal(session)
+                        val size = ptySizes[host.id]
+                        val terminal = sshConnectionManager.openTerminal(session, size?.first, size?.second)
                         // Never replaces a live session with this one: if another dialler installed one
                         // for this host while this handshake was in flight, that session is the one the
                         // app keeps and this one is the redundant half of a duplicate - the opposite of
@@ -473,6 +541,13 @@ class MainViewModel @Inject constructor(
                         // A rejection the server has already made up its mind about is not retried: see
                         // `connectFailureIsFinal`. Among other things it stops a mistyped password being
                         // offered three times, which is how a typo gets an account locked.
+                        diagnostics.record(
+                            host.id,
+                            SessionEvent.ATTEMPT_FAILED,
+                            detail = error.message ?: error::class.java.simpleName,
+                            network = networkMonitor.describe(),
+                            attempt = attempt + 1,
+                        )
                         if (connectFailureIsFinal(error)) break
                         if (attempt < MAX_CONNECT_ATTEMPTS - 1) {
                             updateTab(host.id) { it?.copy(state = SessionConnectionState.RECONNECTING, lastError = "Retrying connection…") }
@@ -480,7 +555,18 @@ class MainViewModel @Inject constructor(
                         }
                     }
                 }
-                updateTab(host.id) { it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = describeConnectFailure(lastError)) }
+                // A connection that never came up is an ERROR, not a session that ended: something -
+                // the credentials, the host, the network - has to change before trying again is worth
+                // anything, and the tab says so in red rather than in the amber of a finished session.
+                val reason = describeConnectFailure(lastError)
+                updateTab(host.id) { it?.copy(state = SessionConnectionState.ERROR, lastError = reason) }
+                diagnostics.record(
+                    host.id,
+                    SessionEvent.CONNECT_FAILED,
+                    state = SessionConnectionState.ERROR,
+                    detail = reason,
+                    network = networkMonitor.describe(),
+                )
             }
         }
         connectJobs[host.id] = job
@@ -527,13 +613,35 @@ class MainViewModel @Inject constructor(
         // stay off screen until they pressed a key.
         publishTerminalFrame(host.id, buffer)
         updateTab(host.id) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
+        connectedAt[host.id] = SystemClock.elapsedRealtime()
+        diagnostics.record(
+            host.id,
+            SessionEvent.SHELL_OPEN,
+            state = SessionConnectionState.CONNECTED,
+            network = networkMonitor.describe(),
+            keepAliveSeconds = host.keepAliveSeconds,
+            pty = "${terminal.ptyColumns}x${terminal.ptyRows}",
+        )
         // Credentials are no longer needed once the session is up.
         pendingConnection = null
         // The ladder is per outage, not per session: a host that reconnects gets its full allowance
         // back for the next one.
         reconnectAttempts.remove(host.id)
         runCatching { hostRepository.save(host.copy(lastConnectedAt = System.currentTimeMillis())) }
+        // Still `runCatching`: a vault that cannot store the credential is not a reason to fail a
+        // session that is already up. But it is said out loud in the trace, because the consequence
+        // lands much later and looks like something else - the reconnect ladder then has nothing to
+        // authenticate with, and an outage ends the session with a credential error instead of
+        // recovering. Only the failure class is recorded; the message could name what it was given.
         runCatching { sessionRegistry.register(host.id, resolved.password, resolved.keyBytes, resolved.keyPassphrase) }
+            .onFailure { failure ->
+                diagnostics.record(
+                    host.id,
+                    SessionEvent.CREDENTIAL_NOT_STORED,
+                    state = SessionConnectionState.CONNECTED,
+                    detail = failure.javaClass.simpleName,
+                )
+            }
         // Auto Login SFTP. Off means SSH only — nothing opens a second channel on this host until the
         // user asks for a listing — which is the point of the switch: an account with a shell and no
         // sftp-server subsystem otherwise greets every successful login with a failure about a feature
@@ -565,6 +673,7 @@ class MainViewModel @Inject constructor(
         keyPair: KeyPair?,
         keyBytes: ByteArray?,
         keyPassphrase: String?,
+        resuming: Boolean = false,
     ): ResolvedCredentials {
         // Skipped entirely when the caller already supplied both halves, so an ordinary
         // password-prompt connection does not touch the credential file at all.
@@ -574,14 +683,31 @@ class MainViewModel @Inject constructor(
             StoredCredentials()
         }
 
+        // What the *live* session authenticated with. The session registry holds it encrypted from the
+        // moment a session is installed until the user closes the tab or deletes the host, so it is
+        // present for exactly as long as there is a session worth resuming and gone as soon as there is
+        // not - nothing new is stored here, and no lifetime is extended.
+        //
+        // Read only for a resume, and only after the caller and the saved credentials have both come up
+        // empty. Without it the reconnect ladder re-dials with no credential at all, so a user who typed
+        // a password rather than saving it got "No more authentication methods available" instead of a
+        // recovery: ten seconds of no signal ended the session permanently, and the attempt spent a
+        // failed authentication against the server on the way. The notification and file-transfer paths
+        // already resume from this registry; the ladder was the one that did not.
+        suspend fun <T> resumed(read: suspend () -> T?): T? =
+            if (resuming) runCatching { read() }.getOrNull() else null
+
         val resolvedPassword = password
-            ?: if (stored.hasPassword) runCatching { credentialStore.password(host.id) }.getOrNull() else null
+            ?: (if (stored.hasPassword) runCatching { credentialStore.password(host.id) }.getOrNull() else null)
+            ?: resumed { sessionRegistry.credential(host.id) }
 
         val material = keyBytes?.takeIf { it.isNotEmpty() }
-            ?: if (stored.hasKey) runCatching { credentialStore.keyBytes(host.id) }.getOrNull() else null
+            ?: (if (stored.hasKey) runCatching { credentialStore.keyBytes(host.id) }.getOrNull() else null)
+            ?: resumed { sessionRegistry.keyBytes(host.id) }
         val label = if (keyBytes != null) PICKED_KEY_NAME else stored.keyLabel ?: PICKED_KEY_NAME
         val passphrase = keyPassphrase?.takeIf { it.isNotBlank() }
-            ?: if (stored.hasPassphrase) runCatching { credentialStore.passphrase(host.id) }.getOrNull() else null
+            ?: (if (stored.hasPassphrase) runCatching { credentialStore.passphrase(host.id) }.getOrNull() else null)
+            ?: resumed { sessionRegistry.keyPassphrase(host.id) }
 
         val pair = when {
             keyPair != null -> keyPair
@@ -652,7 +778,19 @@ class MainViewModel @Inject constructor(
         // Separate coroutine so a slow render can never make the shared flow drop an emission:
         // TerminalChannel publishes with tryEmit first, and a full buffer would otherwise block
         // Apache MINA's pump thread for as long as this loop took to catch up.
-        val pump = launch { terminal.output.collect(incoming::send) }
+        //
+        // It also closes `incoming`, because it is the only thing that writes to it, and it does so on
+        // reaching [TerminalChannel.END_OF_OUTPUT] - the terminator the channel puts at the end of the
+        // stream itself. `closer` used to close the queue the moment `awaitClosed` returned, and those
+        // are two signals delivered on two threads with nothing ordering them: under load the close won
+        // and the chunk still sitting in the shared flow was thrown away. That chunk is the shell's
+        // parting line - the farewell of a `logout`, the last line of a build, the single line a
+        // `nologin` account prints before it goes - so the session ended with its most useful output
+        // missing from the screen and from the transcript that Search and Save logs read.
+        val pump = launch {
+            terminal.output.takeWhile { it !== TerminalChannel.END_OF_OUTPUT }.collect(incoming::send)
+            incoming.close()
+        }
         // Whatever the throttle below declined to publish, published once the throttle window is over.
         // Skipping a rebuild is only ever meant to be a *delay*, but the loop that would have caught up
         // blocks on the next chunk, and a shell that has just printed its prompt sends nothing more -
@@ -676,8 +814,18 @@ class MainViewModel @Inject constructor(
         // anything lets the loop drain what is already queued first, so the shell's parting output -
         // `logout`, a farewell banner, the last line of a job that ended - still reaches the screen.
         val closer = launch {
-            val status = terminal.awaitClosed()
-            incoming.close()
+            val end = terminal.awaitClosed()
+            // Waits for the terminator to travel the stream, so everything the shell said before it
+            // ended is in the buffer before the tab is told the session is over - and so a reconnect,
+            // which cancels this collector to hand the buffer to its replacement, cannot cancel it out
+            // from under output that has arrived but not yet been parsed.
+            //
+            // Bounded, and closing the queue by hand if the wait runs out, because the terminator is
+            // emitted with `tryEmit` and a shared flow holding hundreds of undelivered chunks cannot
+            // take it. That means the collector had already stopped draining, which is the one case
+            // where there is nothing left to protect and a session that never reported its end would
+            // be the worse outcome.
+            if (withTimeoutOrNull(TERMINAL_DRAIN_MS) { pump.join() } == null) incoming.close()
             // Only if nothing newer has taken this host over. A reconnect cancels this coroutine
             // before it closes the channel it is replacing, so ordinarily it never sees that close -
             // but a cancel is a request, not a suspension of physics: this can already have been
@@ -696,9 +844,42 @@ class MainViewModel @Inject constructor(
                 // tab is already going wherever the caller is taking it - closed, replaced by a
                 // reconnect, or ended by Stop sessions - and overwriting it with "Disconnected from
                 // the remote host" would report the app's own decision as a fault of the network.
-                if (terminal.endedDeliberately) return@launch
-                updateTab(hostId) { it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = describeSessionEnd(status)) }
-                if (shouldAutoReconnect(status, tabIsOpen = tabs.value.any { it.hostId == hostId }, endedDeliberately = false)) {
+                if (terminal.endedDeliberately) {
+                    diagnostics.record(
+                        hostId,
+                        SessionEvent.CLOSED_BY_USER,
+                        upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it },
+                    )
+                    return@launch
+                }
+                // Which of the two endings this was decides the colour as well as the wording: a shell
+                // that ran and exited is finished, a transport that died under it failed. See
+                // [SessionEnd.isFault].
+                val reason = describeSessionEnd(end)
+                val willReconnect =
+                    shouldAutoReconnect(end, tabIsOpen = tabs.value.any { it.hostId == hostId }, endedDeliberately = false)
+                // A fault the ladder is about to answer is a *reconnecting* tab, not an error one.
+                // Writing ERROR here and RECONNECTING a moment later - from inside the scheduling
+                // coroutine, on the far side of a settings read from disk - made every genuine drop
+                // flash red with "Disconnected from the remote host" before admitting it was already
+                // dealing with it, and a slow read left it sitting in that state. Nothing is lost by
+                // starting in the state the app is actually in: the reason still rides along as the
+                // line under it, and an ending that is nobody's plan to recover from is still ERROR.
+                val ended = when {
+                    !end.isFault -> SessionConnectionState.DISCONNECTED
+                    willReconnect -> SessionConnectionState.RECONNECTING
+                    else -> SessionConnectionState.ERROR
+                }
+                updateTab(hostId) { it?.copy(state = ended, lastError = reason) }
+                diagnostics.record(
+                    hostId,
+                    SessionEvent.ENDED,
+                    state = ended,
+                    detail = "${end::class.java.simpleName}: $reason",
+                    network = networkMonitor.describe(),
+                    upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it },
+                )
+                if (willReconnect) {
                     scheduleAutoReconnect(hostId)
                 } else {
                     // A shell that exited is finished with its session; nothing is going to use the
@@ -728,13 +909,19 @@ class MainViewModel @Inject constructor(
                 // remote program misbehaving. See [TerminalChannel.droppedChunks].
                 if (!reportedDroppedOutput && terminal.droppedChunks > 0) {
                     reportedDroppedOutput = true
+                    diagnostics.record(hostId, SessionEvent.OUTPUT_DROPPED, detail = "${terminal.droppedChunks} chunks")
                     report("Some terminal output was dropped - the display may be out of step with the shell")
                 }
                 delay(TERMINAL_FRAME_MS)
             }
         } finally {
             pump.cancel()
-            closer.cancel()
+            // `closer` is deliberately left alone. It is what reports the ending, and the loop above
+            // exits *because* of that ending - so cancelling it here is a race whose loser is a tab
+            // that lost its session and never said so. It always finishes on its own: it is waiting on
+            // a channel that has closed, and everything after that wait is a few non-suspending state
+            // updates. This coroutine's completion waits for it, as a parent waits for its children;
+            // a cancelled collector still takes it down, which is what replacing a channel wants.
             transcript.cancel()
             transcriptDue.close()
             // Only when it is still ours. Nothing should be able to overlap a collector with its
@@ -754,20 +941,6 @@ class MainViewModel @Inject constructor(
             publishTerminalFrame(hostId, buffer)
             publishTerminalText(hostId, buffer, force = true)
         }
-    }
-
-    /**
-     * What the tab says when a connected session ended by itself.
-     *
-     * A clean `exit` and a dropped connection are the same event to the channel, and the exit status is
-     * the only thing that tells them apart: a shell that was asked to leave reports one, a socket that
-     * died reports nothing. Both are worth distinguishing from the connect failures in
-     * [describeConnectFailure], which are about a session that never started.
-     */
-    private fun describeSessionEnd(exitStatus: Int?): String = when {
-        exitStatus == null -> "Disconnected from the remote host"
-        exitStatus == 0 -> "Session ended"
-        else -> "Session ended (exit $exitStatus)"
     }
 
     /**
@@ -805,10 +978,17 @@ class MainViewModel @Inject constructor(
         if (attempt > MAX_AUTO_RECONNECT_ATTEMPTS) {
             updateTab(hostId) {
                 it?.copy(
-                    state = SessionConnectionState.DISCONNECTED,
+                    state = SessionConnectionState.ERROR,
                     lastError = "Disconnected · gave up after $MAX_AUTO_RECONNECT_ATTEMPTS reconnect attempts",
                 )
             }
+            diagnostics.record(
+                hostId,
+                SessionEvent.RECONNECT_EXHAUSTED,
+                state = SessionConnectionState.ERROR,
+                network = networkMonitor.describe(),
+                attempt = attempt - 1,
+            )
             return
         }
         reconnectAttempts[hostId] = attempt
@@ -824,6 +1004,14 @@ class MainViewModel @Inject constructor(
                     lastError = "Reconnecting in ${waitMs / 1_000}s · attempt $attempt of $MAX_AUTO_RECONNECT_ATTEMPTS",
                 )
             }
+            diagnostics.record(
+                hostId,
+                SessionEvent.RECONNECT_SCHEDULED,
+                state = SessionConnectionState.RECONNECTING,
+                detail = "waiting ${waitMs}ms",
+                network = networkMonitor.describe(),
+                attempt = attempt,
+            )
             awaitReconnectWindow(waitMs, reconnectWake)
             // Waiting for a network is not an attempt. The counter was already spent above, so it is
             // handed back before parking — otherwise a long outage would arrive with an exhausted
@@ -843,7 +1031,13 @@ class MainViewModel @Inject constructor(
                 reconnectAttempts.remove(hostId)
                 return@launch
             }
-            connect(host)
+            updateTab(hostId) {
+                it?.copy(
+                    state = SessionConnectionState.RECONNECTING,
+                    lastError = "Reconnecting · attempt $attempt of $MAX_AUTO_RECONNECT_ATTEMPTS",
+                )
+            }
+            connect(host, resuming = true)
         }
         reconnectJobs.put(hostId, job)?.cancel()
         job.invokeOnCompletion { reconnectJobs.remove(hostId, job) }
@@ -999,7 +1193,10 @@ class MainViewModel @Inject constructor(
     fun rejectHostKey() {
         hostKeyChallenge.value = null
         sshConnectionManager.challengeHandled()
-        pendingConnection?.host?.id?.let { id -> updateTab(id) { it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = "Host key was rejected") } }
+        pendingConnection?.host?.id?.let { id ->
+            updateTab(id) { it?.copy(state = SessionConnectionState.ERROR, lastError = "Host key was rejected") }
+            diagnostics.record(id, SessionEvent.CONNECT_FAILED, state = SessionConnectionState.ERROR, detail = "host key rejected")
+        }
         pendingConnection = null
     }
 
@@ -1194,6 +1391,23 @@ class MainViewModel @Inject constructor(
                 }
             }
             publishTerminalFrame(hostId, buffer)
+        }
+        // Remembered for the *next* pty this host opens. The composable only reports a size when the
+        // size it measures changes, and a reconnect does not change the screen - so without this a new
+        // channel kept the 120x40 default while the UI, having already reported the real size once,
+        // never mentioned it again. Every full-screen program on a reconnected session was drawn for a
+        // terminal twice the width of the phone.
+        val previous = ptySizes.put(hostId, columns to rows)
+        // Only when the geometry really moved. The composable reports on every measurement pass, and
+        // an entry per pass would push the interesting history out of the ring within seconds of
+        // scrolling.
+        if (previous != columns to rows) {
+            diagnostics.record(
+                hostId,
+                SessionEvent.PTY_RESIZED,
+                pty = "${columns}x$rows",
+                detail = previous?.let { "was ${it.first}x${it.second}" },
+            )
         }
         // sendWindowChange writes an SSH packet, which blocks when the transport is
         // congested; keep it off the main thread so a stalled link cannot cause an ANR.
@@ -2023,7 +2237,10 @@ class MainViewModel @Inject constructor(
         sftpJobs.remove(tab.hostId)?.cancel()
         // Closing a tab is the clearest possible statement that this session is not wanted, so it also
         // ends any reconnect waiting to bring it back.
-        reconnectJobs.remove(tab.hostId)?.cancel()
+        reconnectJobs.remove(tab.hostId)?.let { waiting ->
+            waiting.cancel()
+            diagnostics.record(tab.hostId, SessionEvent.RECONNECT_CANCELLED, detail = "tab closed")
+        }
         reconnectAttempts.remove(tab.hostId)
         sessionStore.forget(tab.hostId)
         tabs.value = tabs.value.filterNot { it.hostId == tab.hostId }
@@ -2035,6 +2252,8 @@ class MainViewModel @Inject constructor(
         commandHistory.value = commandHistory.value - tab.hostId
         serverStats.value = serverStats.value - tab.hostId
         homePaths.remove(tab.hostId)
+        ptySizes.remove(tab.hostId)
+        connectedAt.remove(tab.hostId)
         stopForwardingsFor(tab.hostId)
         viewModelScope.launch { runCatching { sessionRegistry.unregister(tab.hostId) } }
     }
@@ -2133,6 +2352,26 @@ class MainViewModel @Inject constructor(
     fun copyToClipboard(text: String) = launchGuarded("Could not copy to the clipboard") {
         val seconds = settingsRepository.settings.first().clearClipboardAfterSeconds
         secureClipboard.copy(text, seconds)
+    }
+
+    /**
+     * The whole SSH lifecycle trace as text, for the clipboard or a saved file.
+     *
+     * Read straight from the ring rather than from [MainUiState], so what the user exports is what the
+     * app knows right now - including anything recorded while the dialog was open.
+     */
+    fun exportDiagnostics(): String = diagnostics.export()
+
+    /**
+     * Empties the trace.
+     *
+     * Offered because the useful way to use a 500-entry ring is to clear it, reproduce the problem, and
+     * export what is left; a trace that starts at the moment of the bug is far easier to read than one
+     * that starts at app launch.
+     */
+    fun clearDiagnostics() {
+        diagnostics.clear()
+        report("Diagnostics cleared")
     }
 
     /**
@@ -2278,6 +2517,7 @@ class MainViewModel @Inject constructor(
     fun setReconnectBaseSeconds(seconds: Int) = writeSetting("the reconnect delay") { settingsRepository.setReconnectBaseSeconds(seconds) }
     fun setTerminalFontSize(size: Int) = writeSetting("the terminal font size") { settingsRepository.setTerminalFontSize(size) }
     fun setTerminalMinColumns(columns: Int) = writeSetting("the terminal width") { settingsRepository.setTerminalMinColumns(columns) }
+    fun setTerminalKeyRowVisible(visible: Boolean) = writeSetting("the shortcut bar") { settingsRepository.setTerminalKeyRowVisible(visible) }
     fun setLegacyAlgorithms(enabled: Boolean) = writeSetting("the legacy algorithm setting") { settingsRepository.setLegacyAlgorithms(enabled) }
     fun setTerminalTheme(name: String) = writeSetting("the terminal theme") { settingsRepository.setTerminalTheme(name) }
     fun setPin(pin: String) = writeSetting("the app PIN") { settingsRepository.setPin(pin) }
@@ -2334,11 +2574,52 @@ class MainViewModel @Inject constructor(
      * A tab keeps the position it was opened in for as long as it is open.
      */
     private fun updateTab(hostId: String, transform: (SessionTab?) -> SessionTab?) {
-        val existing = tabs.value.indexOfFirst { it.hostId == hostId }
-        val updated = transform(tabs.value.getOrNull(existing)) ?: return
-        tabs.value = if (existing < 0) tabs.value + updated else {
-            tabs.value.toMutableList().also { it[existing] = updated }
+        // Atomic, because not every caller is on the main thread: the connect phase callback is
+        // invoked from MINA's dial on Dispatchers.IO while the collector and the reconnect ladder are
+        // writing the same list from the main dispatcher. Read-modify-write on `tabs.value` lost
+        // whichever update finished second - the state a tab was left showing depended on a race.
+        // `update` retries its transform on conflict, which is safe here: every transform is a pure
+        // `copy` of the tab it was handed.
+        tabs.update { current ->
+            val index = current.indexOfFirst { it.hostId == hostId }
+            val updated = transform(current.getOrNull(index)) ?: return@update current
+            if (index < 0) current + updated else current.toMutableList().also { it[index] = updated }
         }
+    }
+
+    /**
+     * Moves a tab through the two phases of one dial.
+     *
+     * The point of separating them is that they fail for entirely different reasons and take entirely
+     * different amounts of time. "Connecting…" covering both meant a PAM stack thinking for fifteen
+     * seconds, a two-factor prompt waiting on a push notification, and a TCP connection to an
+     * unreachable address all looked identical - a stuck app - and the user's only move was to guess.
+     *
+     * A reconnect keeps saying RECONNECTING throughout: which phase attempt three is in matters much
+     * less than the fact that the app is still trying, and flickering CONNECTING/AUTHENTICATING under
+     * "attempt 3 of 5" reads as instability rather than as progress.
+     *
+     * Never promotes a tab that is already live, because the callback crosses threads: an
+     * authentication that finishes instantly can have its AUTHENTICATING land behind the CONNECTED
+     * that [attachTerminal] wrote, and a connected session must not be told it is still logging in.
+     */
+    private fun onConnectPhase(hostId: String, phase: SshConnectPhase, resuming: Boolean, attempt: Int) {
+        val state = when {
+            resuming -> SessionConnectionState.RECONNECTING
+            phase == SshConnectPhase.HANDSHAKE -> SessionConnectionState.CONNECTING
+            else -> SessionConnectionState.AUTHENTICATING
+        }
+        updateTab(hostId) { tab -> if (tab == null || tab.state.isLive) tab else tab.copy(state = state) }
+        diagnostics.record(
+            hostId,
+            when (phase) {
+                SshConnectPhase.HANDSHAKE -> SessionEvent.HANDSHAKE
+                SshConnectPhase.AUTHENTICATE -> SessionEvent.AUTHENTICATE
+            },
+            state = state,
+            network = networkMonitor.describe(),
+            attempt = attempt + 1,
+        )
     }
 
     private data class BaseState(
@@ -2376,6 +2657,7 @@ class MainViewModel @Inject constructor(
     private data class TerminalState(
         val output: Map<String, String>,
         val history: Map<String, List<String>>,
+        val diagnostics: List<SessionDiagnosticEvent>,
     )
 
     private data class SecurityState(
@@ -2420,6 +2702,15 @@ class MainViewModel @Inject constructor(
          */
         const val TERMINAL_TEXT_MS = 1_000L
 
+        /**
+         * How long the ending of a session waits for output still in flight to reach the buffer.
+         *
+         * Generous because it is not a timeout in the normal case - the terminator is already queued
+         * behind the last chunk when this starts, so the wait is one dispatch - and reaching the bound
+         * means the shared flow was overrun, which the code that waits explains.
+         */
+        const val TERMINAL_DRAIN_MS = 2_000L
+
         /** A sane bound on the reconstructed command line, so a `cat` of binary cannot grow it. */
         const val MAX_TYPED_LINE = 4_096
 
@@ -2459,6 +2750,11 @@ data class MainUiState(
     val forwardings: List<ForwardEntry> = emptyList(),
     val snippets: List<Snippet> = emptyList(),
     val serverStats: Map<String, ServerStats> = emptyMap(),
+    /**
+     * The SSH lifecycle trace, oldest first. Carries no secrets and no host names - see
+     * [dev.eclipse.ssh.ssh.SessionDiagnostics].
+     */
+    val diagnostics: List<SessionDiagnosticEvent> = emptyList(),
 )
 
 /**
@@ -2474,27 +2770,42 @@ internal const val MAX_AUTO_RECONNECT_ATTEMPTS = 5
 /**
  * Whether a session that just ended should be brought back automatically.
  *
- * `null` is the whole distinction. Apache MINA reports the shell's exit status when the remote
- * side sent one, and reports nothing when the channel died without one — a dropped transport,
- * a killed `sshd`, a NAT that stopped forwarding, a heartbeat that ran out of replies. The
- * first is a session that finished, and reconnecting it would resurrect a shell the user
- * closed on purpose; `exit`, `logout` and `Ctrl-D` all land there, and so does a remote command
- * that failed with a non-zero status. The second is a session that was taken away, which is
- * the only case worth reconnecting.
+ * One question decides it: *was the shell taken away, or was it finished?* A transport that died —
+ * a dropped link, a killed `sshd`, a NAT that stopped forwarding, a heartbeat that ran out of replies
+ * — took a working shell away from a user who was using it, and that is the case reconnecting exists
+ * for. A shell that ended is finished, and dialling another one would only end the same way.
  *
- * A closed tab is not reconnected either, whatever the status: the user is not looking at that
- * session any more, and [MainViewModel.closeTab] has already released it.
+ * This used to be decided by `exitStatus == null`, which got the second half wrong in a way users
+ * reported as *"it connects and then goes straight to Reconnecting"*. A shell only reports a status
+ * when it exits normally: killed by a signal it reports a signal, and refused outright it reports
+ * nothing at all. Both arrived here as `null` — indistinguishable from a dead socket — so an account
+ * whose login shell printed a line and exited (`nologin`, a failing `~/.profile`, a `ForceCommand`)
+ * was dialled five more times, each attempt printing the same line and dying the same way, before the
+ * ladder gave up. [SessionEnd] exists so the two are no longer the same value.
+ *
+ * A closed tab is not reconnected either, whatever ended it: the user is not looking at that session
+ * any more, and [MainViewModel.closeTab] has already released it.
  *
  * [endedDeliberately] is the third state, and leaving it out was a bug with a very visible symptom.
  * The app closes sessions itself - a tab closed, Stop sessions, a duplicate session collapsed into the
- * one the app keeps - and every one of those endings looks from here exactly like a dropped link: MINA
- * fires the same close, and no shell reported an exit status, so `exitStatus` is `null`. A tab that
- * said *Reconnecting…* a few seconds after a successful login was this: something closed a session on
- * purpose, and the rule below read it as an outage and started a ladder. See
+ * one the app keeps - and from here every one of those looks like an ending that happened *to* the
+ * session. A tab that said *Reconnecting…* a few seconds after a successful login was this: something
+ * closed a session on purpose, and the rule below read it as an outage and started a ladder. See
  * [dev.eclipse.ssh.ssh.TerminalChannel.endedDeliberately].
  *
  * Pure so the rule can be tested without a network, a server or a view model — the states this
  * has to get right are exactly the ones that are awkward to reproduce on demand.
  */
-internal fun shouldAutoReconnect(exitStatus: Int?, tabIsOpen: Boolean, endedDeliberately: Boolean): Boolean =
-    tabIsOpen && exitStatus == null && !endedDeliberately
+internal fun shouldAutoReconnect(end: SessionEnd, tabIsOpen: Boolean, endedDeliberately: Boolean): Boolean {
+    if (!tabIsOpen || endedDeliberately) return false
+    return when (end) {
+        // The far end is finished with this shell, however it phrased that: a status, a signal, or a
+        // channel closed with neither. A fresh shell would meet the same end, so the tab says what
+        // happened and stops; the manual Reconnect action is still right there for a user who
+        // disagrees.
+        is SessionEnd.ShellEnded -> false
+        // Everything else is the transport, and a transport is the one thing worth waiting out.
+        is SessionEnd.TransportFailed, is SessionEnd.Disconnected -> true
+        SessionEnd.TransportClosed, SessionEnd.Released -> true
+    }
+}

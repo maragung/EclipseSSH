@@ -90,6 +90,30 @@ class SshSessionStore @Inject constructor() {
         dialGates.computeIfAbsent(hostId) { Mutex() }.withLock { attempt() }
 
     /**
+     * Like [dialing], but reports [DialAttempt.Busy] instead of waiting when another dialler already
+     * holds [hostId]'s gate.
+     *
+     * For callers that walk a list of hosts, where waiting is both pointless and harmful. Pointless
+     * because whatever the current dialler installs is found by the next pass anyway; harmful because
+     * the gate is deliberately held for a whole connect ladder - [dev.eclipse.ssh.presentation.MAX_CONNECT_ATTEMPTS]
+     * attempts with a per-attempt timeout the user may set as high as five minutes - so one unreachable
+     * host would stall every host queued behind it for a quarter of an hour.
+     *
+     * The distinction has to be in the return type rather than in a null: the thing being dialled is
+     * itself nullable, and "nobody could connect" and "somebody else is connecting" call for opposite
+     * responses - a backoff in the first case, patience in the second.
+     */
+    suspend fun <T> tryDialing(hostId: String, attempt: suspend () -> T): DialAttempt<T> {
+        val gate = dialGates.computeIfAbsent(hostId) { Mutex() }
+        if (!gate.tryLock()) return DialAttempt.Busy
+        return try {
+            DialAttempt.Ran(attempt())
+        } finally {
+            gate.unlock()
+        }
+    }
+
+    /**
      * Publishes [session] as the session for [hostId] without ever closing a live one.
      *
      * Returns the session the app is now using, which is *not* always the one passed in: if a live
@@ -183,6 +207,24 @@ class SshSessionStore @Inject constructor() {
         sessions.remove(hostId)?.let { session -> runCatching { session.close(false) } }
     }
 
+    /**
+     * Drops the session for [hostId] because it has been *found dead*, without claiming the app meant
+     * it to end.
+     *
+     * The difference from [close] is one line of consequence: [close] marks the channel deliberate,
+     * which tells the collector "the app did this" and suppresses the reconnect. Here the opposite is
+     * required - a liveness probe has just proved the transport is gone, and what has to happen next is
+     * exactly what happens on any other drop: the tab says so and the ladder brings it back.
+     *
+     * `close(true)` rather than `close(false)`, because there is nobody left to be graceful to. A
+     * graceful close writes `SSH_MSG_DISCONNECT` and waits for the write to land, which on a socket
+     * bound to an interface that no longer exists means blocking until the kernel gives up.
+     */
+    fun discard(hostId: String) {
+        channels.remove(hostId)?.let { channel -> runCatching { channel.discard() } }
+        sessions.remove(hostId)?.let { session -> runCatching { session.close(true) } }
+    }
+
     /** [close], and forget the terminal state too. For a tab the user has closed. */
     fun forget(hostId: String) {
         close(hostId)
@@ -193,4 +235,16 @@ class SshSessionStore @Inject constructor() {
     fun closeAll() {
         sessions.keys.toList().forEach(::close)
     }
+}
+
+/**
+ * The outcome of [SshSessionStore.tryDialing]: either it ran, or someone else was already dialling.
+ */
+sealed interface DialAttempt<out T> {
+
+    /** [attempt] ran to completion and produced [value] - which may itself be null. */
+    data class Ran<out T>(val value: T) : DialAttempt<T>
+
+    /** Another dialler holds the host's gate, so nothing was attempted. */
+    data object Busy : DialAttempt<Nothing>
 }

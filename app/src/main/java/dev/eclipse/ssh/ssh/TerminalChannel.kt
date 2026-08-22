@@ -55,9 +55,21 @@ class TerminalChannel(
      * Each element is a private copy. Apache MINA reuses the array it hands to [OutputStream.write],
      * so a collector that saw the original would be reading a buffer that had already been refilled.
      * Collectors must not mutate what they receive.
+     *
+     * The stream ends *in band*, with [END_OF_OUTPUT] as its last element. That is the only way a
+     * collector can know it has seen everything: a `SharedFlow` delivers asynchronously, so a chunk
+     * that has been emitted has not necessarily been received, and [awaitClosed] completing is a
+     * different signal arriving on a different thread. A collector that treated the two as ordered -
+     * closing its own queue the moment the channel reported it had ended - threw away whatever was
+     * still in flight, which is exactly the last thing the shell said: the `logout` on the way out, the
+     * final line of a build, the one line a `nologin` account ever prints. Compared by identity, not
+     * by contents, so an empty write from the remote side cannot be mistaken for it.
      */
     private val outputEvents = MutableSharedFlow<ByteArray>(replay = REPLAY_CHUNKS, extraBufferCapacity = BUFFERED_CHUNKS)
     val output: SharedFlow<ByteArray> = outputEvents
+
+    /** Guards [END_OF_OUTPUT] being emitted once, from whichever of the ending paths gets there first. */
+    private val outputEnded = AtomicBoolean(false)
 
     private val droppedChunkCount = AtomicLong()
 
@@ -71,7 +83,7 @@ class TerminalChannel(
     val droppedChunks: Long get() = droppedChunkCount.get()
 
     /**
-     * Completes when this channel is finished, carrying the shell's exit status if it sent one.
+     * Completes when this channel is finished, carrying [SessionEnd]: *why* it finished.
      *
      * [output] is a `SharedFlow` and a `SharedFlow` never completes, so collecting it says nothing
      * about whether the far end is still there. Without a signal of its own, a session that dropped
@@ -79,11 +91,35 @@ class TerminalChannel(
      * indistinguishable from a shell sitting quietly at a prompt, and the app went on presenting a
      * dead session as a live one.
      *
+     * It used to carry `Int?`, the shell's exit status, which made the six ways a session can end into
+     * two: "the shell reported a status" and `null` for everything else. [SessionEnd] is why that was
+     * not enough.
+     *
      * [CompletableDeferred] rather than a flow because it is a one-shot fact that has to be readable
      * *after* it happens: a listener registered late still gets the answer, which matters because MINA
-     * fires a close future immediately when the channel is already closed.
+     * fires a close future immediately when the channel is already closed. First completion wins, so
+     * every path below may report without checking whether another already has.
      */
-    private val closed = CompletableDeferred<Int?>()
+    private val closed = CompletableDeferred<SessionEnd>()
+
+    /**
+     * What the transport said about its own death, recorded the moment MINA reports it.
+     *
+     * The channel's close future carries no reason at all, and by the time it fires the session may
+     * already have been torn down - so the throwable from [SessionListener.sessionException] and the
+     * reason from [SessionListener.sessionDisconnect] have to be kept when they arrive rather than
+     * looked up afterwards. `@Volatile` because MINA's I/O threads write it and a coroutine reads it.
+     */
+    @Volatile private var transportReason: SessionEnd? = null
+
+    /**
+     * Set while [release] is closing this channel, so a close future firing inside that call knows the
+     * app performed the close.
+     *
+     * Without it, pruning a channel whose transport had already died looked exactly like a shell that
+     * exited without a status - and those two now mean opposite things to the reconnect decision.
+     */
+    @Volatile private var releasing = false
 
     /**
      * Finishes [closed] when the transport under this channel dies, rather than when the channel is
@@ -99,20 +135,59 @@ class TerminalChannel(
      * `shouldAutoReconnect` would have started never gets the chance.
      *
      * [SessionListener.sessionException] is the earliest honest signal: MINA raises it the moment the
-     * heartbeat gives up, before it attempts any teardown. [SessionListener.sessionClosed] covers the
-     * orderly endings - a server-side disconnect, or the app closing the session under a channel that
-     * is still open. Either way the exit status is whatever the shell managed to report, which for a
-     * dropped transport is `null` - exactly what the reconnect decision reads as "went away on its
-     * own" rather than "the user typed exit".
+     * heartbeat gives up, before it attempts any teardown, and it carries the throwable that says what
+     * went wrong. [SessionListener.sessionDisconnect] carries the server's own reason when the server
+     * is the one hanging up. [SessionListener.sessionClosed] covers the rest - a bare socket close, or
+     * the app closing the session under a channel that is still open. All three report a
+     * [SessionEnd] that names the transport, which is what tells the reconnect decision this was an
+     * outage rather than a shell that finished.
      */
     private val transportDeath = object : SessionListener {
-        override fun sessionException(session: Session, t: Throwable) = markClosed()
+        override fun sessionException(session: Session, t: Throwable) {
+            val failure = SessionEnd.TransportFailed(t)
+            transportReason = failure
+            markClosed(failure)
+        }
 
-        override fun sessionClosed(session: Session) = markClosed()
+        /**
+         * Recorded rather than reported, because `sessionClosed` always follows within microseconds
+         * and completing here would race the shell's own exit status onto the floor. The reason is
+         * what this listener exists for: an `SSH_MSG_DISCONNECT` is the one ending where the *server*
+         * says why, and that sentence is worth more to the user than anything the app can infer.
+         */
+        override fun sessionDisconnect(session: Session, reason: Int, msg: String?, language: String?, initiator: Boolean) {
+            if (transportReason == null) {
+                transportReason = SessionEnd.Disconnected(reason = reason, message = msg, byPeer = !initiator)
+            }
+        }
+
+        override fun sessionClosed(session: Session) = markClosed(transportReason ?: SessionEnd.TransportClosed)
     }
 
-    private fun markClosed() {
-        closed.complete(channel.exitStatus)
+    /**
+     * Reports [reason], unless the shell got its own word in first.
+     *
+     * A shell that exits takes its transport with it - OpenSSH closes the session behind the last
+     * channel - so both endings arrive, microseconds apart and on threads MINA does not order for us.
+     * When the shell reported a status or a signal, that is why the session ended and the transport
+     * closing is a consequence; reporting the consequence instead is what made an ordinary `exit` look
+     * like a dropped link.
+     */
+    private fun markClosed(reason: SessionEnd) {
+        finish(shellReport() ?: reason)
+    }
+
+    /**
+     * The shell's own account of its ending, or `null` if it never gave one.
+     *
+     * Wrapped because both getters read channel state that a concurrent teardown is mutating, and a
+     * failure to read it must degrade to "the shell said nothing" rather than take down the thread
+     * MINA is closing the session on.
+     */
+    private fun shellReport(): SessionEnd.ShellEnded? {
+        val status = runCatching { channel.exitStatus }.getOrNull()
+        val signal = runCatching { channel.exitSignal }.getOrNull()?.takeIf { it.isNotBlank() }
+        return if (status != null || signal != null) SessionEnd.ShellEnded(status, signal) else null
     }
 
     /**
@@ -151,17 +226,72 @@ class TerminalChannel(
         deliberate.set(true)
     }
 
-    /** Suspends until the channel closes, returning the remote exit status when one was reported. */
-    suspend fun awaitClosed(): Int? = closed.await()
+    /** Suspends until the channel closes, returning why it did. */
+    suspend fun awaitClosed(): SessionEnd = closed.await()
+
+    /**
+     * Ends the output stream, then reports [end] to whoever is waiting on [awaitClosed].
+     *
+     * Every ending goes through here, and in this order, so that a collector reaches the terminator
+     * behind the last chunk rather than racing it. First completion wins; later calls do nothing.
+     */
+    private fun finish(end: SessionEnd) {
+        endOutput()
+        closed.complete(end)
+    }
+
+    /**
+     * Puts [END_OF_OUTPUT] at the end of the stream, exactly once.
+     *
+     * `tryEmit` only, never the blocking [publish]: this runs on Apache MINA's I/O thread and on
+     * whatever thread closed the channel - the main thread, when the user closes a tab - and pausing
+     * either of those for a collector that is not draining would trade a lost line for a frozen UI.
+     * The one case where the terminator cannot be queued is a shared flow already holding
+     * [BUFFERED_CHUNKS] undelivered chunks, which means the collector has stopped draining
+     * altogether; `MainViewModel.launchTerminalCollector` bounds its wait for the terminator for
+     * exactly that reason.
+     */
+    private fun endOutput() {
+        if (!outputEnded.compareAndSet(false, true)) return
+        outputEvents.tryEmit(END_OF_OUTPUT)
+    }
 
     @Volatile private var columns = DEFAULT_COLUMNS
     @Volatile private var rows = DEFAULT_ROWS
 
-    suspend fun open() {
+    /**
+     * The pty's current size, as the remote side understands it.
+     *
+     * Readable because the app has to be able to *carry the geometry across a reconnect*. A new
+     * channel starts at [DEFAULT_COLUMNS]x[DEFAULT_ROWS], while the composable that measures the real
+     * viewport only reports a size when the size it measures *changes* - so after a reconnect nothing
+     * on the UI side had changed, nothing was reported, and a phone-sized terminal spent the rest of
+     * its life pretending to be 120 columns wide. Every full-screen program was wrapped wrongly.
+     */
+    val ptyColumns: Int get() = columns
+    val ptyRows: Int get() = rows
+
+    /**
+     * Opens the shell, optionally at a known size.
+     *
+     * [columns] and [rows] exist for the reconnect path: sizing the pty *at creation* is not the same
+     * as creating it at 120x40 and sending a window-change immediately afterwards. A shell whose
+     * `$COLUMNS` is read by a login script, and a full-screen program started by one, see only the
+     * first value - the resize arrives after they have already drawn themselves at the wrong width.
+     */
+    suspend fun open(columns: Int = this.columns, rows: Int = this.rows) {
+        // Clamped once and then used everywhere. Sending the *parameter* to the pty while storing the
+        // clamped value in the field put the two sides permanently out of step: the remote came up at
+        // whatever was asked for, the app believed the clamped number, and because `resize` compares
+        // against the field, the correcting window-change looked like a no-op and was never sent.
+        val safeColumns = columns.coerceIn(TERMINAL_COLUMN_RANGE)
+        val safeRows = rows.coerceIn(TERMINAL_ROW_RANGE)
+        this.columns = safeColumns
+        this.rows = safeRows
         (channel as? PtyCapableChannelSession)?.apply {
             setPtyType("xterm-256color")
-            setPtyColumns(columns)
-            setPtyLines(rows)
+            setPtyColumns(safeColumns)
+            setPtyLines(safeRows)
         }
         channel.setIn(input)
         channel.setOut(EmittingOutputStream())
@@ -169,11 +299,11 @@ class TerminalChannel(
         channel.open().verify(OPEN_TIMEOUT_MS)
         // Registered after the open so a failed open reports itself as a failed open, through the
         // exception, rather than as a session that came up and immediately ended.
-        channel.addCloseFutureListener { closed.complete(channel.exitStatus) }
+        channel.addCloseFutureListener { finish(closeReason()) }
         channel.session.addSessionListener(transportDeath)
         // Closes the gap between the open completing and the listener being in place: a session that
         // ended inside that window has already fired every event it is going to fire.
-        if (!channel.session.isOpen) markClosed()
+        if (!channel.session.isOpen) markClosed(transportReason ?: SessionEnd.TransportClosed)
     }
 
     /**
@@ -227,13 +357,38 @@ class TerminalChannel(
      * deliberate flag exists to prevent, arrived at from the other side.
      *
      * There is nothing to mark here: the channel is being tidied up *after* the fact, and the report
-     * of its death belongs to whatever was waiting on [awaitClosed].
+     * of its death belongs to whatever was waiting on [awaitClosed] - which reports whatever the
+     * transport already said, and [SessionEnd.Released] only when nothing did.
      */
     fun discard() {
         release()
     }
 
+    /**
+     * Why this channel closed, decided in order of how much each source actually knows.
+     *
+     * The shell's own report first: a status or a signal is the far end saying what happened. Then
+     * whatever the transport reported, because a channel that closed underneath a failed transport
+     * closed *because* of it. Then the app's own hand, if [release] is running. Only then is the guess
+     * made, and the guess turns on the one question that decides whether reconnecting could help: was
+     * the transport still up when the channel went? If it was, the shell is gone and a new one would
+     * meet the same end; if it was not, the link died and waiting it out is exactly right.
+     */
+    private fun closeReason(): SessionEnd =
+        shellReport()
+            ?: transportReason
+            ?: if (releasing) {
+                SessionEnd.Released
+            } else if (runCatching { channel.session.isOpen }.getOrDefault(false)) {
+                SessionEnd.ShellEnded(status = null, signal = null)
+            } else {
+                SessionEnd.TransportClosed
+            }
+
     private fun release() {
+        // Before the close below, so a close future that fires inside it reports the app's own hand
+        // rather than inventing a shell that exited silently.
+        releasing = true
         runCatching { input.close() }
         // Removed explicitly: one session is shared by every tab pointing at that host, so a listener
         // left behind here would outlive its channel and accumulate one entry per terminal the user
@@ -247,7 +402,7 @@ class TerminalChannel(
         runCatching { channel.close(!transportAlive) }
         // Belt and braces for the case where the channel never opened, so nothing is left awaiting a
         // close future that was never registered.
-        closed.complete(null)
+        finish(closeReason())
     }
 
     private inner class EmittingOutputStream : OutputStream() {
@@ -360,16 +515,25 @@ class TerminalChannel(
         }
     }
 
-    private companion object {
-        const val DEFAULT_COLUMNS = 120
-        const val DEFAULT_ROWS = 40
-        const val OPEN_TIMEOUT_MS = 20_000L
+    companion object {
+        /**
+         * The last element of [output]: the stream is over and nothing follows it.
+         *
+         * Empty, and compared by identity rather than by contents - [EmittingOutputStream] never
+         * publishes a zero-length chunk, but identity means a remote side that somehow produced one
+         * still could not impersonate the end of the session.
+         */
+        val END_OF_OUTPUT: ByteArray = ByteArray(0)
+
+        private const val DEFAULT_COLUMNS = 120
+        private const val DEFAULT_ROWS = 40
+        private const val OPEN_TIMEOUT_MS = 20_000L
 
         /** Enough to hold a login banner for a collector that subscribes just after [open]. */
-        const val REPLAY_CHUNKS = 16
+        private const val REPLAY_CHUNKS = 16
 
         /** Headroom for a burst, so the common case never has to block the pump thread. */
-        const val BUFFERED_CHUNKS = 256
+        private const val BUFFERED_CHUNKS = 256
 
         /**
          * How long the pump thread waits for a collector before giving up on a chunk.
@@ -380,6 +544,6 @@ class TerminalChannel(
          * corrupted terminal state, while the cost of being wrong in the long direction is one pump
          * thread pausing a session nobody is reading.
          */
-        const val PUBLISH_WAIT_MS = 10_000L
+        private const val PUBLISH_WAIT_MS = 10_000L
     }
 }

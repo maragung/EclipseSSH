@@ -1633,3 +1633,135 @@ remain different claims.
 `classes.dex` carries CRC `ffbdc00c` against 1.0.2's `78f68f26` — the payload really is new code and not a
 re-wrapped 1.0.2. The same file is also served over HTTP on port 19001 alongside 1.0.1 and 1.0.2, and was
 fetched back from the public address to confirm the server hands over all 5,694,909 bytes.
+
+## 19. The SSH lifecycle, rebuilt around one session manager
+
+The request behind this section was not "fix the reconnect" but "fix the architecture the reconnect keeps
+falling out of". What follows is the layering the app now has, the state machine it moves through, the
+faults that were found while building it, and what was measured afterwards.
+
+### 19.1 Who owns a connection
+
+| Layer | Owns | Never does |
+|---|---|---|
+| `MainActivity`, `TerminalView` | Drawing, gestures, keys | Create, adopt or close a session |
+| `MainViewModel` | `SessionTab` state, the reconnect ladder, remembered pty size | Hold a socket |
+| `SshSessionStore` | The one `ClientSession`, `TerminalChannel` and `AnsiTerminalBuffer` per host | Dial |
+| `SshConnectionManager` | Handshake, auth, proxies, host keys, keepalive properties | Decide when to reconnect |
+| `TerminalChannel` | The pty, its size, output backpressure, why it ended | Report a deliberate close as an outage |
+| `EclipseSessionService`, `NetworkMonitor` | Keeping the process alive, noticing the default network change | Touch UI state |
+
+The single source of truth is `SshSessionStore`. The UI can ask for a connection and can ask for one to
+end; it cannot make or unmake one, which is what stopped rotation, the software keyboard, navigation and
+backgrounding from each costing a session. `neitherResizeNorKeyboardNorBackgroundingReconnects` is the
+test that holds that line, and it counts shells on the far side of the wire rather than trusting the app's
+own account of itself.
+
+### 19.2 The state machine, and what moves between the states
+
+`IDLE → CONNECTING → AUTHENTICATING → CONNECTED → RECONNECTING → DISCONNECTED / ERROR`, with two rules
+that were previously missing: only a *fault* may enter `RECONNECTING`, and only the user may enter
+`IDLE`. The fault decision lives in one place, `SessionEnd.isFault`, over six causes that used to arrive
+indistinguishably as a null exit status:
+
+| Ending | Fault | Reconnects |
+|---|---|---|
+| Shell exited, any status | no | no |
+| Shell killed by a signal | yes | no — a second shell would be killed too |
+| Server sent `SSH_MSG_DISCONNECT` | yes | no — the server has made its decision |
+| Transport raised | yes | yes |
+| Transport closed with nothing said | yes | yes |
+| App released the channel | depends | only when the pruner found it already dead |
+
+`describeSessionEnd` turns each into a sentence a person can act on, which is the difference between
+"Disconnected from the remote host" — the one message the app used to have for all six — and "The remote
+shell was ended by SIGHUP", which sends the user to `dmesg` instead of to their router.
+
+A connection that never came up is not on that table, because it is not an ending: nothing was ever
+running. `connect` settles it on `ERROR` — red, not the amber of a session that ran and finished — because
+something has to change before another attempt means anything, and by then it has already spent its own
+attempts: three, or exactly one when the server has made up its mind (`connectFailureIsFinal`, which is
+what stops a mistyped password being offered three times and locking an account). The drop ladder is for
+sessions that existed and is not armed here. Five tests written before that distinction existed still
+waited for `DISCONNECTED` after a refused port, a wrong password, an unreachable host or a server that
+accepts TCP and then says nothing; they now wait for `ERROR`. Everything they assert about the failure is
+unchanged — a readable reason, the password absent from it, exactly one login offered, no shell left
+half-open, and the *per-host* timeout being what ends it.
+
+### 19.3 One dial per host
+
+`SshSessionStore.dialing(hostId)` runs a dial as the only one in flight for that host, and the adoption
+check happens *inside* that gate: a session that appeared while this attempt was waiting is one to use,
+not one to duplicate. `install` keeps whichever session already has a shell rather than the newest, so a
+lost race closes the redundant half instead of the half the user is typing into. `tryDialing` exists for
+the callers that must not queue — a notification refresh or a restore pass reports `Busy` and moves on.
+
+### 19.4 A heartbeat that only reports the dead
+
+Keepalive is `keepAliveSeconds` (per host, falling back to the global setting), armed as MINA's
+`HEARTBEAT_INTERVAL` with a reply wait, so silence is only silence when a request the peer *must* answer
+goes unanswered `HEARTBEAT_NO_REPLY_MAX` times. The session idle timeout is derived from the same number
+rather than set independently, which is what used to end idle sessions that were perfectly healthy.
+
+A network change does not wait for that ladder. `NetworkMonitor` reports the default network moving
+between Wi-Fi and mobile data, and `SessionLivenessProbe` sends a global request the peer must answer:
+a live session answers within seconds even when it answers with `SSH_MSG_REQUEST_FAILURE` — a refusal is
+still proof of life — and a black-holed transport fails the probe long before the heartbeat would notice.
+Backoff is exponential with jitter, armed only on a fault, and cancelled the moment the user disconnects
+or connects by hand.
+
+### 19.5 What the trace records, and what it cannot
+
+`SessionDiagnostics` keeps the newest 500 events in a ring: 16 event kinds covering connect, handshake,
+auth, shell open, adoption, each failed attempt, every ending with its reason, the reconnect ladder
+including exhaustion and cancellation, network changes, probe results, pty resizes, and dropped output —
+each with the state, the attempt number, the network, the keepalive, the pty size and how long the
+session had been up.
+
+It identifies a session by an opaque per-process label (`s1`, `s2`) rather than by host id, hostname or
+user, and every detail string passes through `scrub` first: PEM and OpenSSH key bodies are replaced whole,
+`password=`/`passphrase:`/`token =>` values are replaced by name, and any unbroken 40-character run of
+base64-ish characters is replaced whatever it is called. Scrubbing runs *before* the 200-character
+truncation, so length is not a way past it. `SessionDiagnosticsTest` asserts the promise from the other
+side: a key, a password, a passphrase, a bare token and a host id are all absent from an export that
+still says which event it was and what the server said.
+
+### 19.6 The faults this rebuild found, and what caught each one
+
+Every one of these was found by a test written for the behaviour above rather than by reading the code,
+and each fix is in the production path — none of them was made to go away by changing what the test asked
+for.
+
+| Fault | What it did to a user | Caught by |
+|---|---|---|
+| `TerminalChannel.open` sent the *unclamped* size to the pty while recording the clamped one | The remote came up at a geometry the app did not believe it had, and because `resize` compares against the recorded value, the correcting `window-change` looked like a no-op and was never sent — a permanently misdrawn screen on any device whose measured width fell outside 20–400 columns | `a pty asked for at an impossible size is opened at one the display can match`, asserted against the shell's own `COLUMNS`/`LINES` |
+| The reconnect ladder consulted no store for the credential it re-dialled with | A password typed at the prompt rather than saved could never survive an outage: ten seconds without signal ended the session with `No more authentication methods available`, after spending one refused login per rung | `aTypedPasswordThatWasNeverSavedStillRecoversTheSessionAfterAnOutage`, which counts logins the *server* accepted and refused |
+| A vault that could not store that credential failed silently | Same symptom as above on a device whose keystore key had become unusable, with nothing anywhere to say why | Recorded now as `CREDENTIAL_NOT_STORED`; the session is still not failed over it |
+| `scrub` replaced its own placeholder | `invalid key: «key»` became `invalid key: «redacted»` — still redacted, but no longer saying which kind of secret had been dropped, which is the only part of it a reader can use | `a private key in an exception message is replaced whole` |
+| A fault wrote `ERROR` before the ladder wrote `RECONNECTING` | Every genuine drop flashed a red tab reading "Disconnected from the remote host" before admitting it was already reconnecting — and because the second write happens after a settings read from disk, a slow read left it sitting there | `aDroppedTransportIsNeverSilent`, which now refuses `ERROR` as well as `CONNECTED` for a drop with the ladder armed |
+| `aDroppedTransportIsNeverSilent` read the tab state twice | Nothing, in the app — but the test could fail for being read a microsecond later, on either side of the ladder | Kept honest by recording the state at the moment it is observed |
+
+### 19.7 What was run, and what it says
+
+| Check | Result |
+| --- | --- |
+| `testDebugUnitTest` | 690 tests, 57 classes, 0 failures — including one against a real OpenSSH `sshd` |
+| `testReleaseUnitTest` | 690 tests, 57 classes, 0 failures |
+| `lintRelease` | 0 errors, 4 warnings — all four the `ConfigurationScreenWidthHeight` advisory declined in §16, on the same two lines |
+
+Run on two pinned cores under `nice`, offline, with the daemon disabled and `--max-workers=1`. The worker
+cap is new and is not cosmetic: with two workers Gradle runs the debug and release test tasks at the same
+time, which puts two Robolectric JVMs and their two in-process SSH servers on a four-core machine shared
+with other tenants and took the load average past nine. Serialising them costs about five minutes and
+keeps the run inside its two cores.
+
+The stress list in the brief is covered as far as this host allows, and where it is not, the substitute is
+named rather than implied. There is no Android device here — no KVM, so no emulator — so every session
+test drives the real `SshConnectionManager` and `TerminalChannel` against a real SSH server on the
+loopback: Apache MINA in-process for most of the suite, and a real OpenSSH `sshd` for the interop test
+that exists precisely because a MINA client talking to a MINA server agrees with itself for free. Idle is
+tested as keep-alive periods against a server that counts them rather than by waiting half an hour;
+rotation, backgrounding, lock and unlock as the lifecycle callbacks the system delivers; Wi-Fi to mobile
+data as the `NetworkMonitor` transitions the platform reports; a network outage as a transport dropped
+under a live session, which is what the app can actually observe.
+

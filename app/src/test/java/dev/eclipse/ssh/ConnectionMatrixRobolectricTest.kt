@@ -165,7 +165,7 @@ class ConnectionMatrixRobolectricTest {
         val hostId = connectExpectingFailure(port = serverPort, password = "not-the-password")
 
         val tab = checkNotNull(tabFor(hostId))
-        val error = checkNotNull(tab.lastError) { "DISCONNECTED with nothing to show the user" }
+        val error = checkNotNull(tab.lastError) { "a failed connection with nothing to show the user" }
         assertThat(error).isNotEmpty()
         assertThat(error).doesNotContain("not-the-password")
         assertThat(error).doesNotContain(PASSWORD)
@@ -178,7 +178,7 @@ class ConnectionMatrixRobolectricTest {
 
     /** Nothing listening: reported as a connection problem, not as a crash and not as a hang. */
     @Test
-    fun anUnreachableHostSettlesOnDisconnectedWithAReadableError() {
+    fun anUnreachableHostSettlesOnAnErrorStateWithAReadableError() {
         val hostId = connectExpectingFailure(port = deadPort, password = PASSWORD)
 
         val error = checkNotNull(tabFor(hostId)?.lastError)
@@ -347,7 +347,7 @@ class ConnectionMatrixRobolectricTest {
 
         // Edited to a port nothing is listening on, the way the Edit dialog saves.
         editHost(hostId) { it.copy(port = deadPort) }
-        connectSaved(hostId, password = PASSWORD, expect = SessionConnectionState.DISCONNECTED, timeoutMs = SSH_TIMEOUT_MS)
+        connectSaved(hostId, password = PASSWORD, expect = SessionConnectionState.ERROR, timeoutMs = SSH_TIMEOUT_MS)
         assertThat(tabFor(hostId)?.lastError).isNotNull()
 
         // And back again: the same profile, edited once more, connects.
@@ -491,7 +491,7 @@ class ConnectionMatrixRobolectricTest {
      * [pinFingerprint] is on by default and is what makes the rest of the class deterministic. The
      * server generates a fresh host key per run, so every profile would otherwise meet a
      * trust-on-first-use challenge whose *timing* depends on which test happened to run first — and a
-     * test measuring a failure would settle on DISCONNECTED for the wrong reason, having never reached
+     * test measuring a failure would settle on ERROR for the wrong reason, having never reached
      * authentication at all. Pinning is the app's own feature for exactly this: a fingerprint saved on
      * the profile is written to known-hosts by [MainViewModel.saveHost]. The path through the challenge
      * is not lost by pinning here; it is what
@@ -573,7 +573,11 @@ class ConnectionMatrixRobolectricTest {
         timeoutMs: Long = SSH_TIMEOUT_MS,
     ): String {
         val host = saveHost(port = port, timeoutSeconds = timeoutSeconds)
-        connectSaved(host.id, password, expect = SessionConnectionState.DISCONNECTED, timeoutMs = timeoutMs)
+        // ERROR, not DISCONNECTED. A connection that never came up is not a session that ended: the
+        // credentials, the host or the network has to change before another attempt is worth anything,
+        // and the tab shows that in red rather than in the amber of a finished session. Waiting for the
+        // exact state rather than for "anything settled" is deliberate - it is the state the user sees.
+        connectSaved(host.id, password, expect = SessionConnectionState.ERROR, timeoutMs = timeoutMs)
         return host.id
     }
 

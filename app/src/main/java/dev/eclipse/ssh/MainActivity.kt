@@ -67,6 +67,8 @@ import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.MoreVert
@@ -181,6 +183,9 @@ import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
+import dev.eclipse.ssh.data.model.isBusy
+import dev.eclipse.ssh.data.model.isEnded
+import dev.eclipse.ssh.data.model.isLive
 import dev.eclipse.ssh.data.model.Snippet
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
@@ -213,6 +218,7 @@ import dev.eclipse.ssh.data.credentials.describe
 import dev.eclipse.ssh.data.saf.PickedKeyFile
 import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
+import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
 import dev.eclipse.ssh.ssh.fallbackHome
 import dev.eclipse.ssh.data.saf.LocalFile
 import androidx.compose.ui.focus.FocusRequester
@@ -228,6 +234,7 @@ import dev.eclipse.ssh.ui.terminal.terminalTextInset
 import dev.eclipse.ssh.terminal.TerminalExportRenderer
 import dev.eclipse.ssh.security.BiometricUnlocker
 import dev.eclipse.ssh.security.SecureClipboard
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.Dispatchers
@@ -979,6 +986,7 @@ private fun EclipseWorkspace(
                     onReconnectBase = viewModel::setReconnectBaseSeconds,
                     onClipboard = viewModel::setClipboardSeconds,
                     onTerminalFontSize = viewModel::setTerminalFontSize,
+                    onTerminalKeyRow = viewModel::setTerminalKeyRowVisible,
                     onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
@@ -989,6 +997,13 @@ private fun EclipseWorkspace(
                     onForgetKnownHost = viewModel::forgetKnownHost,
                     onClearKnownHosts = viewModel::clearKnownHosts,
                     onForgetAllCredentials = viewModel::forgetAllCredentials,
+                    onCopyDiagnostics = { viewModel.copyToClipboard(viewModel.exportDiagnostics()) },
+                    onSaveDiagnostics = {
+                        pendingTextExport = viewModel.exportDiagnostics().toByteArray()
+                        pickerActive = true
+                        textExportPicker.launch("eclipse-diagnostics.log")
+                    },
+                    onClearDiagnostics = viewModel::clearDiagnostics,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1125,6 +1140,7 @@ private fun EclipseWorkspace(
                     onReconnectBase = viewModel::setReconnectBaseSeconds,
                     onClipboard = viewModel::setClipboardSeconds,
                     onTerminalFontSize = viewModel::setTerminalFontSize,
+                    onTerminalKeyRow = viewModel::setTerminalKeyRowVisible,
                     onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
@@ -1135,6 +1151,13 @@ private fun EclipseWorkspace(
                     onForgetKnownHost = viewModel::forgetKnownHost,
                     onClearKnownHosts = viewModel::clearKnownHosts,
                     onForgetAllCredentials = viewModel::forgetAllCredentials,
+                    onCopyDiagnostics = { viewModel.copyToClipboard(viewModel.exportDiagnostics()) },
+                    onSaveDiagnostics = {
+                        pendingTextExport = viewModel.exportDiagnostics().toByteArray()
+                        pickerActive = true
+                        textExportPicker.launch("eclipse-diagnostics.log")
+                    },
+                    onClearDiagnostics = viewModel::clearDiagnostics,
                     // The shell is the one screen that must not be inset by this Scaffold. Its own
                     // padding comes from `safeDrawingPadding` inside the terminal, and applying both
                     // would inset the grid twice - once for a navigation bar that is not there and
@@ -1459,6 +1482,7 @@ private fun WorkspaceScaffold(
     onReconnectBase: (Int) -> Unit = {},
     onClipboard: (Int) -> Unit = {},
     onTerminalFontSize: (Int) -> Unit = {},
+    onTerminalKeyRow: (Boolean) -> Unit = {},
     onTerminalMinColumns: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
@@ -1470,6 +1494,9 @@ private fun WorkspaceScaffold(
     onForgetKnownHost: (String) -> Unit = {},
     onClearKnownHosts: () -> Unit = {},
     onForgetAllCredentials: () -> Unit = {},
+    onCopyDiagnostics: () -> Unit = {},
+    onSaveDiagnostics: () -> Unit = {},
+    onClearDiagnostics: () -> Unit = {},
 ) {
     // A shell owns the whole window, so it composes outside the Scaffold entirely: no top bar, no
     // Scaffold insets, nothing above the grid but the session strip. This is the branch the app enters
@@ -1500,6 +1527,8 @@ private fun WorkspaceScaffold(
             onSaveText = onSaveText,
             onSaveScreen = onSaveScreen,
             fontSize = state.settings.terminalFontSize,
+            onFontSize = onTerminalFontSize,
+            onKeyRowVisible = onTerminalKeyRow,
             activeTab = openSession,
             onSelectSession = { onOpenSession(it.hostId) },
             onLeaveSession = { onOpenSession(null) },
@@ -1582,6 +1611,9 @@ private fun WorkspaceScaffold(
                     onGenerateKey = onGenerateKey,
                     onImportSshConfig = onImportSshConfig,
                     onForgetAllCredentials = onForgetAllCredentials,
+                    onCopyDiagnostics = onCopyDiagnostics,
+                    onSaveDiagnostics = onSaveDiagnostics,
+                    onClearDiagnostics = onClearDiagnostics,
                 )
             }
         }
@@ -1764,6 +1796,10 @@ private fun TerminalScreen(
     onLeaveSession: () -> Unit,
     modifier: Modifier = Modifier,
     fontSize: Int = 13,
+    /** Persists a pinch-to-zoom result, so the size the user settled on survives leaving the screen. */
+    onFontSize: (Int) -> Unit = {},
+    /** Persists the shortcut bar's collapsed state, for the same reason. */
+    onKeyRowVisible: (Boolean) -> Unit = {},
 ) {
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var showSearch by rememberSaveable { mutableStateOf(false) }
@@ -1812,7 +1848,21 @@ private fun TerminalScreen(
     val latches = rememberTerminalLatches()
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
-    val textStyle = remember(fontSize) { TextStyle(fontFamily = FontFamily.Monospace, fontSize = fontSize.sp) }
+    /**
+     * The size a live pinch is showing, or null when no pinch has happened since the setting caught up.
+     *
+     * A pinch has to change the text under the fingers *while they move*, and the persisted setting
+     * cannot do that: it is written through DataStore, so it arrives a frame or more later and only
+     * once. So the gesture drives this overlay for immediate feedback and writes the setting once, when
+     * the fingers lift; the overlay then stays in charge until [fontSize] reports the same number,
+     * which is what stops the text from snapping back to the old size for the frames in between.
+     */
+    var pinchSize by remember { mutableStateOf<Int?>(null) }
+    /** The size the current pinch started from; zero when no pinch is in progress. */
+    var pinchBase by remember { mutableIntStateOf(0) }
+    LaunchedEffect(fontSize) { if (pinchSize == fontSize) pinchSize = null }
+    val liveFontSize = pinchSize ?: fontSize
+    val textStyle = remember(liveFontSize) { TextStyle(fontFamily = FontFamily.Monospace, fontSize = liveFontSize.sp) }
     val metrics = rememberTerminalCellMetrics(textStyle)
     // Measured against the screen rather than against this box, deliberately. The box loses height to
     // the software keyboard, and a margin derived from it would shrink every time the keyboard opened -
@@ -1870,7 +1920,7 @@ private fun TerminalScreen(
      *    it impossible to type in.
      */
     LaunchedEffect(activeTab.id, activeTab.state, showCommandBar, showSearch, showHistory) {
-        if (activeTab.state != SessionConnectionState.CONNECTED) return@LaunchedEffect
+        if (!activeTab.state.isLive) return@LaunchedEffect
         if (showCommandBar || showSearch || showHistory) return@LaunchedEffect
         var attempts = 0
         while (!inputFocused && attempts < TERMINAL_FOCUS_ATTEMPTS) {
@@ -1897,7 +1947,7 @@ private fun TerminalScreen(
      * output is not thrown back at them by the next reconnect, resize or rotation.
      */
     LaunchedEffect(activeTab.id, activeTab.state, inputFocused, showCommandBar, showSearch, showHistory) {
-        if (activeTab.state != SessionConnectionState.CONNECTED) return@LaunchedEffect
+        if (!activeTab.state.isLive) return@LaunchedEffect
         if (showCommandBar || showSearch || showHistory) return@LaunchedEffect
         if (inputFocused && keyboardOffered.add(activeTab.id)) keyboard?.show()
     }
@@ -1932,6 +1982,8 @@ private fun TerminalScreen(
             onCopyAll = { onCopyText(terminalText) },
             onPaste = { onPaste(activeTab.hostId) },
             onScrollToBottom = { onScrollTo(activeTab.hostId, 0) },
+            keyRowVisible = state.settings.terminalKeyRowVisible,
+            onToggleKeyRow = { onKeyRowVisible(!state.settings.terminalKeyRowVisible) },
             searchQuery = searchQuery,
             onSearchQuery = { searchQuery = it },
             showSearch = showSearch,
@@ -1953,7 +2005,7 @@ private fun TerminalScreen(
                         terminalText.ifBlank { "Waiting for remote shell…" },
                         color = termFg,
                         fontFamily = FontFamily.Monospace,
-                        fontSize = fontSize.sp,
+                        fontSize = liveFontSize.sp,
                         modifier = Modifier
                             .fillMaxSize()
                             .verticalScroll(rememberScrollState())
@@ -1988,6 +2040,21 @@ private fun TerminalScreen(
                         if (selection != null) selection = null else showKeyboard()
                     },
                     onViewportChange = { columns, rows -> onResize(activeTab.hostId, columns, rows) },
+                    onZoom = { scale, ended ->
+                        // The gesture reports a factor against its own start, so the start size has to
+                        // be captured once: reading the current size every step would compound the
+                        // factor against a size it already changed and run away.
+                        val base = if (pinchBase > 0) pinchBase else fontSize.also { pinchBase = it }
+                        val next = (base * scale).roundToInt()
+                            .coerceIn(SettingsRepository.TERMINAL_FONT_SIZE_RANGE)
+                        pinchSize = next
+                        if (ended) {
+                            pinchBase = 0
+                            // Written once, on lift. Writing per step would put a DataStore commit
+                            // behind every frame of the gesture.
+                            if (next == fontSize) pinchSize = null else onFontSize(next)
+                        }
+                    },
                     onLongPressCell = { line, column ->
                         val text = state.terminalLine(activeTab.hostId, line)
                         selection = TerminalSelection.wordAt(line, column, text)
@@ -2009,18 +2076,30 @@ private fun TerminalScreen(
                 }
             }
         }
-        TerminalKeyRow(
-            latches = latches,
-            onKey = { key, ctrl, alt, shift ->
-                onSendKey(activeTab.hostId, key, ctrl, alt, shift)
-                // Every cap is a clickable surface, and a clickable surface is focusable: a tap can
-                // leave the IME host unfocused, after which the software keyboard's characters and a
-                // hardware keyboard's keys both have nowhere to go while the row itself still works.
-                // A no-op when the field already has focus, which is the usual case.
-                if (!inputFocused) runCatching { focusRequester.requestFocus() }
-            },
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+        // Collapsible, and collapsed state persisted: the row is what makes a phone keyboard usable
+        // against a shell - ESC for vi, TAB for completion, CTRL for ^C - but it is also two rows of
+        // chrome above the software keyboard, and on a short screen running `less` there is nothing
+        // left to read. Whoever wants the height back gets it, and keeps it across sessions and
+        // restarts, without losing the way back: the handle stays on screen in both states.
+        val keyRowVisible = state.settings.terminalKeyRowVisible
+        TerminalKeyRowHandle(
+            expanded = keyRowVisible,
+            onToggle = { onKeyRowVisible(!keyRowVisible) },
         )
+        if (keyRowVisible) {
+            TerminalKeyRow(
+                latches = latches,
+                onKey = { key, ctrl, alt, shift ->
+                    onSendKey(activeTab.hostId, key, ctrl, alt, shift)
+                    // Every cap is a clickable surface, and a clickable surface is focusable: a tap can
+                    // leave the IME host unfocused, after which the software keyboard's characters and a
+                    // hardware keyboard's keys both have nowhere to go while the row itself still works.
+                    // A no-op when the field already has focus, which is the usual case.
+                    if (!inputFocused) runCatching { focusRequester.requestFocus() }
+                },
+                modifier = Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, bottom = 6.dp),
+            )
+        }
         if (showCommandBar) {
             TerminalCommandBar(
                 command = command,
@@ -2033,7 +2112,9 @@ private fun TerminalScreen(
                 },
                 foreground = termFg,
                 background = termBg,
-                fontSize = fontSize,
+                // The live size, not the persisted one: the bar is where the user types the line the
+                // grid will echo, and letting it lag a pinch by a frame made it jump on lift.
+                fontSize = liveFontSize,
             )
         }
         // The IME host. One pixel, transparent, always in the tree while the terminal is: an
@@ -2179,6 +2260,52 @@ private fun TerminalSessionsScreen(
 }
 
 /**
+ * The one sentence a session's state is worth.
+ *
+ * Both places that report a session - the row in the sessions list and the status line above a
+ * full-screen shell - read from here, because a session that says "Reconnecting…" in one and
+ * "Disconnected" in the other is worse than either. [compact] is the difference between them: the row
+ * can afford two lines and a start time, the status line above the terminal is sharing a phone-width
+ * row with the Reconnect button and the pty size.
+ *
+ * Every state says something specific. Before this there were four states and one of them, "Connecting…",
+ * covered both dialling and a PAM stack taking fifteen seconds to answer - which is indistinguishable
+ * from a hang unless the app says which one it is waiting for.
+ */
+private fun statusLine(
+    state: SessionConnectionState,
+    startedAt: String?,
+    lastError: String?,
+    compact: Boolean,
+): String = when (state) {
+    SessionConnectionState.IDLE -> "Not connected"
+    SessionConnectionState.CONNECTING -> "Connecting…"
+    SessionConnectionState.AUTHENTICATING -> "Authenticating…"
+    SessionConnectionState.CONNECTED ->
+        if (compact || startedAt == null) "Connected · encrypted" else "Connected · since $startedAt"
+    // The reason travels with the state where there is room for it: "Reconnecting…" on its own cannot
+    // say which attempt this is, or that the app is parked waiting for a network rather than dialling.
+    SessionConnectionState.RECONNECTING -> lastError?.takeIf { !compact } ?: "Reconnecting…"
+    SessionConnectionState.DISCONNECTED -> lastError ?: "Disconnected"
+    SessionConnectionState.ERROR -> lastError ?: "Connection failed"
+}
+
+/**
+ * The colour that state should be said in: green while it is up, red when something failed, amber while
+ * it is working on it, and plain body text once it is simply over.
+ *
+ * ERROR is worth its own colour. A shell that exited and a password that was refused both used to be
+ * amber "Disconnected", and only one of those is something the user has to do something about.
+ */
+@Composable
+private fun statusColor(state: SessionConnectionState): Color = when {
+    state.isLive -> EclipseSuccess
+    state == SessionConnectionState.ERROR -> MaterialTheme.colorScheme.error
+    state.isBusy -> EclipseWarning
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+/**
  * One session in [TerminalSessionsScreen]: what it is, whether it is alive, and the way into it.
  *
  * The whole row is the target that opens the shell, with Close and Reconnect as the only smaller ones
@@ -2195,7 +2322,6 @@ private fun SessionRow(
     onReconnect: () -> Unit,
     onClose: () -> Unit,
 ) {
-    val connected = tab.state == SessionConnectionState.CONNECTED
     val preview = remember(lastOutput) {
         lastOutput?.takeLast(SESSION_PREVIEW_SCAN_CHARS)
             ?.lineSequence()?.lastOrNull { it.isNotBlank() }?.trim()?.take(120)
@@ -2219,7 +2345,7 @@ private fun SessionRow(
         ) {
             Box(
                 Modifier.size(9.dp).clip(RoundedCornerShape(50))
-                    .background(if (connected) EclipseSuccess else EclipseWarning),
+                    .background(statusColor(tab.state)),
             )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -2241,14 +2367,9 @@ private fun SessionRow(
                     )
                 }
                 Text(
-                    when (tab.state) {
-                        SessionConnectionState.CONNECTED -> "Connected · since $startedAt"
-                        SessionConnectionState.CONNECTING -> "Connecting…"
-                        SessionConnectionState.RECONNECTING -> "Reconnecting…"
-                        SessionConnectionState.DISCONNECTED -> tab.lastError ?: "Disconnected"
-                    },
+                    statusLine(tab.state, startedAt, tab.lastError, compact = false),
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (connected) EclipseSuccess else EclipseWarning,
+                    color = statusColor(tab.state),
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -2282,7 +2403,7 @@ private fun SessionRow(
             }
             // Offered here as well as inside the shell, because this is where a dropped session is
             // discovered: the list is what the app falls back to when one ends.
-            if (tab.state == SessionConnectionState.DISCONNECTED) {
+            if (tab.state.isEnded) {
                 TextButton(onClick = onReconnect, contentPadding = PaddingValues(horizontal = 8.dp)) {
                     Icon(Icons.Default.Wifi, null, modifier = Modifier.size(15.dp))
                     Spacer(Modifier.width(4.dp))
@@ -2333,6 +2454,49 @@ private fun ScrollbackBadge(lines: Int, onJump: () -> Unit, modifier: Modifier =
  * competing with it for the screen. Collapsing them into an overflow menu is what freed the rest of
  * the window for the terminal itself.
  */
+/**
+ * The one-tap collapse/expand affordance for [TerminalKeyRow], drawn as a drag handle.
+ *
+ * Deliberately visible in both states rather than only when collapsed. A control that disappears once
+ * used leaves the user with no way back except a menu they have no reason to open, and the same handle
+ * in both directions is the pattern every bottom sheet on the platform already teaches. It is slim on
+ * purpose - the whole point of collapsing is to give the height to the shell - and the full-size,
+ * screen-reader-friendly path to the same setting is the terminal menu's "Shortcut keys" item.
+ */
+@Composable
+private fun TerminalKeyRowHandle(expanded: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
+    Row(
+        modifier
+            .fillMaxWidth()
+            .clickable(
+                onClickLabel = if (expanded) "Hide shortcut keys" else "Show shortcut keys",
+                onClick = onToggle,
+            )
+            .padding(vertical = if (expanded) 2.dp else 5.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            if (expanded) Icons.Default.KeyboardArrowDown else Icons.Default.KeyboardArrowUp,
+            // The row itself carries the label; naming the arrow too would have TalkBack read the
+            // action twice.
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(if (expanded) 16.dp else 18.dp),
+        )
+        if (!expanded) {
+            // Only when collapsed. An empty terminal bottom edge with a bare chevron on it does not
+            // say what the chevron brings back, and the row is the app's answer to "where is ESC?".
+            Spacer(Modifier.width(4.dp))
+            Text(
+                "Shortcut keys",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
 @Composable
 private fun TerminalTabStrip(
     tabs: List<SessionTab>,
@@ -2353,6 +2517,8 @@ private fun TerminalTabStrip(
     onCopyAll: () -> Unit,
     onPaste: () -> Unit,
     onScrollToBottom: () -> Unit,
+    keyRowVisible: Boolean,
+    onToggleKeyRow: () -> Unit,
     searchQuery: String,
     onSearchQuery: (String) -> Unit,
     showSearch: Boolean,
@@ -2382,7 +2548,7 @@ private fun TerminalTabStrip(
                     color = if (tab == activeTab) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                 ) {
                     Row(Modifier.padding(start = 12.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(7.dp).clip(RoundedCornerShape(50)).background(if (tab.state == SessionConnectionState.CONNECTED) EclipseSuccess else EclipseWarning))
+                        Box(Modifier.size(7.dp).clip(RoundedCornerShape(50)).background(statusColor(tab.state)))
                         Spacer(Modifier.width(8.dp))
                         // The label reserves its own width so the close button cannot eat the chip's
                         // tap. Material expands any interactive component's *touch target* to 48dp
@@ -2420,6 +2586,10 @@ private fun TerminalTabStrip(
                     text = { Text(if (showHistory) "Live terminal" else "Transcript") },
                     onClick = { menuOpen = false; onToggleHistory() },
                 )
+                DropdownMenuItem(
+                    text = { Text(if (keyRowVisible) "Hide shortcut keys" else "Show shortcut keys") },
+                    onClick = { menuOpen = false; onToggleKeyRow() },
+                )
                 DropdownMenuItem(text = { Text("Snippets") }, onClick = { menuOpen = false; onSnippets() })
                 DropdownMenuItem(text = { Text("Paste") }, onClick = { menuOpen = false; onPaste() })
                 DropdownMenuItem(text = { Text("Copy all output") }, onClick = { menuOpen = false; onCopyAll() })
@@ -2438,16 +2608,19 @@ private fun TerminalTabStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            when (activeTab.state) {
-                SessionConnectionState.CONNECTED -> "Connected · encrypted"
-                SessionConnectionState.CONNECTING -> "Connecting…"
-                SessionConnectionState.RECONNECTING -> "Reconnecting…"
-                SessionConnectionState.DISCONNECTED -> activeTab.lastError ?: "Disconnected"
-            },
+            statusLine(activeTab.state, startedAt = null, lastError = activeTab.lastError, compact = true),
             style = MaterialTheme.typography.labelMedium,
-            color = if (activeTab.state == SessionConnectionState.CONNECTED) EclipseSuccess else EclipseWarning,
+            color = statusColor(activeTab.state),
             modifier = Modifier.weight(1f),
-            maxLines = 1,
+            // Two lines, because this line stopped being a label and became the diagnostic. A session
+            // that ends now says which of the six ways it ended - "The server disconnected: Timeout,
+            // your session not responding.", "The remote shell was ended by SIGKILL", "Connection
+            // lost: Connection reset" - and on a phone-width row shared with the Reconnect button and
+            // the pty size, one line ellipsised every one of those to "The server disconnected: T…".
+            // The reason a session ended is the only thing on screen that can tell the user whether
+            // to look at their network, their account or their server, so it is worth a row that is
+            // one line taller while it has something to say.
+            maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
         // The way back, next to the reason. A session can end without the user asking - the shell
@@ -2455,7 +2628,7 @@ private fun TerminalTabStrip(
         // working shell again was to close the tab and start over from Hosts, throwing away the
         // scrollback on the way. It goes through the same authentication sheet as any other connection,
         // so a host whose password was never saved asks for it again rather than failing silently.
-        if (activeTab.state == SessionConnectionState.DISCONNECTED) {
+        if (activeTab.state.isEnded) {
             TextButton(onClick = onReconnect, contentPadding = PaddingValues(horizontal = 8.dp)) {
                 Icon(Icons.Default.Wifi, null, modifier = Modifier.size(15.dp))
                 Spacer(Modifier.width(4.dp))
@@ -2901,7 +3074,7 @@ private fun RemoteListing(
                 // one the contents are simply unknown, and calling them empty describes the server
                 // instead of the connection — which on a clean install, where nothing is connected
                 // yet, is the first thing this pane ever says and is wrong.
-                val connected = state.tabs.any { it.hostId == state.selectedHostId && it.state == SessionConnectionState.CONNECTED }
+                val connected = state.tabs.any { it.hostId == state.selectedHostId && it.state.isLive }
                 Text(
                     if (connected) "Empty directory" else "Not connected",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -3401,6 +3574,9 @@ private fun SettingsScreen(
     onGenerateKey: () -> Unit,
     onImportSshConfig: () -> Unit,
     onForgetAllCredentials: () -> Unit = {},
+    onCopyDiagnostics: () -> Unit = {},
+    onSaveDiagnostics: () -> Unit = {},
+    onClearDiagnostics: () -> Unit = {},
 ) {
     var showForwardDialog by remember { mutableStateOf(false) }
     var showKeepAliveDialog by remember { mutableStateOf(false) }
@@ -3411,6 +3587,7 @@ private fun SettingsScreen(
     var showPinDialog by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
+    var showDiagnostics by remember { mutableStateOf(false) }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -3519,6 +3696,25 @@ private fun SettingsScreen(
             "Reconnect delay",
             "First retry after ${state.settings.reconnectBaseSeconds} s, then doubling · auto reconnect on network recovery",
         ) { TextButton(onClick = { showReconnectDialog = true }) { Text("Change") } }
+        SettingRow(
+            Icons.Default.Terminal,
+            "Connection diagnostics",
+            if (state.diagnostics.isEmpty()) {
+                "Records every connect, drop and reconnect · no secrets"
+            } else {
+                "${state.diagnostics.size} event(s) recorded · no secrets"
+            },
+        ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
+    }
+
+    if (showDiagnostics) {
+        DiagnosticsDialog(
+            events = state.diagnostics,
+            onDismiss = { showDiagnostics = false },
+            onCopy = onCopyDiagnostics,
+            onSave = { showDiagnostics = false; onSaveDiagnostics() },
+            onClear = onClearDiagnostics,
+        )
     }
 
     if (showForwardDialog) {
@@ -3588,6 +3784,70 @@ private fun SettingsScreen(
             onClearAll = { onClearKnownHosts(); showKnownHosts = false },
         )
     }
+}
+
+@Composable
+private fun DiagnosticsDialog(
+    events: List<SessionDiagnosticEvent>,
+    onDismiss: () -> Unit,
+    onCopy: () -> Unit,
+    onSave: () -> Unit,
+    onClear: () -> Unit,
+) {
+    // Newest first. A trace is read to answer "what just happened", and the answer is at the end of a
+    // ring that holds up to five hundred entries.
+    val ordered = remember(events) { events.asReversed() }
+    // Fixed 24-hour with seconds, not the locale's time format: the interval between two events is the
+    // whole point of reading this, and half the locales drop seconds entirely.
+    val clock = remember {
+        DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Connection diagnostics") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = 420.dp)) {
+                if (events.isEmpty()) {
+                    Text(
+                        "Nothing recorded yet. Connect a host and this becomes a timestamped trace of every connect, disconnect, reconnect and network change.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Text(
+                        "${events.size} event(s) · sessions are labelled s1, s2… and no password, key or host name is recorded, so this is safe to attach to a bug report.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // The line() form starts with the epoch millis, which the exported text needs and
+                        // a reader does not; the row shows a clock and drops the raw number.
+                        items(ordered, key = { it.sequence }) { entry ->
+                            Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                    Text(
+                                        clock.format(Instant.ofEpochMilli(entry.atMs)),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        entry.line().substringAfter(' '),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontFamily = FontFamily.Monospace,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = onCopy) { Text("Copy") }
+                        TextButton(onClick = onSave) { Text("Save") }
+                        TextButton(onClick = onClear) { Text("Clear", color = MaterialTheme.colorScheme.error) }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 @Composable
@@ -3694,14 +3954,28 @@ private fun TerminalWidthDialog(current: Int, onDismiss: () -> Unit, onConfirm: 
 
 @Composable
 private fun FontSizeDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
-    var size by remember { mutableFloatStateOf(current.coerceIn(10, 20).toFloat()) }
+    // One range, named once. The repository clamps to it on read and on write, this dialog offers it,
+    // and the terminal's pinch-to-zoom gesture rounds into it - three places that have to agree about
+    // what a legal font size is, and did not while each carried its own literal.
+    val range = SettingsRepository.TERMINAL_FONT_SIZE_RANGE
+    var size by remember { mutableFloatStateOf(SettingsRepository.normalizeFontSize(current).toFloat()) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Terminal font size") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("${size.toInt()} sp", style = MaterialTheme.typography.titleMedium)
-                Slider(value = size, onValueChange = { size = it }, valueRange = 10f..20f, steps = 9)
+                Text(
+                    "Pinch the terminal with two fingers to zoom without opening this dialog.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Slider(
+                    value = size,
+                    onValueChange = { size = it },
+                    valueRange = range.first.toFloat()..range.last.toFloat(),
+                    steps = range.last - range.first - 1,
+                )
             }
         },
         confirmButton = { Button(onClick = { onConfirm(size.toInt()) }) { Text("Apply") } },

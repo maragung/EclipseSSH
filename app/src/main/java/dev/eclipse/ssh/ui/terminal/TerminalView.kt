@@ -1,6 +1,9 @@
 package dev.eclipse.ssh.ui.terminal
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollable
@@ -13,6 +16,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
@@ -26,6 +30,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.drawText
@@ -43,6 +48,7 @@ import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalSelection
 import dev.eclipse.ssh.terminal.TerminalColor
 import dev.eclipse.ssh.terminal.TerminalStyle
+import kotlinx.coroutines.delay
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
@@ -237,9 +243,25 @@ fun TerminalView(
     onTap: () -> Unit = {},
     onViewportChange: (columns: Int, rows: Int) -> Unit = { _, _ -> },
     onLongPressCell: (line: Int, column: Int) -> Unit = { _, _ -> },
+    /**
+     * Reports a pinch as a font-size scale factor relative to the size in force when the gesture
+     * started. The view does not own the font size - the setting does - so it reports the factor and
+     * lets the caller decide what size that lands on and when to persist it.
+     */
+    onZoom: (scale: Float, ended: Boolean) -> Unit = { _, _ -> },
 ) {
     val measurer = rememberTextMeasurer()
     val density = LocalDensity.current
+    // Whether the cursor is in its "on" half-period. A [mutableStateOf] read from inside the draw
+    // lambda rather than from the composable body, so a blink invalidates the draw phase only - the
+    // same trick the pan uses. Read as `.value` up here it would recompose the whole grid twice a
+    // second, which on a phone is a measurable amount of work to make a rectangle flash.
+    val cursorOn = remember { mutableStateOf(true) }
+    // Focus, not lifecycle: a terminal behind another app, behind the lock screen, or in the recents
+    // list has nothing to blink at, and the loop below is the kind of 2 Hz timer that costs nothing
+    // per tick and a noticeable amount of battery per night. Window focus covers all three, and unlike
+    // a lifecycle observer it needs no extra dependency here.
+    val focused = LocalWindowInfo.current.isWindowFocused
     val cursorColour = remember(foreground) { foreground.copy(alpha = 0.85f) }
     val selectionColour = remember(foreground) { foreground.copy(alpha = 0.30f) }
     // The callbacks are read from inside long-lived pointer and scroll handlers, which are keyed on
@@ -252,6 +274,7 @@ fun TerminalView(
     val longPress by rememberUpdatedState(onLongPressCell)
     val tap by rememberUpdatedState(onTap)
     val viewportChange by rememberUpdatedState(onViewportChange)
+    val zoom by rememberUpdatedState(onZoom)
 
     BoxWithConstraints(modifier.background(background)) {
         val widthPx = with(density) { maxWidth.toPx() }
@@ -289,6 +312,26 @@ fun TerminalView(
             )
         }
 
+        // Keyed on the cursor's position as well as on whether it exists, so every move restarts the
+        // loop at the start of its "on" half-period: a cursor that happened to be in its dark phase when
+        // the user pressed a key would otherwise be invisible at the moment they looked for it. While
+        // output is streaming the restart happens per frame and the cursor simply stays solid, which is
+        // what every other terminal does too.
+        LaunchedEffect(frame.cursorVisible, focused, frame.cursorRow, frame.cursorColumn) {
+            if (!frame.cursorVisible || !focused) {
+                // Solid, not dark. A cursor frozen mid-blink reads as a rendering bug, and a terminal
+                // whose window is not focused should still show where the caret is.
+                cursorOn.value = true
+                return@LaunchedEffect
+            }
+            while (true) {
+                cursorOn.value = true
+                delay(CURSOR_BLINK_MS)
+                cursorOn.value = false
+                delay(CURSOR_BLINK_MS)
+            }
+        }
+
         // Fractional lines are accumulated because a drag of a few pixels is less than one row and
         // would otherwise be discarded, making a slow scroll feel dead.
         val scrollRemainder = remember { FloatArray(1) }
@@ -316,6 +359,34 @@ fun TerminalView(
                 .clipToBounds()
                 .scrollable(scrollState, Orientation.Vertical, reverseDirection = true)
                 .scrollable(panState, Orientation.Horizontal)
+                // First in the chain and therefore outermost, but it only ever consumes once a second
+                // finger is down, so the single-finger handlers below - tap, long press, scroll, pan -
+                // are untouched. A two-finger gesture is not something any of them can serve: vertical
+                // `scrollable` would read the pinch as a scroll and throw the scrollback around while
+                // the user was trying to make the text bigger.
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        var scale = 1f
+                        var pinching = false
+                        do {
+                            val event = awaitPointerEvent()
+                            val down = event.changes.count { it.pressed }
+                            if (down >= 2) {
+                                pinching = true
+                                val step = event.calculateZoom()
+                                if (step != 0f && step != 1f) {
+                                    scale *= step
+                                    zoom(scale, false)
+                                }
+                                // Consumed only while two fingers are down, which is what stops the
+                                // scroll handlers from also acting on the same pointers.
+                                event.changes.forEach { it.consume() }
+                            }
+                        } while (event.changes.any { it.pressed })
+                        if (pinching) zoom(scale, true)
+                    }
+                }
                 .pointerInput(metrics, origin) {
                     detectTapGestures(
                         onTap = { tap() },
@@ -363,6 +434,7 @@ fun TerminalView(
                             selection = selection,
                             selectionColour = selectionColour,
                             cursorColour = cursorColour,
+                            cursorOn = cursorOn.value,
                         )
                     }
                 },
@@ -413,6 +485,7 @@ private fun DrawScope.drawFrame(
     selection: TerminalSelection?,
     selectionColour: Color,
     cursorColour: Color,
+    cursorOn: Boolean = true,
 ) {
     val cellWidth = metrics.width
     val cellHeight = metrics.height
@@ -470,7 +543,7 @@ private fun DrawScope.drawFrame(
         }
     }
 
-    if (frame.cursorVisible && frame.cursorRow in frame.lines.indices && frame.cursorRow < maxRows) {
+    if (cursorOn && frame.cursorVisible && frame.cursorRow in frame.lines.indices && frame.cursorRow < maxRows) {
         // A hollow block, so the character underneath stays legible - a filled one hides whatever the
         // cursor is on, which on a phone is exactly the character the user is trying to check.
         val left = frame.cursorColumn * cellWidth
@@ -485,6 +558,12 @@ private fun DrawScope.drawFrame(
 }
 
 private const val CURSOR_STROKE = 2f
+
+/**
+ * Half the blink period. 500 ms on, 500 ms off - close enough to xterm's 530 that it reads as a
+ * terminal cursor rather than as something flashing for attention.
+ */
+private const val CURSOR_BLINK_MS = 500L
 
 private fun decorationFor(cell: TerminalCell): TextDecoration? = when {
     cell.style.underline && cell.style.strikethrough ->

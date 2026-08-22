@@ -20,6 +20,10 @@ import dev.eclipse.ssh.data.TransferRepository
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.ssh.DialAttempt
+import dev.eclipse.ssh.ssh.SessionDiagnostics
+import dev.eclipse.ssh.ssh.SessionEvent
+import dev.eclipse.ssh.ssh.SessionLivenessProbe
 import dev.eclipse.ssh.ssh.SshConnectionManager
 import dev.eclipse.ssh.ssh.SshKeyLoader
 import dev.eclipse.ssh.ssh.SshSessionStore
@@ -47,6 +51,9 @@ class EclipseSessionService : LifecycleService() {
     @Inject lateinit var transferRestorer: TransferRestorer
     @Inject lateinit var transferRepository: TransferRepository
     @Inject lateinit var settingsRepository: SettingsRepository
+    @Inject lateinit var networkMonitor: NetworkMonitor
+    @Inject lateinit var livenessProbe: SessionLivenessProbe
+    @Inject lateinit var diagnostics: SessionDiagnostics
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val restoreMutex = Mutex()
@@ -75,6 +82,18 @@ class EclipseSessionService : LifecycleService() {
 
         override fun onLost(network: Network) {
             updateNotification("Network lost · waiting to reconnect")
+            // Recorded per live host rather than once, because the diagnostics stream is read
+            // per session: the question being answered later is "was this host's link up at the
+            // time it died", and a global entry cannot answer it.
+            val describedNetwork = networkMonitor.describe()
+            sessionStore.liveHostIds().forEach { hostId ->
+                diagnostics.record(
+                    hostId,
+                    SessionEvent.NETWORK_CHANGED,
+                    detail = "default network lost",
+                    network = describedNetwork,
+                )
+            }
         }
     }
 
@@ -101,6 +120,10 @@ class EclipseSessionService : LifecycleService() {
         }
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         runCatching { connectivityManager.registerDefaultNetworkCallback(networkCallback) }
+        // A network that was *replaced* has already broken every live socket, and nothing on the
+        // connection itself says so. Started here as well as from the view model because the service is
+        // what is alive while the app is in the background, which is when a phone changes networks.
+        livenessProbe.start()
         serviceScope.launch { restoreSessions("Service active") }
         serviceScope.launch {
             transferRepository.transfers.collect { transfers ->
@@ -160,6 +183,10 @@ class EclipseSessionService : LifecycleService() {
             // a session that has since dropped is still restored here.
             val pending = hostsNeedingRestore(hosts, activeIds) { sessionStore.isLive(it) }
             var connected = 0
+            // Hosts skipped because another dialler already had them. Counted rather than ignored: they
+            // are neither successes (nothing was restored) nor failures (nothing went wrong), and the
+            // backoff below needs to tell those apart.
+            var busy = 0
             pending.forEach { host ->
                 // Under the host's dial gate, which is the other half of the fix for a session that
                 // said *Reconnecting…* seconds after login. `pending` was computed from an `isLive`
@@ -168,10 +195,23 @@ class EclipseSessionService : LifecycleService() {
                 // session to the account the user had just logged into, and collapsing the pair
                 // closed the live one. Holding the gate means the UI's attempt is either finished
                 // (and found by the re-check below) or has not started, never half-done.
-                val session = sessionStore.dialing(host.id) {
+                //
+                // `tryDialing` rather than `dialing`, because this pass walks hosts in order and the
+                // gate is held for a whole connect ladder. Waiting on a host the UI is already dialling
+                // would block every host behind it for up to three connect timeouts - a quarter of an
+                // hour at the maximum the user is allowed to set - to learn something the next pass
+                // finds for free.
+                val outcome = sessionStore.tryDialing(host.id) {
                     // The re-check is the point of the gate: whatever appeared while this host waited
                     // its turn is a session to adopt, not one to duplicate.
                     sessionStore.liveSession(host.id) ?: dial(host)
+                }
+                val session = when (outcome) {
+                    DialAttempt.Busy -> {
+                        busy++
+                        null
+                    }
+                    is DialAttempt.Ran -> outcome.value
                 }
                 if (session != null) {
                     connected++
@@ -182,10 +222,36 @@ class EclipseSessionService : LifecycleService() {
             // Retry only while something is still missing. Comparing `connected == 0` alone
             // spun forever once every host was already restored, waking the CPU every
             // backoff interval for the lifetime of the service.
-            if (connected == 0 && pending.isNotEmpty()) {
-                reconnectAttempts++
+            val failed = pending.size - connected - busy
+            if (connected == 0 && (failed > 0 || busy > 0)) {
+                // Only a real failure escalates the ladder. A host another dialler is working on has not
+                // failed at anything, and letting it double the interval would push a perfectly
+                // reachable host's next attempt into the minutes because the UI happened to be
+                // mid-handshake. The pass still has to come back for it - the other dialler gives up
+                // after its own five attempts, where this one never does - so a busy-only pass waits
+                // one step's worth and re-checks without spending a step.
+                if (failed > 0) reconnectAttempts++ else reconnectAttempts = reconnectAttempts.coerceAtLeast(1)
                 val waitMs = backoffDelay(reconnectAttempts)
-                updateNotification("$attemptReason · retry $reconnectAttempts in ${waitMs / 1_000}s")
+                updateNotification(
+                    if (failed > 0) {
+                        "$attemptReason · retry $reconnectAttempts in ${waitMs / 1_000}s"
+                    } else {
+                        // Nothing failed, so nothing is being retried: the app is simply already
+                        // connecting these hosts somewhere else, and saying "retry 4" about that would
+                        // be a notification describing a problem that does not exist.
+                        "Connecting $busy host(s)…"
+                    },
+                )
+                val describedNetwork = networkMonitor.describe()
+                pending.forEach { host ->
+                    diagnostics.record(
+                        host.id,
+                        SessionEvent.RECONNECT_SCHEDULED,
+                        detail = "background restore: waiting ${waitMs}ms",
+                        network = describedNetwork,
+                        attempt = reconnectAttempts,
+                    )
+                }
                 // The counter is deliberately not reset when the network comes back: a link that
                 // flaps would otherwise retry at the base interval forever. Waking early is about
                 // when the next attempt happens, not about forgiving the ones that already failed.
@@ -213,15 +279,27 @@ class EclipseSessionService : LifecycleService() {
      * which is what makes a session survive process death.
      */
     private suspend fun dial(host: HostProfile) = try {
+        diagnostics.record(
+            host.id,
+            SessionEvent.CONNECT_REQUESTED,
+            detail = "background restore",
+            network = networkMonitor.describe(),
+        )
         sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)))
     } catch (cancelled: CancellationException) {
         // The service is going away. Without this the cancellation was swallowed into a null session
         // and the loop went on to dial every remaining host on an already dead context — pointless
         // work during shutdown, and it hid the one condition that should stop the pass immediately.
         throw cancelled
-    } catch (_: Throwable) {
+    } catch (error: Throwable) {
         // Any other failure is this host's problem alone: unreachable, refused, wrong credentials. The
         // rest of the pass still gets its turn, and the backoff decides when to come back.
+        diagnostics.record(
+            host.id,
+            SessionEvent.CONNECT_FAILED,
+            detail = "background restore: ${error.message ?: error::class.java.simpleName}",
+            network = networkMonitor.describe(),
+        )
         null
     }
 

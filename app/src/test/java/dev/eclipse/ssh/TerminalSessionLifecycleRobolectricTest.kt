@@ -20,6 +20,7 @@ import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import java.io.InputStream
@@ -29,7 +30,9 @@ import java.nio.file.Files
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
+import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
+import org.apache.sshd.common.util.buffer.Buffer
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
 import org.apache.sshd.server.Signal
@@ -87,8 +90,11 @@ class TerminalSessionLifecycleRobolectricTest {
         received.clear()
         liveTransport.set(null)
         windowSize.set(null)
+        ptyRequests.clear()
         shellsStarted.set(0)
         serverWrote.set(0)
+        passwordsAccepted.set(0)
+        passwordsRejected.set(0)
     }
 
     /**
@@ -407,6 +413,102 @@ class TerminalSessionLifecycleRobolectricTest {
     }
 
     /**
+     * A shell that closes without reporting a status is reported as itself, and not dialled again.
+     *
+     * This is the shape of the bug a user hit as "the terminal opens, there is some server text, and
+     * then the tab says Reconnecting". Not every remote shell ends by exiting with a status: an account
+     * whose login shell is `nologin` prints its line and closes, a `ForceCommand` that finishes closes,
+     * a `~/.profile` that fails closes, and an administrator taking the pty away closes. All of those
+     * arrive as a channel close on a transport that is still up, with nothing said about why.
+     *
+     * [dev.eclipse.ssh.ssh.TerminalChannel] used to report every ending as a bare `Int?` exit status,
+     * so all of them arrived as `null` - indistinguishable from the socket dying mid-session. That had
+     * two consequences, and this test exists for both. The app treated it as an outage and re-dialled
+     * it five times, so a host that could only ever answer this way flickered through the whole ladder
+     * before settling; and whatever it settled on said "Disconnected from the remote host", which named
+     * the one thing that had *not* happened. So the assertions are: the tab says the shell closed, it
+     * reaches DISCONNECTED without ever passing through RECONNECTING, and the server never starts a
+     * second shell however long the ladder is given to fire.
+     *
+     * The scrollback is asserted for the same reason [theRemoteShellExitingEndsTheSessionAndTheTabSaysSo]
+     * asserts it: on this path the parting line is the *only* diagnostic the user has, and a teardown
+     * that reported itself promptly by discarding it would be worse than the bug.
+     */
+    @Test
+    fun aShellThatClosesWithoutSayingWhyIsReportedRatherThanRedialled() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        val viewModel = viewModel()
+        assertWithMessage("shells started by connecting").that(shellsStarted.get()).isEqualTo(1)
+
+        compose.runOnUiThread { viewModel.sendInput(hostId, VANISH + "\n") }
+
+        waitForFrameText(hostId, VANISHED)
+        // Sampled per pump as well as held afterwards, because the losing order writes RECONNECTING
+        // immediately after DISCONNECTED and a wait that only looked at the end state would read the
+        // first of the two and pass.
+        val states = linkedSetOf<SessionConnectionState>()
+        pumpUntil(describe = { "the tab never noticed the shell had gone. " + diagnose(hostId) }) {
+            tabFor(hostId)?.state?.let(states::add)
+            tabFor(hostId)?.state == SessionConnectionState.DISCONNECTED
+        }
+
+        val reported = tabFor(hostId)?.lastError
+        assertWithMessage("what the tab says about an ending it was told nothing about")
+            .that(reported).contains("remote shell")
+        assertWithMessage("the ending must not be reported as the transport dying")
+            .that(reported).doesNotContain("Disconnected from the remote host")
+        assertWithMessage("states the tab passed through: $states")
+            .that(states).doesNotContain(SessionConnectionState.RECONNECTING)
+        holdWhileTheLadderWouldHaveFired(
+            describe = { "the ended shell was treated as an outage. " + diagnose(hostId) },
+        ) {
+            tabFor(hostId)?.state == SessionConnectionState.DISCONNECTED && shellsStarted.get() == 1
+        }
+        assertThat(frameFor(hostId).asDrawn()).contains(BANNER)
+        assertThat(frameFor(hostId).asDrawn()).contains(VANISHED)
+    }
+
+    /**
+     * A shell killed by a signal says which signal, and is not dialled again either.
+     *
+     * The realistic member of the family above, and the one most likely to be behind a session that
+     * ends seconds after it started: the OOM killer, an administrator's `pkill`, a login session's
+     * cgroup being torn down, or sshd's own `ClientAliveCountMax` all end the shell by signal, and a
+     * real sshd reports that as `exit-signal` with no exit status at all. MINA's server side has no
+     * sender for it - [ScriptedShell] writes the request itself - but the client half being exercised is
+     * the real one, and `SIGHUP` here comes off the wire exactly as it would from OpenSSH.
+     *
+     * Naming the signal is the whole point. "Disconnected from the remote host" sends a user looking at
+     * their network; "ended by SIGKILL" sends them to `dmesg`, which is where the answer is.
+     *
+     * The state is `ERROR` and not `DISCONNECTED` because `SessionEnd.isFault` puts a killed shell on
+     * the fault side of that line: `exit 1` is an ordinary thing for a command to do, being killed is
+     * not, and the two used to share one amber tab reading "Disconnected". What this test is really
+     * about is unchanged either way - the signal is named, and no ladder fires.
+     */
+    @Test
+    fun aShellKilledBySignalNamesTheSignalAndIsNotRedialled() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        val viewModel = viewModel()
+
+        compose.runOnUiThread { viewModel.sendInput(hostId, KILL + "\n") }
+
+        waitForFrameText(hostId, KILLED)
+        pumpUntil(describe = { "the tab never noticed the shell was killed. " + diagnose(hostId) }) {
+            tabFor(hostId)?.state == SessionConnectionState.ERROR
+        }
+        assertWithMessage("what the tab says about a signalled shell")
+            .that(tabFor(hostId)?.lastError).contains("SIG" + KILL_SIGNAL)
+        holdWhileTheLadderWouldHaveFired(
+            describe = { "a signalled shell was treated as an outage. " + diagnose(hostId) },
+        ) {
+            tabFor(hostId)?.state == SessionConnectionState.ERROR && shellsStarted.get() == 1
+        }
+    }
+
+    /**
      * Reconnecting keeps the tab connected, keeps its scrollback, and lands the keyboard on the new
      * shell.
      *
@@ -449,6 +551,98 @@ class TerminalSessionLifecycleRobolectricTest {
         assertThat(tabFor(hostId)?.lastError).isNull()
         // And the session before it is still readable: a reconnect is not a clear screen.
         assertThat(frameFor(hostId).asDrawn()).contains("echo: before-reconnect")
+    }
+
+    /**
+     * A reconnect brings the pty back at the size the user was working at, not at the default.
+     *
+     * The size lives in the view model rather than in the channel, because the channel that knew it is
+     * exactly the thing a reconnect throws away. Getting this wrong is invisible until a full-screen
+     * program draws: `top` and `vim` come back wrapping at 80 columns inside a 47-column window, and
+     * the only clue is that it started after a dropped connection rather than after a rotation.
+     *
+     * Asserted against the size the *new* pty was requested at, so a `window-change` that happened to
+     * follow cannot make a broken open look fixed.
+     */
+    @Test
+    fun aReconnectAsksForThePtySizeTheUserWasWorkingAt() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+
+        val viewModel = viewModel()
+        compose.runOnUiThread { viewModel.resizeTerminal(hostId, 47, 15) }
+        pumpUntil(describe = { "the remote pty was never told about 47x15, saw ${windowSize.get()}" }) {
+            windowSize.get() == 47 to 15
+        }
+
+        // The drop is staged from the server end rather than by asking the app to connect again:
+        // `connect` on a session that is still alive *adopts* it, which is the behaviour that keeps a
+        // navigation from costing a second login - and adoption reuses the pty, so it could never
+        // exercise this. A genuine outage is the only thing that makes the app open a second one.
+        checkNotNull(liveTransport.get()) { "the server never recorded its session" }.close(true)
+
+        pumpUntil(describe = { "the session never came back. " + diagnose(hostId) }) {
+            tabFor(hostId)?.state == SessionConnectionState.CONNECTED && ptyRequests.size >= 2
+        }
+
+        assertWithMessage("pty sizes requested, one per shell")
+            .that(ptyRequests)
+            .hasSize(2)
+        assertThat(ptyRequests.last()).isEqualTo(47 to 15)
+        // And the local grid agrees with the remote one, which is the pair that has to match.
+        val frame = frameFor(hostId)
+        assertThat(frame.columns).isEqualTo(47)
+        assertThat(frame.rows).isEqualTo(15)
+    }
+
+    /**
+     * A password typed at the prompt and never saved still gets the session back after an outage.
+     *
+     * The ladder re-dials with no credential of its own - it cannot have one, the drop happens long
+     * after the tap that supplied it - so everything it authenticates with has to come from a store.
+     * Two exist: the credentials saved against the host profile, which this host deliberately has none
+     * of, and the live session's own credential, held encrypted for exactly as long as its tab is open.
+     * Consulting only the first meant a user who did not tick "save" got `No more authentication
+     * methods available` out of a ten-second outage, after spending one refused login per rung.
+     *
+     * The counters are the point of the test: the recovery has to be an accepted *login*, not merely a
+     * tab that reads CONNECTED, and no rung may have offered a password the server turned down. The
+     * credential store is then checked again, because the fix must not have quietly promoted "typed,
+     * not saved" to "written to disk" - the resume reads what the session already holds in memory, and
+     * persists nothing.
+     */
+    @Test
+    fun aTypedPasswordThatWasNeverSavedStillRecoversTheSessionAfterAnOutage() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        val viewModel = viewModel()
+        assertWithMessage("the host must have no saved password, or this test proves nothing")
+            .that(viewModel.uiState.value.savedCredentials[hostId]?.hasPassword ?: false)
+            .isFalse()
+        val loginsBefore = passwordsAccepted.get()
+
+        checkNotNull(liveTransport.get()) { "the server never recorded its session" }.close(true)
+
+        // Waited on through the frame rather than `shellsStarted`, for the reason spelled out in
+        // `reconnectingKeepsTheTabConnectedAndItsScrollback`: the server counts a shell before the app
+        // has swapped the channel in.
+        pumpUntil(describe = { "the session never came back. " + diagnose(hostId) }) {
+            greetingsInFrame(hostId) >= 2 && tabFor(hostId)?.state == SessionConnectionState.CONNECTED
+        }
+        assertWithMessage("the reconnect authenticated instead of arriving with nothing to offer")
+            .that(passwordsAccepted.get())
+            .isGreaterThan(loginsBefore)
+        assertWithMessage("a rung offered a password the server refused")
+            .that(passwordsRejected.get())
+            .isEqualTo(0)
+        assertThat(tabFor(hostId)?.lastError).isNull()
+
+        // The shell that came back is a working one, not merely an open one.
+        compose.runOnUiThread { viewModel.sendInput(hostId, "after-outage\n") }
+        waitForFrameText(hostId, "echo: after-outage")
+
+        // And nothing was written to the credential store on the way.
+        assertThat(viewModel.uiState.value.savedCredentials[hostId]?.hasPassword ?: false).isFalse()
     }
 
     /**
@@ -590,14 +784,24 @@ class TerminalSessionLifecycleRobolectricTest {
 
         // Whatever it does about it - reconnect, or say so and offer the button - it is not allowed to
         // go on claiming a connection it no longer has.
+        //
+        // The state is kept at the moment it is seen rather than read again afterwards. Re-reading was
+        // a race in both directions: between the two reads the ladder can fail an attempt and land on
+        // ERROR, or - now that a session opened with a typed password can actually be resumed - finish
+        // one and be CONNECTED again. Neither says anything about whether the drop was noticed, which
+        // is the whole of this test.
+        val noticed = AtomicReference<SessionConnectionState?>(null)
         pumpUntil(describe = { "the drop was never noticed. " + diagnose(hostId) }) {
-            tabFor(hostId)?.state != SessionConnectionState.CONNECTED
+            tabFor(hostId)?.state?.takeIf { it != SessionConnectionState.CONNECTED }?.let(noticed::set)
+            noticed.get() != null
         }
-        // Any of the three honest answers. Which one depends on timing that is not this test's
-        // subject - the drop is reported as DISCONNECTED and the scheduled retry then says
-        // RECONNECTING - and pinning one of them would make the test fail for being read a
-        // millisecond later. CONNECTED is the bug, and it is the only value excluded.
-        val state = tabFor(hostId)?.state
+        // Any of the three honest answers, because which one arrives is timing this test does not own:
+        // a fault with the ladder armed says RECONNECTING straight away, a reconnect already in flight
+        // says CONNECTING, and an ending nothing is going to answer says DISCONNECTED. Two states are
+        // deliberately *not* accepted: CONNECTED, which is the bug, and ERROR, which would mean the
+        // drop was reported as a dead end while a retry was in fact pending - the red flash this used
+        // to produce before the ending picked its state with the ladder's answer in hand.
+        val state = noticed.get()
         assertWithMessage("a dropped tab must be reconnecting or disconnected, not $state")
             .that(state)
             .isAnyOf(
@@ -735,6 +939,28 @@ class TerminalSessionLifecycleRobolectricTest {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /**
+     * Pumps until the first backoff window could not still be pending, failing if [invariant] breaks.
+     *
+     * Two clocks have to run out, because the two things being ruled out are on different ones. The
+     * ladder's wait is a `delay` on the main dispatcher, so it comes due on Compose's *virtual* clock,
+     * and only advancing that past the longest first window the jitter can choose proves the wait was
+     * never armed. Dialling is then real work on real sockets, so a second shell would appear on the
+     * *wall* clock - and a window measured only in virtual time ends microseconds later, before a
+     * connect thread could have got anywhere. Waiting for both is what makes "no second shell" mean it.
+     */
+    private fun holdWhileTheLadderWouldHaveFired(describe: () -> String, invariant: () -> Boolean) {
+        val virtualDeadline = compose.mainClock.currentTime + FIRST_BACKOFF_CEILING_MS
+        val wallDeadline = System.nanoTime() + REAL_DIAL_GRACE_NANOS
+        while (compose.mainClock.currentTime < virtualDeadline || System.nanoTime() < wallDeadline) {
+            assertWithMessage(describe()).that(invariant()).isTrue()
+            Snapshot.sendApplyNotifications()
+            compose.mainClock.advanceTimeByFrame()
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
+        }
+        assertWithMessage(describe()).that(invariant()).isTrue()
     }
 
     /**
@@ -898,6 +1124,20 @@ class TerminalSessionLifecycleRobolectricTest {
         const val BYE = "bye"
         const val FAREWELL = "logout-now"
 
+        /**
+         * The directive that makes the shell close its channel without reporting an exit status, and
+         * the line it leaves on. What a login shell replaced by `nologin`, a `ForceCommand` that ends,
+         * or a pty torn down by an administrator looks like on the wire: data, then a channel close,
+         * with the transport still perfectly alive and nothing said about why.
+         */
+        const val VANISH = "vanish"
+        const val VANISHED = "closing-without-a-status"
+
+        /** The directive that makes the shell die from a signal, the signal it dies from, and its line. */
+        const val KILL = "kill"
+        const val KILLED = "about-to-be-signalled"
+        const val KILL_SIGNAL = "HUP"
+
         const val ESC = 0x1B
         const val BRACKET = 0x5B
         const val UPPER_A = 0x41
@@ -939,6 +1179,15 @@ class TerminalSessionLifecycleRobolectricTest {
          */
         const val SSH_TIMEOUT_MS = 90_000L
 
+        /**
+         * The longest first reconnect wait the ladder can choose: the 5s base doubled no times, plus
+         * the half-window of jitter that is added on top of it.
+         */
+        const val FIRST_BACKOFF_CEILING_MS = 7_500L
+
+        /** Long enough for a real re-dial to have shown up on the server, if one were coming. */
+        const val REAL_DIAL_GRACE_NANOS = 1_000_000_000L
+
         /** Lines of history above the view, so scrolling back provably has somewhere to go. */
         const val SCROLLBACK_MARGIN_LINES = 40
 
@@ -957,9 +1206,28 @@ class TerminalSessionLifecycleRobolectricTest {
         /** The last window size the remote pty was told about, columns to rows. */
         val windowSize = AtomicReference<Pair<Int, Int>?>(null)
 
+        /**
+         * The size each pty was *created* at, one entry per shell, oldest first.
+         *
+         * Separate from [windowSize] on purpose: a `window-change` arriving after the shell started
+         * would overwrite that, so it cannot answer what size a reconnect asked its new pty for.
+         */
+        val ptyRequests: MutableList<Pair<Int, Int>> = Collections.synchronizedList(mutableListOf())
+
         /** Server-side counters, so a silent terminal can be blamed on the right side of the wire. */
         val shellsStarted = java.util.concurrent.atomic.AtomicInteger(0)
         val serverWrote = java.util.concurrent.atomic.AtomicInteger(0)
+
+        /**
+         * Password logins the server accepted, and ones it turned down.
+         *
+         * A reconnect that reaches `CONNECTED` says nothing about *how*; these two say whether the app
+         * had a credential to offer at all. A ladder with none produces no accepted login and no
+         * rejected one either - it never gets as far as an attempt - which is a different failure from
+         * offering the wrong password, and the two are worth telling apart.
+         */
+        val passwordsAccepted = java.util.concurrent.atomic.AtomicInteger(0)
+        val passwordsRejected = java.util.concurrent.atomic.AtomicInteger(0)
 
         private var nextHostId = 0
         private lateinit var server: SshServer
@@ -967,6 +1235,14 @@ class TerminalSessionLifecycleRobolectricTest {
         @JvmStatic
         @BeforeClass
         fun startServer() {
+            // `AndroidKeyStore` does not exist on the JVM, and the vault behind `SessionRegistry` asks
+            // the platform for its key on first use. Without somewhere for that request to land, every
+            // write of a live session's credential fails - silently, because a session that is up is not
+            // failed over a vault error - and the reconnect ladder in this suite then has nothing to
+            // authenticate with, which is a property of the harness rather than of the app. See
+            // [StandInAndroidKeyStore] for what is real about it and what is not.
+            StandInAndroidKeyStore.install()
+
             val root = Files.createTempDirectory("eclipse-terminal-lifecycle")
             server = SshServer.setUpDefaultServer()
             server.port = 0
@@ -974,7 +1250,9 @@ class TerminalSessionLifecycleRobolectricTest {
                 SimpleGeneratorHostKeyProvider(Files.createTempFile("lifecycle-hostkey", ".ser"))
             server.passwordAuthenticator =
                 org.apache.sshd.server.auth.password.PasswordAuthenticator { user, password, _ ->
-                    user == USER && password == PASSWORD
+                    val ok = user == USER && password == PASSWORD
+                    (if (ok) passwordsAccepted else passwordsRejected).incrementAndGet()
+                    ok
                 }
             server.subsystemFactories = Collections.singletonList(SftpSubsystemFactory())
             server.fileSystemFactory = VirtualFileSystemFactory(root.toAbsolutePath())
@@ -987,6 +1265,9 @@ class TerminalSessionLifecycleRobolectricTest {
         @AfterClass
         fun stopServer() {
             runCatching { server.stop(true) }
+            // Gradle runs many test classes in one JVM; a provider left registered would quietly change
+            // how the next one behaves.
+            StandInAndroidKeyStore.uninstall()
         }
     }
 
@@ -1009,6 +1290,15 @@ class TerminalSessionLifecycleRobolectricTest {
         private var output: OutputStream? = null
         private var exit: ExitCallback? = null
 
+        /** This shell's channel, for the endings that have to be written onto the wire by hand. */
+        @Volatile private var channel: ChannelSession? = null
+
+        /**
+         * Set once this shell has closed its own channel, so the reader thread does not then report an
+         * exit status the ending is defined by *not* having.
+         */
+        @Volatile private var handRolledEnding = false
+
         override fun setInputStream(input: InputStream) { this.input = input }
         override fun setOutputStream(output: OutputStream) { this.output = output }
         override fun setErrorStream(error: OutputStream) = Unit
@@ -1018,9 +1308,11 @@ class TerminalSessionLifecycleRobolectricTest {
             val out = output ?: return
             val inn = input ?: return
             shellsStarted.incrementAndGet()
+            this.channel = channel
             // Kept so a test can drop the transport from the far end, which is the only honest way to
             // stage an outage: no exit status, no goodbye, the socket simply stops being a session.
             liveTransport.set(channel.session)
+            sizeOf(env)?.let { ptyRequests += it }
             recordWindow(env)
             // The pty's size arrives as a signal, exactly as it does on a real host, so what is
             // recorded is what the remote side would actually act on.
@@ -1064,14 +1356,18 @@ class TerminalSessionLifecycleRobolectricTest {
                         }
                     }
                 }
-                runCatching { exit?.onExit(0) }
+                if (!handRolledEnding) runCatching { exit?.onExit(0) }
             }.start()
         }
 
         private fun recordWindow(env: Environment) {
-            val columns = env.env[Environment.ENV_COLUMNS]?.toIntOrNull() ?: return
-            val rows = env.env[Environment.ENV_LINES]?.toIntOrNull() ?: return
-            windowSize.set(columns to rows)
+            sizeOf(env)?.let { windowSize.set(it) }
+        }
+
+        private fun sizeOf(env: Environment): Pair<Int, Int>? {
+            val columns = env.env[Environment.ENV_COLUMNS]?.toIntOrNull() ?: return null
+            val rows = env.env[Environment.ENV_LINES]?.toIntOrNull() ?: return null
+            return columns to rows
         }
 
         /** Answers [command], reporting whether the shell should stay up afterwards. */
@@ -1083,6 +1379,35 @@ class TerminalSessionLifecycleRobolectricTest {
                 command == BYE -> {
                     out.write((FAREWELL + CRLF).toByteArray())
                     out.flush()
+                    return false
+                }
+                // The two endings MINA's server side cannot produce on its own. `ChannelSession` only
+                // ever sends `exit-status`, and only from `onExit` - so an ending that has no status,
+                // or that has a signal instead, has to be written as the protocol messages a real sshd
+                // would send. Both are ordinary channel messages on the same session, queued behind the
+                // parting line, so the far end sees the text and then the ending, in that order.
+                command == VANISH -> {
+                    out.write((VANISHED + CRLF).toByteArray())
+                    out.flush()
+                    handRolledEnding = true
+                    closeChannelByHand()
+                    return false
+                }
+                command == KILL -> {
+                    out.write((KILLED + CRLF).toByteArray())
+                    out.flush()
+                    handRolledEnding = true
+                    // RFC 4254 6.10: the signal name carries no SIG prefix, and a dying process never
+                    // asks for a reply.
+                    sendRaw(SshConstants.SSH_MSG_CHANNEL_REQUEST) { buffer ->
+                        buffer.putString("exit-signal")
+                        buffer.putBoolean(false)
+                        buffer.putString(KILL_SIGNAL)
+                        buffer.putBoolean(false)
+                        buffer.putString("Killed by signal $KILL_SIGNAL.")
+                        buffer.putString("")
+                    }
+                    closeChannelByHand()
                     return false
                 }
                 command.startsWith("spam ") -> {
@@ -1097,9 +1422,30 @@ class TerminalSessionLifecycleRobolectricTest {
             return true
         }
 
+        /** EOF then CLOSE, which is how a server says a channel is over and says nothing else. */
+        private fun closeChannelByHand() {
+            sendRaw(SshConstants.SSH_MSG_CHANNEL_EOF)
+            sendRaw(SshConstants.SSH_MSG_CHANNEL_CLOSE)
+        }
+
+        /** Writes one channel message for this channel's far end, as the server's own code would. */
+        private fun sendRaw(command: Byte, fill: (Buffer) -> Unit = {}) {
+            val channel = this.channel ?: return
+            runCatching {
+                val session = channel.session
+                val buffer = session.createBuffer(command, RAW_BUFFER_ESTIMATE)
+                buffer.putUInt(channel.recipient)
+                fill(buffer)
+                session.writePacket(buffer)
+            }
+        }
+
         override fun destroy(channel: ChannelSession) = Unit
 
         private companion object {
+            /** Room for a recipient id and a short request; the buffer grows if a caller needs more. */
+            const val RAW_BUFFER_ESTIMATE = 64
+
             const val CARRIAGE_RETURN = 0x0D
             const val LINE_FEED = 0x0A
             const val ESCAPE = 0x1B

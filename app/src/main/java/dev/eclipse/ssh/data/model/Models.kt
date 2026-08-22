@@ -154,7 +154,7 @@ data class SessionTab(
     val id: String = UUID.randomUUID().toString(),
     val hostId: String,
     val title: String,
-    val state: SessionConnectionState = SessionConnectionState.CONNECTING,
+    val state: SessionConnectionState = SessionConnectionState.IDLE,
     val lastError: String? = null,
     val startedAt: Long = System.currentTimeMillis(),
     /** Where this session's SFTP channel is — see [SftpSessionState]. */
@@ -201,7 +201,77 @@ data class HostKeyChallenge(
     val changed: Boolean,
 )
 
-enum class SessionConnectionState { CONNECTING, CONNECTED, RECONNECTING, DISCONNECTED }
+/**
+ * Where one session is in its life, as a state machine with exactly one state at a time.
+ *
+ * The whole app reads a session's state from here - the tab, the full-screen status line, the
+ * notification, the decision whether to offer a keyboard - so the set has to be able to express every
+ * situation a session can actually be in. It used to have four members, and the two it was missing
+ * were the two the user most needed to be told apart:
+ *
+ *  - a handshake that has completed and is now *offering credentials* looked identical to one still
+ *    waiting for a TCP connection, so a host that answers instantly and then spends ten seconds on a
+ *    slow PAM stack said "Connecting…" the whole time and looked hung;
+ *  - a session that ended because something went wrong looked identical to one that ended because the
+ *    shell exited. Both said "Disconnected", in the same colour, with the same affordances - so the
+ *    two cases that call for opposite reactions from the user (fix something, versus nothing is wrong)
+ *    were indistinguishable at a glance.
+ *
+ * The transitions, and nothing else, are legal:
+ *
+ * ```
+ * IDLE ──▶ CONNECTING ──▶ AUTHENTICATING ──▶ CONNECTED ──▶ DISCONNECTED ──▶ (IDLE via a new connect)
+ *            │  │              │                │
+ *            │  └──────────────┴──▶ ERROR ◀─────┤ (transport failed, ladder exhausted)
+ *            │                                  │
+ *            └──▶ RECONNECTING ◀────────────────┘ (a genuine drop, backing off)
+ *                      │
+ *                      └──▶ CONNECTING (the next attempt)
+ * ```
+ */
+enum class SessionConnectionState {
+    /** A tab exists and nothing has been attempted on it yet. */
+    IDLE,
+
+    /** Dialling: TCP, the proxy if there is one, and the SSH key exchange. */
+    CONNECTING,
+
+    /** The transport is up and the server is being offered credentials. */
+    AUTHENTICATING,
+
+    /** Authenticated, with a pty open and a shell on the other end of it. */
+    CONNECTED,
+
+    /** The session dropped and an attempt to bring it back is armed or in flight. */
+    RECONNECTING,
+
+    /** Over, for a reason that is nobody's fault: the shell exited, or the user disconnected. */
+    DISCONNECTED,
+
+    /** Over because something failed: refused credentials, an unreachable host, a dead transport. */
+    ERROR,
+}
+
+/** Whether a session in this state has a shell that can be typed into. */
+val SessionConnectionState.isLive: Boolean
+    get() = this == SessionConnectionState.CONNECTED
+
+/** Whether this state is one a session is *working through* rather than resting in. */
+val SessionConnectionState.isBusy: Boolean
+    get() = this == SessionConnectionState.CONNECTING ||
+        this == SessionConnectionState.AUTHENTICATING ||
+        this == SessionConnectionState.RECONNECTING
+
+/**
+ * Whether the session is over and only the user can restart it.
+ *
+ * The test for "offer Reconnect", and the reason it is here rather than spelled out at each call site:
+ * every one of those sites compared against [SessionConnectionState.DISCONNECTED] alone, so adding
+ * [SessionConnectionState.ERROR] to the enum without this would have quietly withdrawn the Reconnect
+ * button from the sessions that need it most.
+ */
+val SessionConnectionState.isEnded: Boolean
+    get() = this == SessionConnectionState.DISCONNECTED || this == SessionConnectionState.ERROR
 
 data class TransferItem(
     val id: String = UUID.randomUUID().toString(),
@@ -233,6 +303,15 @@ data class AppSettings(
     val keepAliveSeconds: Int = 30,
     val reconnectBaseSeconds: Int = 5,
     val terminalFontSize: Int = 13,
+    /**
+     * Whether the row of keys a phone keyboard does not have is on screen.
+     *
+     * Persisted, because hiding it is a deliberate trade the user made - three more rows of output in
+     * exchange for two taps to get Esc back - and having to make it again after every launch, rotation
+     * or reconnect would make the row feel broken rather than optional. Collapsed still leaves a handle
+     * on screen: a terminal with no reachable Esc and no visible way to get one would be a dead end.
+     */
+    val terminalKeyRowVisible: Boolean = true,
     /**
      * The narrowest terminal the pty is ever told it has, whatever the screen can show.
      *

@@ -50,7 +50,7 @@ import org.robolectric.annotation.Config
  * The tab is opened through [MainViewModel.connect] rather than by poking state, because that is the
  * path the Connect button takes and its synchronous half — marking the tab CONNECTING — is what puts
  * the terminal on screen. The handshake itself runs on `Dispatchers.IO` and fails on a background
- * thread; that outcome is the subject of [aRefusedConnectionSettlesTheTabOnDisconnectedWithoutCrashing]
+ * thread; that outcome is the subject of [aRefusedConnectionSettlesTheTabOnAnErrorStateWithoutCrashing]
  * and deliberately not asserted by the rendering tests, which must hold in every connection state.
  *
  * What these tests can and cannot reach is worth stating, because the gap is deliberate. There is no
@@ -508,11 +508,13 @@ class TerminalScreenRobolectricTest {
      * lookup blocks for minutes, which made this test time out while the tab was still RECONNECTING
      * and told us nothing about the app.
      *
-     * The tab must survive the failure: a disconnected session the user can read the error off is the
-     * intended behaviour, and dropping the tab would hide the failure entirely.
+     * The tab must survive the failure: a tab in ERROR the user can read the reason off is the intended
+     * behaviour, and dropping the tab would hide the failure entirely. ERROR rather than DISCONNECTED
+     * because nothing came up - a refused port needs something to change before a retry means anything,
+     * which is a red tab, not the amber of a session that ran and finished.
      */
     @Test
-    fun aRefusedConnectionSettlesTheTabOnDisconnectedWithoutCrashing() {
+    fun aRefusedConnectionSettlesTheTabOnAnErrorStateWithoutCrashing() {
         compose.waitForIdle()
         val viewModel = viewModel()
         val unreachable = HostProfile(
@@ -532,11 +534,11 @@ class TerminalScreenRobolectricTest {
             describe = { "tab never settled: ${viewModel.uiState.value.tabs.firstOrNull()?.state}" },
         ) {
             viewModel.uiState.value.tabs.firstOrNull { it.hostId == unreachable.id }?.state ==
-                SessionConnectionState.DISCONNECTED
+                SessionConnectionState.ERROR
         }
 
         val settled = viewModel.uiState.value.tabs.single { it.hostId == unreachable.id }
-        assertThat(settled.state).isEqualTo(SessionConnectionState.DISCONNECTED)
+        assertThat(settled.state).isEqualTo(SessionConnectionState.ERROR)
         assertThat(settled.lastError).isNotNull()
 
         // The failure is surfaced in the terminal, not swallowed. The status line under the tab strip

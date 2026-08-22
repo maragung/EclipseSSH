@@ -52,6 +52,7 @@ internal object Keys {
         val keepAliveSeconds = intPreferencesKey("keep_alive_seconds")
         val reconnectBaseSeconds = intPreferencesKey("reconnect_base_seconds")
         val terminalFontSize = intPreferencesKey("terminal_font_size")
+        val terminalKeyRowVisible = booleanPreferencesKey("terminal_key_row_visible")
         val terminalMinColumns = intPreferencesKey("terminal_min_columns")
         val pinEnabled = booleanPreferencesKey("pin_enabled")
         val pinHash = stringPreferencesKey("pin_hash")
@@ -72,7 +73,10 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     clearClipboardAfterSeconds = prefs[Keys.clipboardSeconds] ?: 30,
     keepAliveSeconds = prefs[Keys.keepAliveSeconds] ?: 30,
     reconnectBaseSeconds = prefs[Keys.reconnectBaseSeconds] ?: SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS,
-    terminalFontSize = prefs[Keys.terminalFontSize] ?: 13,
+    // Clamped on the way out as well as on the way in: this value also arrives from a restored
+    // backup, where the number is whatever the file says, and a 200 sp grid is one cell wide.
+    terminalFontSize = SettingsRepository.normalizeFontSize(prefs[Keys.terminalFontSize] ?: SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE),
+    terminalKeyRowVisible = prefs[Keys.terminalKeyRowVisible] ?: true,
     terminalMinColumns = prefs[Keys.terminalMinColumns] ?: SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS,
     // Requires the hash to actually be present, not just the flag. `pinEnabled` alone gates the
     // entire app through MainActivity's lock screen, and `verifyPin` returns false when there is no
@@ -123,7 +127,21 @@ class SettingsRepository(private val context: Context) {
     suspend fun setReconnectBaseSeconds(seconds: Int) = context.settingsDataStore.edit {
         it[Keys.reconnectBaseSeconds] = seconds.coerceIn(MIN_RECONNECT_BASE_SECONDS, MAX_RECONNECT_BASE_SECONDS)
     }
-    suspend fun setTerminalFontSize(size: Int) = context.settingsDataStore.edit { it[Keys.terminalFontSize] = size }
+    /**
+     * The terminal's text size in sp, clamped to what the app is willing to draw.
+     *
+     * Clamped here rather than only in the dialog because there are now two callers and one of them is
+     * a gesture: a pinch accumulates a scale factor, and a factor bounded only by how far apart two
+     * fingers can get would otherwise store a font size that leaves one column on screen with no way
+     * back except the settings slider.
+     */
+    suspend fun setTerminalFontSize(size: Int) = context.settingsDataStore.edit {
+        it[Keys.terminalFontSize] = normalizeFontSize(size)
+    }
+
+    suspend fun setTerminalKeyRowVisible(visible: Boolean) = context.settingsDataStore.edit {
+        it[Keys.terminalKeyRowVisible] = visible
+    }
 
     /**
      * The narrowest grid the pty may be given, or 0 for "fit the screen".
@@ -170,6 +188,19 @@ class SettingsRepository(private val context: Context) {
 
     companion object {
         const val DEFAULT_TERMINAL_MIN_COLUMNS = 80
+
+        const val DEFAULT_TERMINAL_FONT_SIZE = 13
+
+        /**
+         * The text sizes the terminal may be drawn at, in sp.
+         *
+         * The lower bound is where monospace stops being legible on a phone; the upper is where an
+         * 80-column line needs more panning than reading. Shared by the settings slider and by
+         * pinch-to-zoom so both stop in the same place.
+         */
+        val TERMINAL_FONT_SIZE_RANGE = 10..20
+
+        fun normalizeFontSize(size: Int): Int = size.coerceIn(TERMINAL_FONT_SIZE_RANGE)
 
         /** 0, meaning "fit the screen exactly", plus the widths worth offering above it. */
         val TERMINAL_MIN_COLUMN_CHOICES = listOf(0, 80, 100, 120, 132, 160)

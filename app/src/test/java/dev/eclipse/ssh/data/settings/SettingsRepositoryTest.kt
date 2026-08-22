@@ -39,7 +39,10 @@ class SettingsRepositoryTest {
         assertThat(settings.clearClipboardAfterSeconds).isEqualTo(30)
         assertThat(settings.keepAliveSeconds).isEqualTo(30)
         assertThat(settings.reconnectBaseSeconds).isEqualTo(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
-        assertThat(settings.terminalFontSize).isEqualTo(13)
+        assertThat(settings.terminalFontSize).isEqualTo(SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE)
+        // Shown by default: the row carries ESC, TAB and CTRL, which a phone keyboard does not, so a
+        // first-run terminal that hid it would have no way to interrupt a command.
+        assertThat(settings.terminalKeyRowVisible).isTrue()
         assertThat(settings.pinEnabled).isFalse()
         assertThat(settings.legacyAlgorithms).isFalse()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.DARK.name)
@@ -56,6 +59,7 @@ class SettingsRepositoryTest {
         repo.setKeepAliveSeconds(15)
         repo.setReconnectBaseSeconds(12)
         repo.setTerminalFontSize(18)
+        repo.setTerminalKeyRowVisible(false)
         repo.setLegacyAlgorithms(true)
         repo.setTerminalTheme(TerminalTheme.entries.last().name)
         repo.setBlockScreenshots(true)
@@ -68,6 +72,7 @@ class SettingsRepositoryTest {
         assertThat(settings.keepAliveSeconds).isEqualTo(15)
         assertThat(settings.reconnectBaseSeconds).isEqualTo(12)
         assertThat(settings.terminalFontSize).isEqualTo(18)
+        assertThat(settings.terminalKeyRowVisible).isFalse()
         assertThat(settings.legacyAlgorithms).isTrue()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
         assertThat(settings.blockScreenshots).isTrue()
@@ -173,5 +178,65 @@ class SettingsRepositoryTest {
         // And a hash with the flag off stays off: clearPin removes the hash and writes false, but a
         // half-applied clear must not leave the lock screen up either.
         assertThat(settingsFrom(mutablePreferencesOf(Keys.pinHash to "hash")).pinEnabled).isFalse()
+    }
+
+    /**
+     * The font size is clamped on the way in *and* on the way out.
+     *
+     * Two callers can produce a size the terminal cannot draw. A vault backup is restored field by
+     * field, so an edited or corrupted export can carry any integer at all; and the pinch-to-zoom
+     * gesture multiplies the current size by a gesture factor, which is unbounded by nature. A 200 sp
+     * cell is a grid one column wide - the same unusable terminal `terminalMinColumns` is clamped to
+     * avoid - and a zero or negative size is a crash inside text measurement.
+     */
+    @Test
+    fun `09 the terminal font size is clamped to the range the UI offers`() = runTest {
+        val repo = repository
+        val range = SettingsRepository.TERMINAL_FONT_SIZE_RANGE
+
+        repo.setTerminalFontSize(0)
+        assertThat(repo.settings.first().terminalFontSize).isEqualTo(range.first)
+
+        repo.setTerminalFontSize(-8)
+        assertThat(repo.settings.first().terminalFontSize).isEqualTo(range.first)
+
+        repo.setTerminalFontSize(Int.MAX_VALUE)
+        assertThat(repo.settings.first().terminalFontSize).isEqualTo(range.last)
+
+        // Every size the slider and the pinch gesture can land on stores as itself, so neither ever
+        // redraws showing a number the user did not choose.
+        range.forEach { size ->
+            repo.setTerminalFontSize(size)
+            assertWithMessage("the font dialog offers %s sp", size)
+                .that(repo.settings.first().terminalFontSize)
+                .isEqualTo(size)
+        }
+
+        // A value already written by an older build, or by a hand-edited backup, is clamped on read
+        // too - there is no setter that could have fixed it after the fact.
+        assertThat(settingsFrom(mutablePreferencesOf(Keys.terminalFontSize to 200)).terminalFontSize)
+            .isEqualTo(range.last)
+        assertThat(settingsFrom(mutablePreferencesOf(Keys.terminalFontSize to 0)).terminalFontSize)
+            .isEqualTo(range.first)
+
+        repo.setTerminalFontSize(SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE)
+    }
+
+    /**
+     * The collapsed shortcut bar survives a restart.
+     *
+     * It is persisted rather than remembered per screen because the reason to collapse it - a short
+     * screen, or a full-screen program that needs every row - does not change between sessions, and
+     * re-collapsing it on every connect would be a chore.
+     */
+    @Test
+    fun `10 the shortcut bar visibility round-trips both ways`() = runTest {
+        val repo = repository
+
+        repo.setTerminalKeyRowVisible(false)
+        assertThat(repo.settings.first().terminalKeyRowVisible).isFalse()
+
+        repo.setTerminalKeyRowVisible(true)
+        assertThat(repo.settings.first().terminalKeyRowVisible).isTrue()
     }
 }

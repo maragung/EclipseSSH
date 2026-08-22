@@ -80,11 +80,42 @@ jobs:
       - name: Lint (release variant)
         run: ./gradlew --stacktrace lintRelease
 
+      # One test in the suite talks to a real `sshd` rather than to MINA, because that
+      # is the only way to see the interop gap: extension negotiation, `ext-info` and
+      # `hostkeys-00@openssh.com` arriving unasked, an unknown global request answered
+      # with SSH_MSG_REQUEST_FAILURE, a login shell behind a real pty, `sftp-server` as
+      # a subsystem process. "Connects, prints the motd, then says Reconnecting" is what
+      # a bug in that gap looks like, and MINA-to-MINA tests cannot reproduce it.
+      #
+      # The sandbox is built here and thrown away below: its own host key, its own
+      # authorized_keys, its own throwaway client key under .tmp-build/sshd-test, bound
+      # to the loopback, sharing nothing with the runner's SSH configuration. It is
+      # started before the tests because the test finds it by file, not by fixture, and
+      # skips itself when it is absent.
+      - name: Start the isolated OpenSSH sandbox
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          tools/local-sshd.sh start
+          # Asserted rather than assumed: on a runner that has `sshd`, a sandbox that did
+          # not come up is a broken harness, and a skipped interop test looks identical to
+          # a passing one in the summary.
+          test -f .tmp-build/sshd-test/port
+
       # The project's integration tests live in src/test: they drive the real
       # SshConnectionManager, TerminalChannel and SFTP client against a local MINA
       # SSHD server on a loopback port, so they need no emulator and no external host.
       - name: Unit and integration tests
         run: ./gradlew --stacktrace testDebugUnitTest testReleaseUnitTest
+
+      # Before the reports are uploaded, so a failed test run still leaves no server
+      # and no key material behind in a cached workspace.
+      - name: Stop the OpenSSH sandbox
+        if: always()
+        run: tools/local-sshd.sh clean
 
       # No emulator here (see docs/ci.md), but the instrumentation sources must keep
       # compiling or they rot silently.

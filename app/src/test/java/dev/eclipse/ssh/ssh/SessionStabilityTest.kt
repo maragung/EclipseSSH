@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.ssh
 
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
@@ -13,6 +14,7 @@ import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import dev.eclipse.ssh.terminal.Utf8StreamDecoder
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
@@ -26,14 +28,18 @@ import java.util.Collections
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.sshd.client.session.ClientSession
 import org.apache.sshd.common.channel.RequestHandler
@@ -96,6 +102,29 @@ class SessionStabilityTest {
 
         /** The shortest keep-alive the app allows, so the dead-peer test is 20s and not 2 minutes. */
         private const val HEARTBEAT_SECONDS = 5
+
+        /**
+         * Probe deadline for the tests that expect no answer.
+         *
+         * Shorter than [SshConnectionManager]'s own default, because the tests that use it are asserting
+         * that a *dead* link is reported dead - there is nothing to wait for - and the sweep's real
+         * deadline is already covered by the bound in the black-hole test.
+         */
+        private const val PROBE_TIMEOUT_SECONDS = 3L
+
+        /**
+         * Lines in the flood test, chosen so the payload is over a megabyte.
+         *
+         * That is comfortably more than the channel's own buffer of 256 chunks, which is what puts the
+         * blocking publish path - the one that exists only for floods - under test rather than the
+         * `tryEmit` fast path every other test here exercises.
+         */
+        private const val FLOOD_LINES = 120_000
+        private const val FLOOD_MIN_BYTES = 1_048_576
+        private const val FLOOD_WAIT_MS = 120_000L
+
+        /** [dev.eclipse.ssh.terminal.AnsiTerminalBuffer]'s own scrollback ceiling, which is private to it. */
+        private const val MAX_SCROLLBACK_LINES = 2_000
 
         private const val CTRL_C = 0x03.toByte()
         private const val CTRL_D = 0x04.toByte()
@@ -406,6 +435,48 @@ class SessionStabilityTest {
         }
     }
 
+    /**
+     * A pty asked for at a size no display can render is opened at one that can, and both sides agree.
+     *
+     * The size handed to `open` comes from measuring the window, so it is only as sane as the
+     * measurement: a very small font in a very wide window, or a viewport measured before the layout
+     * settled, produces a number far outside what the buffer will hold. What made this worth a test is
+     * the failure it caused rather than the number itself - the clamped value was stored in the channel
+     * while the *raw* value was sent to the pty, so the remote came up wider than the buffer and every
+     * later `resize` to the clamp was discarded as "already that size". The two sides could not
+     * converge again for the life of the session, and every full-screen program wrapped.
+     */
+    @Test
+    fun `a pty asked for at an impossible size is opened at one the display can match`() = runBlocking {
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile())
+            session.use {
+                val started = shells.size
+                val terminal = manager.openTerminal(session, columns = 4_000, rows = 2)
+                val shell = awaitShell(started)
+                try {
+                    val columns = TERMINAL_COLUMN_RANGE.last
+                    val rows = TERMINAL_ROW_RANGE.first
+                    assertThat(awaitTrue { shell.env()?.get(Environment.ENV_COLUMNS) == "$columns" }).isTrue()
+                    assertThat(shell.env()?.get(Environment.ENV_LINES)).isEqualTo("$rows")
+                    // What the app believes, which is the geometry a reconnect carries across.
+                    assertThat(terminal.ptyColumns).isEqualTo(columns)
+                    assertThat(terminal.ptyRows).isEqualTo(rows)
+
+                    // And a size inside the range still reaches the pty afterwards.
+                    terminal.resize(90, 25)
+                    assertThat(awaitTrue { shell.env()?.get(Environment.ENV_COLUMNS) == "90" }).isTrue()
+                    assertThat(shell.env()?.get(Environment.ENV_LINES)).isEqualTo("25")
+                } finally {
+                    terminal.close()
+                }
+            }
+        } finally {
+            manager.close()
+        }
+    }
+
     @Test
     fun `a shell the user ends reports a status so nothing reconnects it`() = runBlocking {
         val manager = newManager()
@@ -418,9 +489,11 @@ class SessionStabilityTest {
                 // Ctrl-D at a prompt is how a shell is closed on purpose. It must come back with a
                 // status, because the status is what stops the reconnect logic resurrecting it.
                 terminal.writeBytes(byteArrayOf(CTRL_D))
-                val status = withTimeoutOrNull(WAIT_MS) { terminal.awaitClosed() }
-                assertThat(status).isEqualTo(0)
-                assertThat(shouldAutoReconnect(status, tabIsOpen = true, endedDeliberately = false)).isFalse()
+                val end = withTimeoutOrNull(WAIT_MS) { terminal.awaitClosed() }
+                assertThat(end).isEqualTo(SessionEnd.ShellEnded(status = 0, signal = null))
+                assertThat(shouldAutoReconnect(end!!, tabIsOpen = true, endedDeliberately = false)).isFalse()
+                // And it reads as an ending rather than as a fault of the network.
+                assertThat(describeSessionEnd(end)).isEqualTo("Session ended")
             }
         } finally {
             manager.close()
@@ -456,8 +529,12 @@ class SessionStabilityTest {
             val closed = withTimeoutOrNull(DEAD_PEER_WAIT_MS) { listOf(terminal.awaitClosed()) }
             val elapsedSeconds = (System.nanoTime() - frozenAt) / 1_000_000_000L
             assertThat(closed).isNotNull()
-            val status = closed!!.single()
-            assertThat(status).isNull()
+            val end = closed!!.single()
+            // The transport, named as such. Not "the shell ended with no status", which is what this
+            // used to be indistinguishable from and is the one ending that must not be reconnected.
+            assertThat(end).isInstanceOf(SessionEnd.TransportFailed::class.java)
+            // And the reason reaches the user instead of being replaced by a generic sentence.
+            assertThat(describeSessionEnd(end)).startsWith("Connection lost: ")
             assertThat(awaitTrue { !session.isOpen }).isTrue()
 
             // And it was the heartbeat that noticed, not the idle-timeout backstop: detection is
@@ -470,7 +547,7 @@ class SessionStabilityTest {
             // fresh one instead of adopting a corpse, and the tab asks for a reconnect.
             assertThat(store.isLive(profile.id)).isFalse()
             assertThat(store.liveHostIds()).isEmpty()
-            assertThat(shouldAutoReconnect(status, tabIsOpen = true, endedDeliberately = terminal.endedDeliberately)).isTrue()
+            assertThat(shouldAutoReconnect(end, tabIsOpen = true, endedDeliberately = terminal.endedDeliberately)).isTrue()
             // Nothing on this side asked for it, so the flag that suppresses a reconnect is clear -
             // the transport really did die, and this is the case that must still come back.
             assertThat(terminal.endedDeliberately).isFalse()
@@ -564,6 +641,12 @@ class SessionStabilityTest {
 
             assertThat(fromUi).isSameInstanceAs(fromService)
             assertThat(logins.get() - loginsBefore).isEqualTo(1)
+            // Waited for rather than sampled. `openTerminal` returns when the channel is open, and the
+            // server runs its ShellFactory a moment later when the `shell` request arrives - so reading
+            // the count immediately is a race that reports zero shells on a loaded machine. The exact
+            // count is still asserted, and it is still meaningful: one login was already proved above,
+            // and one session cannot produce two shells here.
+            assertThat(awaitTrue { shells.size - shellsBefore >= 1 }).isTrue()
             assertThat(shells.size - shellsBefore).isEqualTo(1)
             // And what the second caller was handed is the working session, not a corpse.
             assertThat(fromService.isOpen).isTrue()
@@ -661,7 +744,7 @@ class SessionStabilityTest {
                 assertThat(terminal.isOpen).isTrue()
                 assertThat(store.isLive(profile.id)).isTrue()
                 assertThat(store.adoptableHostIds()).containsExactly(profile.id)
-                // No exit status, because nothing ended: awaitClosed is still waiting.
+                // Nothing ended, so there is nothing to report: awaitClosed is still waiting.
                 assertThat(withTimeoutOrNull(200) { terminal.awaitClosed() }).isNull()
                 assertThat(terminal.droppedChunks).isEqualTo(0L)
                 // And the shell is still there to prove it, after all that silence.
@@ -741,6 +824,325 @@ class SessionStabilityTest {
             assertThat(store.liveHostIds()).isEmpty()
             assertThat(store.sessions).isEmpty()
             assertThat(store.channels).isEmpty()
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * A live session answers the probe, and a server that has never heard of the request still counts.
+     *
+     * [SshConnectionManager.probeLiveness] is what turns a network migration into a two-second
+     * discovery instead of a ninety-second one, and its correctness rests entirely on an asymmetry that
+     * is easy to get backwards: *any* reply proves the peer is there, including the
+     * `SSH_MSG_REQUEST_FAILURE` that every real OpenSSH server sends for `keepalive@openssh.com`,
+     * because no server implements that global request. MINA surfaces that failure as a `null` return
+     * rather than as an exception, so a probe written to require a success reply would report every
+     * healthy session dead - and the sweep would then close all of them. That is a worse bug than the
+     * one being fixed, which is why the counted keep-alive is asserted too: it proves the probe left
+     * the client and was refused, rather than passing on a probe that was never sent.
+     */
+    @Test
+    fun `a live session answers the liveness probe even when the server refuses the request`() = runBlocking {
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile())
+            session.use {
+                val before = keepalives.count()
+
+                assertThat(manager.probeLiveness(session)).isTrue()
+
+                // It really went on the wire, under the name OpenSSH uses.
+                assertThat(keepalives.count()).isGreaterThan(before)
+                // And it cost the session nothing: a probe that disturbed the shell would be worse
+                // than the delay it removes.
+                assertThat(session.isOpen).isTrue()
+                assertThat(session.isAuthenticated).isTrue()
+            }
+        } finally {
+            manager.close()
+        }
+    }
+
+    /**
+     * The probe finds a black-holed transport that `isOpen` cannot, and finds it in seconds.
+     *
+     * This is the Wi-Fi-to-mobile-data handover, reproduced honestly: the sockets stay established at
+     * both ends and not one byte crosses again. Everything the app can cheaply ask is still true -
+     * `isOpen`, `isAuthenticated`, the channel is open - which is precisely why the keep-alive's three
+     * unanswered requests used to be the only detector, and why the terminal spent that time
+     * swallowing keystrokes.
+     *
+     * The bound is the point of the test. A probe that eventually returns false is not worth having if
+     * it takes as long as the heartbeat it exists to pre-empt, so detection is required to land well
+     * inside [HEARTBEAT_SECONDS] x (no-reply-max + 1). Paired with the test above - which proves a live
+     * session answers - this cannot be satisfied by a probe that simply always fails.
+     */
+    @Test
+    fun `a session behind a black holed transport fails the probe long before the heartbeat would`() = runBlocking {
+        val relay = FreezableRelay(serverPort)
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile(port = relay.port, keepAlive = HEARTBEAT_SECONDS))
+            session.use {
+                relay.freeze()
+                // Nothing here is false, which is the whole problem.
+                assertThat(session.isOpen).isTrue()
+                assertThat(session.isAuthenticated).isTrue()
+
+                val startedAt = System.nanoTime()
+                assertThat(manager.probeLiveness(session, timeoutSeconds = PROBE_TIMEOUT_SECONDS)).isFalse()
+                val elapsedSeconds = (System.nanoTime() - startedAt) / 1_000_000_000L
+
+                // Sooner than the heartbeat would have concluded anything - the reason the probe exists.
+                assertThat(elapsedSeconds).isLessThan(HEARTBEAT_SECONDS.toLong() * 4)
+            }
+        } finally {
+            manager.close()
+            relay.close()
+        }
+    }
+
+    /**
+     * A session that has already been closed answers "dead" instead of throwing.
+     *
+     * [SessionLivenessProbe.sweep] probes every live session concurrently, and a user can disconnect
+     * one while the sweep is in flight. An exception escaping a single probe there would abort the
+     * whole `awaitAll` and leave the other sessions - the ones that really did die in the handover -
+     * unexamined until the heartbeat noticed, which is the delay this machinery removes.
+     */
+    @Test
+    fun `a closed session fails the probe without throwing`() = runBlocking {
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile())
+            session.close(true)
+            assertThat(awaitTrue { !session.isOpen }).isTrue()
+
+            assertThat(manager.probeLiveness(session, timeoutSeconds = PROBE_TIMEOUT_SECONDS)).isFalse()
+        } finally {
+            manager.close()
+        }
+    }
+
+    /**
+     * The non-blocking dial gate: busy is reported, not waited for, and it is per host.
+     *
+     * [SshSessionStore.dialing] is deliberately held for a whole connect ladder -
+     * [dev.eclipse.ssh.presentation.MAX_CONNECT_ATTEMPTS] attempts, each with a timeout the user may
+     * set as high as five minutes - because that is what makes two components dialling one host cost
+     * one login. But [dev.eclipse.ssh.background.EclipseSessionService]'s restore pass walks its hosts
+     * *sequentially*, so blocking on that gate made one slow host stall every host queued behind it for
+     * up to a quarter of an hour: a head-of-line block that looked exactly like the app refusing to
+     * reconnect anything.
+     *
+     * Both halves matter. Reporting busy is what lets the pass move on; keeping the gates per host is
+     * what stops the report from being "busy" for hosts nobody is dialling at all.
+     */
+    @Test
+    fun `the dial gate reports busy rather than queueing behind another component`() = runBlocking {
+        val store = SshSessionStore()
+        val slowHost = "host-being-dialled"
+        val otherHost = "host-nobody-is-dialling"
+        val inside = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        withTimeout(WAIT_MS) {
+            val holder = launch(Dispatchers.IO) {
+                store.dialing(slowHost) {
+                    inside.complete(Unit)
+                    release.await()
+                }
+            }
+            inside.await()
+
+            var ran = false
+            val outcome = store.tryDialing(slowHost) { ran = true }
+
+            assertThat(outcome).isEqualTo(DialAttempt.Busy)
+            // Not merely reported busy: the attempt itself must not run, or the login the gate exists
+            // to deduplicate happens anyway.
+            assertThat(ran).isFalse()
+
+            // A different host is dialled immediately, which is the head-of-line block being absent.
+            assertThat(store.tryDialing(otherHost) { "dialled" }).isEqualTo(DialAttempt.Ran("dialled"))
+
+            release.complete(Unit)
+            holder.join()
+
+            // And the gate is free again the moment the holder is done.
+            assertThat(store.tryDialing(slowHost) { "free" }).isEqualTo(DialAttempt.Ran("free"))
+        }
+    }
+
+    /**
+     * A dial that fails, throws or is cancelled leaves the gate open.
+     *
+     * A gate held by a dead attempt is not an error the user can see and retry past - it is a host that
+     * can never be dialled again for the life of the process, because every later attempt either waits
+     * forever or is told somebody else is already on it. Every exit path is covered here, including
+     * cancellation, which is the ordinary case: it is what leaving the terminal screen mid-connect
+     * produces.
+     */
+    @Test
+    fun `a dial that fails or is cancelled releases the gate instead of wedging the host`() = runBlocking {
+        val store = SshSessionStore()
+        val hostId = "host-that-fails"
+
+        assertThat(runCatching { store.dialing<Unit>(hostId) { throw IOException("refused") } }.isFailure).isTrue()
+        assertThat(store.tryDialing(hostId) { "after failure" }).isEqualTo(DialAttempt.Ran("after failure"))
+
+        assertThat(runCatching { store.tryDialing<Unit>(hostId) { throw IOException("refused") } }.isFailure).isTrue()
+        assertThat(store.tryDialing(hostId) { "after try failure" }).isEqualTo(DialAttempt.Ran("after try failure"))
+
+        withTimeout(WAIT_MS) {
+            val started = CompletableDeferred<Unit>()
+            val job = launch(Dispatchers.IO) {
+                store.dialing(hostId) {
+                    started.complete(Unit)
+                    awaitCancellation()
+                }
+            }
+            started.await()
+            job.cancelAndJoin()
+
+            assertThat(store.tryDialing(hostId) { "after cancel" }).isEqualTo(DialAttempt.Ran("after cancel"))
+        }
+    }
+
+    /**
+     * A flood of output arrives whole, in order, and does not grow the buffer without bound.
+     *
+     * The two failure modes this covers are the ones a `cat` of a large file, a verbose build, or
+     * `journalctl -f` on a busy server actually produce, and they fail in opposite directions. Dropping
+     * chunks corrupts the *emulator*, not just the display: bytes lost in the middle of an escape
+     * sequence leave the parser treating the remainder as text, which is why the channel blocks its
+     * pump thread rather than dropping - and why [TerminalChannel.droppedChunks] must be zero here.
+     * Keeping everything is the other failure: an unbounded scrollback is an out-of-memory kill after a
+     * long-running tail, so the emulator trims to its scrollback limit and this asserts the trim.
+     *
+     * The payload is deliberately larger than the channel's whole [MutableSharedFlow] buffer, so the
+     * blocking publish path - the one that only exists for floods - is the path under test. Line
+     * numbers are extracted and compared as a sequence rather than as a substring match: that catches
+     * reordering and duplication, which a `contains` assertion cannot.
+     */
+    @Test
+    fun `a flood of output arrives whole and in order and the scrollback stays bounded`() = runBlocking {
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile())
+            session.use {
+                val started = shells.size
+                val terminal = manager.openTerminal(session)
+                awaitShell(started)
+                val (sink, collector) = collectText(terminal)
+                try {
+                    val payload = buildString(FLOOD_LINES * 12) {
+                        repeat(FLOOD_LINES) { append("line ").append(it).append('\n') }
+                    }
+                    assertThat(payload.length).isGreaterThan(FLOOD_MIN_BYTES)
+
+                    terminal.write(payload)
+
+                    // Length rather than content while waiting: this sink holds more than a megabyte,
+                    // and copying it out every 25ms to test a predicate would cost more than the
+                    // transfer being measured.
+                    val arrived = awaitTrue(FLOOD_WAIT_MS) {
+                        synchronized(sink) { sink.length } >= payload.length
+                    }
+                    val text = synchronized(sink) { sink.toString() }
+                    assertWithMessage("only %s of %s bytes arrived", text.length, payload.length)
+                        .that(arrived).isTrue()
+
+                    val numbers = Regex("line (\\d+)").findAll(text).map { it.groupValues[1].toInt() }.toList()
+                    assertThat(numbers).hasSize(FLOOD_LINES)
+                    // Every line, exactly once, in the order it was written.
+                    assertThat(numbers).isEqualTo(List(FLOOD_LINES) { it })
+                    assertThat(terminal.droppedChunks).isEqualTo(0L)
+
+                    // And the emulator that renders it holds a bounded amount of it.
+                    val buffer = AnsiTerminalBuffer()
+                    buffer.feed(text)
+                    assertThat(buffer.lineCount()).isAtMost(buffer.viewportRows + MAX_SCROLLBACK_LINES)
+                } finally {
+                    collector.cancel()
+                    terminal.close()
+                }
+            }
+        } finally {
+            manager.close()
+        }
+    }
+
+    /**
+     * Three sessions run at once, each seeing only its own output, and closing one leaves the rest.
+     *
+     * Everything about a session in this app is keyed by host id - the session, the channel, the
+     * emulator buffer, the pty size, the scroll offset - and a single one of those keyed by anything
+     * else is a cross-talk bug: one host's output painted into another's scrollback, or one tab's
+     * resize applied to the wrong pty. Three is the smallest number that catches a mistake that sends
+     * everything to the *first* or the *last* host rather than to the right one.
+     */
+    @Test
+    fun `three sessions run at once without mixing their output`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val opened = (1..3).map { index ->
+                val profile = hostProfile()
+                // Sequential, so each shell can be identified by position rather than by a race.
+                val session = trustedConnect(manager, profile)
+                val startedShells = shells.size
+                val terminal = manager.openTerminal(session)
+                awaitShell(startedShells)
+                store.install(profile.id, session)
+                store.channels[profile.id] = terminal
+                store.buffers[profile.id] = AnsiTerminalBuffer()
+                Triple(profile, terminal, "host$index")
+            }
+
+            assertThat(store.liveHostIds()).containsExactlyElementsIn(opened.map { it.first.id })
+            assertThat(store.adoptableHostIds()).containsExactlyElementsIn(opened.map { it.first.id })
+
+            coroutineScope {
+                val sinks = opened.map { (_, terminal, _) -> collectText(terminal) }
+                try {
+                    // Written concurrently, because that is how three open tabs behave.
+                    opened.forEachIndexed { index, (_, terminal, marker) ->
+                        launch(Dispatchers.IO) {
+                            repeat(40) { line -> terminal.write("$marker-$line\r") }
+                        }
+                        // Kept distinct so a mix-up cannot be hidden by identical payloads.
+                        assertThat(marker).isEqualTo("host${index + 1}")
+                    }
+
+                    opened.forEachIndexed { index, (profile, _, marker) ->
+                        val (sink, _) = sinks[index]
+                        val ownText = awaitText(sink, FLOOD_WAIT_MS) { it.contains("$marker-39") }
+                        assertWithMessage("host %s never saw its own last line", marker)
+                            .that(ownText).contains("$marker-39")
+                        // And nothing that belongs to a sibling.
+                        opened.map { it.third }.filter { it != marker }.forEach { other ->
+                            assertWithMessage("%s's output appeared in %s's terminal", other, marker)
+                                .that(ownText).doesNotContain(other)
+                        }
+                        store.buffers.getValue(profile.id).feed(ownText)
+                    }
+                } finally {
+                    sinks.forEach { (_, job) -> job.cancel() }
+                }
+            }
+
+            // One tab closed leaves the other two exactly as they were, which is the property a shared
+            // store makes easy to break: a close that reached the wrong entry, or all of them.
+            val (closed, _, _) = opened.first()
+            store.close(closed.id)
+            assertThat(store.isLive(closed.id)).isFalse()
+            opened.drop(1).forEach { (profile, terminal, _) ->
+                assertThat(store.isLive(profile.id)).isTrue()
+                assertThat(terminal.isOpen).isTrue()
+                assertThat(terminal.endedDeliberately).isFalse()
+            }
         } finally {
             store.closeAll()
             manager.close()
