@@ -1765,3 +1765,47 @@ rotation, backgrounding, lock and unlock as the lifecycle callbacks the system d
 data as the `NetworkMonitor` transitions the platform reports; a network outage as a transport dropped
 under a live session, which is what the app can actually observe.
 
+
+## 20. Releasing 1.0.4
+
+`versionCode` 4 → 5, `versionName` 1.0.3 → 1.0.4, carrying section 19: one session manager that owns every
+connection, an explicit state machine instead of states inferred from the transport, a heartbeat that only
+reports a genuinely dead link, and a reconnect that can authenticate with the credential the live session
+used even when the user never saved it.
+
+Built the way 1.0.2 and 1.0.3 were: GitHub Actions assembles from the commit on `main` and this host does
+nothing but sign, so the artifact is a build of what is published rather than of a working tree. The
+signing key never leaves the host and never enters the repository or the workflow.
+
+Run #14 from `953d78b` is also the first run of the OpenSSH sandbox step, and it did what it was written to
+do: installed `openssh-server` on the runner, started the sandbox on the loopback with its own throwaway
+keys, asserted the port file existed rather than letting a missing server turn into a silently skipped
+test, and tore the sandbox down on the way out. The interop test ran for 33 seconds against a real `sshd`
+in both variants instead of skipping.
+
+What shipped:
+
+| | |
+|---|---|
+| File | `EclipseSSH-1.0.4-release.apk`, 5,744,061 bytes |
+| SHA-256 | `2cad38d3515456d9ba311c50d8012ad11fc3b8e6069feb411bf93f3080fd34f6` |
+| Version | `versionCode` 5, `versionName` 1.0.4 |
+| Platform | minSdk 28, targetSdk 35, arm64-v8a / armeabi-v7a / x86 / x86_64 |
+| Signer | `CN=Eclipse SSH, OU=Mobile, O=Eclipse SSH, L=Jakarta, C=ID`, SHA-256 `a75a6f…2921e` |
+| Schemes | v3 at the manifest's minSdk, v2 and v3 at `--min-sdk-version 24`; `zipalign -c 4` clean |
+| Tag | `v1.0.4` at `953d78b`, release `https://github.com/maragung/EclipseSSH/releases/tag/v1.0.4` |
+
+Same certificate as 1.0.0 through 1.0.3, so this installs over any of them as an upgrade. The workflow's
+own artifact was checked first and is again *not* what shipped: with no signing secrets in the repository
+the workflow's `Restore release signing material` step reports `signed=false` and Gradle falls back to the
+debug key, and `apksigner --print-certs` said `CN=Android Debug` on the 5,707,472-byte artifact. That file
+was re-signed here, which is what the size and digest above describe.
+
+The published asset was then pulled back out of the release and checked rather than assumed: byte identical
+to the file on this host, verifying under the release certificate, aligned, and reporting `versionCode='5'
+versionName='1.0.4'`. `classes.dex` carries CRC `02e47c41` against 1.0.3's `ffbdc00c`, so the payload is new
+code and not a re-wrapped 1.0.3.
+
+The same file is served over HTTP on port 19001 alongside 1.0.1, 1.0.2 and 1.0.3, and was fetched back from
+the public address to confirm the server hands over all 5,744,061 bytes with a matching digest. The
+directory behind that server holds the four APKs and a README and nothing else.
