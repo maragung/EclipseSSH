@@ -18,31 +18,44 @@ class AutoReconnectDecisionTest {
 
     @Test
     fun `a transport that died without a status is reconnected`() {
-        assertThat(shouldAutoReconnect(exitStatus = null, tabIsOpen = true)).isTrue()
+        assertThat(shouldAutoReconnect(exitStatus = null, tabIsOpen = true, endedDeliberately = false)).isTrue()
     }
 
     @Test
     fun `a shell that exited cleanly is left alone`() {
         // `exit`, `logout` and Ctrl-D all arrive as status 0. Reconnecting here would resurrect a
         // shell the user closed on purpose, which is the reconnect loop this feature must not become.
-        assertThat(shouldAutoReconnect(exitStatus = 0, tabIsOpen = true)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = 0, tabIsOpen = true, endedDeliberately = false)).isFalse()
     }
 
     @Test
     fun `a shell that exited with a failure status is also left alone`() {
         // A non-zero status is still the remote side reporting an end. `sshd` was reachable enough to
         // send it, so nothing was dropped.
-        assertThat(shouldAutoReconnect(exitStatus = 1, tabIsOpen = true)).isFalse()
-        assertThat(shouldAutoReconnect(exitStatus = 130, tabIsOpen = true)).isFalse()
-        assertThat(shouldAutoReconnect(exitStatus = -1, tabIsOpen = true)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = 1, tabIsOpen = true, endedDeliberately = false)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = 130, tabIsOpen = true, endedDeliberately = false)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = -1, tabIsOpen = true, endedDeliberately = false)).isFalse()
     }
 
     @Test
     fun `a closed tab is never reconnected whatever the status`() {
         // Closing the tab is the user saying they are done with the host. A drop that arrives just
         // afterwards - closing the channel is itself a drop - must not dial it again.
-        assertThat(shouldAutoReconnect(exitStatus = null, tabIsOpen = false)).isFalse()
-        assertThat(shouldAutoReconnect(exitStatus = 0, tabIsOpen = false)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = null, tabIsOpen = false, endedDeliberately = false)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = 0, tabIsOpen = false, endedDeliberately = false)).isFalse()
+    }
+
+    @Test
+    fun `a close the app asked for is never reconnected, even though it looks exactly like a drop`() {
+        // The one case the status cannot distinguish, and the reason this parameter exists. Closing a
+        // channel from this side ends it with no exit status at all - byte for byte what a dropped
+        // transport looks like - so a deliberate close read as an outage, and the reconnect it
+        // scheduled dialled a host the app had just decided to stop talking to. That is what put
+        // "Reconnecting..." on screen seconds after a successful login: a second dial displaced the
+        // first session, closing it counted as a drop, and each round produced the next.
+        assertThat(shouldAutoReconnect(exitStatus = null, tabIsOpen = true, endedDeliberately = true)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = 0, tabIsOpen = true, endedDeliberately = true)).isFalse()
+        assertThat(shouldAutoReconnect(exitStatus = null, tabIsOpen = false, endedDeliberately = true)).isFalse()
     }
 
     @Test

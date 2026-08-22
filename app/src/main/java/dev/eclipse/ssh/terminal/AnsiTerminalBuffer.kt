@@ -112,6 +112,19 @@ data class TerminalFrame(
     val cursorColumn: Int,
     val columns: Int,
     val rows: Int,
+    /**
+     * The widest column any line in this window actually paints into, and how far the view may pan.
+     *
+     * Not the same number as [columns], in either direction. It is *smaller* for an ordinary shell
+     * screen, where nothing reaches the right margin and panning into that emptiness would only be a
+     * way to lose the text; it is *larger* whenever the history was printed at a wider terminal than
+     * the one on display now - after a rotation, or on a phone whose screen fits fewer columns than
+     * the pty was given - because those lines keep every character they were printed with. Counted
+     * the way the renderer counts a painted cell, so a coloured blank in a status bar extends it and
+     * the trailing spaces of a short line do not, plus the cursor's own cell: the cell being typed
+     * into is blank until the character lands, and the view has to be able to follow it there.
+     */
+    val contentColumns: Int = 0,
     val cursorVisible: Boolean,
     val revision: Long,
     val title: String? = null,
@@ -242,9 +255,9 @@ class AnsiTerminalBuffer(
         val wasFullRegion = topMargin == 0 && bottomMargin == previousRows - 1
         columns = newColumns.coerceIn(TERMINAL_COLUMN_RANGE)
         rows = newRows.coerceIn(TERMINAL_ROW_RANGE)
-        lines.forEach { line -> normalizeLine(line) }
         while (lines.size < rows) lines += blankLine()
         trimBlankRowsForShrink(lines, cursorRow)
+        normalizeScreen(lines)
         // A region that covered the whole screen still covers it at the new height. One that did not
         // is clamped instead, so a shrink cannot leave a margin pointing past the last row - every
         // scroll after that would have indexed outside the list.
@@ -259,9 +272,9 @@ class AnsiTerminalBuffer(
         // `vim` is open otherwise dropped the user back onto a shell screen still laid out for the
         // old width, with every wrapped line folded at the wrong column.
         primary?.let { saved ->
-            saved.lines.forEach { line -> normalizeLine(line) }
             while (saved.lines.size < rows) saved.lines += blankLine()
             trimBlankRowsForShrink(saved.lines, saved.cursorRow)
+            normalizeScreen(saved.lines)
         }
         cursorRow = cursorRow.coerceIn(0, lines.lastIndex)
         cursorColumn = cursorColumn.coerceIn(0, columns - 1)
@@ -315,8 +328,15 @@ class AnsiTerminalBuffer(
         val offset = scrollOffset.coerceIn(0, (lines.size - take).coerceAtLeast(0))
         val first = (lines.size - take - offset).coerceAtLeast(0)
         val window = ArrayList<List<TerminalCell>>(take)
-        for (index in first until first + take) window += lines[index].toList()
+        var content = 0
+        for (index in first until first + take) {
+            val line = lines[index]
+            window += line.toList()
+            val painted = paintedWidth(line)
+            if (painted > content) content = painted
+        }
         val relativeCursor = cursorRow - first
+        if (cursorVisible && relativeCursor in 0 until take) content = maxOf(content, cursorColumn + 1)
         return TerminalFrame(
             lines = window,
             firstLine = first,
@@ -325,6 +345,7 @@ class AnsiTerminalBuffer(
             cursorColumn = cursorColumn.coerceIn(0, columns - 1),
             columns = columns,
             rows = rows,
+            contentColumns = content,
             cursorVisible = cursorVisible,
             revision = revision,
             title = title,
@@ -361,6 +382,25 @@ class AnsiTerminalBuffer(
     }
 
     private fun isBlank(line: List<TerminalCell>): Boolean = line.all { it == BLANK_CELL }
+
+    /**
+     * How many columns of [line] carry anything: a glyph, a background colour, or an inverse.
+     *
+     * The same test the renderer uses to find the last cell worth drawing, and it has to stay the
+     * same test - this is what [TerminalFrame.contentColumns] reports and therefore how far the view
+     * lets the user pan, so a cell that is painted but not pannable would be unreachable. Scanned
+     * backwards because the answer is near the end of the line: most of a terminal row is the run of
+     * blanks after the text.
+     */
+    private fun paintedWidth(line: List<TerminalCell>): Int {
+        var index = line.size
+        while (index > 0) {
+            val cell = line[index - 1]
+            if (cell.value != ' ' || !cell.style.background.isDefault || cell.style.inverse) return index
+            index--
+        }
+        return 0
+    }
 
     /**
      * The viewport height the buffer is sized to, without building a frame to find out.
@@ -689,9 +729,9 @@ class AnsiTerminalBuffer(
         lines = saved.lines
         // The screen may have been resized while the alternate one was up; resize() keeps the stored
         // lines in step, but a fresh height still has to be topped up here.
-        lines.forEach { line -> normalizeLine(line) }
         while (lines.size < rows) lines += blankLine()
         trimBlankRowsForShrink(lines, saved.cursorRow)
+        normalizeScreen(lines)
         topMargin = saved.topMargin.coerceIn(0, rows - 1)
         bottomMargin = saved.bottomMargin.coerceIn(topMargin, rows - 1)
         cursorRow = saved.cursorRow.coerceIn(0, lines.lastIndex)
@@ -1105,6 +1145,26 @@ class AnsiTerminalBuffer(
     }
 
     private fun blankLine() = MutableList(columns) { TerminalCell() }
+
+    /**
+     * Fits the *screen* to the current width, and deliberately does not touch the scrollback.
+     *
+     * [normalizeLine] pads a short line and truncates a long one, and it used to be applied to every
+     * line in the buffer on every resize. Truncating the screen is right - the region a full-screen
+     * program addresses has to be exactly [columns] wide, or a redraw at the new width would leave
+     * the tail of the old one standing to the right of it. Truncating the history is data loss, and
+     * on a phone it is constant: turning the device to portrait cut every line of the session so far
+     * at the narrower width, and turning it back showed the wreckage rather than the output. What was
+     * lost was whatever sat past that column - the end of a path, of a URL, of a hash, of a table's
+     * last column - and it was lost from the copy buffer and the saved log too, because both read the
+     * same cells. Scrollback is finished text: no program will ever address it again, so its width is
+     * simply the width it was printed at, and every character of it survives a rotation.
+     *
+     * The screen is the *tail* of the list, so this has to run after the row count is settled.
+     */
+    private fun normalizeScreen(target: ArrayList<MutableList<TerminalCell>>) {
+        for (index in (target.size - rows).coerceAtLeast(0) until target.size) normalizeLine(target[index])
+    }
 
     private fun normalizeLine(line: MutableList<TerminalCell>) {
         while (line.size < columns) line += TerminalCell()

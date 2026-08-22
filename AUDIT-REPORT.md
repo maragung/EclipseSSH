@@ -1388,3 +1388,180 @@ rather than a `@Suppress`, so the next person sees the tension instead of a sile
 claiming it was considered. The pure function behind it, `terminalTextInset(Int, Int)`, takes plain dp
 integers and is indifferent to where they came from: if a future `minSdk` of 30 makes `containerSize`
 safe here, the change is the two lines at the call site and nothing else.
+
+## 17. The keyboard, the wrap, and a reconnect that fired for the wrong reason
+
+Three complaints, and each turned out to have a different cause than its symptom suggested: output that
+looked "cut in the middle of a hostname", `Reconnecting…` a few seconds after a successful login, and a
+keyboard that appeared to be connected to the terminal but was not.
+
+### 17.1 The resize was destroying history, not wrapping it
+
+`AnsiTerminalBuffer.resize(columns, rows)` re-shaped **every** line it held to the new width — the
+screen and the scrollback alike. Narrowing is therefore lossy, and narrowing happens constantly on a
+phone: rotating to portrait, opening the software keyboard, or simply connecting on a handset whose
+screen fits 46 columns while the session was printed at 120. Each time, every line already on screen
+was truncated to the new width and the characters past it were gone from the buffer — not visually
+clipped, but deleted. A 64-character hash printed at 120 columns became 45 characters of hash after the
+keyboard opened, and no amount of scrolling brought the rest back, because there was no rest.
+
+The rule the emulator now follows is the one a terminal actually follows: the **screen** is exactly as
+wide as the pty, because those are the cells the remote program addresses by column, and the **history
+above it is immutable**. It keeps every character it was printed with. `resize` re-shapes the last
+`rows` lines and leaves the rest alone, so what is off the right edge of a narrow screen is off the
+edge, not gone.
+
+Making history wider than the screen means the view has to be able to reach it, which is the other half
+of the fix:
+
+- `TerminalFrame.contentColumns` reports the widest **painted** line in the frame rather than the
+  terminal width — counting a coloured blank in a status bar as painted, ignoring the trailing spaces
+  of a short line, and always including the cursor's own cell, since the cell being typed into is blank
+  until the character lands and the view must be able to follow it there.
+- `TerminalGrid.atLeastColumns(n)` keeps the pty at a usable width on a narrow screen: the grid the
+  glyphs are drawn on is what fits, the number the pty is told is at least `n`, and the difference is
+  what the user pans across. A 46-column phone still runs `top` at 80 columns.
+- Panning follows the cursor off either edge and nowhere else, so typing a long command scrolls the view
+  with it, while a user who has deliberately panned away is not yanked back by the next keystroke.
+
+No characters are altered anywhere on this path. ANSI colour, spacing and indentation are properties of
+the cells, and re-shaping a line never rewrites one.
+
+### 17.2 A liveness check was marking outages as deliberate
+
+Section 14.2 added `endedDeliberately` to `TerminalChannel` for a real reason: closing a channel from
+this side ends it with no exit status at all, byte for byte what a dropped transport looks like, so
+without the flag the app's own teardown scheduled a reconnect to a host it had just decided to stop
+talking to. The flag was set in `close()`.
+
+Which made `close()` the wrong place for it, because `close()` is also what *bookkeeping* called.
+`SshSessionStore.liveSession()` prunes a session it finds dead on any liveness check — the notification
+refresh, the restore pass, the next connect — and it closed that session's channel through the same
+call the UI uses to close a tab. So a genuine outage that happened to be noticed by a background check
+first was retroactively relabelled as intentional, and the reconnect the user was waiting for never ran.
+The two failure modes are exact opposites, and one fix had introduced the other.
+
+`close()` is now intent and `discard()` is bookkeeping; both release the same resources, only `close()`
+marks the end deliberate. The pruner calls `discard()`.
+
+The same race had a second half in `MainViewModel`. Its session-closer guarded on
+`if (channels.remove(hostId, terminal))`, treating "the entry was not there" as proof the session had
+been replaced by a newer one. But the pruner removes that entry too, so on a real drop the pruner and
+the closer raced for it — and when the pruner won, the closer returned early and the tab that had just
+lost its connection was left reading **Connected**, with a dead session behind it and nothing scheduled
+to bring it back. Absent and replaced are now distinguished: `channels[hostId]` is read first, and the
+handler proceeds when the entry is missing or still its own.
+
+### 17.3 The keyboard was never given focus
+
+The most visible of the three and the simplest: focus was only ever requested from a tap on the terminal
+grid. Nothing focused the invisible IME host when a session became ready, and Compose routes key events
+only to the focused node — so after login the software keyboard stayed shut, a hardware keyboard's
+letters, Enter, Backspace and arrows all went nowhere, and the user had to know to tap the screen first.
+On a session with text selected it took two taps, because the first one dismissed the selection.
+
+The terminal now connects the keyboard to the shell as soon as there is a shell to type into, under
+rules that each correspond to a way this is got wrong: only when the tab reports `CONNECTED`, never over
+the command bar, search field or transcript view, and never re-*showing* an IME the user had dismissed
+to read output — focus is re-established freely, since it is invisible and nothing works without it, but
+the keyboard itself is offered once per session.
+
+Two things were also wrong with how it gave up, both fixed in this pass:
+
+- The retry budget was five frames — about 80 ms — which is a fair estimate of how long a first layout
+  takes and a poor budget for one. These are the frames of a cold start: the session was dialled,
+  authenticated and given a pty in the same breath, Room and DataStore are reading, and a full-screen
+  terminal is measuring a glyph. It is now 60 frames, about a second, still bounded so a screen where
+  focus genuinely cannot be taken stops asking rather than spinning for the life of the session.
+- The decision to show the IME sat at the end of that retry loop, so if the budget ran out before focus
+  arrived — and focus can arrive later, from the key row's own fallback or a tap — the app ended in the
+  worst of the two states: wired to the shell, so keystrokes worked, with no keyboard on screen to
+  produce any. Showing the IME is now its own effect keyed on the focus itself, and still offered once.
+
+Whether focus was actually *taken* is reported outwards by the field through `onFocusChanged` rather
+than inferred from the request having been made. Those are different facts — a `FocusRequester` cannot
+focus a node that has not been placed yet — and the difference is a terminal that silently swallows
+everything typed into it.
+
+### 17.4 What the tests now pin
+
+Twenty-eight tests, all against a real Apache MINA SSHD server in-process or against the emulator
+directly. No external host, no mocked channel.
+
+`TerminalSessionLifecycleRobolectricTest` (4) drives the actual UI:
+
+- The `"Terminal input"` node is asserted **focused** immediately after connecting, with no tap of any
+  kind, then `performTextInput` is asserted to arrive at the remote pty and the on-screen `ENTER` cap to
+  execute it. Focus is asserted rather than "the requester was called", because those two came apart in
+  exactly this bug.
+- Every cap on the key row is pressed and the bytes are asserted **at the server**: `ESC`, `TAB`, the
+  four arrows as CSI, `HOME`, `END`, `PGUP`/`PGDN` as `ESC[5~`/`ESC[6~`, `DEL` as `ESC[3~`, `BKSP` as
+  `0x7F`, `ENTER` as `0x0D`, and the `CTRL` latch plus a typed `c` as `0x03` — followed by a plain `c`
+  to prove the latch disarmed itself. Each cap must send *exactly* its bytes and leave focus on the
+  bridge, since a cap that steals the keyboard breaks the next thing typed.
+- A transport dropped from the server end, with no exit status and no `SSH_MSG_DISCONNECT`, must leave
+  the tab reporting something other than Connected. This is the regression test for 17.2.
+- Resizing four times, losing and regaining focus, leaving the terminal and coming back, and moving the
+  activity through `onStop`/`onStart` must all leave `shellsStarted` at **one**. Counted on the far side
+  of the wire: the app cannot reach a shell without a session, so one shell for the whole test means one
+  session however many times the UI was rebuilt around it — and the shell still answers at the end,
+  because a session that survived on paper but stopped carrying input would pass a count and fail a
+  user.
+
+`SessionStabilityTest` (3) covers the dial: two components dialling one host concurrently cost exactly
+one login and one shell (asserted by counting logins at the server's authenticator, since that is the
+only place a duplicate dial is provable); installing a second session keeps the one that already has a
+shell; and an idle session across four keep-alive periods stays live, keeps its channel, drops no output
+and answers a command afterwards.
+
+`AnsiTerminalBufferTest` (11) covers 17.1 — history surviving a narrowing, a selection copied out of
+narrowed history still being the whole line, `contentColumns` including the caret and a coloured blank —
+and the programs people actually run:
+
+- A program repainting in place 120 times, the way `top` and `htop` do, leaves ten rows and no
+  scrollback. The failure this guards is a leak, not a wrong character: a terminal that treats each
+  repainted row as new output fills its 2 000-line scrollback in half a minute and then holds two
+  thousand stale copies of one screen while the session's real history is gone.
+- An editor on the alternate screen — 1049 up, cursor hidden, a full paint with a reverse-video status
+  line, 1049 down — leaves the shell's scrollback *and* its cursor exactly as they were. Both halves
+  fail separately: painting onto the primary screen destroys the history, and restoring the lines but
+  not the cursor prints the next prompt over the last one.
+- A pager scrolling inside a `DECSTBM` region keeps its status line on the bottom row, forwards with
+  `ESC D` and backwards with `ESC M`.
+- A row rewritten with a shorter string keeps its tail unless the server erases to the end of the line.
+  That is the other way output gets "cut in the middle of a hash" with no wrapping bug in sight, and the
+  rule being pinned is that the emulator changes exactly the cells it was told to.
+
+`TerminalGeometryTest` (9) pins the geometry helpers, including a stored width beyond what a pty accepts
+being bounded rather than obeyed, an offset stranded past the end of a narrower frame, and unmeasured
+font metrics being unable to make the pan a `NaN`.
+
+`AutoReconnectDecisionTest` (1) pins the one case a status cannot distinguish: a close the app asked for
+is never reconnected even though it looks exactly like a drop.
+
+One pre-existing assertion was narrowed rather than deleted. `writing after a shrink stays inside the
+buffer` required *every* line in the buffer to be exactly the new width — which is the data-losing
+contract of 17.1 written down as a test. It now requires it of the screen, which is where it is true,
+with a comment pointing at the test that pins what happens to the history. Nothing else in the suite was
+touched.
+
+### 17.5 Verification
+
+| Check | Result |
+| --- | --- |
+| `testDebugUnitTest` | 641 tests, 53 classes, 0 failures |
+| `testReleaseUnitTest` | 641 tests, 53 classes, 0 failures |
+| `lintRelease` | 0 errors, 4 warnings — all four the `ConfigurationScreenWidthHeight` advisory declined in §16, on the same two lines |
+| Release APK | built and signed by CI, as since §16 |
+
+Run on two pinned cores under `nice`, offline, with the daemon disabled — which is also why the 47
+dependency-freshness advisories §16 describes do not appear in the local report: lint discovers newer
+versions over the network and has nothing to compare against here.
+
+The programs in the brief — `top`, `htop`, `vim`, `nano`, `less` — are tested as the byte streams they
+send, not as binaries, because no emulator on this host can run an Android device (no KVM) and the
+scripted shell is a test double rather than a login shell. What is asserted is the emulator's response to
+the exact sequences those programs use: in-place repaint, the alternate screen with a hidden cursor,
+`DECSTBM` with `ESC D` and `ESC M`, `DECCKM` arrows, 256-colour and true-colour SGR, and rewriting a row
+without an erase. The 10-minute idle case is likewise tested as four keep-alive periods against a server
+that counts the keep-alives it received, rather than by waiting ten minutes.

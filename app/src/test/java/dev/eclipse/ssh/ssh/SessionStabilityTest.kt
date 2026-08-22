@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -109,6 +110,16 @@ class SessionStabilityTest {
         /** Counts `keepalive@openssh.com` arriving at the server, and answers them as any server does. */
         private val keepalives = CountingKeepaliveHandler()
 
+        /**
+         * Successful password authentications the server has performed.
+         *
+         * The duplicate-dial bug was only ever provable here. The client end of it looks like a
+         * working session - two sessions to one account are both open and both authenticated - and
+         * what gave it away in the field was two lines in the server's auth log for one tap on
+         * Connect.
+         */
+        private val logins = AtomicInteger()
+
         @JvmStatic
         @BeforeClass
         fun startServer() {
@@ -117,7 +128,9 @@ class SessionStabilityTest {
             server.port = 0
             server.keyPairProvider = SimpleGeneratorHostKeyProvider(root.resolve("hostkey.ser"))
             server.passwordAuthenticator = PasswordAuthenticator { username, password, _ ->
-                username == USER && password == PASSWORD
+                val ok = username == USER && password == PASSWORD
+                if (ok) logins.incrementAndGet()
+                ok
             }
             server.shellFactory = ShellFactory { RecordingShell().also(shells::add) }
             server.globalRequestHandlers =
@@ -407,7 +420,7 @@ class SessionStabilityTest {
                 terminal.writeBytes(byteArrayOf(CTRL_D))
                 val status = withTimeoutOrNull(WAIT_MS) { terminal.awaitClosed() }
                 assertThat(status).isEqualTo(0)
-                assertThat(shouldAutoReconnect(status, tabIsOpen = true)).isFalse()
+                assertThat(shouldAutoReconnect(status, tabIsOpen = true, endedDeliberately = false)).isFalse()
             }
         } finally {
             manager.close()
@@ -457,7 +470,10 @@ class SessionStabilityTest {
             // fresh one instead of adopting a corpse, and the tab asks for a reconnect.
             assertThat(store.isLive(profile.id)).isFalse()
             assertThat(store.liveHostIds()).isEmpty()
-            assertThat(shouldAutoReconnect(status, tabIsOpen = true)).isTrue()
+            assertThat(shouldAutoReconnect(status, tabIsOpen = true, endedDeliberately = terminal.endedDeliberately)).isTrue()
+            // Nothing on this side asked for it, so the flag that suppresses a reconnect is clear -
+            // the transport really did die, and this is the case that must still come back.
+            assertThat(terminal.endedDeliberately).isFalse()
         } finally {
             runCatching { store.closeAll() }
             manager.close()
@@ -498,6 +514,163 @@ class SessionStabilityTest {
             assertThat(store.buffers).containsKey(profile.id)
             store.forget(profile.id)
             assertThat(store.buffers).doesNotContainKey(profile.id)
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * Two components dialling the same host at once cost one login and leave one session.
+     *
+     * This is the regression test for the app's most visible connection bug: a tab that said
+     * *Reconnecting…* a few seconds after a successful login. Tapping Connect authenticates in the
+     * view model and starts the foreground service, whose restore pass asks the registry which hosts
+     * are active, finds one the UI has not finished installing, and dials a second session to the
+     * same account. Both completed, the later one's `put` closed the earlier one's *live* session,
+     * and the surviving shell saw its transport close and reported a drop - which started the
+     * reconnect ladder, which dialled again.
+     *
+     * Both halves are asserted because either alone would still pass with the bug present: one login
+     * (the gate serialised the attempts) *and* one session that is still the one with the open shell
+     * (the loser adopted rather than replacing it).
+     */
+    @Test
+    fun `two components dialling one host at the same time cost one login and one session`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        val profile = hostProfile()
+        // First contact is what the app's own connect path does: trust the key once, then dial.
+        trustedConnect(manager, profile).close(false)
+        try {
+            val loginsBefore = logins.get()
+            val shellsBefore = shells.size
+
+            // Exactly the app's dial path, as MainViewModel and EclipseSessionService both run it.
+            suspend fun dialOrAdopt(): ClientSession = store.dialing(profile.id) {
+                store.adoptable(profile.id)?.first ?: run {
+                    val dialled = manager.connect(profile, PASSWORD, null)
+                    val installed = store.install(profile.id, dialled)
+                    if (installed === dialled) store.channels[profile.id] = manager.openTerminal(dialled)
+                    installed
+                }
+            }
+
+            val (fromUi, fromService) = coroutineScope {
+                val ui = async(Dispatchers.IO) { dialOrAdopt() }
+                val service = async(Dispatchers.IO) { dialOrAdopt() }
+                ui.await() to service.await()
+            }
+
+            assertThat(fromUi).isSameInstanceAs(fromService)
+            assertThat(logins.get() - loginsBefore).isEqualTo(1)
+            assertThat(shells.size - shellsBefore).isEqualTo(1)
+            // And what the second caller was handed is the working session, not a corpse.
+            assertThat(fromService.isOpen).isTrue()
+            assertThat(fromService.isAuthenticated).isTrue()
+            assertThat(store.adoptableHostIds()).containsExactly(profile.id)
+            val channel = store.channels.getValue(profile.id)
+            assertThat(channel.isOpen).isTrue()
+            // The shell still answers, which is the user-visible claim: nothing was reconnected.
+            val shell = shells.last()
+            channel.write("echo alive\r")
+            assertThat(awaitTrue { shell.received().isNotEmpty() }).isTrue()
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * A redundant session loses to the live one, and takes nothing of the live one's with it.
+     *
+     * `sessions.put` closed whatever it displaced, so a late-arriving duplicate dial closed the
+     * session the user was typing into and the tab went to *Reconnecting…*. The channel matters as
+     * much as the session: dropping it from the registry would leave the host un-adoptable and the
+     * next UI would dial all over again.
+     */
+    @Test
+    fun `installing a second session keeps the one that already has a shell`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        val profile = hostProfile()
+        try {
+            val live = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(live)
+            val shell = awaitShell(started)
+            assertThat(store.install(profile.id, live)).isSameInstanceAs(live)
+            store.channels[profile.id] = terminal
+
+            val redundant = trustedConnect(manager, profile)
+            assertThat(store.install(profile.id, redundant)).isSameInstanceAs(live)
+
+            // The newcomer is the one that closes.
+            assertThat(awaitTrue { !redundant.isOpen }).isTrue()
+            // The incumbent, its shell and its registry entry are all untouched.
+            assertThat(live.isOpen).isTrue()
+            assertThat(live.isAuthenticated).isTrue()
+            assertThat(terminal.isOpen).isTrue()
+            assertThat(terminal.endedDeliberately).isFalse()
+            assertThat(store.channels[profile.id]).isSameInstanceAs(terminal)
+            terminal.write("still here\r")
+            assertThat(awaitTrue { shell.received().isNotEmpty() }).isTrue()
+
+            // Installing the same instance twice is what a restore pass does; it must be a no-op and
+            // must not close the session it was asked to keep.
+            assertThat(store.install(profile.id, live)).isSameInstanceAs(live)
+            assertThat(live.isOpen).isTrue()
+            assertThat(terminal.isOpen).isTrue()
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * A session nobody types into stays Connected across several heartbeat periods.
+     *
+     * The complaint this answers is "*Reconnecting…* appears seconds after login on an idle tab".
+     * Silence is the normal state of a shell at a prompt, so no part of the app is allowed to read it
+     * as a fault: the transport stays open, the shell stays open, no exit status is produced, and the
+     * reconnect predicate says no. [`the client really sends answerable keepalives`] proves the
+     * heartbeat exists; this proves the heartbeat is the *only* thing that happens while idle.
+     */
+    @Test
+    fun `an idle session is not a broken one`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        val profile = hostProfile(keepAlive = HEARTBEAT_SECONDS)
+        try {
+            val keepalivesBefore = keepalives.count()
+            val session = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(session)
+            awaitShell(started)
+            store.install(profile.id, session)
+            store.channels[profile.id] = terminal
+            val (sink, collector) = collectText(terminal)
+            try {
+                // Not one byte typed for several heartbeat periods - the app's shortest keep-alive, so
+                // this covers the same ground as a ten-minute idle at the default of 60s.
+                val idleFor = HEARTBEAT_SECONDS * 1_000L * 4
+                assertThat(awaitTrue(idleFor + WAIT_MS) { keepalives.count() - keepalivesBefore >= 3 }).isTrue()
+
+                assertThat(session.isOpen).isTrue()
+                assertThat(session.isAuthenticated).isTrue()
+                assertThat(terminal.isOpen).isTrue()
+                assertThat(store.isLive(profile.id)).isTrue()
+                assertThat(store.adoptableHostIds()).containsExactly(profile.id)
+                // No exit status, because nothing ended: awaitClosed is still waiting.
+                assertThat(withTimeoutOrNull(200) { terminal.awaitClosed() }).isNull()
+                assertThat(terminal.droppedChunks).isEqualTo(0L)
+                // And the shell is still there to prove it, after all that silence.
+                synchronized(sink) { sink.setLength(0) }
+                terminal.write("awake\r")
+                assertThat(awaitText(sink) { it.contains("awake") }).contains("awake")
+            } finally {
+                collector.cancel()
+            }
         } finally {
             store.closeAll()
             manager.close()

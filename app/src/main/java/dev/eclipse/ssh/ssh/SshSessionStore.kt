@@ -4,6 +4,8 @@ import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.apache.sshd.client.session.ClientSession
 
 /**
@@ -22,7 +24,10 @@ import org.apache.sshd.client.session.ClientSession
  *
  * Ownership rules, so that "one session per host" is a property of the app rather than a coincidence:
  *
- *  - whoever dials puts the session here, keyed by host id, and closes any session it replaces;
+ *  - whoever is about to dial holds that host's [dialing] gate for the whole attempt, so there is
+ *    never a second dial in flight to the same account;
+ *  - whoever dials [install]s the result, which keeps a live incumbent and closes the newcomer
+ *    instead of the other way round;
  *  - whoever is about to dial asks [isLive] first and adopts what it finds instead;
  *  - a session is closed when the user closes the tab or stops sessions from the notification, not
  *    when a component that happened to open it goes away. An `Activity` being finished is not a
@@ -53,6 +58,80 @@ class SshSessionStore @Inject constructor() {
     val buffers = ConcurrentHashMap<String, AnsiTerminalBuffer>()
 
     /**
+     * One dial at a time per host. See [dialing].
+     *
+     * Never removed. A [Mutex] with nothing waiting on it is two fields and no thread, hosts are
+     * counted in tens, and pruning one would need the very lock it is pruning to stay correct.
+     */
+    private val dialGates = ConcurrentHashMap<String, Mutex>()
+
+    /**
+     * Runs [attempt] as the only dial in flight for [hostId].
+     *
+     * This is the fix for the app's most visible connection bug: a tab that said *Reconnecting…* a
+     * few seconds after a successful login, with two authentications in the server's log for one tap.
+     *
+     * Checking [isLive] before dialling is not enough on its own, because the check and the dial are
+     * not atomic and the window between them is a whole SSH handshake. Tapping Connect starts the
+     * foreground service, whose restore pass asks which hosts are active and finds one the UI is
+     * still authenticating - `isLive` is false, because the UI has not put its session in the store
+     * yet - so it dials a second session to the same account. Both then complete, and whichever
+     * finishes last used to close the other's *live* session. The survivor's shell saw its transport
+     * close, reported it as a drop, and the reconnect ladder started; the reconnect dialled again,
+     * and the loop sustained itself.
+     *
+     * Serialising per host closes the window: the second dialler waits, and by the time it holds the
+     * gate the first has installed its session, so its own [isLive] check inside the gate answers
+     * truthfully and it adopts instead of dialling. Per host rather than global so connecting to one
+     * server is never delayed by a handshake with another. Cancellation-safe - a cancelled attempt
+     * releases the gate - and re-entrancy is not required: no dial path takes this gate twice.
+     */
+    suspend fun <T> dialing(hostId: String, attempt: suspend () -> T): T =
+        dialGates.computeIfAbsent(hostId) { Mutex() }.withLock { attempt() }
+
+    /**
+     * Publishes [session] as the session for [hostId] without ever closing a live one.
+     *
+     * Returns the session the app is now using, which is *not* always the one passed in: if a live
+     * session is already installed, the newcomer is the redundant one and it is closed. `put` did the
+     * opposite - it closed whatever it replaced, which on the duplicate-dial path above meant closing
+     * the session the user was typing into.
+     *
+     * A dead incumbent is replaced, along with its channel: the shell on a closed transport cannot be
+     * reused, and leaving it in the map would let [adoptableHostIds] offer it to the next UI.
+     */
+    fun install(hostId: String, session: ClientSession): ClientSession {
+        val incumbent = liveSession(hostId)
+        if (incumbent != null && incumbent !== session) {
+            runCatching { session.close(false) }
+            return incumbent
+        }
+        sessions.put(hostId, session)?.let { previous ->
+            if (previous !== session) {
+                channels.remove(hostId)?.let { channel ->
+                    channel.markDeliberate()
+                    runCatching { channel.close() }
+                }
+                runCatching { previous.close(false) }
+            }
+        }
+        return session
+    }
+
+    /**
+     * The live session and open shell for [hostId], for a caller that would otherwise dial one.
+     *
+     * Both halves or nothing: a session whose pty has gone has nothing to attach a terminal to, and
+     * answering with it would produce a tab that shows CONNECTED and never prints anything.
+     */
+    fun adoptable(hostId: String): Pair<ClientSession, TerminalChannel>? {
+        val session = liveSession(hostId) ?: return null
+        val channel = channels[hostId] ?: return null
+        if (!channel.isOpen) return null
+        return session to channel
+    }
+
+    /**
      * The session for [hostId] if it is still usable, dropping it if it is not.
      *
      * Both conditions are checked because both have been wrong in practice. A session whose peer went
@@ -65,7 +144,10 @@ class SshSessionStore @Inject constructor() {
         val session = sessions[hostId] ?: return null
         if (session.isOpen && session.isAuthenticated) return session
         sessions.remove(hostId, session)
-        channels.remove(hostId)?.let { channel -> runCatching { channel.close() } }
+        // discard, not close: this is bookkeeping about a session that has already died, and saying the
+        // app meant it to end would suppress the reconnect the user is waiting for. See
+        // [TerminalChannel.discard].
+        channels.remove(hostId)?.let { channel -> runCatching { channel.discard() } }
         return null
     }
 
@@ -91,7 +173,13 @@ class SshSessionStore @Inject constructor() {
      * MINA sends `SSH_MSG_DISCONNECT` and lets the server tidy up.
      */
     fun close(hostId: String) {
-        channels.remove(hostId)?.let { channel -> runCatching { channel.close() } }
+        channels.remove(hostId)?.let { channel ->
+            // Marked before either close, so the shell's own close listener - which may run on a MINA
+            // thread while this call is still in flight - reports the app's decision rather than an
+            // outage, and nothing schedules a reconnect to a session the user asked to end.
+            channel.markDeliberate()
+            runCatching { channel.close() }
+        }
         sessions.remove(hostId)?.let { session -> runCatching { session.close(false) } }
     }
 

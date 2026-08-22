@@ -121,6 +121,13 @@ class EclipseSessionService : LifecycleService() {
                 stopSelf()
             }
             ACTION_REFRESH, ACTION_RESTORE -> serviceScope.launch { restoreSessions("Manual reconnect") }
+            // "Keep running, the UI has a session now." Deliberately does nothing else: the UI dials
+            // its own session and puts it in the shared store, so a restore pass here would only be a
+            // second dialler racing it. That is what tapping Connect used to launch — the intent
+            // carried no action, and a null action means the process was killed and restarted (see
+            // below), so every single Connect tap ran a full restore pass alongside the UI's own
+            // handshake. The dial gate makes that harmless now, and this makes it not happen.
+            ACTION_TRACK -> Unit
             // A null intent means START_STICKY re-created the service after the process was
             // killed, so the sessions genuinely need restoring rather than a text refresh
             // that would overwrite the live reconnect status.
@@ -154,28 +161,19 @@ class EclipseSessionService : LifecycleService() {
             val pending = hostsNeedingRestore(hosts, activeIds) { sessionStore.isLive(it) }
             var connected = 0
             pending.forEach { host ->
-                val password = sessionRegistry.credential(host.id)
-                val keyPair = sessionRegistry.keyBytes(host.id)?.let { bytes -> runCatching { SshKeyLoader.load(bytes, "${host.username}-key", sessionRegistry.keyPassphrase(host.id)) }.getOrNull() }
-                val session = try {
-                    sshConnectionManager.connect(host, password, keyPair)
-                } catch (cancelled: CancellationException) {
-                    // The service is going away. Without this the cancellation was swallowed into a
-                    // null session and the loop went on to dial every remaining host on an already
-                    // dead context — pointless work during shutdown, and it hid the one condition
-                    // that should stop the pass immediately.
-                    throw cancelled
-                } catch (_: Throwable) {
-                    // Any other failure is this host's problem alone: unreachable, refused, wrong
-                    // credentials. The rest of the pass still gets its turn, and the backoff below
-                    // decides when to come back.
-                    null
+                // Under the host's dial gate, which is the other half of the fix for a session that
+                // said *Reconnecting…* seconds after login. `pending` was computed from an `isLive`
+                // check that cannot see a handshake the UI has started and not yet finished, and
+                // tapping Connect is what starts this service — so this pass would dial a second
+                // session to the account the user had just logged into, and collapsing the pair
+                // closed the live one. Holding the gate means the UI's attempt is either finished
+                // (and found by the re-check below) or has not started, never half-done.
+                val session = sessionStore.dialing(host.id) {
+                    // The re-check is the point of the gate: whatever appeared while this host waited
+                    // its turn is a session to adopt, not one to duplicate.
+                    sessionStore.liveSession(host.id) ?: dial(host)
                 }
                 if (session != null) {
-                    // Into the shared store, so the UI adopts this session instead of dialling its own
-                    // when it comes back — which is what makes a session survive process death.
-                    sessionStore.sessions.put(host.id, session)?.let { previous ->
-                        if (previous !== session) runCatching { previous.close(false) }
-                    }
                     connected++
                     val resumed = runCatching { transferRestorer.resumeForHost(host.id, session) }.getOrDefault(0)
                     if (resumed > 0) updateNotification("Resuming $resumed transfer(s) for ${host.name}")
@@ -203,6 +201,33 @@ class EclipseSessionService : LifecycleService() {
                 return@withLock
             }
         }
+    }
+
+    /**
+     * One dial to [host] with the credentials the registry kept for it, or null if it failed.
+     *
+     * The session is [installed][SshSessionStore.install] rather than `put`, so a live session this
+     * pass did not know about is kept and *this* one is closed — the opposite of `put`, which closed
+     * whatever it replaced and so could close the shell the user was typing into. Into the shared
+     * store either way, so the UI adopts the session instead of dialling its own when it comes back,
+     * which is what makes a session survive process death.
+     */
+    private suspend fun dial(host: HostProfile) = try {
+        sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)))
+    } catch (cancelled: CancellationException) {
+        // The service is going away. Without this the cancellation was swallowed into a null session
+        // and the loop went on to dial every remaining host on an already dead context — pointless
+        // work during shutdown, and it hid the one condition that should stop the pass immediately.
+        throw cancelled
+    } catch (_: Throwable) {
+        // Any other failure is this host's problem alone: unreachable, refused, wrong credentials. The
+        // rest of the pass still gets its turn, and the backoff decides when to come back.
+        null
+    }
+
+    /** The saved private key for [host] as a usable pair, or null when there is none or it is unreadable. */
+    private suspend fun keyPairFor(host: HostProfile) = sessionRegistry.keyBytes(host.id)?.let { bytes ->
+        runCatching { SshKeyLoader.load(bytes, "${host.username}-key", sessionRegistry.keyPassphrase(host.id)) }.getOrNull()
     }
 
     /**
@@ -312,6 +337,12 @@ class EclipseSessionService : LifecycleService() {
 
     companion object {
         const val ACTION_STOP = "dev.eclipse.ssh.action.STOP"
+
+        /**
+         * Sent by the UI when it has just connected a session of its own: start the service (or keep
+         * it alive) without asking it to restore anything. See the `when` in [onStartCommand].
+         */
+        const val ACTION_TRACK = "dev.eclipse.ssh.action.TRACK"
         const val ACTION_REFRESH = "dev.eclipse.ssh.action.REFRESH"
         const val ACTION_RESTORE = "dev.eclipse.ssh.action.RESTORE"
 

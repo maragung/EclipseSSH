@@ -130,6 +130,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -662,7 +663,15 @@ private fun EclipseWorkspace(
         // from the app crashing on connect. Nothing about the session depends on the service; only
         // surviving minimise does, so the honest outcome is to say so and go to the terminal anyway.
         runCatching {
-            ContextCompat.startForegroundService(context, Intent(context, EclipseSessionService::class.java))
+            ContextCompat.startForegroundService(
+                context,
+                // With an action, because an actionless intent is how the platform reports "your
+                // process was killed and I restarted the service", and the service answers that by
+                // restoring every registered session. Tapping Connect is not that: the UI is dialling
+                // this host itself, right now, and a restore pass alongside it was a second dialler
+                // racing the first. See [EclipseSessionService.ACTION_TRACK].
+                Intent(context, EclipseSessionService::class.java).setAction(EclipseSessionService.ACTION_TRACK),
+            )
         }.onFailure { viewModel.reportUiFailure("Sessions will not survive minimising", it) }
         // Straight into the shell, full screen: the list of sessions is somewhere to come back to, not
         // somewhere to pass through on the way in.
@@ -970,6 +979,7 @@ private fun EclipseWorkspace(
                     onReconnectBase = viewModel::setReconnectBaseSeconds,
                     onClipboard = viewModel::setClipboardSeconds,
                     onTerminalFontSize = viewModel::setTerminalFontSize,
+                    onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onTerminalTheme = viewModel::setTerminalTheme,
@@ -1115,6 +1125,7 @@ private fun EclipseWorkspace(
                     onReconnectBase = viewModel::setReconnectBaseSeconds,
                     onClipboard = viewModel::setClipboardSeconds,
                     onTerminalFontSize = viewModel::setTerminalFontSize,
+                    onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onTerminalTheme = viewModel::setTerminalTheme,
@@ -1448,6 +1459,7 @@ private fun WorkspaceScaffold(
     onReconnectBase: (Int) -> Unit = {},
     onClipboard: (Int) -> Unit = {},
     onTerminalFontSize: (Int) -> Unit = {},
+    onTerminalMinColumns: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
@@ -1557,6 +1569,7 @@ private fun WorkspaceScaffold(
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
                     onImportVault, onKeepAlive, onClipboard, onTerminalFontSize,
+                    onTerminalMinColumns = onTerminalMinColumns,
                     onReconnectBase = onReconnectBase,
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
@@ -1809,9 +1822,84 @@ private fun TerminalScreen(
     val textInset = remember(configuration.screenWidthDp, configuration.screenHeightDp) {
         terminalTextInset(configuration.screenWidthDp, configuration.screenHeightDp)
     }
+    /**
+     * Whether the invisible IME host actually holds focus, reported by the field itself.
+     *
+     * Observed rather than assumed because a focus *request* can fail - the node has to be attached
+     * and placed before it can take focus, and on the first composition of this screen it is neither -
+     * and a failed request is indistinguishable, from the outside, from a terminal that swallows every
+     * keystroke.
+     */
+    var inputFocused by remember { mutableStateOf(false) }
     val showKeyboard = {
-        focusRequester.requestFocus()
+        runCatching { focusRequester.requestFocus() }
         keyboard?.show()
+    }
+    /**
+     * Tabs whose keyboard has already been offered, so it is offered once and not fought over.
+     *
+     * A plain [remember] set, not state: it is read inside an effect and never drives a recomposition.
+     * Keyed on the tab rather than the host so a reconnect on the same tab does not reopen a keyboard
+     * the user had put away, while a new session gets one.
+     */
+    val keyboardOffered = remember { mutableSetOf<String>() }
+    /**
+     * Connects the keyboard to the shell as soon as the shell exists.
+     *
+     * This is the difference between a terminal and a picture of one. Focus was only ever requested
+     * from a tap on the grid, so after logging in the app sat with an unfocused IME host: the software
+     * keyboard stayed shut, and - because [onPreviewKeyEvent] only sees events routed to the focused
+     * node - a hardware keyboard's letters, Enter, Backspace and arrows all went nowhere. The user had
+     * to know to tap the screen first, and tapping is also what dismisses a selection, so on a session
+     * with anything selected it took two.
+     *
+     * The rules it follows, each of which is a way this can be got wrong:
+     *
+     *  - **Only when there is a shell to type into.** Gated on [SessionConnectionState.CONNECTED], so
+     *    a keyboard does not open over a failed connection or in front of a handshake.
+     *  - **Retried until it takes.** A [FocusRequester] cannot focus a node that has not been placed,
+     *    and on the frame this screen first composes it has not been; requesting once and hoping was
+     *    the version that worked on a fast device and failed on a slow one. It asks again on each of
+     *    the next few frames and stops as soon as the field reports focus.
+     *  - **The keyboard is offered once per session.** Focus is re-established freely - it is
+     *    invisible, and without it nothing works - but the IME is only *shown* the first time, so a
+     *    user who put the keyboard away to read output does not have it thrown back at them by a
+     *    reconnect, a resize, or a rotation.
+     *  - **Never over another field.** The command bar, the search box and the transcript view all own
+     *    the keyboard while they are open, and stealing focus from the search box mid-query would make
+     *    it impossible to type in.
+     */
+    LaunchedEffect(activeTab.id, activeTab.state, showCommandBar, showSearch, showHistory) {
+        if (activeTab.state != SessionConnectionState.CONNECTED) return@LaunchedEffect
+        if (showCommandBar || showSearch || showHistory) return@LaunchedEffect
+        var attempts = 0
+        while (!inputFocused && attempts < TERMINAL_FOCUS_ATTEMPTS) {
+            // One frame per attempt: the bridge is composed in the same pass as this effect, so the
+            // first thing to wait for is the layout that places it.
+            withFrameNanos { }
+            runCatching { focusRequester.requestFocus() }
+            attempts++
+        }
+    }
+    /**
+     * Offers the software keyboard once the field can actually receive it, and only once per session.
+     *
+     * Separate from the effect above, and keyed on the focus itself, because the two questions have
+     * different answers at different times. Showing the IME is only meaningful once something holds
+     * focus - `show()` against an unfocused window does nothing at all - and focus does not always
+     * arrive inside the retry budget: it can be taken a moment later by the key row's own fallback, by
+     * a tap, or by a layout that finally settled. Deciding at the end of the retry loop meant that
+     * whenever the budget ran out first, the app ended up in the worst of the two states - a terminal
+     * wired to the shell, so keystrokes worked, with no keyboard on screen to produce any, and the user
+     * tapping to find out why.
+     *
+     * [keyboardOffered] still holds it to one offer per tab, so a keyboard the user dismissed to read
+     * output is not thrown back at them by the next reconnect, resize or rotation.
+     */
+    LaunchedEffect(activeTab.id, activeTab.state, inputFocused, showCommandBar, showSearch, showHistory) {
+        if (activeTab.state != SessionConnectionState.CONNECTED) return@LaunchedEffect
+        if (showCommandBar || showSearch || showHistory) return@LaunchedEffect
+        if (inputFocused && keyboardOffered.add(activeTab.id)) keyboard?.show()
     }
 
     // Painted to the edges of the screen, laid out inside them.
@@ -1882,6 +1970,7 @@ private fun TerminalScreen(
                     foreground = termFg,
                     metrics = metrics,
                     modifier = Modifier.fillMaxSize().padding(textInset),
+                    minColumns = state.settings.terminalMinColumns,
                     selection = selection,
                     onSelectionChange = { selection = it },
                     onSelectionFinished = { finished ->
@@ -1902,7 +1991,10 @@ private fun TerminalScreen(
                     onLongPressCell = { line, column ->
                         val text = state.terminalLine(activeTab.hostId, line)
                         selection = TerminalSelection.wordAt(line, column, text)
-                            ?: TerminalSelection.wholeLine(line, frame.columns)
+                            // The line's own length, not the grid's: scrollback printed at a wider
+                            // terminal keeps every character, and a whole-line selection that stopped
+                            // at the current width would copy a truncated line.
+                            ?: TerminalSelection.wholeLine(line, maxOf(frame.columns, text.length))
                         selection?.let { onCopySelection(activeTab.hostId, it) }
                     },
                 )
@@ -1919,7 +2011,14 @@ private fun TerminalScreen(
         }
         TerminalKeyRow(
             latches = latches,
-            onKey = { key, ctrl, alt, shift -> onSendKey(activeTab.hostId, key, ctrl, alt, shift) },
+            onKey = { key, ctrl, alt, shift ->
+                onSendKey(activeTab.hostId, key, ctrl, alt, shift)
+                // Every cap is a clickable surface, and a clickable surface is focusable: a tap can
+                // leave the IME host unfocused, after which the software keyboard's characters and a
+                // hardware keyboard's keys both have nowhere to go while the row itself still works.
+                // A no-op when the field already has focus, which is the usual case.
+                if (!inputFocused) runCatching { focusRequester.requestFocus() }
+            },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
         )
         if (showCommandBar) {
@@ -1946,6 +2045,7 @@ private fun TerminalScreen(
             onText = { text -> onSendText(activeTab.hostId, text) },
             onKey = { key, ctrl, alt, shift -> onSendKey(activeTab.hostId, key, ctrl, alt, shift) },
             onChar = { char, ctrl, alt -> onSendChar(activeTab.hostId, char, ctrl, alt) },
+            onFocusChanged = { focused -> inputFocused = focused },
         )
     }
 
@@ -1980,6 +2080,26 @@ private fun TerminalScreen(
  * non-blank line and is bounded work per row however long the session has been open.
  */
 private const val SESSION_PREVIEW_SCAN_CHARS = 1_000
+
+/**
+ * How many frames the terminal spends trying to put focus on its IME host before giving up.
+ *
+ * A focus request can only land on a node that is attached *and placed*, and on the frame the terminal
+ * first composes its one-pixel input field is neither - so a single request is lost on any device slow
+ * enough to need a second frame for the first layout, and the user is left with a shell that ignores
+ * the keyboard.
+ *
+ * Sixty frames is about a second at 60Hz. It was five - 80ms - which is a fair estimate of how long a
+ * first layout takes and a poor budget for one, because the frames this competes with are the frames
+ * of a cold start: the session was dialled, authenticated and given a pty in the same breath, Room and
+ * DataStore are reading, and the first composition of a full-screen terminal is measuring a glyph. On a
+ * slow device the field can easily still be unplaced after five of those, and the cost of guessing low
+ * is the exact complaint this exists to answer. A focus request that finds nothing to focus is cheap;
+ * asking sixty times over a second is not something a user can perceive, and it is still bounded, so a
+ * screen where focus genuinely cannot be taken - something else holding it, a harness with no window -
+ * stops asking rather than spinning for the life of the session.
+ */
+private const val TERMINAL_FOCUS_ATTEMPTS = 60
 
 /**
  * The Terminal destination with no shell open: every live session, as a list.
@@ -3266,6 +3386,7 @@ private fun SettingsScreen(
     onKeepAlive: (Int) -> Unit,
     onClipboard: (Int) -> Unit,
     onTerminalFontSize: (Int) -> Unit,
+    onTerminalMinColumns: (Int) -> Unit = {},
     // After the last parameter its only caller passes positionally, so adding it did not shift
     // onTerminalFontSize onto a different slot.
     onReconnectBase: (Int) -> Unit = {},
@@ -3286,6 +3407,7 @@ private fun SettingsScreen(
     var showClipboardDialog by remember { mutableStateOf(false) }
     var showReconnectDialog by remember { mutableStateOf(false) }
     var showFontDialog by remember { mutableStateOf(false) }
+    var showWidthDialog by remember { mutableStateOf(false) }
     var showPinDialog by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
@@ -3342,6 +3464,15 @@ private fun SettingsScreen(
         SettingRow(Icons.Default.Wifi, "Keep-alive interval", "Every ${state.settings.keepAliveSeconds} seconds") { TextButton(onClick = { showKeepAliveDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Clipboard auto-clear", if (state.settings.clearClipboardAfterSeconds == 0) "Never clear copied secrets automatically" else "Clear secrets after ${state.settings.clearClipboardAfterSeconds} seconds") { TextButton(onClick = { showClipboardDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Terminal, "Terminal font size", "${state.settings.terminalFontSize} sp monospace") { TextButton(onClick = { showFontDialog = true }) { Text("Change") } }
+        SettingRow(
+            Icons.Default.Terminal,
+            "Terminal width",
+            if (state.settings.terminalMinColumns <= 0) {
+                "Exactly what fits on screen, so the server wraps long lines"
+            } else {
+                "At least ${state.settings.terminalMinColumns} columns; drag sideways for the rest"
+            },
+        ) { TextButton(onClick = { showWidthDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Terminal, "Terminal theme", "Colours the grid and its background") {
             SettingDropdown(
                 label = "Terminal theme",
@@ -3433,6 +3564,13 @@ private fun SettingsScreen(
             onConfirm = { onTerminalFontSize(it); showFontDialog = false },
         )
     }
+    if (showWidthDialog) {
+        TerminalWidthDialog(
+            current = state.settings.terminalMinColumns,
+            onDismiss = { showWidthDialog = false },
+            onConfirm = { onTerminalMinColumns(it); showWidthDialog = false },
+        )
+    }
     if (showPinDialog) {
         PinDialog(
             enabled = state.settings.pinEnabled,
@@ -3507,6 +3645,43 @@ private fun IntervalDialog(title: String, subtitle: String, current: Int, option
                             selected = selected == option,
                             onClick = { selected = option },
                             label = { Text(if (option == 0) "Off" else "$option s") },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Picks the narrowest grid the pty may be given. See [dev.eclipse.ssh.data.model.AppSettings.terminalMinColumns].
+ *
+ * Its own dialog rather than an [IntervalDialog], only because that one labels every chip in seconds.
+ * The choices come from the repository that clamps them, so a chip cannot offer a width that would be
+ * stored as a different number.
+ */
+@Composable
+private fun TerminalWidthDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+    var selected by remember { mutableIntStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Terminal width") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "80 columns is what command-line output is formatted for. Ask for fewer than the " +
+                        "server needs and it breaks paths, URLs and tables itself, which nothing here " +
+                        "can undo; ask for more than the screen fits and the grid pans sideways.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                    SettingsRepository.TERMINAL_MIN_COLUMN_CHOICES.forEach { option ->
+                        FilterChip(
+                            selected = selected == option,
+                            onClick = { selected = option },
+                            label = { Text(if (option == 0) "Fit screen" else "$option cols") },
                         )
                     }
                 }

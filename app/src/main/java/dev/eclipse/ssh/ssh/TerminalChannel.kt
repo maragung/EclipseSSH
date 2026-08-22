@@ -5,6 +5,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.Charset
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
 import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
@@ -114,6 +115,42 @@ class TerminalChannel(
         closed.complete(channel.exitStatus)
     }
 
+    /**
+     * Set before the app closes this shell, or the session under it, on purpose.
+     *
+     * Without it a deliberate close is indistinguishable from a dropped link, and the difference
+     * decides whether the app reconnects. Every ending arrives here the same way - MINA fires
+     * [SessionListener.sessionClosed], the exit status is `null` because no shell reported one - so
+     * `MainViewModel.shouldAutoReconnect` read the app's own teardown as "the network went away" and
+     * started a reconnect ladder against a session the app had just closed. That is the mechanism
+     * behind a tab that says *Reconnecting…* seconds after a successful login: something closed the
+     * duplicate session, and the survivor's channel reported it as an outage.
+     *
+     * [AtomicBoolean] rather than `@Volatile var` so the flag can only be raised, and raised from any
+     * thread: MINA's close listeners run on its own I/O threads while the close was requested from a
+     * coroutine.
+     */
+    private val deliberate = AtomicBoolean(false)
+
+    /**
+     * Whether this shell ended because the app ended it, rather than because the far end went away.
+     *
+     * Read by the session collector to decide what to tell the user and whether to reconnect. A close
+     * the app asked for needs neither.
+     */
+    val endedDeliberately: Boolean get() = deliberate.get()
+
+    /**
+     * Declares that what happens to this channel next was the app's decision.
+     *
+     * Called *before* the close itself, and before closing the session underneath it, because the
+     * listener that reports the death can fire inside that call - on another thread, and before the
+     * caller resumes. Raising the flag afterwards would be a race whose loser is a spurious reconnect.
+     */
+    fun markDeliberate() {
+        deliberate.set(true)
+    }
+
     /** Suspends until the channel closes, returning the remote exit status when one was reported. */
     suspend fun awaitClosed(): Int? = closed.await()
 
@@ -171,6 +208,32 @@ class TerminalChannel(
     val isOpen: Boolean get() = channel.isOpen
 
     override fun close() {
+        // First, so a listener that fires inside the close below already knows this was deliberate.
+        markDeliberate()
+        release()
+    }
+
+    /**
+     * Releases a channel whose transport is already gone, without claiming the app meant it to end.
+     *
+     * [close] and this do the same work; they differ only in what they say about *why*, and the
+     * difference decides whether a dropped session comes back. The registry closes a channel in two
+     * quite different situations - the user closed the tab, and something noticed the session behind it
+     * had died - and using [close] for the second one turned a real outage into "the app asked for
+     * this": [SshSessionStore.liveSession] prunes a dead entry on any liveness check, so a heartbeat
+     * failure raced the notification refresh and the tab's own close handler, and whichever got there
+     * first decided whether the reconnect happened at all. Losing that race left a tab that had
+     * genuinely dropped sitting there with no reconnect and no message - the exact failure the
+     * deliberate flag exists to prevent, arrived at from the other side.
+     *
+     * There is nothing to mark here: the channel is being tidied up *after* the fact, and the report
+     * of its death belongs to whatever was waiting on [awaitClosed].
+     */
+    fun discard() {
+        release()
+    }
+
+    private fun release() {
         runCatching { input.close() }
         // Removed explicitly: one session is shared by every tab pointing at that host, so a listener
         // left behind here would outlive its channel and accumulate one entry per terminal the user

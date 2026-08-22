@@ -10,6 +10,7 @@ import dev.eclipse.ssh.data.model.HOST_KEY_FINGERPRINT_PATTERN
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.TerminalTheme
+import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.UUID
@@ -45,6 +46,7 @@ object VaultBackup {
             put("keepAliveSeconds", settings.keepAliveSeconds)
             put("reconnectBaseSeconds", settings.reconnectBaseSeconds)
             put("terminalFontSize", settings.terminalFontSize)
+            put("terminalMinColumns", settings.terminalMinColumns)
             put("pinEnabled", settings.pinEnabled)
             put("legacyAlgorithms", settings.legacyAlgorithms)
             put("terminalTheme", settings.terminalTheme)
@@ -93,6 +95,11 @@ object VaultBackup {
             keepAliveSeconds = settingsObj.optInt("keepAliveSeconds", defaults.keepAliveSeconds),
             reconnectBaseSeconds = settingsObj.optInt("reconnectBaseSeconds", defaults.reconnectBaseSeconds),
             terminalFontSize = settingsObj.optInt("terminalFontSize", defaults.terminalFontSize),
+            // Normalized on the way in as well as on the way out: a backup is a file a user can edit,
+            // and the width it names has to be one the pty would actually accept.
+            terminalMinColumns = SettingsRepository.normalizeMinColumns(
+                settingsObj.optInt("terminalMinColumns", defaults.terminalMinColumns),
+            ),
             pinEnabled = settingsObj.optBoolean("pinEnabled", defaults.pinEnabled),
             legacyAlgorithms = settingsObj.optBoolean("legacyAlgorithms", defaults.legacyAlgorithms),
             terminalTheme = settingsObj.optString("terminalTheme", defaults.terminalTheme)

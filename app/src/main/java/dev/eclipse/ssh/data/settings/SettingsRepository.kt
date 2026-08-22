@@ -12,6 +12,7 @@ import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import dev.eclipse.ssh.data.model.AppSettings
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.security.PinHasher
+import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
 import java.io.IOException
 import java.util.Base64
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +52,7 @@ internal object Keys {
         val keepAliveSeconds = intPreferencesKey("keep_alive_seconds")
         val reconnectBaseSeconds = intPreferencesKey("reconnect_base_seconds")
         val terminalFontSize = intPreferencesKey("terminal_font_size")
+        val terminalMinColumns = intPreferencesKey("terminal_min_columns")
         val pinEnabled = booleanPreferencesKey("pin_enabled")
         val pinHash = stringPreferencesKey("pin_hash")
         val pinSalt = stringPreferencesKey("pin_salt")
@@ -71,6 +73,7 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     keepAliveSeconds = prefs[Keys.keepAliveSeconds] ?: 30,
     reconnectBaseSeconds = prefs[Keys.reconnectBaseSeconds] ?: SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS,
     terminalFontSize = prefs[Keys.terminalFontSize] ?: 13,
+    terminalMinColumns = prefs[Keys.terminalMinColumns] ?: SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS,
     // Requires the hash to actually be present, not just the flag. `pinEnabled` alone gates the
     // entire app through MainActivity's lock screen, and `verifyPin` returns false when there is no
     // hash to compare against — so the flag surviving without its hash is a permanent lockout with
@@ -121,6 +124,19 @@ class SettingsRepository(private val context: Context) {
         it[Keys.reconnectBaseSeconds] = seconds.coerceIn(MIN_RECONNECT_BASE_SECONDS, MAX_RECONNECT_BASE_SECONDS)
     }
     suspend fun setTerminalFontSize(size: Int) = context.settingsDataStore.edit { it[Keys.terminalFontSize] = size }
+
+    /**
+     * The narrowest grid the pty may be given, or 0 for "fit the screen".
+     *
+     * Clamped to what the terminal itself accepts rather than trusted: [AppSettings.terminalMinColumns]
+     * also arrives from a restored vault, where the number is whatever the file says. A width below
+     * the buffer's own minimum would be silently raised at the far end, so the value the screen shows
+     * would not be the value in force; above its maximum it would be silently lowered, and the user
+     * would be panning across a grid the server never had.
+     */
+    suspend fun setTerminalMinColumns(columns: Int) = context.settingsDataStore.edit {
+        it[Keys.terminalMinColumns] = normalizeMinColumns(columns)
+    }
     suspend fun setLegacyAlgorithms(enabled: Boolean) = context.settingsDataStore.edit { it[Keys.legacyAlgorithms] = enabled }
     suspend fun setTerminalTheme(name: String) = context.settingsDataStore.edit { it[Keys.terminalTheme] = name }
 
@@ -153,6 +169,15 @@ class SettingsRepository(private val context: Context) {
     }
 
     companion object {
+        const val DEFAULT_TERMINAL_MIN_COLUMNS = 80
+
+        /** 0, meaning "fit the screen exactly", plus the widths worth offering above it. */
+        val TERMINAL_MIN_COLUMN_CHOICES = listOf(0, 80, 100, 120, 132, 160)
+
+        /** 0 stays 0; anything else is pulled inside the range the pty and the buffer share. */
+        fun normalizeMinColumns(columns: Int): Int =
+            if (columns <= 0) 0 else columns.coerceIn(TERMINAL_COLUMN_RANGE)
+
         const val DEFAULT_RECONNECT_BASE_SECONDS = 5
         const val MIN_RECONNECT_BASE_SECONDS = 1
         const val MAX_RECONNECT_BASE_SECONDS = 60

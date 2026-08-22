@@ -24,6 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
@@ -117,6 +118,12 @@ fun rememberTerminalLatches(): TerminalLatches =
  * Hardware keys are taken before the field sees them, so an arrow key moves the remote cursor instead
  * of a caret that is not there, and so nothing arrives twice: consuming the event means no text
  * change follows it.
+ *
+ * Focus is the whole thing. Nothing here can receive a keystroke - not the IME's text, not a hardware
+ * key through [onPreviewKeyEvent] - unless this field holds focus, which is why [onFocusChanged] is
+ * reported outwards: the screen has to be able to tell whether the keyboard is connected to the shell
+ * and ask again if it is not. Guessing "focus was requested, so it must be focused" is not the same
+ * fact, and the difference is a terminal that silently swallows everything the user types.
  */
 @Composable
 fun TerminalInputBridge(
@@ -126,6 +133,7 @@ fun TerminalInputBridge(
     onKey: (TerminalKey, Boolean, Boolean, Boolean) -> Unit,
     onChar: (Char, Boolean, Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    onFocusChanged: (Boolean) -> Unit = {},
 ) {
     var field by remember { mutableStateOf(sentinelValue()) }
     BasicTextField(
@@ -151,6 +159,9 @@ fun TerminalInputBridge(
         modifier = modifier
             .size(1.dp)
             .focusRequester(focusRequester)
+            // Before the requester in the chain would report the focus of whatever is above it; after
+            // it, this observes the field itself.
+            .onFocusChanged { state -> onFocusChanged(state.isFocused) }
             .semantics { contentDescription = "Terminal input" }
             .onPreviewKeyEvent { event -> handleKeyEvent(event, latches, onKey, onChar) },
         // A terminal is not prose: autocorrect would rewrite commands, capitalisation would rewrite

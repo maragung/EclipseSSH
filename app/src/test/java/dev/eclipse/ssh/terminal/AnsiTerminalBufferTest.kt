@@ -221,17 +221,68 @@ class AnsiTerminalBufferTest {
 
     // --- Resize: happens on rotation and on soft-keyboard show/hide ---
 
+    /**
+     * The screen - and only the screen - is cut to the new width.
+     *
+     * This test used to require it of every row in the buffer, scrollback included, because that is
+     * what [AnsiTerminalBuffer.resize] did. It is the wrong contract and it destroyed output: a
+     * rotation to portrait, or the soft keyboard opening, narrowed the terminal and permanently
+     * dropped every character past the new column count from lines that had already been printed and
+     * would never be redrawn. What made it hard to see is that it looked like ordinary wrapping until
+     * you tried to copy the text or save the log and found the tail was gone from those too.
+     *
+     * The screen still has to be trimmed: the emulator addresses those rows by column, and a redraw
+     * at the new width would otherwise leave a stale tail beyond the last column it repaints.
+     */
     @Test
-    fun `resizing keeps every row exactly as wide as the new terminal`() {
-        val buffer = AnsiTerminalBuffer(columns = 40, rows = 6)
-        buffer.feed("hello world\nsecond line")
+    fun `a resize trims the screen to the new width and leaves the history it cannot redraw`() {
+        val buffer = AnsiTerminalBuffer(columns = 40, rows = 5)
+        val hostname = "gateway-eu-west-1b.internal.example"
 
-        buffer.resize(20, 4)
+        // Nine lines into a five-row screen, so the first four are genuinely history.
+        buffer.feed(hostname + "\r\n" + (1..8).joinToString("\r\n") { "line $it" })
+        buffer.resize(20, 5)
 
         val snapshot = buffer.snapshot()
         assertThat(snapshot.columns).isEqualTo(20)
-        assertThat(snapshot.lines.all { it.size == 20 }).isTrue()
-        assertThat(buffer.plainText()).contains("hello world")
+        // The screen is the last five rows, and those are exactly the new width.
+        assertThat(snapshot.lines.takeLast(5).all { it.size == 20 }).isTrue()
+        // The history above it is untouched - still as wide as it was printed, characters and all.
+        assertThat(snapshot.lines.first().size).isEqualTo(40)
+        assertThat(snapshot.lines.first().text()).isEqualTo(hostname)
+        assertThat(buffer.plainText()).contains(hostname)
+    }
+
+    @Test
+    fun `narrowing then widening again shows the history whole, not the part that fit`() {
+        val buffer = AnsiTerminalBuffer(columns = 120, rows = 6)
+        val path = "/var/log/eclipse/very/deep/directory/tree/application-2026-08-22.log"
+        buffer.feed(path + "\r\n" + (1..9).joinToString("\r\n") { "line $it" })
+
+        // Keyboard opens, device rotates, keyboard closes. Two of the three narrow the terminal, and
+        // under the old contract each one cut the tail off every line in the buffer.
+        buffer.resize(45, 5)
+        buffer.resize(120, 6)
+
+        assertThat(buffer.plainText()).contains(path)
+        // The cells themselves, not just the joined text: copying that region has to work too.
+        val row = buffer.snapshot().lines.first { it.text().contains("eclipse") }
+        assertThat(row.text()).isEqualTo(path)
+    }
+
+    @Test
+    fun `a selection copied out of narrowed history is still the whole line`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 5)
+        val hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        buffer.feed(hash + "\r\n" + (1..8).joinToString("\r\n") { "line $it" })
+
+        buffer.resize(24, 5)
+
+        // Copying that line asks for more columns than the terminal now has: the text comes from the
+        // line as stored, not from the current geometry. This is what a long-press-copy of a hash,
+        // a git sha or a full path does after the keyboard has narrowed the screen once.
+        val copied = buffer.textIn(fromLine = 0, fromColumn = 0, toLine = 0, toColumn = hash.length)
+        assertThat(copied).isEqualTo(hash)
     }
 
     @Test
@@ -304,7 +355,9 @@ class AnsiTerminalBufferTest {
         buffer.feed("${E}[Hafter")
 
         assertThat(buffer.plainText()).contains("after")
-        assertThat(buffer.snapshot().lines.all { it.size == 20 }).isTrue()
+        // The screen - the rows the emulator addresses by column - is exactly the new width. The
+        // history above it is not: see `a resize trims the screen to the new width`.
+        assertThat(buffer.snapshot().lines.takeLast(5).all { it.size == 20 }).isTrue()
     }
 
     /**
@@ -554,5 +607,208 @@ class AnsiTerminalBufferTest {
 
         assertThat(buffer.snapshot().cursorRow).isEqualTo(0)
         assertThat(buffer.plainText().lineSequence().first()).isEqualTo("abcdefgX")
+    }
+
+    // --- contentColumns: how far the view is allowed to pan ---
+
+    @Test
+    fun `contentColumns reports the widest painted line, not the terminal width`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 5)
+        // Trailing CR parks the cursor at column 0, so this measures the glyphs and nothing else.
+        buffer.feed("short\r\n" + "x".repeat(64) + "\r")
+
+        val frame = buffer.frame()
+
+        assertThat(frame.columns).isEqualTo(80)
+        assertThat(frame.contentColumns).isEqualTo(64)
+    }
+
+    @Test
+    fun `trailing blanks are not content, but the cursor cell is`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 5)
+
+        // An untouched screen is 80 blank cells per row and paints one of them: the caret. It has to
+        // be inside the pannable extent or typing at the right margin would go on off-screen.
+        assertThat(buffer.frame().contentColumns).isEqualTo(1)
+
+        buffer.feed("ok")
+        // Two glyphs plus the caret on the third - not the 80 the row is allocated at.
+        assertThat(buffer.frame().contentColumns).isEqualTo(3)
+
+        buffer.feed("$E[2J$E[H")
+        // Erased: written once, blank now, and back to nothing but the caret.
+        assertThat(buffer.frame().contentColumns).isEqualTo(1)
+    }
+
+    @Test
+    fun `a blank cell with a background is painted and counts`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 5)
+
+        // What a selection, a highlighted `less` match or a full-width status bar looks like: spaces
+        // that are visible only because of their background, and clipping them would be visible too.
+        buffer.feed("$E[44m" + " ".repeat(40) + "$E[0m")
+
+        assertThat(buffer.frame().contentColumns).isAtLeast(40)
+    }
+
+    @Test
+    fun `the cursor is reachable even when it sits past the last printed cell`() {
+        val buffer = AnsiTerminalBuffer(columns = 200, rows = 5)
+
+        // Cursor addressed to column 151 of an otherwise blank row - a full-screen editor placing its
+        // caret. Typing there must not be off-screen, so the extent has to include it.
+        buffer.feed("$E[1;151H")
+
+        assertThat(buffer.frame().contentColumns).isEqualTo(151)
+    }
+
+    @Test
+    fun `history printed wide stays pannable after the terminal narrows`() {
+        val buffer = AnsiTerminalBuffer(columns = 120, rows = 5)
+        buffer.feed("a".repeat(110) + "\r\n" + (1..8).joinToString("\r\n") { "line $it" })
+
+        buffer.resize(45, 5)
+
+        // That line is history now. The screen is 45 columns wide, but a frame that includes the line
+        // reports the 110 columns the view has to be able to reach.
+        val whole = buffer.frame(scrollOffset = 0, viewportRows = buffer.snapshot().lines.size)
+        assertThat(whole.columns).isEqualTo(45)
+        assertThat(whole.contentColumns).isEqualTo(110)
+    }
+
+    // ------------------------------------------------------------ the programs people actually run
+    //
+    // The tests above pin each sequence on its own. These replay what `top`, `vim` and `less` really
+    // send, because every one of them is a *combination* whose parts can each be right while the whole
+    // is wrong - and because they are the programs whose breakage is unmissable: a terminal that cannot
+    // run `vim` is not a terminal.
+
+    /**
+     * A program that repaints in place does not grow the scrollback.
+     *
+     * `top` and `htop` address the screen: home, then each row erased and rewritten, once a second,
+     * for as long as the user watches. Nothing is appended, so nothing may accumulate. The failure this
+     * guards is not a wrong character but a leak - a terminal that treats each repainted row as new
+     * output fills its 2 000-line scrollback in half a minute, and from then on holds two thousand
+     * stale copies of one screen in memory while the user's actual session history is gone.
+     */
+    @Test
+    fun `a program repainting in place does not grow the scrollback`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 10)
+
+        repeat(120) { tick ->
+            // Cursor addressed per row and the row erased first, which is exactly what `top` does and
+            // why its display never scrolls.
+            (1..10).forEach { row -> buffer.feed("$E[$row;1H$E[K" + "tick $tick row $row") }
+        }
+
+        val lines = buffer.snapshot().lines
+        // Ten rows after two minutes of repainting, not 1 200 and not the 2 000 cap.
+        assertThat(lines.size).isEqualTo(10)
+        assertThat(lines.first().text()).isEqualTo("tick 119 row 1")
+        assertThat(lines.last().text()).isEqualTo("tick 119 row 10")
+    }
+
+    /**
+     * `vim` leaves the shell exactly where it found it.
+     *
+     * The alternate screen is a promise: whatever the editor draws is thrown away when it exits, and
+     * the scrollback the user had is untouched underneath. Both halves matter and they fail
+     * separately - drawing onto the primary screen destroys the session history, and restoring the
+     * lines but not the cursor leaves the next prompt printed over the last one.
+     *
+     * The sequence is the real one: 1049 up, the cursor hidden, a full-screen paint including a tilde
+     * column and a reverse-video status line, then 1049 down.
+     */
+    @Test
+    fun `an editor on the alternate screen leaves the shell untouched underneath`() {
+        val buffer = AnsiTerminalBuffer(columns = 40, rows = 6)
+        buffer.feed((1..8).joinToString("") { "history $it\r\n" } + "user@host:~$ vim notes.txt")
+        val before = buffer.snapshot()
+        val historyBefore = before.lines.map { it.text() }
+        val cursorBefore = before.cursorRow to before.cursorColumn
+
+        buffer.feed("$E[?1049h$E[?25l$E[H$E[2J")
+        buffer.feed("the quick brown fox\r\n" + (2..5).joinToString("") { "~\r\n" })
+        buffer.feed("$E[6;1H$E[7m\"notes.txt\" 1L, 20C$E[27m")
+        // While it is up, the editor's paint is what is on screen and none of it is history: the
+        // alternate screen is a fixed window of exactly `rows`.
+        val editing = buffer.snapshot()
+        assertThat(buffer.frame().alternateScreen).isTrue()
+        assertThat(editing.lines.size).isEqualTo(6)
+        assertThat(editing.lines.first().text()).isEqualTo("the quick brown fox")
+
+        buffer.feed("$E[?1049l$E[?25h")
+
+        val after = buffer.snapshot()
+        assertThat(buffer.frame().alternateScreen).isFalse()
+        assertWithMessage("the editor's paint reached the session history")
+            .that(after.lines.map { it.text() })
+            .isEqualTo(historyBefore)
+        assertWithMessage("the next prompt would print over the last one")
+            .that(after.cursorRow to after.cursorColumn)
+            .isEqualTo(cursorBefore)
+        // Hidden by the editor and given back on the way out; a terminal that kept it hidden would
+        // leave the user typing at a prompt with no caret.
+        assertThat(buffer.frame().cursorVisible).isTrue()
+    }
+
+    /**
+     * `less` scrolls its text without disturbing the status line it keeps at the bottom.
+     *
+     * A pager sets a scroll region over everything but the last row and then scrolls *inside* it: index
+     * at the bottom to go forward, reverse index at the top to go back. A terminal that ignores DECSTBM
+     * scrolls the whole screen instead, which drags the status line up into the text and leaves the
+     * bottom row blank - the pager then repaints a status line on top of a line of the file.
+     */
+    @Test
+    fun `a pager scrolls inside its region and keeps its status line`() {
+        val buffer = AnsiTerminalBuffer(columns = 30, rows = 5)
+        buffer.feed("$E[?1049h$E[H$E[2J")
+        buffer.feed((1..4).joinToString("") { "file line $it\r\n" })
+        buffer.feed("$E[5;1H$E[7m:$E[27m")
+        // Rows 1-4 scroll; row 5 is the pager's own.
+        buffer.feed("$E[1;4r")
+
+        // Forward one line: park at the bottom of the region and index.
+        buffer.feed("$E[4;1H" + "$E" + "D" + "file line 5")
+        var lines = buffer.snapshot().lines
+        assertThat(lines.map { it.text() }.take(4))
+            .isEqualTo(listOf("file line 2", "file line 3", "file line 4", "file line 5"))
+        assertWithMessage("the status line was dragged out of place")
+            .that(lines[4].text())
+            .isEqualTo(":")
+
+        // And back again: reverse index at the top of the region.
+        buffer.feed("$E[1;1H" + "$E" + "M" + "file line 1")
+        lines = buffer.snapshot().lines
+        assertThat(lines.map { it.text() }.take(4))
+            .isEqualTo(listOf("file line 1", "file line 2", "file line 3", "file line 4"))
+        assertThat(lines[4].text()).isEqualTo(":")
+        // Nothing a pager displays is session output, so nothing it scrolled past is in the history.
+        assertThat(lines.size).isEqualTo(5)
+    }
+
+    /**
+     * A long line survives a repaint that redraws only part of it.
+     *
+     * The report behind this was output "cut in the middle of a hostname or a hash". One way that
+     * happens without any wrapping bug: a program rewrites a row with a shorter string and does not
+     * erase to the end, so the tail of the old line stays on screen and reads as a mangled version of
+     * the new one. The rule being pinned is that the emulator changes exactly the cells it was told to
+     * and neither pads nor truncates the rest - so `\r` alone leaves the tail, and `$E[K` removes it.
+     */
+    @Test
+    fun `a rewrite without an erase leaves the tail, and with one does not`() {
+        val hash = "9f2b" + "c".repeat(56) + "a1d4"
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 4)
+
+        buffer.feed(hash + "\r" + "short")
+        assertWithMessage("the emulator invented an erase the server never sent")
+            .that(buffer.snapshot().lines.first().text())
+            .isEqualTo("short" + hash.substring(5))
+
+        buffer.feed("\r$E[K" + "short")
+        assertThat(buffer.snapshot().lines.first().text()).isEqualTo("short")
     }
 }

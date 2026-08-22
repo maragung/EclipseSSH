@@ -423,77 +423,126 @@ class MainViewModel @Inject constructor(
             // the host, or a rotated server password could not be used at all without editing the
             // profile first.
             val resolved = resolveCredentials(host, password, keyPair, keyBytes, keyPassphrase)
-            var lastError: Throwable? = null
-            for (attempt in 0 until MAX_CONNECT_ATTEMPTS) {
-                try {
-                    val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair)
-                    // The tab may have been closed (or the host deleted) while the handshake
-                    // was in flight. Honour that instead of resurrecting the tab — and tear
-                    // the new session down so it does not leak. Dereferencing the missing tab
-                    // here used to throw an NPE inside the coroutine and crash the app.
-                    if (tabs.value.none { it.hostId == host.id }) {
-                        runCatching { session.close(false) }
-                        return@launch
-                    }
-                    val terminal = sshConnectionManager.openTerminal(session)
-                    // The outgoing collector goes first, and it is *waited for*, before anything it
-                    // is watching is closed or handed to its replacement. Three reasons, and only the
-                    // first was ever obvious:
-                    //
-                    //  - reconnecting to the same host otherwise stacked a new collector per attempt,
-                    //    each pinning its buffer for the lifetime of the ViewModel;
-                    //  - a collector reports the close of its channel as the end of the session, which
-                    //    for the channel being replaced below is not what it means. Cancelled first, it
-                    //    never sees that close at all;
-                    //  - a reconnect deliberately keeps the host's buffer so its scrollback survives,
-                    //    and AnsiTerminalBuffer is a plain list model with no locking. A cancel only
-                    //    *asks* a coroutine to stop, so the outgoing collector could still be feeding
-                    //    or reading that buffer while its replacement fed it from another thread. That
-                    //    is a data race on an ArrayList: torn frames at best, an index out of bounds in
-                    //    the middle of a reconnect at worst. Joining makes the handover exclusive, and
-                    //    it is quick - every suspension point in the collector is cancellable and its
-                    //    teardown does no I/O.
-                    terminalJobs.remove(host.id)?.cancelAndJoin()
-                    sessions.put(host.id, session)?.let { previous -> runCatching { previous.close(false) } }
-                    channels.put(host.id, terminal)?.let { previous -> runCatching { previous.close() } }
-                    val buffer = terminalBuffers.getOrPut(host.id) { AnsiTerminalBuffer() }
-                    terminalJobs[host.id] = launchTerminalCollector(host.id, terminal, buffer)
-                    updateTab(host.id) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
-                    // Credentials are no longer needed once the session is up.
-                    pendingConnection = null
-                    // The ladder is per outage, not per session: a host that reconnects gets its full
-                    // allowance back for the next one.
-                    reconnectAttempts.remove(host.id)
-                    runCatching { hostRepository.save(host.copy(lastConnectedAt = System.currentTimeMillis())) }
-                    runCatching { sessionRegistry.register(host.id, resolved.password, resolved.keyBytes, resolved.keyPassphrase) }
-                    // Auto Login SFTP. Off means SSH only — nothing opens a second channel on this
-                    // host until the user asks for a listing — which is the point of the switch: an
-                    // account with a shell and no sftp-server subsystem otherwise greets every
-                    // successful login with a failure about a feature the user never asked for.
-                    if (host.autoLoginSftp) {
-                        loginSftp(host)
-                    } else {
-                        updateTab(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
-                    }
-                    return@launch
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Throwable) {
-                    lastError = error
-                    // A rejection the server has already made up its mind about is not retried: see
-                    // `connectFailureIsFinal`. Among other things it stops a mistyped password being
-                    // offered three times, which is how a typo gets an account locked.
-                    if (connectFailureIsFinal(error)) break
-                    if (attempt < MAX_CONNECT_ATTEMPTS - 1) {
-                        updateTab(host.id) { it?.copy(state = SessionConnectionState.RECONNECTING, lastError = "Retrying connection…") }
-                        delay(RECONNECT_DELAY_MS * (attempt + 1))
+            // Everything from here to the shell being on screen happens under this host's dial gate,
+            // which is what stops two dials to the same account existing at once. The service's
+            // restore pass takes the same gate, so the pass that used to run concurrently with this
+            // one - tapping Connect is what starts the service - now waits, finds the session this
+            // attempt installed, and adopts it. See [SshSessionStore.dialing].
+            sessionStore.dialing(host.id) {
+                // Asked again inside the gate, because a session that appeared while this attempt waited
+                // for it is one to use, not one to duplicate. Adopting also keeps the scrollback: the
+                // buffer, the pty and the socket are all still the ones the user was looking at.
+                sessionStore.adoptable(host.id)?.let { (_, existing) ->
+                    attachTerminal(host, existing, resolved)
+                    return@dialing
+                }
+                var lastError: Throwable? = null
+                for (attempt in 0 until MAX_CONNECT_ATTEMPTS) {
+                    try {
+                        val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair)
+                        // The tab may have been closed (or the host deleted) while the handshake
+                        // was in flight. Honour that instead of resurrecting the tab — and tear
+                        // the new session down so it does not leak. Dereferencing the missing tab
+                        // here used to throw an NPE inside the coroutine and crash the app.
+                        if (tabs.value.none { it.hostId == host.id }) {
+                            runCatching { session.close(false) }
+                            return@dialing
+                        }
+                        val terminal = sshConnectionManager.openTerminal(session)
+                        // Never replaces a live session with this one: if another dialler installed one
+                        // for this host while this handshake was in flight, that session is the one the
+                        // app keeps and this one is the redundant half of a duplicate - the opposite of
+                        // what `put` did, which closed the session the user was already typing into.
+                        val installed = sessionStore.install(host.id, session)
+                        if (installed !== session) {
+                            // Ours lost, so its pty goes with it. Marked first so its collector reports
+                            // the app's decision rather than an outage the reconnect ladder would answer.
+                            terminal.markDeliberate()
+                            runCatching { terminal.close() }
+                            val survivor = sessionStore.adoptable(host.id)
+                            if (survivor == null) continue
+                            attachTerminal(host, survivor.second, resolved)
+                            return@dialing
+                        }
+                        attachTerminal(host, terminal, resolved)
+                        return@dialing
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Throwable) {
+                        lastError = error
+                        // A rejection the server has already made up its mind about is not retried: see
+                        // `connectFailureIsFinal`. Among other things it stops a mistyped password being
+                        // offered three times, which is how a typo gets an account locked.
+                        if (connectFailureIsFinal(error)) break
+                        if (attempt < MAX_CONNECT_ATTEMPTS - 1) {
+                            updateTab(host.id) { it?.copy(state = SessionConnectionState.RECONNECTING, lastError = "Retrying connection…") }
+                            delay(RECONNECT_DELAY_MS * (attempt + 1))
+                        }
                     }
                 }
+                updateTab(host.id) { it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = describeConnectFailure(lastError)) }
             }
-            updateTab(host.id) { it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = describeConnectFailure(lastError)) }
         }
         connectJobs[host.id] = job
         job.invokeOnCompletion { connectJobs.remove(host.id, job) }
+    }
+
+    /**
+     * Puts [terminal] on screen as [host]'s shell: collector, tab state, saved credentials, SFTP.
+     *
+     * Shared by the two ways a session becomes the one the user is typing into - a handshake that
+     * just succeeded, and a live session adopted instead of dialling a second one - so that an
+     * adopted session is indistinguishable from a fresh one. It used to exist only on the fresh
+     * path, which is why adopting was a partial imitation of connecting.
+     *
+     * The outgoing collector goes first, and it is *waited for*, before anything it is watching is
+     * closed or handed to its replacement. Three reasons, and only the first was ever obvious:
+     *
+     *  - reconnecting to the same host otherwise stacked a new collector per attempt, each pinning
+     *    its buffer for the lifetime of the ViewModel;
+     *  - a collector reports the close of its channel as the end of the session, which for a channel
+     *    being replaced is not what it means. Cancelled first, it never sees that close at all;
+     *  - a reconnect deliberately keeps the host's buffer so its scrollback survives, and
+     *    [AnsiTerminalBuffer] is a plain list model with no locking. A cancel only *asks* a coroutine
+     *    to stop, so the outgoing collector could still be feeding or reading that buffer while its
+     *    replacement fed it from another thread. That is a data race on an ArrayList: torn frames at
+     *    best, an index out of bounds in the middle of a reconnect at worst. Joining makes the
+     *    handover exclusive, and it is quick - every suspension point in the collector is cancellable
+     *    and its teardown does no I/O.
+     */
+    private suspend fun attachTerminal(host: HostProfile, terminal: TerminalChannel, resolved: ResolvedCredentials) {
+        terminalJobs.remove(host.id)?.cancelAndJoin()
+        channels.put(host.id, terminal)?.let { previous ->
+            // Never the channel just installed: adopting hands back the channel that is already in
+            // the map, and closing it would end the session this call exists to present.
+            if (previous !== terminal) {
+                previous.markDeliberate()
+                runCatching { previous.close() }
+            }
+        }
+        val buffer = terminalBuffers.getOrPut(host.id) { AnsiTerminalBuffer() }
+        terminalJobs[host.id] = launchTerminalCollector(host.id, terminal, buffer)
+        // An adopted session may be sitting at a prompt with nothing to say, and the collector only
+        // publishes when output arrives - so without this the scrollback the user already had would
+        // stay off screen until they pressed a key.
+        publishTerminalFrame(host.id, buffer)
+        updateTab(host.id) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
+        // Credentials are no longer needed once the session is up.
+        pendingConnection = null
+        // The ladder is per outage, not per session: a host that reconnects gets its full allowance
+        // back for the next one.
+        reconnectAttempts.remove(host.id)
+        runCatching { hostRepository.save(host.copy(lastConnectedAt = System.currentTimeMillis())) }
+        runCatching { sessionRegistry.register(host.id, resolved.password, resolved.keyBytes, resolved.keyPassphrase) }
+        // Auto Login SFTP. Off means SSH only — nothing opens a second channel on this host until the
+        // user asks for a listing — which is the point of the switch: an account with a shell and no
+        // sftp-server subsystem otherwise greets every successful login with a failure about a feature
+        // the user never asked for.
+        if (host.autoLoginSftp) {
+            loginSftp(host)
+        } else {
+            updateTab(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
+        }
     }
 
     /**
@@ -629,14 +678,27 @@ class MainViewModel @Inject constructor(
         val closer = launch {
             val status = terminal.awaitClosed()
             incoming.close()
-            // Only if this is still the session on that host. A reconnect cancels this coroutine
+            // Only if nothing newer has taken this host over. A reconnect cancels this coroutine
             // before it closes the channel it is replacing, so ordinarily it never sees that close -
             // but a cancel is a request, not a suspension of physics: this can already have been
             // resumed on another core, and reporting a replaced channel as a disconnection would
             // overwrite the CONNECTED state the new session had just been given.
-            if (channels.remove(hostId, terminal)) {
+            //
+            // Absent is not the same as replaced, and testing for `remove` returning true conflated
+            // them. A liveness check anywhere in the app prunes a dead session and takes its channel
+            // out of the registry with it, so on a real drop the pruner and this handler raced for the
+            // same entry - and when the pruner won, this returned early and the tab that had just lost
+            // its connection was left saying CONNECTED, with nothing scheduled to bring it back.
+            val current = channels[hostId]
+            if (current == null || current === terminal) {
+                channels.remove(hostId, terminal)
+                // A close the app asked for is not an outage, and must not be described as one: the
+                // tab is already going wherever the caller is taking it - closed, replaced by a
+                // reconnect, or ended by Stop sessions - and overwriting it with "Disconnected from
+                // the remote host" would report the app's own decision as a fault of the network.
+                if (terminal.endedDeliberately) return@launch
                 updateTab(hostId) { it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = describeSessionEnd(status)) }
-                if (shouldAutoReconnect(status, tabIsOpen = tabs.value.any { it.hostId == hostId })) {
+                if (shouldAutoReconnect(status, tabIsOpen = tabs.value.any { it.hostId == hostId }, endedDeliberately = false)) {
                     scheduleAutoReconnect(hostId)
                 } else {
                     // A shell that exited is finished with its session; nothing is going to use the
@@ -1888,18 +1950,35 @@ class MainViewModel @Inject constructor(
             val host = hostRepository.hosts.first().firstOrNull { it.id == item.hostId }
                 ?: return@launch report("The host for ${item.name} no longer exists")
             val uri = item.localUri?.let(Uri::parse) ?: return@launch report("${item.name} has no local file")
-            val session = sessions[host.id] ?: run {
-                val password = sessionRegistry.credential(host.id)
-                val keyPair = sessionRegistry.keyBytes(host.id)?.let { bytes -> runCatching { SshKeyLoader.load(bytes, "${host.username}-key", sessionRegistry.keyPassphrase(host.id)) }.getOrNull() }
-                val reconnected = try {
-                    sshConnectionManager.connect(host, password, keyPair)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Throwable) {
-                    return@launch report("Could not reconnect to ${host.name}", error)
+            var dialFailure: Throwable? = null
+            // The same gate and the same install as [connect], for the same reason: this runs from a
+            // notification action, so it can land in the middle of the UI's own dial to the host it
+            // wants. `sessions[hostId]` also did not prune - a session that had died was handed
+            // straight to `openSftp` - which is what [SshSessionStore.liveSession] is for.
+            val session = sessionStore.liveSession(host.id) ?: sessionStore.dialing(host.id) {
+                sessionStore.liveSession(host.id) ?: run {
+                    val password = sessionRegistry.credential(host.id)
+                    val keyPair = sessionRegistry.keyBytes(host.id)?.let { bytes -> runCatching { SshKeyLoader.load(bytes, "${host.username}-key", sessionRegistry.keyPassphrase(host.id)) }.getOrNull() }
+                    val reconnected = try {
+                        sshConnectionManager.connect(host, password, keyPair)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Throwable) {
+                        dialFailure = error
+                        null
+                    }
+                    reconnected?.let { sessionStore.install(host.id, it) }
                 }
-                sessions.put(host.id, reconnected)?.let { previous -> runCatching { previous.close(false) } }
-                reconnected
+            }
+            if (session == null) {
+                // The dial can also come back null with nothing thrown - another caller holding the
+                // gate installed a session that had already died - so the cause is genuinely optional.
+                val failure = dialFailure
+                return@launch if (failure == null) {
+                    report("Could not reconnect to ${host.name}")
+                } else {
+                    report("Could not reconnect to ${host.name}", failure)
+                }
             }
             // Measure the partial file before reopening it: the persisted byte counter is
             // throttled and lags behind, and appending from it would duplicate bytes.
@@ -2103,6 +2182,7 @@ class MainViewModel @Inject constructor(
             settingsRepository.setKeepAliveSeconds(settings.keepAliveSeconds)
             settingsRepository.setReconnectBaseSeconds(settings.reconnectBaseSeconds)
             settingsRepository.setTerminalFontSize(settings.terminalFontSize)
+            settingsRepository.setTerminalMinColumns(settings.terminalMinColumns)
             settingsRepository.setLegacyAlgorithms(settings.legacyAlgorithms)
             settingsRepository.setTerminalTheme(settings.terminalTheme)
             settingsRepository.setBlockScreenshots(settings.blockScreenshots)
@@ -2197,6 +2277,7 @@ class MainViewModel @Inject constructor(
      */
     fun setReconnectBaseSeconds(seconds: Int) = writeSetting("the reconnect delay") { settingsRepository.setReconnectBaseSeconds(seconds) }
     fun setTerminalFontSize(size: Int) = writeSetting("the terminal font size") { settingsRepository.setTerminalFontSize(size) }
+    fun setTerminalMinColumns(columns: Int) = writeSetting("the terminal width") { settingsRepository.setTerminalMinColumns(columns) }
     fun setLegacyAlgorithms(enabled: Boolean) = writeSetting("the legacy algorithm setting") { settingsRepository.setLegacyAlgorithms(enabled) }
     fun setTerminalTheme(name: String) = writeSetting("the terminal theme") { settingsRepository.setTerminalTheme(name) }
     fun setPin(pin: String) = writeSetting("the app PIN") { settingsRepository.setPin(pin) }
@@ -2404,8 +2485,16 @@ internal const val MAX_AUTO_RECONNECT_ATTEMPTS = 5
  * A closed tab is not reconnected either, whatever the status: the user is not looking at that
  * session any more, and [MainViewModel.closeTab] has already released it.
  *
+ * [endedDeliberately] is the third state, and leaving it out was a bug with a very visible symptom.
+ * The app closes sessions itself - a tab closed, Stop sessions, a duplicate session collapsed into the
+ * one the app keeps - and every one of those endings looks from here exactly like a dropped link: MINA
+ * fires the same close, and no shell reported an exit status, so `exitStatus` is `null`. A tab that
+ * said *Reconnecting…* a few seconds after a successful login was this: something closed a session on
+ * purpose, and the rule below read it as an outage and started a ladder. See
+ * [dev.eclipse.ssh.ssh.TerminalChannel.endedDeliberately].
+ *
  * Pure so the rule can be tested without a network, a server or a view model — the states this
  * has to get right are exactly the ones that are awkward to reproduce on demand.
  */
-internal fun shouldAutoReconnect(exitStatus: Int?, tabIsOpen: Boolean): Boolean =
-    tabIsOpen && exitStatus == null
+internal fun shouldAutoReconnect(exitStatus: Int?, tabIsOpen: Boolean, endedDeliberately: Boolean): Boolean =
+    tabIsOpen && exitStatus == null && !endedDeliberately

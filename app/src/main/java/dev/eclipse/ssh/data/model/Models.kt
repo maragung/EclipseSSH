@@ -233,6 +233,24 @@ data class AppSettings(
     val keepAliveSeconds: Int = 30,
     val reconnectBaseSeconds: Int = 5,
     val terminalFontSize: Int = 13,
+    /**
+     * The narrowest terminal the pty is ever told it has, whatever the screen can show.
+     *
+     * 80 by default, and that number is not arbitrary: it is the width command-line output has been
+     * formatted for since the punch card, and the width every program still assumes when it decides
+     * where to put a column break. A phone fits somewhere near forty-five columns of legible
+     * monospace, and telling the server forty-five is what makes it do the cutting - `ls -l` loses a
+     * column, a URL or a hash or a long path folds at whatever character lands on the margin, and a
+     * table's alignment goes with it. The break arrives as a newline in the stream, indistinguishable
+     * from one that was meant, so nothing downstream can undo it: not the display, not a copy, not a
+     * saved log.
+     *
+     * Asking for 80 instead keeps the lines whole and moves the only real cost - that the screen
+     * cannot show all of them at once - to something reversible: the grid pans sideways under the
+     * finger. 0 means "exactly what fits on screen", which is the older behaviour and the right choice
+     * for anyone who would rather never pan.
+     */
+    val terminalMinColumns: Int = 80,
     val pinEnabled: Boolean = false,
     val legacyAlgorithms: Boolean = false,
     val terminalTheme: String = TerminalTheme.DARK.name,
