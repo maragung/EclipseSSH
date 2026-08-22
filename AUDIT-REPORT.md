@@ -1600,3 +1600,36 @@ upgrade to another 1.0.2, since Android compares `versionCode`.
 Built the same way as 1.0.2: GitHub Actions assembles from the tagged commit on `main` and this host does
 nothing but sign, so the artifact is a build of what is published rather than of a working tree. The
 signing key never leaves the host and never enters the repository or the workflow.
+
+What shipped, run #12 from `ccf5b65`:
+
+| | |
+|---|---|
+| File | `EclipseSSH-1.0.3-release.apk`, 5,694,909 bytes |
+| SHA-256 | `60c43a613c2ba3f1370f524b2052d0b87627da5f4a5a2101a715c2e97e29cb6d` |
+| Version | `versionCode` 4, `versionName` 1.0.3 |
+| Platform | minSdk 28, targetSdk 35, arm64-v8a / armeabi-v7a / x86 / x86_64 |
+| Signer | `CN=Eclipse SSH, OU=Mobile, O=Eclipse SSH, L=Jakarta, C=ID`, SHA-256 `a75a6f…2921e` |
+| Schemes | v3 at the manifest's minSdk, v2 and v3 at `--min-sdk-version 24`; `zipalign -c 4` clean |
+| Tag | `v1.0.3` at `ccf5b65`, release `https://github.com/maragung/EclipseSSH/releases/tag/v1.0.3` |
+
+The certificate is the one 1.0.0 through 1.0.2 were signed with, so this installs over any of them as an
+upgrade. The APK the workflow produced was checked first and is *not* what shipped: with no signing
+secrets in the repository the workflow signs with the Android debug key, and `apksigner --print-certs`
+said `CN=Android Debug` on the 5,658,320-byte artifact. That one was re-signed here, which is what the
+size and digest above describe.
+
+Then the published asset was pulled back out of the release and compared: byte identical to the file on
+this host, and it still verifies under the release certificate, is still aligned, and still reports
+`versionCode='4' versionName='1.0.3'`. Two details of that check are worth recording because both looked
+at first like a corrupt upload. An unauthenticated `GET` of the browser download URL returns nine bytes —
+the repository is private, so the URL needs a credential and answers `Not Found` without one. Sending
+`Accept: application/octet-stream` *in addition to* the API's JSON `Accept` returns 1.7 KB of the asset's
+metadata rather than its bytes; the octet-stream header has to replace the JSON one, not join it. Neither
+was a bad artifact, and neither would have been visible from the upload response, which reported
+`state: uploaded` and the right size throughout. Publishing something and checking what actually arrived
+remain different claims.
+
+`classes.dex` carries CRC `ffbdc00c` against 1.0.2's `78f68f26` — the payload really is new code and not a
+re-wrapped 1.0.2. The same file is also served over HTTP on port 19001 alongside 1.0.1 and 1.0.2, and was
+fetched back from the public address to confirm the server hands over all 5,694,909 bytes.
