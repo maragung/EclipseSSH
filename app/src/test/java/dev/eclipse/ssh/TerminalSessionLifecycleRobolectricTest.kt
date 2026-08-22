@@ -495,6 +495,20 @@ class TerminalSessionLifecycleRobolectricTest {
         assertThat(sentCodes().last()).isEqualTo(CARRIAGE_RETURN)
         // And the keyboard is still connected afterwards, so the next command needs no tap either.
         bridge.assertIsFocused()
+
+        // The other route Return takes. Some keyboards do not report it as a key event at all, they
+        // commit it as text - and a clipboard suggestion or voice typing puts newlines mid-commit. That
+        // has to execute the command exactly as the cap did, which means the newline has to leave as the
+        // app's own CR and not as the raw LF it arrived as: `TerminalKeysTest` and
+        // `TerminalCommittedTextTest` pin the encoding, and this pins that the committed newline reaches
+        // the wire at all rather than being filtered out somewhere in the field.
+        clearRecording()
+        bridge.performTextInput("uptime\n")
+        waitForFrameText(hostId, "echo: uptime")
+        assertWithMessage("a committed newline reached the pty as a bare line feed, not the app's Enter")
+            .that(sentCodes())
+            .doesNotContain(LINE_FEED)
+        assertThat(sentCodes().last()).isEqualTo(CARRIAGE_RETURN)
     }
 
     /**
@@ -896,6 +910,7 @@ class TerminalSessionLifecycleRobolectricTest {
         const val TILDE = 0x7E
         const val HORIZONTAL_TAB = 0x09
         const val CARRIAGE_RETURN = 0x0D
+        const val LINE_FEED = 0x0A
         const val DELETE = 0x7F
 
         /** Ctrl-C, the byte that interrupts a running command. */

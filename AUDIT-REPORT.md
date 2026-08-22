@@ -1504,7 +1504,10 @@ directly. No external host, no mocked channel.
 - The `"Terminal input"` node is asserted **focused** immediately after connecting, with no tap of any
   kind, then `performTextInput` is asserted to arrive at the remote pty and the on-screen `ENTER` cap to
   execute it. Focus is asserted rather than "the requester was called", because those two came apart in
-  exactly this bug.
+  exactly this bug. The same test then commits `uptime\n` as *text* — the second route Return takes — and
+  requires the command to run with **no `0x0A` anywhere in what the server read**. That also answers a
+  question the unit tests cannot: a committed newline does reach the field, so before the fix the raw line
+  feed really was going to the wire, and this is a regression test rather than a precaution.
 - Every cap on the key row is pressed and the bytes are asserted **at the server**: `ESC`, `TAB`, the
   four arrows as CSI, `HOME`, `END`, `PGUP`/`PGDN` as `ESC[5~`/`ESC[6~`, `DEL` as `ESC[3~`, `BKSP` as
   `0x7F`, `ENTER` as `0x0D`, and the `CTRL` latch plus a typed `c` as `0x03` — followed by a plain `c`
