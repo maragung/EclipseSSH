@@ -1478,6 +1478,17 @@ Two things were also wrong with how it gave up, both fixed in this pass:
   worst of the two states: wired to the shell, so keystrokes worked, with no keyboard on screen to
   produce any. Showing the IME is now its own effect keyed on the focus itself, and still offered once.
 
+A third defect in the same path was found by reading it rather than by a failing test: Return arrives by
+two routes and only one of them was mapped. Most keyboards report it as a key event, which the bridge
+translates to the terminal's own Enter — but a keyboard may equally *commit* it as text, and a clipboard
+suggestion or voice typing puts newlines in the middle of a commit. Committed text was passed through
+verbatim, so on those keyboards Return reached the pty as a bare `0x0A` while the app's Enter key, its
+`ENTER` cap and its paste path all send `0x0D`. Whether Return executed a command therefore depended on
+which keyboard the user had installed and on how the remote's line discipline felt about a lone line
+feed. Committed newlines now go through the same Enter as everything else, `CRLF` counting once, so every
+line of a multi-line commit is typed and executed in order. It is not the paste path, which still
+brackets a paste when the remote asked for it.
+
 Whether focus was actually *taken* is reported outwards by the field through `onFocusChanged` rather
 than inferred from the request having been made. Those are different facts — a `FocusRequester` cannot
 focus a node that has not been placed yet — and the difference is a terminal that silently swallows
@@ -1485,7 +1496,7 @@ everything typed into it.
 
 ### 17.4 What the tests now pin
 
-Twenty-eight tests, all against a real Apache MINA SSHD server in-process or against the emulator
+Thirty-seven tests, all against a real Apache MINA SSHD server in-process or against the emulator
 directly. No external host, no mocked channel.
 
 `TerminalSessionLifecycleRobolectricTest` (4) drives the actual UI:
@@ -1536,6 +1547,12 @@ and the programs people actually run:
 being bounded rather than obeyed, an offset stranded past the end of a narrower frame, and unmeasured
 font metrics being unable to make the pan a `NaN`.
 
+`TerminalCommittedTextTest` (9) pins the other half of Return: a bare newline and a lone `CR` each become
+one Enter, `CRLF` becomes one and not two, `uptime\n` is typed and then executed, a three-line commit
+sends and runs every line in order, two consecutive newlines stay two keypresses — a swallowed blank line
+is a lost answer at a prompt waiting for a default — and leading and trailing spaces around a newline
+survive on both sides, because indentation is content in a shell.
+
 `AutoReconnectDecisionTest` (1) pins the one case a status cannot distinguish: a close the app asked for
 is never reconnected even though it looks exactly like a drop.
 
@@ -1549,8 +1566,8 @@ touched.
 
 | Check | Result |
 | --- | --- |
-| `testDebugUnitTest` | 641 tests, 53 classes, 0 failures |
-| `testReleaseUnitTest` | 641 tests, 53 classes, 0 failures |
+| `testDebugUnitTest` | 650 tests, 54 classes, 0 failures |
+| `testReleaseUnitTest` | 650 tests, 54 classes, 0 failures |
 | `lintRelease` | 0 errors, 4 warnings — all four the `ConfigurationScreenWidthHeight` advisory declined in §16, on the same two lines |
 | Release APK | built and signed by CI, as since §16 |
 

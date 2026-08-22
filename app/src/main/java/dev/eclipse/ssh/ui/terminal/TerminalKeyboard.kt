@@ -147,7 +147,7 @@ fun TerminalInputBridge(
                         // A latched modifier applies to one character, which is what Ctrl-C is.
                         typed.forEach { char -> onChar(char, ctrl, alt) }
                     } else {
-                        onText(typed)
+                        sendCommittedText(typed, onText, onKey)
                     }
                 }
                 change.text.length < SENTINEL.length ->
@@ -176,6 +176,53 @@ fun TerminalInputBridge(
         cursorBrush = androidx.compose.ui.graphics.SolidColor(Color.Transparent),
     )
 }
+
+/**
+ * Sends text the IME committed, turning any newline inside it into a real Enter.
+ *
+ * Most keyboards report Return as a key event, which [handleKeyEvent] maps to [TerminalKey.ENTER];
+ * some commit it as text instead, and a multi-line clipboard suggestion or a voice-typed "new line"
+ * arrives the same way. Passing those through verbatim would put a bare LF on the wire where every
+ * other route in the app sends CR - `TerminalKeys.normalizeNewlines` already holds that line for a
+ * paste - so the same Return would encode differently depending on which keyboard the user installed,
+ * and a shell reading a raw pty would see the wrong end-of-line. CRLF is one Return, not two.
+ *
+ * This is not the paste path: a paste goes through `MainViewModel.pasteIntoTerminal`, which brackets
+ * it when the remote asked for bracketed paste.
+ */
+internal fun sendCommittedText(
+    typed: String,
+    onText: (String) -> Unit,
+    onKey: (TerminalKey, Boolean, Boolean, Boolean) -> Unit,
+) {
+    // Nothing to send is not a write of nothing: the call site already guards this, and a helper that
+    // cannot be trusted on its own is the kind that grows a second caller without one.
+    if (typed.isEmpty()) return
+    if (typed.none { it == LINE_FEED || it == CARRIAGE_RETURN }) {
+        onText(typed)
+        return
+    }
+    val run = StringBuilder(typed.length)
+    var index = 0
+    while (index < typed.length) {
+        val char = typed[index]
+        if (char != LINE_FEED && char != CARRIAGE_RETURN) {
+            run.append(char)
+            index++
+            continue
+        }
+        if (run.isNotEmpty()) {
+            onText(run.toString())
+            run.setLength(0)
+        }
+        onKey(TerminalKey.ENTER, false, false, false)
+        index += if (char == CARRIAGE_RETURN && typed.getOrNull(index + 1) == LINE_FEED) 2 else 1
+    }
+    if (run.isNotEmpty()) onText(run.toString())
+}
+
+private const val LINE_FEED = '\n'
+private const val CARRIAGE_RETURN = '\r'
 
 /**
  * Turns a hardware or IME key event into terminal input, or declines it.
