@@ -2,6 +2,7 @@
 
 `dev.eclipse.ssh` · versionCode 3 / versionName 1.0.2 · minSdk 28, target/compileSdk 35
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
+Where those snapshots call `lintRelease` clean, read §16.2: the current count is 0 errors and 51 warnings, and §16.2 says which are new and which are not.
 Kotlin 2.1.20 · AGP 8.9.1 · Gradle 8.11.1 · JDK 17 · Compose BOM 2025.04.01 · Hilt 2.56.1 · Room 2.7.1 · Apache MINA SSHD 2.14.0
 
 ---
@@ -1309,3 +1310,81 @@ requires the information rows and Export account and Favourite to be present *an
 to be absent - so the two routes cannot silently converge again. It also settled an open question about
 the harness: a `ModalBottomSheet` composes into the same window and is directly assertable, unlike an
 `AlertDialog`, which still has to be checked through `ShadowDialog`.
+
+---
+
+## 16. Releasing 1.0.2, and one lint advisory that is not followed
+
+### 16.1 What shipped, and how it was proved
+
+`versionCode` 2 → 3, `versionName` 1.0.1 → 1.0.2, carrying section 15's terminal margin and host-card
+arrow. The build itself was made by GitHub Actions from commit `8f320a5` (workflow run #7) and signed on
+this host afterwards, which is the arrangement from 1.0.1: the release key never leaves the machine, so
+it is never a repository secret and never in a runner's environment. The signing passwords are read out
+of `keystore.properties` into mode-600 files inside a mode-700 directory and handed to `apksigner` as
+`--ks-pass file:` / `--key-pass file:`, then shredded on every exit path, because `/proc/<pid>/cmdline`
+is world-readable on this shared host and a password on a command line would be readable by every
+tenant on it.
+
+Run #7 was green before anything was published, and the figures come from that run's own report
+artifact rather than from a local run: 613 tests across 53 classes in **both** the debug and the release
+variant, zero failures, zero errors, zero skips, and `lintRelease` at 0 errors. Instrumentation sources
+compile but do not execute — the runners have no KVM, the same limit this host has.
+
+Four things were checked on the signed artifact itself, not assumed:
+
+| Check | Result |
+| --- | --- |
+| `apksigner verify` | Verifies, one signer, v2 **and** v3 blocks present |
+| Certificate SHA-256 | `a75a6f…2921e` — the same certificate as 1.0.0 and 1.0.1, so 1.0.2 installs as an upgrade |
+| `zipalign -c 4` | aligned |
+| `aapt2 dump badging` | reads back `versionCode='3' versionName='1.0.2'`, minSdk 28, targetSdk 35 |
+
+Then the published asset was downloaded back from the release and `cmp`-ed against the local file: byte
+identical, and it still verifies. The copy served over HTTP hashes to the same
+`0a2fce84…957242`. Publishing something and *checking what actually arrived* are different claims, and
+only the second one is worth anything to whoever installs it.
+
+Two traps in that sequence are worth writing down. `apksigner verify` prints `v2 scheme: false` for this
+APK, which looks like a missing signature and is not one: the tool takes its minimum from the manifest,
+and at API 28 it verifies through v3 and never needs to look at v2. `--min-sdk-version 24` shows the v2
+block is there. And 1.0.1 and 1.0.2 are the same number of bytes — 5,637,368 — which looked like a
+copied file. It is a compression coincidence: the SHA-256 sums differ, the `classes.dex` CRCs differ,
+and the accessibility string `"Details and export for"` is present in 1.0.2 and absent from 1.0.1, which
+is what actually proves the new code is inside.
+
+### 16.2 `ConfigurationScreenWidthHeight`: an advisory declined on purpose
+
+Run #7's lint is 0 errors and **51 warnings**. Earlier sections of this report record `lintRelease` as
+"No issues found", and two separate things were hiding behind that, both worth correcting here.
+
+Forty-seven of the 51 are dependency freshness — 44 `GradleDependency`, 2 `AndroidGradlePluginVersion`
+(AGP 9.3.1 exists), 1 `OldTargetApi` — and they are invisible to every local run in this report, because
+those ran with `--offline`. Lint discovers newer versions over the network; with no network it has
+nothing to compare against and says nothing. They are not new and not caused by this release: CI run #4,
+which built 1.0.1, reports the same 47. Upgrading a dependency is a decision with its own testing, not a
+fix to fold into a patch release.
+
+The other four are genuinely mine, and the earlier "clean" reading was simply wrong about them: the
+local report for the section 15 pass does contain 4 warnings, and calling it clean was counting errors
+and not warnings. Run #4 has none of them; runs #5, #6 and #7 each have exactly 4.
+
+They sit on the two lines section 15 added: `ConfigurationScreenWidthHeight` at
+`MainActivity.kt:1809-1810`, telling us to read
+`LocalWindowInfo.current.containerSize` instead of `Configuration.screenWidthDp/screenHeightDp`. It is
+not followed, and the reason is the same reason the code reads the screen in the first place.
+
+`containerSize` measures the **window**. This activity is edge-to-edge, and on API 30+ that makes the
+keyboard an inset rather than a resize, so on a modern device the two would agree. But `minSdk` is 28,
+and on 28 and 29 `adjustResize` can still shrink the window when the IME opens — at which point a margin
+derived from `containerSize` would shrink as the user typed, walking the text towards the top edge
+keystroke by keystroke. That is exactly the defect the screen-derived value exists to prevent, and it
+would appear only on the oldest supported platform, which is where it is least likely to be noticed. A
+`Configuration` is not updated by an IME on any API level.
+
+So the trade lint proposes is a warning removed in exchange for a regression risk on the app's minimum
+API, on a device class no emulator on this host can run. It was declined, and left as a visible warning
+rather than a `@Suppress`, so the next person sees the tension instead of a silenced check and a comment
+claiming it was considered. The pure function behind it, `terminalTextInset(Int, Int)`, takes plain dp
+integers and is indifferent to where they came from: if a future `minSdk` of 30 makes `containerSize`
+safe here, the change is the two lines at the call site and nothing else.
