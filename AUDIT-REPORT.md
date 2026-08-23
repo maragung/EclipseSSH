@@ -2014,3 +2014,50 @@ With the fix, all three suites pass against real servers: `SessionStabilityTest`
 `ConnectionMatrixRobolectricTest` 19 tests and `TerminalSessionLifecycleRobolectricTest` 18 tests, no
 failures and no errors in any of them, on both the debug and the release variant. The whole gate is
 694 tests per variant, 0 failures and 0 errors on each, with `lintRelease` reporting no errors.
+
+## 22. Releasing 1.0.5
+
+Same process as §20, and for the same reason: GitHub Actions assembles the APK from the commit on `main`,
+this host does nothing but re-sign it. The release key is in no repository secret and never enters a
+runner, so a compromised workflow file cannot reach it. `Restore release signing material` finds no
+secrets, says so, and CI's own release APK carries the debug key — which is why the artifact is re-signed
+here rather than published as it arrives.
+
+Workflow run #16 built commit `9281e91`: `lintRelease` with **0 errors and 51 warnings**, and **694 unit
+and integration tests per variant across 57 classes, 0 failures and 0 errors** on both the debug and the
+release variant, one of the suites against a real OpenSSH `sshd` rather than the in-process server, plus
+the instrumentation compile and both APKs. The warning count is the same 51 as §16.2 describes and breaks
+down the same way — 44 `GradleDependency`, 2 `AndroidGradlePluginVersion`, 1 `OldTargetApi`, all of them
+advisories that ask the network whether a newer version exists, and the 4 `ConfigurationScreenWidthHeight`
+that the offline run finds too. Nothing in §21 added a warning.
+
+Then, on this host: the artifact re-signed with the real key through `.tmp-build/sign-release.sh`, which
+never puts a password on a command line — `/proc/<pid>/cmdline` is world-readable here — and shreds the
+files it reads them into on every exit path, including a failure or an interrupt. The result verifies under
+certificate SHA-256 `a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e`, the same one as
+every release since 1.0.0, with a single signer and schemes v2 and v3; it is aligned on 4 bytes and reports
+`versionCode='6' versionName='1.0.5'`, `minSdkVersion:'28'`, `targetSdkVersion:'35'` and all four ABIs.
+
+| | 1.0.5 |
+|---|---|
+| Size | 5,744,061 bytes |
+| SHA-256 | `86efd482ed5f8d5b275c3c8119df118168588487dd79ff2bb6d1ced82fca6d7e` |
+| `classes.dex` CRC | `2fd4a065` (1.0.4: `02e47c41`) |
+| Tag | `v1.0.5` |
+
+The published asset was pulled back out of the release and checked rather than assumed: byte-identical to
+the file signed here, verifying under the release certificate, aligned, and reporting versionCode 6 /
+versionName 1.0.5. It downloads through the API rather than the plain `releases/download` URL, because the
+repository is private and that URL answers `Not Found` without a credential — which is also why the HTTP
+server below is the way to install it on a phone.
+
+**1.0.5 is exactly as many bytes as 1.0.4, and that is not a coincidence.** The eight native libraries are
+stored uncompressed and page-aligned, so zipalign's padding absorbs a payload that grew by 1,272 bytes —
+`classes.dex` from 5,161,736 to 5,163,044 among them — and the file lands on the same length. The two are
+not the same file: the SHA-256 sums differ, and so does every dex CRC. The identical sizes of 1.0.1 and
+1.0.2 have the same cause, and this is the entry that says so, because "same size" read as "same build" is
+the kind of mistake a release note should pre-empt.
+
+The same file is served over HTTP on port 19001 alongside 1.0.1 through 1.0.4, and was fetched back from
+the public address to confirm the server hands over all 5,744,061 bytes with a matching digest. The
+directory behind that server holds the five APKs and a README and nothing else.
