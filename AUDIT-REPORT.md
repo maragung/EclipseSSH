@@ -2402,3 +2402,61 @@ rule is tested where it is deterministic — `TerminalFramePublishOrderTest`, fo
 revisions from a real buffer rather than hand-written numbers, because the property being leaned on
 belongs to the buffer. The integration stays covered by the lifecycle suite, which is where the fault
 surfaced in the first place.
+
+## 25. Releasing 1.0.6
+
+Same process as §20 and §22, and for the same reason: GitHub Actions assembles the APK from the commit on
+`main`, this host does nothing but re-sign it. The release key is in no repository secret and never enters
+a runner, so a compromised workflow file cannot reach it. `Restore release signing material` finds no
+secrets, says so, and CI's own release APK carries the debug key — `CN=Android Debug`, 5,707,608 bytes —
+which is why the artifact is re-signed here rather than published as it arrives.
+
+Workflow run #19 built commit `435d3a1`: `lintRelease` with **0 errors and 51 warnings**, and **706 unit
+and integration tests per variant across 58 classes, 0 failures and 0 errors** on both the debug and the
+release variant, one of the suites against a real OpenSSH `sshd` rather than the in-process server, plus
+the instrumentation compile and both APKs. The warning count is the same 51 as §16.2 and §22 describe and
+breaks down the same way — 44 `GradleDependency`, 2 `AndroidGradlePluginVersion`, 1 `OldTargetApi`, all
+advisories that ask the network whether a newer version exists, and the 4 `ConfigurationScreenWidthHeight`
+that the offline run finds too. Nothing in §23 or §24 added a warning.
+
+**This is the first release where the idle item on the stress list is answered by CI rather than by a
+promise.** The `verify` job reports one skipped test, and it is exactly one:
+`RealOpenSshInteropRobolectricTest.aDefaultSessionSurvivesTenMinutesOfSilence`, held behind
+`ECLIPSE_STRESS=1` because half an hour of wall clock does not belong on every push. The `stress` job sets
+that variable and runs it — **612.124 s, passed** — against a real `sshd` configured with
+`ClientAliveInterval 0`, so nothing but the app's own keepalive touches the connection for ten minutes.
+The session was still alive at the end and no reconnect was attempted. That is the *"login, then idle for
+10–30 minutes"* item, measured, on a machine that is not this one.
+
+Then, on this host: the artifact re-signed with the real key through `.tmp-build/sign-release.sh`, which
+never puts a password on a command line — `/proc/<pid>/cmdline` is world-readable here — and shreds the
+files it reads them into on every exit path, including a failure or an interrupt. The result verifies under
+certificate SHA-256 `a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e`, the same one as
+every release since 1.0.0, with a single signer and schemes v2 and v3; it is aligned on 4 bytes and reports
+`versionCode='7' versionName='1.0.6'`, `minSdkVersion:'28'`, `targetSdkVersion:'35'` and all four ABIs.
+
+| | 1.0.6 |
+|---|---|
+| Size | 5,744,061 bytes |
+| SHA-256 | `4f25f8c645c4841feaed2a1ae6f1153ce573930d8a92c04e30af941f7cc1a57f` |
+| `classes.dex` CRC | `a276957a` (1.0.5: `2fd4a065`) |
+| Tag | `v1.0.6` |
+
+The published asset was pulled back out of the release and checked rather than assumed: byte-identical to
+the file signed here, verifying under the release certificate, aligned, and reporting versionCode 7 /
+versionName 1.0.6. It downloads through the API rather than the plain `releases/download` URL, because the
+repository is private and that URL answers `Not Found` without a credential — which is also why the HTTP
+server below is the way to install it on a phone.
+
+**1.0.6 is the third release in a row with exactly 5,744,061 bytes, and it is still not the same file.**
+§22 explains the mechanism — the eight native libraries are stored uncompressed and page-aligned, so
+zipalign's padding absorbs a payload that grew — and here the payload grew by only 635 compressed bytes:
+`classes.dex` from 5,163,044 to 5,163,504 and `resources.arsc` from 117,484 to 117,620, 518 entries in
+both files. The proof that the new code is in there is not the length, it is the content: every dex CRC
+differs (`a276957a` against `2fd4a065`), and the reworded timeout notification string from this release is
+present in 1.0.6 and absent in 1.0.5, with the old wording present in 1.0.5 and absent in 1.0.6. A release
+whose size did not move is worth checking this way, not worth assuming either direction about.
+
+The same file is served over HTTP on port 19001 alongside 1.0.1 through 1.0.5, and was fetched back from
+the public address to confirm the server hands over all 5,744,061 bytes with a matching digest. The
+directory behind that server holds the six APKs and a README and nothing else.
