@@ -2,6 +2,7 @@ package dev.eclipse.ssh.background
 
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
 import org.junit.Test
 
 /**
@@ -59,5 +60,52 @@ class SessionRestoreDecisionTest {
         val pending = hostsNeedingRestore(hosts, activeIds = setOf("a", "gone"), isLive = { false })
 
         assertThat(pending.map { it.id }).containsExactly("a")
+    }
+
+    @Test
+    fun `a host that switched auto reconnect off is not dialled unattended`() {
+        // This pass is the most unattended dialler in the app - it runs from a connectivity callback
+        // while the phone is in a pocket - so it is exactly what a host that "must never be dialled
+        // unattended" is switching off. Reconnect by hand still works; nothing here does it for them.
+        val hosts = listOf(host("a").copy(autoReconnect = false), host("b"))
+
+        val pending = hostsNeedingRestore(hosts, activeIds = setOf("a", "b"), isLive = { false })
+
+        assertThat(pending.map { it.id }).containsExactly("b")
+    }
+
+    @Test
+    fun `the pass waits the shortest delay any pending host asked for`() {
+        // One wait serves every host in the pass, so a host that asked to retry after two seconds must
+        // not be held behind another host's minute.
+        val hosts = listOf(
+            host("slow").copy(reconnectBackoffSeconds = 60),
+            host("quick").copy(reconnectBackoffSeconds = 2),
+        )
+
+        assertThat(restoreBaseSeconds(hosts, globalSeconds = 30)).isEqualTo(2)
+    }
+
+    @Test
+    fun `a host that never chose a delay follows Settings`() {
+        assertThat(restoreBaseSeconds(listOf(host("a")), globalSeconds = 45)).isEqualTo(45)
+        // Including against a host that did choose one, when Settings is the shorter of the two.
+        val mixed = listOf(host("a"), host("b").copy(reconnectBackoffSeconds = 60))
+        assertThat(restoreBaseSeconds(mixed, globalSeconds = 45)).isEqualTo(45)
+    }
+
+    @Test
+    fun `a pass with nothing pending still has a delay to report`() {
+        // The notification interpolates this number, and the pass can reach the wait with only busy
+        // hosts in it.
+        assertThat(restoreBaseSeconds(emptyList(), globalSeconds = 45)).isEqualTo(45)
+    }
+
+    @Test
+    fun `a host carrying a delay no form would have accepted is clamped`() {
+        val hosts = listOf(host("a").copy(reconnectBackoffSeconds = 9_999))
+
+        assertThat(restoreBaseSeconds(hosts, globalSeconds = 30))
+            .isEqualTo(RECONNECT_BACKOFF_RANGE.last)
     }
 }

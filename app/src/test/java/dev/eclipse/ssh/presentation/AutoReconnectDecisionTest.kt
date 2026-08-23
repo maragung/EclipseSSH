@@ -2,7 +2,13 @@ package dev.eclipse.ssh.presentation
 
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.background.MAX_BACKOFF_MS
+import dev.eclipse.ssh.background.ReconnectPolicy
+import dev.eclipse.ssh.background.reconnectPolicyOf
 import dev.eclipse.ssh.background.backoffWindowMs
+import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
+import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
+import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.ssh.SessionEnd
 import java.io.IOException
@@ -35,6 +41,14 @@ class AutoReconnectDecisionTest {
         // liveness check, so treating it as the user's decision would leave a genuinely dropped tab
         // sitting there with no reconnect and no message.
         assertThat(shouldAutoReconnect(SessionEnd.Released, tabIsOpen = true, endedDeliberately = false)).isTrue()
+    }
+
+    @Test
+    fun `a session the app dropped because the network went comes back`() {
+        // The ending the app concludes itself, rather than one MINA reported. It has to reconnect, and for
+        // the strongest reason of any of them: the session was proven to have lost the address it was
+        // bound to, so there is nothing to salvage and something to redial.
+        assertThat(shouldAutoReconnect(SessionEnd.NetworkLost, tabIsOpen = true, endedDeliberately = false)).isTrue()
     }
 
     @Test
@@ -116,6 +130,7 @@ class AutoReconnectDecisionTest {
         SessionEnd.ShellEnded(status = null, signal = null),
         SessionEnd.Disconnected(reason = SshConstants.SSH2_DISCONNECT_BY_APPLICATION, message = "bye", byPeer = true),
         SessionEnd.TransportFailed(IOException("Broken pipe")),
+        SessionEnd.NetworkLost,
         SessionEnd.TransportClosed,
         SessionEnd.Released,
     )
@@ -149,4 +164,89 @@ class AutoReconnectDecisionTest {
         val window = backoffWindowMs(SettingsRepository.MAX_RECONNECT_BASE_SECONDS, MAX_AUTO_RECONNECT_ATTEMPTS)
         assertThat(window).isAtMost(MAX_BACKOFF_MS)
     }
+
+    /**
+     * A host with auto-reconnect switched off is not reconnected, whatever ended it.
+     *
+     * Checked against the endings that *are* reconnect-worthy, because the switch is only meaningful
+     * where the answer would otherwise have been yes.
+     */
+    @Test
+    fun `a host with auto reconnect off is never reconnected`() {
+        val faults = listOf(
+            SessionEnd.TransportFailed(IOException("reset")),
+            SessionEnd.Disconnected(SshConstants.SSH2_DISCONNECT_BY_APPLICATION, "bye", byPeer = true),
+            SessionEnd.NetworkLost,
+            SessionEnd.TransportClosed,
+            SessionEnd.Released,
+        )
+
+        for (end in faults) {
+            assertThat(
+                shouldAutoReconnect(end, tabIsOpen = true, endedDeliberately = false, autoReconnectEnabled = false),
+            ).isFalse()
+            // The same ending with the switch on is the control: without this the assertion above
+            // would pass just as well if the rule had stopped reconnecting anything at all.
+            assertThat(
+                shouldAutoReconnect(end, tabIsOpen = true, endedDeliberately = false, autoReconnectEnabled = true),
+            ).isTrue()
+        }
+    }
+
+    @Test
+    fun `a host policy takes its attempt ceiling and delay from the profile`() {
+        val profile = hostProfile().copy(
+            autoReconnect = true,
+            maxReconnectAttempts = 12,
+            reconnectBackoffSeconds = 9,
+        )
+
+        val policy = reconnectPolicyOf(profile)
+
+        assertThat(policy.enabled).isTrue()
+        assertThat(policy.maxAttempts).isEqualTo(12)
+        // The global delay is offered and ignored, because this host stated its own.
+        assertThat(policy.backoffSeconds(globalSeconds = 45)).isEqualTo(9)
+    }
+
+    /**
+     * A host that never set a delay follows the app-wide one, and follows it *live*.
+     *
+     * The inherit sentinel is the reason this is resolved at scheduling time rather than at dial time:
+     * a user who raises the global delay while a tab is open should have the next wait honour it.
+     */
+    @Test
+    fun `a host with no delay of its own inherits the app wide one`() {
+        val policy = reconnectPolicyOf(hostProfile().copy(reconnectBackoffSeconds = INHERIT_RECONNECT_BACKOFF))
+
+        assertThat(policy.backoffSeconds(globalSeconds = 45)).isEqualTo(45)
+        assertThat(policy.backoffSeconds(globalSeconds = SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS))
+            .isEqualTo(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+    }
+
+    /** A profile carrying an out-of-range number - an old backup, a hand-written import - is clamped. */
+    @Test
+    fun `a policy clamps values a profile should not have held`() {
+        val policy = reconnectPolicyOf(
+            hostProfile().copy(maxReconnectAttempts = 9_999, reconnectBackoffSeconds = 9_999),
+        )
+
+        assertThat(policy.maxAttempts).isEqualTo(MAX_RECONNECT_ATTEMPTS_RANGE.last)
+        assertThat(policy.backoffSeconds(globalSeconds = 5)).isEqualTo(RECONNECT_BACKOFF_RANGE.last)
+    }
+
+    /** The fallback for a session no profile was seen for behaves exactly as the app always has. */
+    @Test
+    fun `the default policy matches the app wide ladder`() {
+        assertThat(ReconnectPolicy.DEFAULT.enabled).isTrue()
+        assertThat(ReconnectPolicy.DEFAULT.maxAttempts).isEqualTo(MAX_AUTO_RECONNECT_ATTEMPTS)
+        assertThat(ReconnectPolicy.DEFAULT.backoffSeconds(globalSeconds = 45)).isEqualTo(45)
+    }
+
+    private fun hostProfile() = HostProfile(
+        id = "policy-host",
+        name = "Policy",
+        host = "policy.example.com",
+        username = "root",
+    )
 }

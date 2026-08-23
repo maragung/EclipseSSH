@@ -383,6 +383,87 @@ class SessionStabilityTest {
         }
     }
 
+    /**
+     * What the diagnostic trace is able to say about a channel it is handed.
+     *
+     * Three one-line accessors, and the reason they are worth a real server is that all three read
+     * state the client cannot be trusted to report about itself: whether the channel is *still* open
+     * after a close, whether the geometry it prints is the one the pty actually holds, and whether a
+     * byte from the far end moved the activity clock. A trace whose `chan=` or `idle=` fields are
+     * stale or invented is worse than one without them - it is the evidence a dropped-session report
+     * gets diagnosed from.
+     */
+    @Test
+    fun `the trace reads a live channel, the pty it holds and how long the far end has been quiet`() = runBlocking {
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile())
+            session.use {
+                val started = shells.size
+                val terminal = manager.openTerminal(session)
+                awaitShell(started)
+                coroutineScope {
+                    val (sink, pump) = collectText(terminal)
+                    try {
+                        assertThat(terminal.channelLabel).isEqualTo("open")
+                        // Nothing has been said by the far end yet, and "no output ever" is not the
+                        // same answer as "output a very long time ago": the trace prints no `idle`
+                        // field at all rather than an age measured from an epoch nobody set.
+                        assertThat(terminal.idleForMs()).isNull()
+
+                        // The label follows the pty rather than being fixed at the size it opened at,
+                        // which is what makes it usable after a resize - the geometry a reconnect
+                        // carries forward is the one the user's screen decided.
+                        terminal.resize(100, 30)
+                        assertThat(terminal.ptyLabel).isEqualTo("100x30")
+
+                        terminal.write("a")
+                        assertThat(awaitText(sink) { it.contains("a") }).contains("a")
+                        // Only *server* bytes move this clock, and one has now arrived.
+                        assertThat(terminal.idleForMs()).isNotNull()
+                        assertThat(terminal.idleForMs()!!).isLessThan(WAIT_MS)
+                    } finally {
+                        pump.cancel()
+                        terminal.close()
+                    }
+                }
+                assertThat(awaitTrue { terminal.channelLabel == "closed" }).isTrue()
+            }
+        } finally {
+            manager.close()
+        }
+    }
+
+    /**
+     * A channel opened without a pty says so, instead of printing a size nobody applied.
+     *
+     * The geometry is still recorded on such a channel - a resize keeps it so a reconnect can carry it
+     * forward - so a trace that printed it would show `pty=120x40` for a session with no pty at all,
+     * which is the explanation for a whole class of reports: no colours, `top` refusing to start, a
+     * shell with no prompt. See [HostProfile.usePty].
+     */
+    @Test
+    fun `a channel with no pty reports none rather than a geometry`() = runBlocking {
+        val manager = newManager()
+        try {
+            val session = trustedConnect(manager, hostProfile())
+            session.use {
+                val started = shells.size
+                val terminal = manager.openTerminal(session, profile = hostProfile().copy(usePty = false))
+                awaitShell(started)
+                try {
+                    assertThat(terminal.ptyLabel).isEqualTo("none")
+                    // Still tracked underneath, which is why the label cannot be derived from these.
+                    assertThat(terminal.ptyColumns).isGreaterThan(0)
+                } finally {
+                    terminal.close()
+                }
+            }
+        } finally {
+            manager.close()
+        }
+    }
+
     @Test
     fun `a pasted command longer than the buffer arrives whole and in order`() = runBlocking {
         val manager = newManager()
@@ -665,6 +746,84 @@ class SessionStabilityTest {
             assertThat(
                 shouldAutoReconnect(closed!!.single(), tabIsOpen = true, endedDeliberately = terminal.endedDeliberately),
             ).isTrue()
+        } finally {
+            runCatching { store.closeAll() }
+            manager.close()
+            relay.close()
+        }
+    }
+
+    /**
+     * The reaper cannot be the old bug wearing a new name.
+     *
+     * Pruning-on-read was removed because a reader that mutates killed working sessions; what replaced it
+     * is [SshSessionStore.reap], and the only thing worth proving about it is that it declines. A live
+     * session with a live shell is the exact input the old code got wrong, so it is the input tested,
+     * and the last assertion is deliberately not "the map still has it" but "the shell still carries
+     * bytes" - a half-released channel passes the first and fails the second.
+     */
+    @Test
+    fun `the reaper leaves a live session alone`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile()
+            val session = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(session)
+            val shell = awaitShell(started)
+            store.sessions[profile.id] = session
+            store.channels[profile.id] = terminal
+
+            assertThat(store.reap(profile.id)).isFalse()
+            assertThat(store.liveSession(profile.id)).isSameInstanceAs(session)
+            assertThat(store.channels[profile.id]).isSameInstanceAs(terminal)
+
+            val line = "still-here-after-the-reaper\n"
+            terminal.write(line)
+            assertThat(awaitTrue { shell.received().size >= line.length }).isTrue()
+        } finally {
+            runCatching { store.closeAll() }
+            manager.close()
+        }
+    }
+
+    /**
+     * A session whose transport genuinely died leaves the registry, and leaves it *after* saying why.
+     *
+     * The ordering is the point. The reason reaches the tab from the channel's own close future, and
+     * [TerminalChannel.finish] is first-completion-wins, so the reaper releasing the same channel a
+     * moment later cannot overwrite a transport failure with [SessionEnd.Released] - which is precisely
+     * the substitution that used to turn a diagnosis into "the app tidied something up". Both halves are
+     * asserted: the ending the user acts on, then the empty registry.
+     */
+    @Test
+    fun `the registry stops holding a session whose transport died`() = runBlocking {
+        val relay = FreezableRelay(serverPort)
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile(port = relay.port)
+            val session = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(session)
+            awaitShell(started)
+            store.sessions[profile.id] = session
+            store.channels[profile.id] = terminal
+
+            // Taken away rather than closed: the sockets vanish under a session nobody asked to end.
+            relay.close()
+            val end = withTimeoutOrNull(WAIT_MS) { terminal.awaitClosed() }
+            assertThat(end).isNotNull()
+            assertThat(terminal.endedDeliberately).isFalse()
+            assertThat(shouldAutoReconnect(end!!, tabIsOpen = true, endedDeliberately = false)).isTrue()
+
+            assertThat(awaitTrue { !session.isOpen }).isTrue()
+            assertThat(store.reap(profile.id)).isTrue()
+            assertThat(store.sessions).doesNotContainKey(profile.id)
+            assertThat(store.channels).doesNotContainKey(profile.id)
+            // Nothing left to reap, and saying so is how a caller on every ending stays cheap.
+            assertThat(store.reap(profile.id)).isFalse()
         } finally {
             runCatching { store.closeAll() }
             manager.close()

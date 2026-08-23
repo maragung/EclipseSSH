@@ -45,7 +45,9 @@ import androidx.compose.ui.unit.dp
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
 import dev.eclipse.ssh.terminal.TerminalCell
 import dev.eclipse.ssh.terminal.TerminalFrame
+import dev.eclipse.ssh.terminal.TerminalLayout
 import dev.eclipse.ssh.terminal.TerminalSelection
+import dev.eclipse.ssh.terminal.terminalLayout
 import dev.eclipse.ssh.terminal.TerminalColor
 import dev.eclipse.ssh.terminal.TerminalStyle
 import kotlinx.coroutines.delay
@@ -106,8 +108,9 @@ data class TerminalGrid(val columns: Int, val rows: Int, val originX: Float, val
  *
  * Asking for eighty instead - the width every command-line program on earth is written for - moves the
  * decision back to where it can be undone: the lines arrive whole, and the part that does not fit on
- * screen is reached by panning sideways. [rows] is never touched, because vertical space is not
- * scarce in the same way: the view can always show every row it has, and a program that thinks it has
+ * screen is wrapped at a word boundary by [dev.eclipse.ssh.terminal.terminalLayout], or panned to on the
+ * alternate screen where wrapping would move a full-screen program's rows. [rows] is never touched,
+ * because vertical space is not scarce in the same way: the view can always show every row it has, and a program that thinks it has
  * more rows than the screen would draw its status line where nobody can see it.
  *
  * Bounded by the same range the pty and the buffer accept, so a stored setting can never ask for a
@@ -117,6 +120,36 @@ fun TerminalGrid.atLeastColumns(minColumns: Int): TerminalGrid {
     val wanted = minColumns.coerceAtMost(TERMINAL_COLUMN_RANGE.last)
     return if (wanted <= columns) this else copy(columns = wanted)
 }
+
+/**
+ * The narrowest grid to give a host's pty: the wider of the app-wide floor and this host's own choice.
+ *
+ * A per-host width has to be a floor *here*, at the view, and not only an argument to the pty when the
+ * shell opens. The viewport is reported on every measurement pass and each report resizes the pty, so a
+ * width applied at open time and nowhere else survives exactly until the first frame is measured - which
+ * is a few milliseconds later, before any output has arrived. The setting looked as if it did nothing.
+ *
+ * The wider of the two rather than the more specific of the two, because both are floors and neither is
+ * a ceiling: the app-wide setting says how narrow a terminal the user is willing to read anywhere, and
+ * the host's says this particular server needs at least that much to format itself.
+ */
+internal fun minTerminalColumns(settingColumns: Int, hostColumns: Int): Int =
+    maxOf(settingColumns.coerceAtLeast(0), hostColumns.coerceAtLeast(0))
+
+/**
+ * The same grid, shortened to a host's chosen height when the screen can show that many rows.
+ *
+ * A height is the one dimension that cannot be a floor. Columns past the right edge are reachable by
+ * wrapping or panning, but a row past the bottom edge is nowhere: a pty told it has sixty rows on a
+ * screen that fits forty puts the shell's prompt, and every full-screen program's status line, twenty
+ * rows below the last pixel. So a host asking for more than fits is given what fits, and a host asking
+ * for fewer - which is a real thing to want, and the only way to tell a server the window is short -
+ * gets exactly what it asked for, drawn at the top with the rest of the screen left blank.
+ *
+ * Zero means "match the screen", the same sentinel the stored setting uses.
+ */
+fun TerminalGrid.atMostRows(hostRows: Int): TerminalGrid =
+    if (hostRows in 1 until rows) copy(rows = hostRows) else this
 
 /** Remembers the cell metrics for [style], measuring a run of glyphs rather than a single one. */
 @Composable
@@ -162,8 +195,10 @@ private const val TEXT_INSET_FRACTION = 0.01f
  *
  * Only *painted* columns are pannable. A shell screen is mostly empty on the right, and being able to
  * drag the text away to stare at that emptiness is a way to lose the output rather than a feature - so
- * the extent comes from [TerminalFrame.contentColumns], which counts what is actually on the line
- * (including the cursor's own cell), and not from the width the pty was given.
+ * the extent comes from [dev.eclipse.ssh.terminal.TerminalLayout.contentColumns], which counts what is
+ * actually on the widest drawn row (including the cursor's own cell), and not from the width the pty was
+ * given. After wrapping that is usually the window itself and there is nothing to pan; what is left is
+ * the alternate screen, and the single token too wide to break.
  */
 internal fun maxPanPx(contentColumns: Int, visibleColumns: Int, cellWidth: Float): Float =
     ((maxOf(contentColumns, visibleColumns) - visibleColumns) * cellWidth).coerceAtLeast(0f)
@@ -215,15 +250,23 @@ internal fun panForCursor(
  * The frame is a plain value, so recomposition is driven by [TerminalFrame.revision] rather than by a
  * deep comparison of a quarter of a million cells.
  *
+ * Rows are drawn through [dev.eclipse.ssh.terminal.terminalLayout] rather than one per buffer line, so a
+ * line wider than the window occupies as many rows as it needs, broken at word boundaries. Every
+ * coordinate the view deals in - the touch that starts a selection, the tint that shows it, the cursor,
+ * the pan extent - goes through that same mapping, which is why it is one pure function and not a
+ * sprinkling of arithmetic.
+ *
  * Gestures, because a terminal has to spend them carefully. A drag scrolls - vertically through the
- * scrollback and horizontally across a grid wider than the screen, which is what makes [minColumns]
- * usable at all. Selection is therefore behind a long press: the press alone selects the word under
+ * scrollback and horizontally across whatever is still wider than the screen, which after wrapping is
+ * the alternate screen and the occasional unbreakable token. Selection is therefore behind a long press: the press alone selects the word under
  * the finger, and holding and then dragging extends the selection by cell. A plain drag used to start
  * a selection, which meant a terminal that could not be scrolled with a finger at all - every attempt
  * painted a selection and put a fragment of a line on the clipboard instead.
  *
  * @param minColumns the narrowest grid to give the pty regardless of how many columns fit on screen;
- *   0 fits the screen exactly. See [atLeastColumns].
+ *   0 fits the screen exactly. See [atLeastColumns] and [minTerminalColumns].
+ * @param hostRows the height this host asked for, capped by what the screen can show; 0 fits the screen.
+ *   See [atMostRows].
  * @param onScroll called with a line delta; positive scrolls back into the history.
  * @param onSelectionChange the live drag selection, in absolute buffer lines, or null when cleared.
  */
@@ -236,6 +279,7 @@ fun TerminalView(
     metrics: TerminalCellMetrics,
     modifier: Modifier = Modifier,
     minColumns: Int = 0,
+    hostRows: Int = 0,
     selection: TerminalSelection? = null,
     onSelectionChange: (TerminalSelection?) -> Unit = {},
     onSelectionFinished: (TerminalSelection) -> Unit = {},
@@ -283,7 +327,9 @@ fun TerminalView(
         // screen; `grid` is what the pty is told it has, which is at least as wide. They are the same
         // object whenever the setting is "fit screen".
         val visible = remember(metrics, widthPx, heightPx) { metrics.gridIn(widthPx, heightPx) }
-        val grid = remember(visible, minColumns) { visible.atLeastColumns(minColumns) }
+        val grid = remember(visible, minColumns, hostRows) {
+            visible.atLeastColumns(minColumns).atMostRows(hostRows)
+        }
         val origin = remember(visible) { Offset(visible.originX, visible.originY) }
         // Reported on every size change, including the one the software keyboard causes: the pty has
         // to know the window it is drawing into or a full-screen program wraps its own status line.
@@ -294,18 +340,32 @@ fun TerminalView(
         // rather than a plain `var` so the draw below re-runs on a pan without recomposing anything.
         val pan = remember { mutableFloatStateOf(0f) }
         val visibleWidthPx = visible.columns * metrics.width
-        val maxPan = maxPanPx(frame.contentColumns, visible.columns, metrics.width)
+        // Where every row of this frame goes once lines too wide for the window have been wrapped at a
+        // word boundary. Keyed on what the answer depends on rather than on the frame, whose equality is
+        // a comparison of several thousand cells: the revision covers every mutation of the buffer and
+        // `firstLine` covers a scroll, which moves the window without mutating anything.
+        val layout = remember(frame.revision, frame.firstLine, frame.lines.size, visible.columns, grid.rows) {
+            terminalLayout(frame, visible.columns, grid.rows)
+        }
+        // Read from the long-lived gesture handlers, which are keyed on the metrics and would otherwise
+        // map a touch through the layout of whichever frame was on screen when they were installed.
+        val currentLayout by rememberUpdatedState(layout)
+        // From the layout, not the frame: after wrapping, the frame's widest line is no longer drawn as
+        // one row, and panning to reach a column that is now on the row below would only lose the text.
+        val maxPan = maxPanPx(layout.contentColumns, visible.columns, metrics.width)
 
         // Follows the cursor, which is the one thing that must never be off-screen: with an 80-column
         // grid on a 45-column phone, typing a long command would otherwise run out of sight and the
         // user would be editing a line they cannot see. Keyed on the cursor rather than on the frame,
         // so this settles once per cursor move and a manual pan is left alone until the cursor moves
         // again - and re-clamped here too, because a narrower frame can strand an old pan past its end.
-        LaunchedEffect(frame.cursorColumn, frame.cursorRow, frame.cursorVisible, maxPan, visible.columns, metrics.width) {
+        LaunchedEffect(layout.cursorColumn, layout.cursorRow, maxPan, visible.columns, metrics.width) {
             pan.floatValue = panForCursor(
                 current = pan.floatValue,
-                cursorColumn = frame.cursorColumn,
-                cursorOnScreen = frame.cursorVisible && frame.cursorRow >= 0,
+                // The cursor's column *within its row*. On a wrapped line the two differ, and following
+                // the line's column would pan a window whose text is already on screen.
+                cursorColumn = layout.cursorColumn,
+                cursorOnScreen = layout.cursorRow >= 0,
                 cellWidth = metrics.width,
                 visibleWidthPx = visibleWidthPx,
                 maxPan = maxPan,
@@ -317,7 +377,7 @@ fun TerminalView(
         // the user pressed a key would otherwise be invisible at the moment they looked for it. While
         // output is streaming the restart happens per frame and the cursor simply stays solid, which is
         // what every other terminal does too.
-        LaunchedEffect(frame.cursorVisible, focused, frame.cursorRow, frame.cursorColumn) {
+        LaunchedEffect(frame.cursorVisible, focused, layout.cursorRow, layout.cursorColumn) {
             if (!frame.cursorVisible || !focused) {
                 // Solid, not dark. A cursor frozen mid-blink reads as a rendering bug, and a terminal
                 // whose window is not focused should still show where the caret is.
@@ -391,7 +451,8 @@ fun TerminalView(
                     detectTapGestures(
                         onTap = { tap() },
                         onLongPress = { position ->
-                            val (line, column) = position.toCell(currentFrame, metrics, origin, pan.floatValue)
+                            val (line, column) =
+                                position.toCell(currentFrame, currentLayout, metrics, origin, pan.floatValue)
                             longPress(line, column)
                         },
                     )
@@ -405,12 +466,14 @@ fun TerminalView(
                             // selected the word under the finger, and replacing that with a one-cell
                             // selection before the user has moved would undo it in front of them.
                             moved = false
-                            val (line, column) = position.toCell(currentFrame, metrics, origin, pan.floatValue)
+                            val (line, column) =
+                                position.toCell(currentFrame, currentLayout, metrics, origin, pan.floatValue)
                             anchor = TerminalSelection.at(line, column)
                         },
                         onDrag = { change, _ ->
                             moved = true
-                            val (line, column) = change.position.toCell(currentFrame, metrics, origin, pan.floatValue)
+                            val (line, column) =
+                                change.position.toCell(currentFrame, currentLayout, metrics, origin, pan.floatValue)
                             anchor = anchor?.movedTo(line, column)?.also(selectionCallback)
                         },
                         onDragEnd = { if (moved) anchor?.let(selectionFinished) },
@@ -425,6 +488,7 @@ fun TerminalView(
                     translate(visible.originX - pan.floatValue, visible.originY) {
                         drawFrame(
                             frame = currentFrame,
+                            layout = currentLayout,
                             measurer = measurer,
                             style = style,
                             foreground = foreground,
@@ -456,14 +520,19 @@ fun TerminalView(
  */
 private fun Offset.toCell(
     frame: TerminalFrame,
+    layout: TerminalLayout,
     metrics: TerminalCellMetrics,
     origin: Offset,
     pan: Float = 0f,
 ): Pair<Int, Int> {
     val row = if (metrics.height <= 0f) 0 else floor((y - origin.y) / metrics.height).toInt()
     val column = if (metrics.width <= 0f) 0 else floor((x + pan - origin.x) / metrics.width).toInt()
-    val boundedRow = row.coerceIn(0, (frame.lines.size - 1).coerceAtLeast(0))
-    return (frame.firstLine + boundedRow) to column.coerceAtLeast(0)
+    // Through the layout, because the row under the finger is a *visual* row: on a wrapped line the
+    // third row of the screen can be the second half of the second line of output, and a selection
+    // addressed by screen row would copy text from somewhere else entirely.
+    val visual = layout.rows.getOrNull(row.coerceIn(0, layout.rows.lastIndex.coerceAtLeast(0)))
+        ?: return frame.firstLine to column.coerceAtLeast(0)
+    return (frame.firstLine + visual.line) to (visual.from + column).coerceAtLeast(0)
 }
 
 /**
@@ -473,9 +542,13 @@ private fun Offset.toCell(
  * line of ordinary output is a single draw call and a colourful prompt is a few - against one call
  * per character, which is what made the old renderer's cost scale with the text rather than with the
  * styling. Trailing blanks are skipped entirely: most of a terminal grid is empty space.
+ *
+ * One row of [layout] per row of the screen, so which columns of which line are drawn where is decided
+ * in one pure, tested function instead of here; this loop only paints what it is handed.
  */
 private fun DrawScope.drawFrame(
     frame: TerminalFrame,
+    layout: TerminalLayout,
     measurer: TextMeasurer,
     style: TextStyle,
     foreground: Color,
@@ -491,24 +564,26 @@ private fun DrawScope.drawFrame(
     val cellHeight = metrics.height
     if (cellWidth <= 0f || cellHeight <= 0f) return
 
-    frame.lines.forEachIndexed { row, line ->
+    layout.rows.forEachIndexed { row, visual ->
         // Bounded by the grid rather than by `size.height`: a draw modifier does not clip, and the
         // translate that centres the grid moves the bottom row past the height this scope reports, so
         // a height test would let a partial row paint into the margin below it.
         if (row >= maxRows) return@forEachIndexed
+        val line = frame.lines.getOrNull(visual.line) ?: return@forEachIndexed
         val top = row * cellHeight
-        val absoluteLine = frame.firstLine + row
-        // Trailing empty cells are skipped, but only the ones that are truly empty: a blank with a
-        // background set is a painted cell, which is how a highlighted selection bar or a status
-        // line's coloured padding is drawn.
-        val lastPainted = line.indexOfLast { it.value != ' ' || !it.style.background.isDefault || it.style.inverse }
-        var column = 0
-        while (column <= lastPainted) {
+        val absoluteLine = frame.firstLine + visual.line
+        // The row's own columns, and only those: the layout has already dropped the trailing blanks and
+        // decided where a line too wide for the window breaks. Bounded by the line again because the
+        // layout and the frame are read at slightly different moments while output is arriving.
+        val lastColumn = visual.to.coerceAtMost(line.size)
+        var column = visual.from
+        while (column < lastColumn) {
             val cell = line[column]
             var end = column + 1
-            while (end <= lastPainted && line[end].style == cell.style) end++
+            while (end < lastColumn && line[end].style == cell.style) end++
             val text = buildString(end - column) { for (index in column until end) append(line[index].value) }
-            val left = column * cellWidth
+            // Relative to the row, not to the line: a wrapped continuation is drawn from the left margin.
+            val left = (column - visual.from) * cellWidth
             val runWidth = (end - column) * cellWidth
             val resolved = cell.style.resolve(foreground, background)
             if (resolved.background != null) {
@@ -531,23 +606,25 @@ private fun DrawScope.drawFrame(
             column = end
         }
         if (selection != null && absoluteLine in selection.startLine..selection.endLine) {
-            val from = selection.firstColumnOn(absoluteLine)
-            val to = selection.lastColumnOn(absoluteLine, frame.columns)
+            // Clipped to this row's columns, so a line selected across a wrap is tinted on each of the
+            // rows it occupies and on no part of the grid that holds none of it.
+            val from = maxOf(selection.firstColumnOn(absoluteLine), visual.from)
+            val to = minOf(selection.lastColumnOn(absoluteLine, frame.columns), visual.to - 1)
             if (to >= from) {
                 drawRect(
                     selectionColour,
-                    topLeft = Offset(from * cellWidth, top),
+                    topLeft = Offset((from - visual.from) * cellWidth, top),
                     size = Size((to - from + 1) * cellWidth, cellHeight),
                 )
             }
         }
     }
 
-    if (cursorOn && frame.cursorVisible && frame.cursorRow in frame.lines.indices && frame.cursorRow < maxRows) {
+    if (cursorOn && frame.cursorVisible && layout.cursorRow in 0 until maxRows) {
         // A hollow block, so the character underneath stays legible - a filled one hides whatever the
         // cursor is on, which on a phone is exactly the character the user is trying to check.
-        val left = frame.cursorColumn * cellWidth
-        val top = frame.cursorRow * cellHeight
+        val left = layout.cursorColumn * cellWidth
+        val top = layout.cursorRow * cellHeight
         drawRect(
             cursorColour,
             topLeft = Offset(left, top),

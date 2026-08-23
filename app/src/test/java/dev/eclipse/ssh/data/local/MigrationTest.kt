@@ -16,7 +16,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
- * The database has grown from version 2 to 11 through hand-written `ALTER TABLE` migrations.
+ * The database has grown from version 2 to 12 through hand-written `ALTER TABLE` migrations.
  * Room validates the migrated schema against the entities when it opens, so a single missing
  * or mistyped column turns an app update into a crash on launch. The schema is not exported,
  * so these tests build the old database by hand rather than using [MigrationTestHelper].
@@ -35,7 +35,7 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 2 database migrates all the way to 11 with its rows intact`() = runTest {
+    fun `a version 2 database migrates all the way to 12 with its rows intact`() = runTest {
         seedVersion2()
 
         val db = openWithMigrations()
@@ -85,6 +85,28 @@ class MigrationTest {
         // directory unconditionally. An upgrade that silently switched the file browser off would
         // read as the Files tab having broken, so an existing profile keeps the behaviour it had.
         assertThat(host.autoLoginSftp).isTrue()
+        // Version 12's advanced settings. Every default reproduces what the engine did before the
+        // column existed, so an upgraded profile connects identically until the user edits it: no
+        // compression was ever offered, the heartbeat was always armed with three missed replies
+        // allowed, MINA's own 30-second auth timeout applied, the reconnect ladder used 5 attempts
+        // from a 5-second base, the pty request was unconditional at xterm-256color, the geometry came
+        // from the view (the 0 sentinel), MINA's full authentication method list was offered, and the
+        // verifier asked about an unknown key. legacyAlgorithms is null because "follow the global
+        // switch" was the only behaviour there was.
+        assertThat(host.compression).isFalse()
+        assertThat(host.keepAliveEnabled).isTrue()
+        assertThat(host.serverAliveCountMax).isEqualTo(3)
+        assertThat(host.authTimeoutSeconds).isEqualTo(30)
+        assertThat(host.autoReconnect).isTrue()
+        assertThat(host.maxReconnectAttempts).isEqualTo(5)
+        assertThat(host.reconnectBackoffSeconds).isEqualTo(0)
+        assertThat(host.usePty).isTrue()
+        assertThat(host.terminalType).isEqualTo("xterm-256color")
+        assertThat(host.terminalColumns).isEqualTo(0)
+        assertThat(host.terminalRows).isEqualTo(0)
+        assertThat(host.keyboardInteractiveAuth).isTrue()
+        assertThat(host.legacyAlgorithms).isNull()
+        assertThat(host.hostKeyPolicy).isEqualTo("ASK")
 
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.hostId).isNull()
@@ -140,6 +162,7 @@ class MigrationTest {
                 Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
+                Migrations.MIGRATION_11_12,
             )
             .fallbackToDestructiveMigration(dropAllTables = true)
             .allowMainThreadQueries()
@@ -157,6 +180,7 @@ class MigrationTest {
                 Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
+                Migrations.MIGRATION_11_12,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()

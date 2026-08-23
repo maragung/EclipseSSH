@@ -1,0 +1,153 @@
+package dev.eclipse.ssh.presentation
+
+import dev.eclipse.ssh.data.model.AUTH_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.DEFAULT_AUTH_TIMEOUT_SECONDS
+import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
+import dev.eclipse.ssh.data.model.DEFAULT_SERVER_ALIVE_COUNT_MAX
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
+import dev.eclipse.ssh.data.model.HostKeyPolicy
+import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
+import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
+import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
+import dev.eclipse.ssh.data.model.SERVER_ALIVE_COUNT_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
+
+/**
+ * The Advanced section of the Add / Edit Host form, as data.
+ *
+ * Same reasoning as [HostFormDraft], which this sits beside: a rule reachable only by tapping through
+ * an `AlertDialog` cannot be tested on this project at all, because Robolectric never idles with a
+ * Compose dialog window open. Everything here - what a blank field means, which numbers are accepted,
+ * what Reset restores, and how fourteen widgets become fourteen columns - is therefore a plain value
+ * with plain tests, and the composable holds nothing but the state it is editing.
+ *
+ * The numeric fields are strings for the reason every form's numeric fields are: an `Int` cannot
+ * represent "the user has cleared this field", and three of these fields need exactly that state to
+ * mean something specific - "inherit the app-wide delay", "match the screen".
+ *
+ * Only settings Apache MINA SSHD 2.14.0 can actually apply per host are here. Four the request asked
+ * for are absent, and their absence is deliberate rather than an omission:
+ *
+ *  - **Socket read timeout.** `NIO2_READ_TIMEOUT` is read from the client when the socket is created,
+ *    not from the session, so it cannot differ per host - and a read deadline on an interactive shell
+ *    is the very bug this release exists to remove: a session sitting at a prompt with nothing to say
+ *    is healthy, and a deadline cannot tell it from a dead one.
+ *  - **Agent forwarding.** There is no SSH agent on the client path here to forward.
+ *  - **X11 forwarding.** MINA's client has no X11 channel implementation, so a switch would set a flag
+ *    nothing reads.
+ *  - **"Allow TCP forwarding".** Forwarding is per-tunnel on a client; the protocol has no session-wide
+ *    client-side switch to expose. The Port forwarding screen is where it is decided.
+ */
+internal data class AdvancedHostOptions(
+    val compression: Boolean = false,
+    val keepAliveEnabled: Boolean = true,
+    val serverAliveCountMax: String = DEFAULT_SERVER_ALIVE_COUNT_MAX.toString(),
+    val authTimeoutSeconds: String = DEFAULT_AUTH_TIMEOUT_SECONDS.toString(),
+    val autoReconnect: Boolean = true,
+    val maxReconnectAttempts: String = DEFAULT_MAX_RECONNECT_ATTEMPTS.toString(),
+    /** Blank inherits the app-wide reconnect delay from Settings. */
+    val reconnectBackoffSeconds: String = "",
+    val usePty: Boolean = true,
+    val terminalType: String = DEFAULT_TERMINAL_TYPE,
+    /** Blank matches the on-screen terminal, which is what almost every host wants. */
+    val terminalColumns: String = "",
+    /** Blank matches the on-screen terminal. */
+    val terminalRows: String = "",
+    val keyboardInteractiveAuth: Boolean = true,
+    /** Null follows the app-wide legacy-algorithm switch; true or false overrides it for this host. */
+    val legacyAlgorithms: Boolean? = null,
+    val hostKeyPolicy: HostKeyPolicy = HostKeyPolicy.ASK,
+) {
+
+    val serverAliveCountValid: Boolean = serverAliveCountMax.toIntOrNull() in SERVER_ALIVE_COUNT_RANGE
+    val authTimeoutValid: Boolean = authTimeoutSeconds.toIntOrNull() in AUTH_TIMEOUT_RANGE
+    val maxReconnectAttemptsValid: Boolean = maxReconnectAttempts.toIntOrNull() in MAX_RECONNECT_ATTEMPTS_RANGE
+    val backoffValid: Boolean = reconnectBackoffSeconds.isBlank() ||
+        reconnectBackoffSeconds.toIntOrNull() in RECONNECT_BACKOFF_RANGE
+    val columnsValid: Boolean = terminalColumns.isBlank() || terminalColumns.toIntOrNull() in TERMINAL_COLUMNS_RANGE
+    val rowsValid: Boolean = terminalRows.isBlank() || terminalRows.toIntOrNull() in TERMINAL_ROWS_RANGE
+
+    /**
+     * Whether these options may be saved.
+     *
+     * The keep-alive interval itself is not here: it belongs to [HostFormDraft], which has validated it
+     * since before this section existed. This is only about the fields the section owns.
+     */
+    val isValid: Boolean = serverAliveCountValid && authTimeoutValid && maxReconnectAttemptsValid &&
+        backoffValid && columnsValid && rowsValid
+
+    /**
+     * Whether anything here differs from the shipped defaults, which is what enables Reset.
+     *
+     * A getter, not a stored value: a stored one is computed in the constructor, and the constructor of
+     * [DEFAULTS] itself runs while the companion is still initialising it, so that one instance would
+     * compare itself against null and report "customised" forever - and [from] hands that very instance
+     * to every unconfigured host.
+     */
+    val isDefault: Boolean get() = this == DEFAULTS
+
+    /** Copies these options onto [profile]. Blank optional fields become their sentinels, not zeroes. */
+    fun applyTo(profile: HostProfile): HostProfile = profile.copy(
+        compression = compression,
+        keepAliveEnabled = keepAliveEnabled,
+        serverAliveCountMax = serverAliveCountMax.toIntOrNull()?.coerceIn(SERVER_ALIVE_COUNT_RANGE)
+            ?: DEFAULT_SERVER_ALIVE_COUNT_MAX,
+        authTimeoutSeconds = authTimeoutSeconds.toIntOrNull()?.coerceIn(AUTH_TIMEOUT_RANGE)
+            ?: DEFAULT_AUTH_TIMEOUT_SECONDS,
+        autoReconnect = autoReconnect,
+        maxReconnectAttempts = maxReconnectAttempts.toIntOrNull()?.coerceIn(MAX_RECONNECT_ATTEMPTS_RANGE)
+            ?: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+        reconnectBackoffSeconds = reconnectBackoffSeconds.toIntOrNull()?.coerceIn(RECONNECT_BACKOFF_RANGE)
+            ?: INHERIT_RECONNECT_BACKOFF,
+        usePty = usePty,
+        terminalType = terminalType.trim().ifBlank { DEFAULT_TERMINAL_TYPE },
+        terminalColumns = terminalColumns.toIntOrNull()?.coerceIn(TERMINAL_COLUMNS_RANGE) ?: 0,
+        terminalRows = terminalRows.toIntOrNull()?.coerceIn(TERMINAL_ROWS_RANGE) ?: 0,
+        keyboardInteractiveAuth = keyboardInteractiveAuth,
+        legacyAlgorithms = legacyAlgorithms,
+        hostKeyPolicy = hostKeyPolicy,
+    )
+
+    companion object {
+
+        val DEFAULTS = AdvancedHostOptions()
+
+        /**
+         * The options as [profile] has them, or [DEFAULTS] for a host being created.
+         *
+         * The two sentinel columns come back as blank fields rather than "0", because a user who opens
+         * a host they never configured should see the same empty box a new host shows - reading `0` in
+         * a column count and having to know it means "automatic" is a puzzle, not a setting.
+         */
+        fun from(profile: HostProfile?): AdvancedHostOptions {
+            if (profile == null) return DEFAULTS
+            return AdvancedHostOptions(
+                compression = profile.compression,
+                keepAliveEnabled = profile.keepAliveEnabled,
+                serverAliveCountMax = profile.serverAliveCountMax.toString(),
+                authTimeoutSeconds = profile.authTimeoutSeconds.toString(),
+                autoReconnect = profile.autoReconnect,
+                maxReconnectAttempts = profile.maxReconnectAttempts.toString(),
+                reconnectBackoffSeconds = profile.reconnectBackoffSeconds
+                    .takeIf { it != INHERIT_RECONNECT_BACKOFF }?.toString().orEmpty(),
+                usePty = profile.usePty,
+                terminalType = profile.terminalType,
+                terminalColumns = profile.terminalColumns.takeIf { it != 0 }?.toString().orEmpty(),
+                terminalRows = profile.terminalRows.takeIf { it != 0 }?.toString().orEmpty(),
+                keyboardInteractiveAuth = profile.keyboardInteractiveAuth,
+                legacyAlgorithms = profile.legacyAlgorithms,
+                hostKeyPolicy = profile.hostKeyPolicy,
+            )
+        }
+    }
+}
+
+/**
+ * True when [value] is inside this range. Null - an unparseable or empty field - never is.
+ *
+ * Written out rather than relying on the stdlib's nullable `contains`, so that `in` reads the same for
+ * every field here whether or not its blank state is meaningful.
+ */
+private operator fun IntRange.contains(value: Int?): Boolean = value != null && value >= first && value <= last

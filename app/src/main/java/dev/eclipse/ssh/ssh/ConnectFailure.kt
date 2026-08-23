@@ -29,8 +29,34 @@ private val FINAL_FAILURE_MARKERS = listOf(
     "No more authentication methods available",
 )
 
+/**
+ * What MINA leaves behind when the TCP connection was accepted and then dropped before the SSH
+ * transport existed.
+ *
+ * `MissingAttachedSessionException` reads like an internal accounting error and is nothing of the kind:
+ * the client's connector attaches an SSH session to the socket as its first act, so "no session
+ * attached" means the socket was already gone by then. Servers do this on purpose - `MaxStartups`
+ * shedding load, `fail2ban` or tcpwrappers dropping an address, a load balancer with nothing behind it,
+ * a firewall that allows the SYN and nothing after - and a rejected algorithm proposal can arrive this
+ * way too when the server closes fast enough to beat its own disconnect packet.
+ *
+ * Recognised because MINA's own text for it is unusable on screen: it names an internal exception class
+ * and prints both socket addresses, one of which is the device's own address on the local network.
+ */
+private val HANDSHAKE_CLOSED_MARKERS = listOf(
+    "MissingAttachedSessionException",
+    "No session attached",
+)
+
 /** How far down a `cause` chain to look, so a self-referencing chain cannot spin here. */
 private const val MAX_CAUSE_DEPTH = 8
+
+/** Every message in a `cause` chain, flattened, so a marker is matched wherever it was raised. */
+private fun causeMessages(error: Throwable): String =
+    generateSequence(error) { previous -> previous.cause?.takeIf { it !== previous } }
+        .take(MAX_CAUSE_DEPTH)
+        .mapNotNull { it.message }
+        .joinToString(separator = " ")
 
 /**
  * Whether a failed connect attempt can only fail the same way again.
@@ -47,11 +73,31 @@ private const val MAX_CAUSE_DEPTH = 8
  */
 fun connectFailureIsFinal(error: Throwable): Boolean {
     if ((error as? SshException)?.disconnectCode in FINAL_DISCONNECT_CODES) return true
-    val messages = generateSequence(error) { previous -> previous.cause?.takeIf { it !== previous } }
-        .take(MAX_CAUSE_DEPTH)
-        .mapNotNull { it.message }
-        .joinToString(separator = " ")
+    val messages = causeMessages(error)
     return FINAL_FAILURE_MARKERS.any { marker -> marker in messages }
+}
+
+/**
+ * Whether the connection got as far as the SSH handshake and was turned away *there*.
+ *
+ * The distinction this draws is between a host that could not be reached and a host that was reached and
+ * said no. A refused port, an unknown name, a routing failure and a timeout all happen before a single
+ * SSH byte is exchanged; a failed algorithm negotiation and a server that hangs up mid-handshake happen
+ * after the socket is up, and mean the server - or something in front of it - made a decision.
+ *
+ * Written as a function rather than left implicit because two callers need the same judgement and would
+ * otherwise reach it by matching MINA's wording independently: [describeConnectFailure], which has to
+ * phrase it for a person, and the interoperability tests, which assert that a server configured to
+ * refuse *did* refuse rather than that some unrelated failure happened to occur. A negotiation refusal
+ * has two faces - the message when the server's disconnect packet arrives, and an early close when the
+ * socket dies first - and treating either as "the connect failed somehow" would let a test pass while
+ * proving nothing.
+ */
+fun failedDuringSshHandshake(error: Throwable?): Boolean {
+    if (error == null) return false
+    if ((error as? SshException)?.disconnectCode == SshConstants.SSH2_DISCONNECT_KEY_EXCHANGE_FAILED) return true
+    val messages = causeMessages(error)
+    return "Unable to negotiate" in messages || HANDSHAKE_CLOSED_MARKERS.any { it in messages }
 }
 
 /**
@@ -65,6 +111,16 @@ fun connectFailureIsFinal(error: Throwable): Boolean {
  */
 fun describeConnectFailure(error: Throwable?): String {
     val message = error?.message?.takeIf { it.isNotBlank() } ?: return "Connection failed"
+    // Before the negotiation branch, because this case has no negotiation text to hint about, and it is
+    // the one message in this file that must *not* be passed through: MINA's version names an internal
+    // exception class and prints both socket addresses, and one of those is this device's own address on
+    // the local network. Nothing is lost by replacing it - the original says only that a socket had no
+    // session attached, which is not something a user can act on, whereas what happened is.
+    if (HANDSHAKE_CLOSED_MARKERS.any { it in causeMessages(error) }) {
+        return "The server accepted the connection and then closed it during the SSH handshake. " +
+            "It may be refusing connections from this address, limiting how many start at once, " +
+            "or sharing no algorithm with this client."
+    }
     val negotiation = (error as? SshException)?.disconnectCode == SshConstants.SSH2_DISCONNECT_KEY_EXCHANGE_FAILED ||
         "Unable to negotiate" in message
     if (!negotiation) return message

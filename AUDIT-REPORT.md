@@ -2460,3 +2460,209 @@ whose size did not move is worth checking this way, not worth assuming either di
 The same file is served over HTTP on port 19001 alongside 1.0.1 through 1.0.5, and was fetched back from
 the public address to confirm the server hands over all 5,744,061 bytes with a matching digest. The
 directory behind that server holds the six APKs and a README and nothing else.
+
+## 26. The whole session architecture, audited against the request that asked for it
+
+Three releases had tried to stop *"connects, logs in, prints its banner, then says Reconnecting"* and none
+of them had found the mechanism, because each one treated what it could see: a timeout was lengthened, a
+retry budget was widened, a duplicate dial was gated. This round was asked for something different — study
+two clients that do keep a connection alive, find the root cause across the whole lifecycle, and repair the
+architecture rather than the symptom. What follows is what was actually wrong.
+
+### 26.1 The two reference clients, and the single principle they share
+
+**ConnectBot** and **Chuchu** were read as architecture references, not as code to copy.
+
+ConnectBot's reader has **no deadline at all** — `waitForCondition(conditions, 0)` — so idleness is
+structurally incapable of looking like death; only EOF or a real `IOException` ends a bridge, and the reader
+never decides policy. It dispatches a disconnect *reason* before `close()`, so the first reason wins instead
+of racing a generic I/O error. On losing the network it does not disconnect at all: affected bridges enter a
+**sixty-second grace period**, and when connectivity returns it compares the device's local addresses with
+the ones from before — an overlap means resume in silence. Reconnects are **queued and drained on
+connectivity**, never fired by a timer. Its disconnect policy is a pure function. It ships **no
+application-level keepalive whatsoever**.
+
+Chuchu keeps one application-scoped `TerminalSessionRepository` with `attachClient()` / `detachClient()`, so
+a screen coming and going cannot own a session, and its key handling is a **pure, fully unit-tested
+`object KeyMapper`**. Its empty-read counter is a diagnostic and never a death signal.
+
+They converge on one rule, and it is the rule this codebase was breaking: **nothing concludes that a session
+is dead from weak evidence, and the component that reads bytes never decides policy.**
+
+### 26.2 The root cause: a reader that reaped
+
+`SshSessionStore.liveSession()` was a *reader that mutated*. Asked for the session belonging to a host, it
+checked `session.isOpen && session.isAuthenticated` and, on a false, removed the session from the registry
+and called `channels.remove(hostId)?.discard()`.
+
+`discard()` does not mark the channel deliberate. So the channel's collector reported `SessionEnd.Released`,
+`shouldAutoReconnect` treats `Released` as reconnect-worthy, and the ladder started. **No transport event
+was involved anywhere in that sequence.** The trigger was a single method call that happened to observe a
+false.
+
+And that method was reached from everywhere: `isLive()`, `liveHostIds()`, `adoptableHostIds()`,
+`adoptable()`, `sessionAwaitingShell()`, `install()` and the probe sweep — which is to say from the
+foreground service's restore pass, from the network callback, and from the UI, concurrently with a login
+that was still bringing its channel up. A session that is authenticated but whose `isOpen` has not yet
+settled, or that is being installed at the moment a sweep walks the registry, is exactly the window between
+*authentication succeeded* and *the shell is attached*. That is the window the user was watching when the
+banner appeared and the tab flipped.
+
+The repair is structural, not a stronger condition: **reading no longer mutates.** `liveSession()` is a
+pure lookup. The pruning moved into one explicit `reap(hostId)` (`ssh/SshSessionStore.kt:298`) with a single
+caller — the reconnect ladder, at `presentation/MainViewModel.kt:988`, which is the one component entitled
+to change a session's fate. `reap` refuses to act unless the session is really not live, the channel has
+**already published its own ending** (`TerminalChannel.hasEnded`, first-completion-wins, so a reap can never
+overwrite the real reason with `Released`), and nothing has replaced either entry in the meantime; both
+removals are compare-and-remove, so a dial that installed a live session while `reap` was deciding keeps it.
+
+### 26.3 The other two ways a healthy session could be declared dead
+
+**The probe killed on a network change.** `SessionLivenessProbe` probed every live session whenever
+`NetworkMonitor` reported a migration and `discard()`ed after two unanswered global requests — with no
+record anywhere in the app of when bytes had last arrived. A session actively streaming output could be
+killed for not answering a global request. It now has that record: `TerminalChannel` stamps
+`lastActivityAtMs` where every chunk already passes, and the pure `probeContradicted(lastActivityAtMs,
+probeStartedAtMs)` (`ssh/SessionLivenessProbe.kt:351`) **vetoes the conclusion** when the far end spoke
+while the probes were timing out. Bytes are stronger evidence than an unanswered request, and they are now
+allowed to say so. The seven tests in `LivenessEvidenceTest` pin the edge cases, including a clock that
+moved backwards and a channel that has never produced output — which contradicts nothing, rather than
+counting as fresh.
+
+**A connect-time retry wore the reconnect label.** Inside `connect()`'s attempt loop a failure set
+`RECONNECTING` with *"Retrying connection…"*. Because `openTerminal()` runs *after* authentication has
+succeeded, a channel or pty failure produced precisely the reported string immediately after a successful
+login — the same words for a completely different situation, which is why three rounds of investigation
+kept looking at the reconnect ladder for a bug that was not in it.
+
+### 26.4 The eighth state
+
+`SessionConnectionState` gained `CHANNEL_PTY_INITIALIZING` between `AUTHENTICATING` and `CONNECTED`
+(`data/model/Models.kt:462`), declared — like the whole enum — in lifecycle order, which is what lets a test
+assert that a healthy login only ever moves *forwards*. The status line and its colour follow it, and
+`ConnectPhaseReportingTest` covers the phases and the refusal to demote a live tab.
+
+The sixty-second network hold is deliberately **not** a state. The session stays `CONNECTED`, because that
+is what it is — the socket, the pty and the buffer are all untouched — and only the status line changes to
+say the app is waiting.
+
+### 26.5 A network gap is not a disconnect
+
+`SessionLivenessProbe` and `background/NetworkMonitor.kt` now behave the way ConnectBot does, via the pure
+`ssh/NetworkTransition.kt`: hold for `NETWORK_GRACE_MS` (60 s), record the local address set, and on restore
+compare. `graceOutcome(before, after)` answers **three** ways rather than two — `RESUME` when an address
+survived, `DROP` when none did, and `UNKNOWN` when the comparison could not run at all. Collapsing
+`UNKNOWN` into either neighbour is a bug in both directions: into `DROP` it kills working sessions, into
+`RESUME` it leaves a terminal that looks connected and swallows keystrokes. `UNKNOWN` asks the session
+instead, with the probe the app already has. `NetworkTransitionTest` (10 tests) and `NetworkSignalTest`
+(5 tests) cover the verdicts and the signals that produce them, including the one that matters most on a
+phone: *a loss while another network is already carrying the device is not a loss.*
+
+### 26.6 Per-host advanced settings, and the coupling that made "keepalive off" fatal
+
+`HostProfile` gained the requested per-host options as real columns — compression, keepalive on/off and
+interval, missed-reply tolerance, connect and auth budgets, auto-reconnect on/off with attempt cap and
+backoff, pty on/off, terminal type and forced geometry, keyboard-interactive, host-key policy, legacy
+algorithms — with Room at version 12, a hand-written migration, a committed schema and *Reset to defaults*.
+Only options MINA SSHD 2.14.0 can honour per host are offered; §26.12 lists the four that were left out and
+why.
+
+The coupling that had to be found first: `configureIdleTimeout()` sets MINA's `IDLE_TIMEOUT` to
+`keepAlive × 3 + 60 s`. A user who switched keepalive **off** would therefore have had their healthy idle
+session dropped about 150 seconds after login — the exact bug being fixed, shipped as a setting. Switching
+the keepalive off now switches the idle timeout off with it, and `SessionTuningTest` (22 tests) asserts it,
+along with the rule that the idle timeout must outlive every reply the heartbeat is allowed to miss.
+
+### 26.7 What the diagnostics now carry
+
+Per-host tracing already scrubbed secrets and recorded phase, state, network and uptime. It gained what this
+audit needed to be able to read a trace at all: a **per-connection number** so one host's sockets can be
+told apart, the **channel and pty state**, the **age of the last output**, and a **reconnect tally** separate
+from the attempt counter. Seventeen tests in `SessionDiagnosticsTest` hold the line that matters more than
+any of them — no password, passphrase, key or bare token can reach a line, an oversized token-shaped detail
+is redacted rather than merely truncated, and no host id appears in the trace at all.
+
+### 26.8 Word wrap that does not break a path
+
+A new pure display layer (`terminal/TerminalLayout.kt`, 18 tests) maps grid rows to visual rows, breaking
+only at word boundaries and reusing the word-character set from `terminal/TerminalSelection.kt`, so *whole
+token* means the same thing to wrapping and to a long-press copy. A token wider than the window is **not**
+broken: it keeps its own row and stays reachable by the existing horizontal pan. The server's own spacing
+survives. The emulator is untouched — `AnsiTerminalBuffer` still hard-wraps at the pty width, so selection
+coordinates, `contentColumns`, resize and its 83 existing tests all stay valid.
+
+Wrapping is suppressed while the **alternate screen** is active, because there every row is positional:
+reflowing it would corrupt `top`, `htop`, `vim`, `nano` and `less`, which the same request requires to
+behave like a desktop terminal. This was raised as a deviation from the literal instruction and is one
+predicate away from either behaviour; a per-host forced width overrides both.
+
+### 26.9 The keyboard, as a pure function
+
+The byte encoding was already complete and covered (38 tests: CR for Enter, DEL for Backspace, ctrl-folding,
+DECCKM SS3 switching, xterm modifier parameters, F1–F12, bracketed paste). What was untestable was the
+*decision* — which key acts, what a latched modifier does, when a key event is declined — because it lived
+inside a Compose `onPreviewKeyEvent`. It is now `ui/terminal/TerminalKeyMapper.kt`, a pure function over
+(key down, key, code point, held modifiers, latched modifiers), with the platform key table beside it so a
+test can prove the table is **complete** against `TerminalKey` rather than trusting that it is. Fourteen
+tests, including the rule that a latch survives a key the terminal declines — previously a consume-then-
+re-toggle dance that worked by luck.
+
+### 26.10 What the stress list actually measured
+
+Everything below ran; nothing on it is a promise. The suite is **846 unit and integration tests, 0 failures,
+0 errors**, with the ten longest held behind `ECLIPSE_STRESS=1` and run separately.
+
+The interop tests talk to a **real OpenSSH `sshd`** (`tools/local-sshd.sh`) rather than to the MINA server
+the rest of the suite uses, on two ports of the same daemon: one with `ClientAliveInterval 5`, and one with
+`ClientAliveInterval 0` — OpenSSH's own default, and therefore what most VPS images run — where the app's
+own heartbeat is the only traffic on an idle link and the only thing standing between the session and its
+idle timeout.
+
+The assertion this whole audit turns on is now written down: every wait loop samples the tab's state ten
+times a second and appends it to a per-host trace, and the trace is asserted to contain **no `RECONNECTING`,
+no `DISCONNECTED` and no `ERROR`**, to be **strictly increasing in lifecycle order**, and to end at
+`CONNECTED`. Sampling only at the end could not see the reported fault at all: by then the app has
+reconnected and the tab looks exactly as it did before. Connected → RECONNECTING → connected is a *decrease*
+in that order, and it stays on the record.
+
+The first attempt against the sandbox always fails, because the server's key has never been seen and the app
+stops to ask — and that attempt correctly reports `ERROR`, **not** `RECONNECTING`, which is the fault
+classification the request asked for: a host-key or credential failure must not enter a retry loop.
+`ConnectFailureTest` covers the rest of that table.
+
+### 26.11 ABI splits, measured before being believed
+
+`app/build.gradle.kts` now emits four per-ABI APKs plus a universal one, all five signed and published, and
+CI's verify step loops over **every** output — it previously checked `find … | head -1`, which verified one
+APK out of five and reported the other four as checked.
+
+The payoff, stated honestly rather than assumed: the only native libraries in this APK are two AndroidX
+shims totalling **60,292 bytes across all four ABIs**, against a **5,163,504-byte `classes.dex`**. A per-ABI
+APK therefore saves roughly 45 KB of 5.74 MB — about **0.8 %**. All five outputs keep **one versionCode**,
+because distribution here is a GitHub release and a plain HTTP server rather than Play: distinct codes would
+make switching from the universal APK to a per-ABI one read as a downgrade, and would make "1.1.0" the name
+of five different version codes.
+
+### 26.12 The five options that are not switches on that screen, and why
+
+The request listed the advanced options it wanted and added the qualifier that made the list workable —
+*show only what the SSH library actually supports.* Five of them are not there, and each is a fact about
+Apache MINA SSHD 2.14.0 or about Android rather than an omission:
+
+* **Socket read timeout.** MINA's `NIO2_READ_TIMEOUT` is a property of the **client**, not of a session. A
+  per-host box for it would have been a per-host box that silently changed every other host, which is worse
+  than not offering it. The per-host budgets that *are* honoured — connect, auth, keepalive interval, missed
+  replies, idle backstop — cover what a read timeout would have been used for, and `SessionTuningTest` holds
+  each of them to its own host.
+* **Agent forwarding.** There is no agent to forward. Android has no `ssh-agent` socket, and MINA's client
+  agent support wants an agent implementation to proxy; a switch here would forward nothing.
+* **X11 forwarding.** Nothing on the device can serve an X display, so a request the server accepted would
+  open a channel with no other end.
+* **TCP forwarding.** `AllowTcpForwarding` is a *server* policy. The client-side thing a user actually wants
+  is the app's own port forwarding, which already exists as a feature with its own screen; a per-host switch
+  would have looked like it governed that and governed nothing.
+* **Cipher / KEX / host-key preference lists.** MINA can be given factory lists, but as free text per host
+  they are a way to make a host unreachable in a manner that looks like a network fault. The one distinction
+  that changes whether a real server can be reached at all is offered instead, as a switch with a plain
+  explanation: **legacy algorithms** — CBC ciphers, `ssh-rsa`, truncated HMACs, SHA-1 key exchange — off by
+  default, and `SshIntegrationTest` proves both directions against servers that accept nothing else.

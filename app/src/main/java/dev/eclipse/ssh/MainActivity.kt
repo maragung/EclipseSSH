@@ -196,11 +196,13 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
+import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
 import dev.eclipse.ssh.presentation.transfersForDisplay
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
@@ -228,6 +230,7 @@ import dev.eclipse.ssh.terminal.TerminalSelection
 import dev.eclipse.ssh.ui.terminal.TerminalInputBridge
 import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
+import dev.eclipse.ssh.ui.terminal.minTerminalColumns
 import dev.eclipse.ssh.ui.terminal.rememberTerminalCellMetrics
 import dev.eclipse.ssh.ui.terminal.rememberTerminalLatches
 import dev.eclipse.ssh.ui.terminal.terminalTextInset
@@ -1840,6 +1843,12 @@ private fun TerminalScreen(
         }
     }
     val terminalText = state.terminalOutput[activeTab.hostId].orEmpty()
+    // The geometry this host has chosen, or zeroes for "match the screen". Looked up here rather than
+    // carried on the tab because it is a stored setting: editing it and coming back has to take effect.
+    val hostGeometry = remember(state.hosts, activeTab.hostId) {
+        state.hosts.firstOrNull { it.id == activeTab.hostId }
+            ?.let { it.terminalColumns to it.terminalRows } ?: (0 to 0)
+    }
     // Collected here, at the one composable that draws it, and with the lifecycle: the collection ends
     // when this screen leaves composition or the app stops, which is the signal the view model uses to
     // stop producing frames nobody can see.
@@ -2022,7 +2031,10 @@ private fun TerminalScreen(
                     foreground = termFg,
                     metrics = metrics,
                     modifier = Modifier.fillMaxSize().padding(textInset),
-                    minColumns = state.settings.terminalMinColumns,
+                    // The host's own width is a floor here as well as an argument to the pty: a
+                    // viewport report resizes the pty, and the first one arrives before any output does.
+                    minColumns = minTerminalColumns(state.settings.terminalMinColumns, hostGeometry.first),
+                    hostRows = hostGeometry.second,
                     selection = selection,
                     onSelectionChange = { selection = it },
                     onSelectionFinished = { finished ->
@@ -2277,17 +2289,31 @@ private fun statusLine(
     startedAt: String?,
     lastError: String?,
     compact: Boolean,
-): String = when (state) {
-    SessionConnectionState.IDLE -> "Not connected"
-    SessionConnectionState.CONNECTING -> "Connecting…"
-    SessionConnectionState.AUTHENTICATING -> "Authenticating…"
-    SessionConnectionState.CONNECTED ->
-        if (compact || startedAt == null) "Connected · encrypted" else "Connected · since $startedAt"
-    // The reason travels with the state where there is room for it: "Reconnecting…" on its own cannot
-    // say which attempt this is, or that the app is parked waiting for a network rather than dialling.
-    SessionConnectionState.RECONNECTING -> lastError?.takeIf { !compact } ?: "Reconnecting…"
-    SessionConnectionState.DISCONNECTED -> lastError ?: "Disconnected"
-    SessionConnectionState.ERROR -> lastError ?: "Connection failed"
+    networkHeld: Boolean = false,
+): String = if (networkHeld && state.isLive) {
+    // Said as a connected session that is waiting, because that is what it is: nothing has been closed,
+    // and if the network returns to the same address the shell carries on mid-command. Saying
+    // "Reconnecting…" here would be a lie in the one direction that matters, since it is the word the
+    // user has learnt to read as "your session is gone".
+    if (compact) "Connected · waiting for network" else "Connected · waiting for the network to come back"
+} else {
+    when (state) {
+        SessionConnectionState.IDLE -> "Not connected"
+        SessionConnectionState.CONNECTING -> "Connecting…"
+        SessionConnectionState.AUTHENTICATING -> "Authenticating…"
+        // Not "Connecting…": the login is done by this point, and a user watching a slow server open a
+        // pty is entitled to know the difference between a host that will not let them in and one that
+        // has.
+        SessionConnectionState.CHANNEL_PTY_INITIALIZING -> "Opening shell…"
+        SessionConnectionState.CONNECTED ->
+            if (compact || startedAt == null) "Connected · encrypted" else "Connected · since $startedAt"
+        // The reason travels with the state where there is room for it: "Reconnecting…" on its own
+        // cannot say which attempt this is, or that the app is parked waiting for a network rather than
+        // dialling.
+        SessionConnectionState.RECONNECTING -> lastError?.takeIf { !compact } ?: "Reconnecting…"
+        SessionConnectionState.DISCONNECTED -> lastError ?: "Disconnected"
+        SessionConnectionState.ERROR -> lastError ?: "Connection failed"
+    }
 }
 
 /**
@@ -2298,7 +2324,10 @@ private fun statusLine(
  * amber "Disconnected", and only one of those is something the user has to do something about.
  */
 @Composable
-private fun statusColor(state: SessionConnectionState): Color = when {
+private fun statusColor(state: SessionConnectionState, networkHeld: Boolean = false): Color = when {
+    // A held session is up but unusable until the network is back, which is exactly what amber says
+    // everywhere else in this app. Green would invite the user to type into it.
+    networkHeld && state.isLive -> EclipseWarning
     state.isLive -> EclipseSuccess
     state == SessionConnectionState.ERROR -> MaterialTheme.colorScheme.error
     state.isBusy -> EclipseWarning
@@ -2345,7 +2374,7 @@ private fun SessionRow(
         ) {
             Box(
                 Modifier.size(9.dp).clip(RoundedCornerShape(50))
-                    .background(statusColor(tab.state)),
+                    .background(statusColor(tab.state, tab.networkHeld)),
             )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -2367,9 +2396,9 @@ private fun SessionRow(
                     )
                 }
                 Text(
-                    statusLine(tab.state, startedAt, tab.lastError, compact = false),
+                    statusLine(tab.state, startedAt, tab.lastError, compact = false, networkHeld = tab.networkHeld),
                     style = MaterialTheme.typography.labelMedium,
-                    color = statusColor(tab.state),
+                    color = statusColor(tab.state, tab.networkHeld),
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -2548,7 +2577,10 @@ private fun TerminalTabStrip(
                     color = if (tab == activeTab) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                 ) {
                     Row(Modifier.padding(start = 12.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(7.dp).clip(RoundedCornerShape(50)).background(statusColor(tab.state)))
+                        Box(
+                            Modifier.size(7.dp).clip(RoundedCornerShape(50))
+                                .background(statusColor(tab.state, tab.networkHeld)),
+                        )
                         Spacer(Modifier.width(8.dp))
                         // The label reserves its own width so the close button cannot eat the chip's
                         // tap. Material expands any interactive component's *touch target* to 48dp
@@ -2608,9 +2640,15 @@ private fun TerminalTabStrip(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
-            statusLine(activeTab.state, startedAt = null, lastError = activeTab.lastError, compact = true),
+            statusLine(
+                activeTab.state,
+                startedAt = null,
+                lastError = activeTab.lastError,
+                compact = true,
+                networkHeld = activeTab.networkHeld,
+            ),
             style = MaterialTheme.typography.labelMedium,
-            color = statusColor(activeTab.state),
+            color = statusColor(activeTab.state, activeTab.networkHeld),
             modifier = Modifier.weight(1f),
             // Two lines, because this line stopped being a label and became the diagnostic. A session
             // that ends now says which of the six ways it ended - "The server disconnected: Timeout,
@@ -3814,7 +3852,7 @@ private fun DiagnosticsDialog(
                     )
                 } else {
                     Text(
-                        "${events.size} event(s) · sessions are labelled s1, s2… and no password, key or host name is recorded, so this is safe to attach to a bug report.",
+                        "${events.size} event(s) · hosts are labelled s1, s2… and the number after the dot counts that host's connections, so s2.3 is its third. No password, key or host name is recorded, so this is safe to attach to a bug report.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.labelMedium,
                     )
@@ -4422,6 +4460,9 @@ private fun AddHostDialog(
     var autoLoginSftp by remember(initialHost?.id) {
         mutableStateOf(initialHost?.autoLoginSftp ?: HostProfile.DEFAULT_AUTO_LOGIN_SFTP)
     }
+    // The fourteen per-host engine settings, as one value. See [AdvancedHostOptions] for why none of
+    // their rules live in this file.
+    var advanced by remember(initialHost?.id) { mutableStateOf(AdvancedHostOptions.from(initialHost)) }
     // The credential fields. All four start empty on every open, including when editing: a saved
     // secret is never rendered back into the field it came from, not even masked, because a field
     // that holds it can be read out by an accessibility service, offered to an autofill provider, or
@@ -4718,6 +4759,7 @@ private fun AddHostDialog(
                     }
                     ProxyType.NONE -> Unit
                 }
+                AdvancedHostSection(advanced, onChange = { advanced = it })
             }
         },
         confirmButton = {
@@ -4746,7 +4788,7 @@ private fun AddHostDialog(
                             connectTimeoutSeconds = draft.timeoutNumber ?: DEFAULT_CONNECT_TIMEOUT_SECONDS,
                             keepAliveSeconds = draft.keepAliveNumber,
                             autoLoginSftp = autoLoginSftp,
-                        ),
+                        ).let(advanced::applyTo),
                         HostCredentialUpdate(
                             // A typed replacement beats a pending forget; a pending forget beats
                             // leaving it alone. Anything else leaves what is stored untouched, which
@@ -4774,7 +4816,10 @@ private fun AddHostDialog(
                         ),
                     )
                 },
-                enabled = draft.canSave,
+                // Both halves of the form gate the button: the identity fields through
+                // [HostFormDraft], the engine settings through [AdvancedHostOptions]. A collapsed
+                // section can still hold an out-of-range number typed before it was closed.
+                enabled = draft.canSave && advanced.isValid,
             ) { Text(if (editing) "Save changes" else "Save securely") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },

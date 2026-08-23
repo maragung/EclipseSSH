@@ -266,7 +266,7 @@ class EclipseSessionService : LifecycleService() {
                 // after its own five attempts, where this one never does - so a busy-only pass waits
                 // one step's worth and re-checks without spending a step.
                 if (failed > 0) reconnectAttempts++ else reconnectAttempts = reconnectAttempts.coerceAtLeast(1)
-                val waitMs = backoffDelay(reconnectAttempts)
+                val waitMs = backoffDelay(reconnectAttempts, pending)
                 updateNotification(
                     if (failed > 0) {
                         "$attemptReason · retry $reconnectAttempts in ${waitMs / 1_000}s"
@@ -344,13 +344,13 @@ class EclipseSessionService : LifecycleService() {
     }
 
     /**
-     * Exponential backoff seeded from the user's reconnect base delay, with jitter so
+     * Exponential backoff seeded from the shortest delay any pending host asked for, with jitter so
      * several hosts recovering at once do not retry in lockstep.
      */
-    private suspend fun backoffDelay(attempt: Int): Long {
-        val baseSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
+    private suspend fun backoffDelay(attempt: Int, pending: List<HostProfile>): Long {
+        val globalSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
             .getOrDefault(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
-        val base = backoffWindowMs(baseSeconds, attempt)
+        val base = backoffWindowMs(restoreBaseSeconds(pending, globalSeconds), attempt)
         return base + Random.nextLong(0, base / 2 + 1)
     }
 
@@ -518,4 +518,25 @@ internal fun hostsNeedingRestore(
     hosts: List<HostProfile>,
     activeIds: Set<String>,
     isLive: (String) -> Boolean,
-): List<HostProfile> = hosts.filter { it.id in activeIds && !isLive(it.id) }
+): List<HostProfile> = hosts.filter {
+    // A host that switched auto-reconnect off is never dialled by this pass. That switch exists for a
+    // host which "must never be dialled unattended" - a bastion behind a one-time code, an audited
+    // account, a metered link - and this pass is the most unattended dialler in the app: it runs from a
+    // connectivity callback while the phone is in a pocket. Its session is still *kept* if one exists,
+    // and Reconnect still works; nothing here brings it back on its own.
+    it.autoReconnect && it.id in activeIds && !isLive(it.id)
+}
+
+/**
+ * The base reconnect delay for a pass that is retrying [hosts], in seconds.
+ *
+ * The pass has one wait for every host in it, so the shortest delay any of them asked for is the one
+ * that has to be honoured: a host configured to retry after two seconds must not be held behind another
+ * host's minute. The overshoot is harmless in the other direction - the slower host is simply retried
+ * sooner than it asked, which is what it would have got before this setting existed.
+ *
+ * [globalSeconds] is the app-wide delay from Settings, used for every host that inherits it and for a
+ * pass with nothing pending.
+ */
+internal fun restoreBaseSeconds(hosts: List<HostProfile>, globalSeconds: Int): Int =
+    hosts.minOfOrNull { reconnectPolicyOf(it).backoffSeconds(globalSeconds) } ?: globalSeconds

@@ -1,0 +1,249 @@
+package dev.eclipse.ssh.ssh
+
+import com.google.common.truth.Truth.assertThat
+import dev.eclipse.ssh.data.model.AuthMethod
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
+import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
+import org.apache.sshd.common.compression.BuiltinCompressions
+import org.junit.Test
+
+/**
+ * The per-host settings that have to be turned into numbers and lists before a session exists.
+ *
+ * All of these are decided during the connect, most of them before authentication and two of them
+ * before the session object is even finished being constructed, so none can be observed from a running
+ * app - a wrong answer shows up as a session that dies quietly two minutes later, or as a key exchange
+ * that fails for reasons the log attributes to the server. They are pure functions for that reason and
+ * are stated here directly.
+ */
+class SessionTuningTest {
+
+    @Test
+    fun `a host with no interval of its own follows the app wide one`() {
+        assertThat(resolveKeepAliveSeconds(profile(), globalSeconds = 45)).isEqualTo(45)
+    }
+
+    @Test
+    fun `a host with its own interval keeps it whatever settings says`() {
+        val profile = profile().copy(keepAliveSeconds = 20)
+
+        assertThat(resolveKeepAliveSeconds(profile, globalSeconds = 45)).isEqualTo(20)
+    }
+
+    @Test
+    fun `a host that switched the keep alive off gets no interval at all`() {
+        // Not "a very long interval": zero is what switches the heartbeat off in MINA, and switching it
+        // off is the whole point of the setting.
+        val profile = profile().copy(keepAliveEnabled = false, keepAliveSeconds = 20)
+
+        assertThat(resolveKeepAliveSeconds(profile, globalSeconds = 45)).isEqualTo(0)
+    }
+
+    @Test
+    fun `an interval outside the allowed range is clamped rather than trusted`() {
+        // A profile can arrive from an imported vault backup that no form ever validated.
+        assertThat(resolveKeepAliveSeconds(profile().copy(keepAliveSeconds = 1), globalSeconds = 45))
+            .isEqualTo(KEEP_ALIVE_RANGE.first)
+        assertThat(resolveKeepAliveSeconds(profile().copy(keepAliveSeconds = 100_000), globalSeconds = 45))
+            .isEqualTo(KEEP_ALIVE_RANGE.last)
+        // Including when the out-of-range number came from Settings rather than the host.
+        assertThat(resolveKeepAliveSeconds(profile(), globalSeconds = 100_000))
+            .isEqualTo(KEEP_ALIVE_RANGE.last)
+    }
+
+    /**
+     * The coupling this whole workstream exists for: no heartbeat means no idle timeout.
+     *
+     * With the heartbeat off there are no missed replies for an idle timeout to back up, so the timeout
+     * stops being a backstop and becomes the only thing in the app that ends healthy sessions - on
+     * exactly the host whose owner asked for *less* traffic.
+     */
+    @Test
+    fun `switching the keep alive off switches the idle timeout off with it`() {
+        assertThat(idleTimeoutSeconds(keepAliveSeconds = 0, serverAliveCountMax = 3)).isEqualTo(0L)
+    }
+
+    @Test
+    fun `the idle timeout outlives every reply the heartbeat is allowed to miss`() {
+        val keepAlive = 30
+        val misses = 3
+
+        val idle = idleTimeoutSeconds(keepAlive, misses)
+
+        // Strictly greater, or the idle clock fires first and reports a timeout for a session the
+        // heartbeat had not given up on - the wrong reason, and one that reads as the server's fault.
+        assertThat(idle).isGreaterThan(keepAlive.toLong() * misses)
+        assertThat(idle).isEqualTo(30L * 3 + 60L)
+    }
+
+    @Test
+    fun `a host that tolerates more missed replies waits longer before the backstop fires`() {
+        val lenient = idleTimeoutSeconds(keepAliveSeconds = 30, serverAliveCountMax = 10)
+        val strict = idleTimeoutSeconds(keepAliveSeconds = 30, serverAliveCountMax = 1)
+
+        assertThat(lenient).isGreaterThan(strict)
+        assertThat(strict).isGreaterThan(30L)
+    }
+
+    @Test
+    fun `a nonsense miss count still leaves room for one reply`() {
+        // Zero misses would make the idle timeout equal to the interval, so the backstop would fire in
+        // the same second the first keep-alive was sent.
+        assertThat(idleTimeoutSeconds(keepAliveSeconds = 30, serverAliveCountMax = 0))
+            .isEqualTo(idleTimeoutSeconds(keepAliveSeconds = 30, serverAliveCountMax = 1))
+    }
+
+    @Test
+    fun `public key is offered before anything that can leak a password`() {
+        val offered = preferredAuths(profile()).split(",")
+
+        assertThat(offered.first()).isEqualTo("publickey")
+    }
+
+    @Test
+    fun `keyboard interactive is offered by default and withdrawn when the host says so`() {
+        assertThat(preferredAuths(profile())).contains("keyboard-interactive")
+        assertThat(preferredAuths(profile().copy(keyboardInteractiveAuth = false)))
+            .doesNotContain("keyboard-interactive")
+        // Password stays either way: withdrawing keyboard-interactive is about not being asked twice,
+        // not about refusing to log in.
+        assertThat(preferredAuths(profile().copy(keyboardInteractiveAuth = false))).contains("password")
+    }
+
+    @Test
+    fun `a host that authenticates by keyboard interactive keeps the method it was configured to use`() {
+        val profile = profile().copy(
+            authMethod = AuthMethod.KEYBOARD_INTERACTIVE,
+            keyboardInteractiveAuth = false,
+        )
+
+        assertThat(preferredAuths(profile)).contains("keyboard-interactive")
+    }
+
+    @Test
+    fun `compression off proposes only none`() {
+        val factories = compressionFactories(enabled = false)
+
+        assertThat(factories.map { it.name }).containsExactly("none")
+    }
+
+    @Test
+    fun `compression on proposes the delayed variant first and still leaves none to fall back to`() {
+        val names = compressionFactories(enabled = true).map { it.name }
+
+        // The literal wire names on purpose. These strings go out in KEX_INIT and are what a server
+        // matches on, and Kotlin's Enum.name shadows MINA's own getName() on these constants, so
+        // BuiltinCompressions.delayedZlib.name reads "delayedZlib" here and never "zlib@openssh.com".
+        //
+        // A server with no compression support has to have something to agree to, or enabling
+        // compression on this host would mean failing to connect to that server at all.
+        assertThat(names.last()).isEqualTo("none")
+        if (BuiltinCompressions.delayedZlib.isSupported) {
+            // zlib@openssh.com before plain zlib: it starts compressing only after authentication.
+            assertThat(names.first()).isEqualTo("zlib@openssh.com")
+        }
+        assertThat(names).containsNoDuplicates()
+        assertThat(compressionFactories(enabled = true).all { it.create() != null }).isTrue()
+    }
+
+    @Test
+    fun `a pty is asked for with the terminal type the emulator implements`() {
+        val request = ptyRequestFor(profile(), measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.enabled).isTrue()
+        assertThat(request.terminalType).isEqualTo(DEFAULT_TERMINAL_TYPE)
+        assertThat(request.columns).isEqualTo(96)
+        assertThat(request.rows).isEqualTo(30)
+    }
+
+    @Test
+    fun `a host that forced a size wins over what was measured`() {
+        val profile = profile().copy(terminalColumns = 132, terminalRows = 43)
+
+        val request = ptyRequestFor(profile, measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.columns).isEqualTo(132)
+        assertThat(request.rows).isEqualTo(43)
+    }
+
+    @Test
+    fun `a forced size is clamped to something a shell is usable at`() {
+        val profile = profile().copy(terminalColumns = 4, terminalRows = 9_999)
+
+        val request = ptyRequestFor(profile, measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.columns).isEqualTo(TERMINAL_COLUMNS_RANGE.first)
+        assertThat(request.rows).isEqualTo(TERMINAL_ROWS_RANGE.last)
+    }
+
+    @Test
+    fun `each axis is forced on its own`() {
+        // Forcing the width of a table without also fixing how much of it fits on the phone is the
+        // reason these are two settings and not one.
+        val request = ptyRequestFor(profile().copy(terminalColumns = 132), measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.columns).isEqualTo(132)
+        assertThat(request.rows).isEqualTo(30)
+    }
+
+    @Test
+    fun `a host that never measured a viewport asks for no size rather than a guessed one`() {
+        // Null is not zero: the channel's own default geometry is what fills this in, and a zero here
+        // would be sent as a pty 0 columns wide.
+        val request = ptyRequestFor(profile(), measuredColumns = null, measuredRows = null)
+
+        assertThat(request.columns).isNull()
+        assertThat(request.rows).isNull()
+    }
+
+    @Test
+    fun `a forced size survives a viewport that has not been measured yet`() {
+        // Which is what makes a forced width hold through a rotation rather than reverting for one frame.
+        val profile = profile().copy(terminalColumns = 132, terminalRows = 43)
+
+        val request = ptyRequestFor(profile, measuredColumns = null, measuredRows = null)
+
+        assertThat(request.columns).isEqualTo(132)
+        assertThat(request.rows).isEqualTo(43)
+    }
+
+    @Test
+    fun `a host that turned the pty off still reports a terminal type and geometry`() {
+        // Both are ignored while the pty is off, and both have to be right the moment it is turned back
+        // on - the alternative is a channel opened with no pty and a window-change sent against it.
+        val request = ptyRequestFor(profile().copy(usePty = false), measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.enabled).isFalse()
+        assertThat(request.terminalType).isEqualTo(DEFAULT_TERMINAL_TYPE)
+        assertThat(request.columns).isEqualTo(96)
+    }
+
+    @Test
+    fun `a blank terminal type falls back rather than being sent as an empty TERM`() {
+        val request = ptyRequestFor(profile().copy(terminalType = "  "), measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.terminalType).isEqualTo(DEFAULT_TERMINAL_TYPE)
+    }
+
+    @Test
+    fun `a session opened with no profile behaves exactly as the app did before hosts could choose`() {
+        // Every call site that has no profile in scope - an adopted session, a restored tab - has to
+        // land on the old hard-coded behaviour rather than on a disabled pty.
+        val request = ptyRequestFor(profile = null, measuredColumns = 96, measuredRows = 30)
+
+        assertThat(request.enabled).isTrue()
+        assertThat(request.terminalType).isEqualTo(DEFAULT_TERMINAL_TYPE)
+        assertThat(request.columns).isEqualTo(96)
+        assertThat(request.rows).isEqualTo(30)
+    }
+
+    private fun profile() = HostProfile(
+        id = "tuning-host",
+        name = "Tuning",
+        host = "tuning.example.com",
+        username = "root",
+    )
+}

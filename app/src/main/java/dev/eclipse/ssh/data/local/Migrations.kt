@@ -82,4 +82,48 @@ object Migrations {
             db.execSQL("ALTER TABLE host_profiles ADD COLUMN autoLoginSftp INTEGER NOT NULL DEFAULT 1")
         }
     }
+
+    /**
+     * The advanced per-host settings: compression, keep-alive, timeouts, reconnect policy, pty and
+     * terminal geometry, authentication methods, algorithm set and host-key policy.
+     *
+     * Every default here is chosen to reproduce what the engine did *before* the column existed, so
+     * an upgraded profile connects exactly as it did on the previous build and nothing changes until
+     * the user opens the form:
+     *
+     *  - `compression` 0, because the client never offered zlib.
+     *  - `keepAliveEnabled` 1 with `serverAliveCountMax` 3, which is the heartbeat that was always
+     *    armed and the missed-reply limit that was hard-coded.
+     *  - `authTimeoutSeconds` 30: authentication used to share the connect timeout, whose own default
+     *    is 15, but that number was never *about* authentication - it bounded the socket. Thirty is
+     *    Apache MINA's own `AUTH_TIMEOUT` default, so a host that has never been told otherwise keeps
+     *    the timeout MINA was already applying internally.
+     *  - `autoReconnect` 1, `maxReconnectAttempts` 5, `reconnectBackoffSeconds` 0 (inherit): the values the
+     *    ladder used for every host.
+     *  - `usePty` 1 and `terminalType` 'xterm-256color': the pty request was unconditional and the
+     *    TERM string was hard-coded to exactly this.
+     *  - `terminalColumns`/`terminalRows` 0, the "match the screen" sentinel, which is what the app
+     *    has always done - the geometry came from the view.
+     *  - `keyboardInteractiveAuth` 1, because the client offered MINA's full default method list.
+     *  - `legacyAlgorithms` NULL, meaning "follow the global switch" - the only behaviour that existed.
+     *  - `hostKeyPolicy` 'ASK', which is what the verifier did: emit a challenge and wait.
+     */
+    val MIGRATION_11_12 = object : Migration(11, 12) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN compression INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN keepAliveEnabled INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN serverAliveCountMax INTEGER NOT NULL DEFAULT 3")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN authTimeoutSeconds INTEGER NOT NULL DEFAULT 30")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN autoReconnect INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN maxReconnectAttempts INTEGER NOT NULL DEFAULT 5")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN reconnectBackoffSeconds INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN usePty INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN terminalType TEXT NOT NULL DEFAULT 'xterm-256color'")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN terminalColumns INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN terminalRows INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN keyboardInteractiveAuth INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN legacyAlgorithms INTEGER")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN hostKeyPolicy TEXT NOT NULL DEFAULT 'ASK'")
+        }
+    }
 }

@@ -1,5 +1,10 @@
 package dev.eclipse.ssh.background
 
+import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
+import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
+import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
+import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.ReceiveChannel
@@ -60,3 +65,43 @@ internal suspend fun awaitReconnectWindow(windowMs: Long, wake: ReceiveChannel<U
     }
     return woken
 }
+
+/**
+ * The reconnect rules for one host, as they stood when it was dialled.
+ *
+ * A class rather than three loose parameters because all three are read together at one point and are
+ * meaningless apart: an attempt ceiling with no backoff is a busy loop, and a backoff with the feature
+ * switched off is nothing at all.
+ */
+internal class ReconnectPolicy(
+    val enabled: Boolean,
+    val maxAttempts: Int,
+    private val hostBackoffSeconds: Int,
+) {
+    /**
+     * The first reconnect wait in seconds, resolving [HostProfile.reconnectBackoffSeconds]'s
+     * inherit sentinel against the app-wide delay from Settings.
+     */
+    fun backoffSeconds(globalSeconds: Int): Int =
+        if (hostBackoffSeconds == INHERIT_RECONNECT_BACKOFF) globalSeconds else hostBackoffSeconds
+
+    companion object {
+        /** For a session no profile was seen for - a background restore, or an adopted session. */
+        val DEFAULT = ReconnectPolicy(
+            enabled = true,
+            maxAttempts = DEFAULT_MAX_RECONNECT_ATTEMPTS,
+            hostBackoffSeconds = INHERIT_RECONNECT_BACKOFF,
+        )
+    }
+}
+
+/** [profile]'s reconnect rules, clamped to the ranges the form accepts. */
+internal fun reconnectPolicyOf(profile: HostProfile): ReconnectPolicy = ReconnectPolicy(
+    enabled = profile.autoReconnect,
+    maxAttempts = profile.maxReconnectAttempts
+        .coerceIn(MAX_RECONNECT_ATTEMPTS_RANGE.first, MAX_RECONNECT_ATTEMPTS_RANGE.last),
+    hostBackoffSeconds = profile.reconnectBackoffSeconds
+        .takeIf { it != INHERIT_RECONNECT_BACKOFF }
+        ?.coerceIn(RECONNECT_BACKOFF_RANGE.first, RECONNECT_BACKOFF_RANGE.last)
+        ?: INHERIT_RECONNECT_BACKOFF,
+)

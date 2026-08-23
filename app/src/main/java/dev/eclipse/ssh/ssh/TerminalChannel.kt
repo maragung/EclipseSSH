@@ -7,6 +7,7 @@ import java.nio.charset.Charset
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
 import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import kotlinx.coroutines.CompletableDeferred
@@ -72,6 +73,39 @@ class TerminalChannel(
     private val outputEnded = AtomicBoolean(false)
 
     private val droppedChunkCount = AtomicLong()
+
+    /**
+     * When the remote side last sent anything, as [System.currentTimeMillis], or 0 before it has.
+     *
+     * The strongest evidence a session is alive, and until this existed the app was throwing it away.
+     * Every other liveness signal is inferential - a flag MINA may be mid-way through updating, a
+     * global request that may be queued behind a burst of output, an interface that changed underneath
+     * a socket that is still fine. Bytes arriving from the far end are none of those things: they are
+     * the peer, answering, now.
+     *
+     * Only *server* bytes count. A keystroke proves the user is present, not that anyone is listening,
+     * and counting writes here would let a user typing into a dead session keep it looking healthy -
+     * which is the failure this is meant to prevent, inverted.
+     *
+     * Read by [SessionLivenessProbe] to veto a death conclusion. [AtomicLong] because MINA's pump
+     * threads write it while a coroutine reads it.
+     */
+    private val lastActivityAt = AtomicLong(0)
+
+    /** @see lastActivityAt */
+    val lastActivityAtMs: Long get() = lastActivityAt.get()
+
+    /**
+     * When [open] completed, as [System.currentTimeMillis], or 0 while it has not.
+     *
+     * A session too young to have been asked anything cannot be judged for not answering. Without
+     * this, a probe triggered by an interface change that happened to land moments after login would
+     * put two six-second deadlines on a session that had not yet finished saying hello.
+     */
+    private val openedAt = AtomicLong(0)
+
+    /** @see openedAt */
+    val openedAtMs: Long get() = openedAt.get()
 
     /**
      * How many output chunks were discarded because nothing drained [output] in time.
@@ -230,6 +264,17 @@ class TerminalChannel(
     suspend fun awaitClosed(): SessionEnd = closed.await()
 
     /**
+     * Whether this channel's ending has already been reported to [awaitClosed].
+     *
+     * The question a caller asks before tidying a channel away: [finish] is first-completion-wins, so
+     * once this is true no later release can invent an ending, and removing the channel is bookkeeping
+     * that nobody can observe. Asked instead of [isOpen] because they are not the same instant - the
+     * close future that publishes the reason runs after the channel reports itself shut - and it is the
+     * *reason* being published that a reaper must not be allowed to race. See [SshSessionStore.reap].
+     */
+    val hasEnded: Boolean get() = closed.isCompleted
+
+    /**
      * Ends the output stream, then reports [end] to whoever is waiting on [awaitClosed].
      *
      * Every ending goes through here, and in this order, so that a collector reaches the terminator
@@ -260,6 +305,15 @@ class TerminalChannel(
     @Volatile private var rows = DEFAULT_ROWS
 
     /**
+     * Whether this channel actually asked for a pty.
+     *
+     * Recorded because a window-change on a channel with no pty is not a no-op: RFC 4254 defines
+     * `window-change` as a request against a pty that exists, and a server that is strict about it
+     * answers with a channel failure. Every resize on such a host would then look like a fault.
+     */
+    @Volatile private var hasPty = true
+
+    /**
      * The pty's current size, as the remote side understands it.
      *
      * Readable because the app has to be able to *carry the geometry across a reconnect*. A new
@@ -272,14 +326,55 @@ class TerminalChannel(
     val ptyRows: Int get() = rows
 
     /**
+     * The pty as the trace records it: its geometry, or `none` on a channel that was given no pty.
+     *
+     * A trace that printed a geometry for a channel with no pty would be actively misleading - the
+     * numbers exist either way, because a resize keeps recording them so a reconnect can carry the
+     * size forward, so `80x24` on a pty-less channel is a size nobody applied. And "no pty" is the
+     * explanation for a whole class of reports: no colours, `top` refusing to start, a shell with no
+     * prompt. See [hasPty].
+     */
+    val ptyLabel: String get() = if (hasPty) "${columns}x$rows" else "none"
+
+    /** Whether the channel itself is still open, as one word for the trace. See [isOpen]. */
+    val channelLabel: String get() = if (isOpen) "open" else "closed"
+
+    /**
+     * How long since the far end last sent anything, or null while it has not sent anything yet.
+     *
+     * The single most useful number in a trace of a dropped session, because it separates the two
+     * shapes that look identical from the outside: a session that was streaming output until the
+     * moment it ended - which points at the transport or at this app - and one that had been silent
+     * for minutes, which points at the far end or at whatever sits between. See [lastActivityAtMs].
+     */
+    fun idleForMs(nowMs: Long = System.currentTimeMillis()): Long? =
+        lastActivityAtMs.takeIf { it > 0L }?.let { (nowMs - it).coerceAtLeast(0L) }
+
+    /**
      * Opens the shell, optionally at a known size.
      *
      * [columns] and [rows] exist for the reconnect path: sizing the pty *at creation* is not the same
      * as creating it at 120x40 and sending a window-change immediately afterwards. A shell whose
      * `$COLUMNS` is read by a login script, and a full-screen program started by one, see only the
      * first value - the resize arrives after they have already drawn themselves at the wrong width.
+     *
+     * [usePty] `false` asks for a shell with no terminal at all, which is what a scripted or
+     * automation-only host wants: no echo, no line editing, no window size, and `$TERM` unset, so a
+     * remote command cannot decide to draw a progress bar or a colour code at something that is reading
+     * the bytes rather than watching them. It is off the normal path - an interactive terminal without a
+     * pty is barely usable - so it stays a per-host choice.
+     *
+     * [terminalType] is what `$TERM` becomes on the far side, and it is a promise: claiming
+     * `xterm-256color` tells the server this app understands everything an xterm does, and a host whose
+     * emulator or curses build predates that is better served by being told `vt100` than by being sent
+     * sequences it will print as text.
      */
-    suspend fun open(columns: Int = this.columns, rows: Int = this.rows) {
+    suspend fun open(
+        columns: Int = this.columns,
+        rows: Int = this.rows,
+        usePty: Boolean = true,
+        terminalType: String = DEFAULT_TERMINAL_TYPE,
+    ) {
         // Clamped once and then used everywhere. Sending the *parameter* to the pty while storing the
         // clamped value in the field put the two sides permanently out of step: the remote came up at
         // whatever was asked for, the app believed the clamped number, and because `resize` compares
@@ -288,8 +383,10 @@ class TerminalChannel(
         val safeRows = rows.coerceIn(TERMINAL_ROW_RANGE)
         this.columns = safeColumns
         this.rows = safeRows
+        this.hasPty = usePty
         (channel as? PtyCapableChannelSession)?.apply {
-            setPtyType("xterm-256color")
+            setUsePty(usePty)
+            setPtyType(terminalType)
             setPtyColumns(safeColumns)
             setPtyLines(safeRows)
         }
@@ -297,11 +394,23 @@ class TerminalChannel(
         channel.setOut(EmittingOutputStream())
         channel.setErr(EmittingOutputStream())
         channel.open().verify(OPEN_TIMEOUT_MS)
-        // Registered after the open so a failed open reports itself as a failed open, through the
+        // Stamped before either listener, so a session judged for its age is judged from the moment it
+        // became judgeable rather than from whenever the last registration returned.
+        openedAt.set(System.currentTimeMillis())
+        // Both registered after the open so a failed open reports itself as a failed open, through the
         // exception, rather than as a session that came up and immediately ended.
-        channel.addCloseFutureListener { finish(closeReason()) }
+        //
+        // The *session* listener goes on first, and the order is the whole point: it is the only thing
+        // that records a named [transportReason], and [closeReason] consults that reason before it
+        // falls back to guessing from `channel.session.isOpen`. Registered the other way round, a
+        // transport that died in the window between the two registrations fired its close future
+        // against an empty `transportReason` - so the guess ran instead, and the guess produces
+        // `ShellEnded(null, null)` or a bare `TransportClosed` for what was in fact a named failure the
+        // server or the socket had already explained. First reason wins only if the thing that knows
+        // the reason is listening first.
         channel.session.addSessionListener(transportDeath)
-        // Closes the gap between the open completing and the listener being in place: a session that
+        channel.addCloseFutureListener { finish(closeReason()) }
+        // Closes the gap between the open completing and the listeners being in place: a session that
         // ended inside that window has already fired every event it is going to fire.
         if (!channel.session.isOpen) markClosed(transportReason ?: SessionEnd.TransportClosed)
     }
@@ -332,6 +441,9 @@ class TerminalChannel(
         if (safeColumns == this.columns && safeRows == this.rows) return
         this.columns = safeColumns
         this.rows = safeRows
+        // Still recorded above even with no pty, so the geometry a reconnect carries forward stays
+        // right - only the request that needs a pty is skipped. See [hasPty].
+        if (!hasPty) return
         runCatching { (channel as? PtyCapableChannelSession)?.sendWindowChange(safeColumns, safeRows) }
     }
 
@@ -350,7 +462,7 @@ class TerminalChannel(
      * difference decides whether a dropped session comes back. The registry closes a channel in two
      * quite different situations - the user closed the tab, and something noticed the session behind it
      * had died - and using [close] for the second one turned a real outage into "the app asked for
-     * this": [SshSessionStore.liveSession] prunes a dead entry on any liveness check, so a heartbeat
+     * this": a dead entry used to be pruned by any liveness check, so a heartbeat
      * failure raced the notification refresh and the tab's own close handler, and whichever got there
      * first decided whether the reconnect happened at all. Losing that race left a tab that had
      * genuinely dropped sitting there with no reconnect and no message - the exact failure the
@@ -359,8 +471,15 @@ class TerminalChannel(
      * There is nothing to mark here: the channel is being tidied up *after* the fact, and the report
      * of its death belongs to whatever was waiting on [awaitClosed] - which reports whatever the
      * transport already said, and [SessionEnd.Released] only when nothing did.
+     *
+     * [reason] is for the one case where the app knows something the transport does not: the platform
+     * has said the network this session was bound to is gone, so `isOpen` is still true, MINA has
+     * nothing to report, and the honest answer would take three unanswered keep-alives to arrive at.
+     * It is recorded only when the transport has said nothing yet, because a first-hand report always
+     * outranks the app's conclusion - see [closeReason], which reads them in that order.
      */
-    fun discard() {
+    fun discard(reason: SessionEnd? = null) {
+        if (reason != null && transportReason == null) transportReason = reason
         release()
     }
 
@@ -435,6 +554,9 @@ class TerminalChannel(
      * a session nobody is reading would be the worse failure.
      */
     private fun publish(chunk: ByteArray) {
+        // First, and unconditionally: this is the proof the peer is alive, and it is true whether or
+        // not anyone is currently collecting the output it arrived in.
+        lastActivityAt.set(System.currentTimeMillis())
         if (outputEvents.tryEmit(chunk)) return
         val delivered = runBlocking {
             withTimeoutOrNull(PUBLISH_WAIT_MS) {

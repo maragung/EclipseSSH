@@ -16,6 +16,7 @@ import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.time.Duration
+import org.junit.After
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
@@ -58,6 +59,36 @@ class RealOpenSshInteropRobolectricTest {
     val compose = createAndroidComposeRule<MainActivity>()
 
     /**
+     * Closes every session this test opened, before the next test starts counting.
+     *
+     * Sessions deliberately outlive the activity - that is the whole point of adoption, and what stops a
+     * rotation from dialling again - so nothing in the app tears one down between two test methods
+     * sharing a JVM. The consequence showed up in the one place it could not be argued away: a session
+     * left over from an earlier test keeps sending its own keep-alives, the server logs them, and the
+     * next test counts them as its own. That is what made
+     * [aSessionWithKeepAliveOffSurvivesPastTheDeadlineItWouldHaveHad] see thirty heartbeats from a
+     * session configured to send none - three leftover sessions at the shipped 30-second interval across
+     * a five-minute hold. The app was doing exactly what it says; the harness was measuring the wrong
+     * sessions.
+     *
+     * A session that will not close is a failure worth reporting, so this asserts rather than hoping.
+     * JUnit reports an `@After` failure alongside the test's own, so nothing is masked by it.
+     */
+    @After
+    fun closeEverySession() {
+        if (viewModel().uiState.value.tabs.isEmpty()) return
+        compose.runOnUiThread { viewModel().disconnectAll() }
+        pumpUntil(
+            timeoutMs = 10_000,
+            describe = { "a session was still open after disconnectAll" },
+        ) { viewModel().uiState.value.tabs.isEmpty() }
+        // The tab going away is the app's decision; the socket closing is MINA finishing it. Give the
+        // close futures a moment on the looper so the next test's log offset lands after the server has
+        // logged the disconnect rather than in the middle of it.
+        pumpFor(CLOSE_SETTLE_MS)
+    }
+
+    /**
      * A real login, a real pty, real SFTP, and the session still up several heartbeats later.
      *
      * One test rather than four because each stage is a precondition of the next and the setup is a
@@ -96,6 +127,7 @@ class RealOpenSshInteropRobolectricTest {
         pumpUntil(describe = { "the session never connected. " + diagnose(saved.id) }) {
             if (viewModel.uiState.value.hostKeyChallenge != null) {
                 compose.runOnUiThread { viewModel.acceptHostKey() }
+                restartStateTrace(saved.id)
             }
             tabFor(saved.id)?.state == SessionConnectionState.CONNECTED
         }
@@ -107,6 +139,10 @@ class RealOpenSshInteropRobolectricTest {
         pumpUntil(describe = { "the login shell printed nothing. " + diagnose(saved.id) }) {
             drawn(saved.id).isNotBlank()
         }
+
+        // The reported fault, asserted against a real OpenSSH server: the banner is the first thing the
+        // server sends unasked, and arriving output must never be read as the session going away.
+        assertNothingLookedLikeADrop(saved.id)
 
         // What the on-screen keyboard does to a session a second after it connects.
         compose.runOnUiThread { viewModel.resizeTerminal(saved.id, PHONE_COLUMNS, PHONE_ROWS) }
@@ -145,6 +181,9 @@ class RealOpenSshInteropRobolectricTest {
             drawn(saved.id).contains(LATE_MARKER)
         }
         assertThat(tabFor(saved.id)?.lastError).isNull()
+        // One connection from the first frame to the last, through the motd, a resize, two commands,
+        // an SFTP login and several heartbeats.
+        assertNothingLookedLikeADrop(saved.id)
     }
 
     /**
@@ -194,6 +233,7 @@ class RealOpenSshInteropRobolectricTest {
         pumpUntil(describe = { "the session never connected. " + diagnose(saved.id) }) {
             if (viewModel.uiState.value.hostKeyChallenge != null) {
                 compose.runOnUiThread { viewModel.acceptHostKey() }
+                restartStateTrace(saved.id)
             }
             tabFor(saved.id)?.state == SessionConnectionState.CONNECTED
         }
@@ -292,6 +332,7 @@ class RealOpenSshInteropRobolectricTest {
         pumpUntil(describe = { "the session never connected. " + diagnose(saved.id) }) {
             if (viewModel.uiState.value.hostKeyChallenge != null) {
                 compose.runOnUiThread { viewModel.acceptHostKey() }
+                restartStateTrace(saved.id)
             }
             tabFor(saved.id)?.state == SessionConnectionState.CONNECTED
         }
@@ -343,21 +384,114 @@ class RealOpenSshInteropRobolectricTest {
      * reads for a few minutes crosses it four times over, and "connects, works for a couple of minutes,
      * then keeps reconnecting" is the report this exists to reproduce or refute.
      *
-     * Held on the silent port, so the server contributes nothing and every packet on the link is the
-     * app's. Nothing is typed. The three things asserted are the three ways this can fail:
-     *
-     *  - the tab leaving CONNECTED, which is the drop itself;
-     *  - the server logging a second `Accepted publickey`, which is a redial - a session that died and
-     *    came back inside a sampling gap would look connected at every sample but has authenticated
-     *    twice, and the server is the only honest witness to that;
-     *  - the shell not answering at the end, which is a session that is up in name only.
+     * How the hold is watched is in [holdASilentSession], which this and the rest of the idle matrix
+     * share.
      *
      * Off by default and skipped, not failed, because ten minutes does not belong in a gate that runs on
      * every push: set `ECLIPSE_STRESS=1` to run it. CI has a `stress` job that does, triggered by hand
-     * from the Actions tab, and it fails rather than passes if the test skips.
+     * from the Actions tab, and it fails rather than passes if any of these skip.
      */
     @Test
     fun aDefaultSessionSurvivesTenMinutesOfSilence() {
+        // Deliberately no keep-alive interval: the shipped default is what the idle deadline is derived
+        // from and what a user who never opened Settings is running.
+        holdASilentSession(id = "real-openssh-idle-10m", holdMs = MINUTE_MS * 10)
+    }
+
+    /**
+     * The rest of the idle matrix, which is one rule at five durations and three configurations.
+     *
+     * Thirty seconds and a minute are here because the bug reports are not all about long idles - "it
+     * drops while I read the output of one command" is the same complaint at a shorter scale, and a
+     * session that dies at thirty seconds and one that dies at thirty minutes have different causes. The
+     * middle of the range is where the app's own timers live, so it is where an off-by-one in the idle
+     * deadline shows up.
+     */
+    @Test
+    fun aSessionSurvivesThirtySecondsOfSilence() {
+        holdASilentSession(id = "real-openssh-idle-30s", holdMs = 30_000L)
+    }
+
+    @Test
+    fun aSessionSurvivesOneMinuteOfSilence() {
+        holdASilentSession(id = "real-openssh-idle-1m", holdMs = MINUTE_MS)
+    }
+
+    @Test
+    fun aSessionSurvivesFiveMinutesOfSilence() {
+        holdASilentSession(id = "real-openssh-idle-5m", holdMs = MINUTE_MS * 5)
+    }
+
+    /**
+     * Half an hour, which is the top of the range the reports describe and twelve crossings of the
+     * 150-second deadline the shipped keep-alive implies.
+     *
+     * Nothing here differs from the ten-minute case except patience, and that is the point: if the app
+     * has any timer that fires once and is never rearmed, this is the hold that finds it.
+     */
+    @Test
+    fun aSessionSurvivesThirtyMinutesOfSilence() {
+        holdASilentSession(id = "real-openssh-idle-30m", holdMs = MINUTE_MS * 30)
+    }
+
+    /**
+     * Compression on, because it changes who is holding the bytes.
+     *
+     * zlib puts a deflate stream between the channel and the transport, and a deflater holds output in
+     * its own buffer until it has enough to emit. That is worth a test of its own: if the app ever
+     * concluded anything from "no bytes arrived", compression is the setting that would make a healthy
+     * session look silent, and the heartbeat travels the same compressed link as everything else.
+     */
+    @Test
+    fun aCompressedSessionSurvivesFiveMinutesOfSilence() {
+        holdASilentSession(id = "real-openssh-idle-zlib", holdMs = MINUTE_MS * 5, compression = true)
+    }
+
+    /**
+     * Keep-alive off, held well past the deadline it would have implied - the W4 coupling, tested.
+     *
+     * This is the case that used to be a bug and is easy to reintroduce. `configureIdleTimeout` asks MINA
+     * for `keepAlive * 3 + 60` seconds of patience, so at the shipped thirty-second interval a silent
+     * transport is closed after 150. Turning the heartbeat off removes the traffic that resets that timer
+     * without removing the timer, and the result is a session that dies two and a half minutes after
+     * login *because* the user asked for less network chatter. Five minutes of silence is twice the
+     * deadline, so a session that reaches the end of this hold proves the timeout went off with the
+     * heartbeat.
+     *
+     * The zero-probe assertion is the other half: "off" has to mean nothing was sent, or this test would
+     * pass on a session that was quietly still beating.
+     */
+    @Test
+    fun aSessionWithKeepAliveOffSurvivesPastTheDeadlineItWouldHaveHad() {
+        holdASilentSession(
+            id = "real-openssh-idle-nokeepalive",
+            holdMs = MINUTE_MS * 5,
+            keepAliveEnabled = false,
+        )
+    }
+
+    /**
+     * Logs in, says nothing for [holdMs], and then checks the shell still answers.
+     *
+     * Sampling every [IDLE_STEP_MS] rather than only at the end, because the three ways this fails are
+     * not all visible afterwards:
+     *
+     *  - the tab leaving CONNECTED, which is the drop itself;
+     *  - the server logging a second `Accepted publickey`, which is a redial - a session that died and
+     *    came back inside a sampling gap looks connected at every sample but has authenticated twice,
+     *    and the server is the only honest witness to that;
+     *  - the shell not answering at the end, which is a session that is up in name only.
+     *
+     * Held on the silent port, so the server contributes nothing (`ClientAliveInterval 0`) and every
+     * packet on the link is the app's.
+     */
+    private fun holdASilentSession(
+        id: String,
+        holdMs: Long,
+        keepAliveEnabled: Boolean = true,
+        keepAliveSeconds: Int? = null,
+        compression: Boolean = false,
+    ) {
         assumeTrue(
             "long idle stress test is off: set ECLIPSE_STRESS=1 to run it",
             System.getenv("ECLIPSE_STRESS") == "1",
@@ -377,16 +511,16 @@ class RealOpenSshInteropRobolectricTest {
 
         val viewModel = viewModel()
         val profile = HostProfile(
-            id = "real-openssh-long-idle",
-            name = "real-openssh-long-idle",
+            id = id,
+            name = id,
             host = LOOPBACK,
             username = File(sandbox, "user").readText().trim(),
             port = port,
             authMethod = AuthMethod.SSH_KEY,
             connectTimeoutSeconds = 60,
-            // Deliberately *not* set: the point of this test is the shipped default, which is what the
-            // idle deadline is derived from and what a user who never opened Settings is running.
-            keepAliveSeconds = null,
+            keepAliveSeconds = keepAliveSeconds,
+            keepAliveEnabled = keepAliveEnabled,
+            compression = compression,
             autoLoginSftp = false,
         )
         compose.runOnUiThread { viewModel.saveHost(profile) }
@@ -399,6 +533,7 @@ class RealOpenSshInteropRobolectricTest {
         pumpUntil(describe = { "the session never connected. " + diagnose(saved.id) }) {
             if (viewModel.uiState.value.hostKeyChallenge != null) {
                 compose.runOnUiThread { viewModel.acceptHostKey() }
+                restartStateTrace(saved.id)
             }
             tabFor(saved.id)?.state == SessionConnectionState.CONNECTED
         }
@@ -406,16 +541,18 @@ class RealOpenSshInteropRobolectricTest {
             drawn(saved.id).isNotBlank()
         }
 
-        val deadline = System.nanoTime() + LONG_IDLE_HOLD_MS * 1_000_000
+        val deadline = System.nanoTime() + holdMs * 1_000_000
         while (System.nanoTime() < deadline) {
             Thread.sleep(IDLE_STEP_MS)
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(IDLE_STEP_MS))
-            val heldMs = LONG_IDLE_HOLD_MS - (deadline - System.nanoTime()) / 1_000_000
+            sampleStates()
+            val heldMs = holdMs - (deadline - System.nanoTime()) / 1_000_000
             val tab = tabFor(saved.id)
             check(tab?.state == SessionConnectionState.CONNECTED) {
-                "an idle session dropped after ${heldMs}ms at the default keep-alive: " +
+                "an idle session dropped after ${heldMs}ms of ${holdMs}ms " +
+                    "(keepAlive=$keepAliveEnabled@${keepAliveSeconds ?: "default"}s compression=$compression): " +
                     "state=${tab?.state} error=${tab?.lastError}. " +
                     "Heartbeats the server logged: ${clientProbes(log, logOffset)}, " +
                     "logins: ${logins(log, logOffset)}. " + diagnose(saved.id)
@@ -427,16 +564,25 @@ class RealOpenSshInteropRobolectricTest {
             }
         }
 
-        // The heartbeat must have been the traffic keeping it up, at roughly the configured rate.
-        assertThat(clientProbes(log, logOffset)).isAtLeast(MIN_CLIENT_PROBES)
+        val probes = clientProbes(log, logOffset)
+        if (keepAliveEnabled) {
+            // The heartbeat must have been the traffic keeping it up, at roughly the configured rate.
+            assertThat(probes).isAtLeast(MIN_CLIENT_PROBES)
+        } else {
+            // "Off" means nothing was sent. Without this the test would also pass on a session that was
+            // quietly still beating, which is the opposite of what the setting promises.
+            assertThat(probes).isEqualTo(0)
+        }
         assertThat(logins(log, logOffset)).isEqualTo(1)
 
-        compose.runOnUiThread { viewModel.sendText(saved.id, "echo $LONG_IDLE_MARKER") }
+        val marker = "$IDLE_MARKER_PREFIX-$id"
+        compose.runOnUiThread { viewModel.sendText(saved.id, "echo $marker") }
         compose.runOnUiThread { viewModel.sendKey(saved.id, TerminalKey.ENTER) }
-        pumpUntil(describe = { "the shell stopped answering after ten minutes idle. " + diagnose(saved.id) }) {
-            drawn(saved.id).contains(LONG_IDLE_MARKER)
+        pumpUntil(describe = { "the shell stopped answering after ${holdMs}ms idle. " + diagnose(saved.id) }) {
+            drawn(saved.id).contains(marker)
         }
         assertThat(tabFor(saved.id)?.lastError).isNull()
+        assertNothingLookedLikeADrop(saved.id)
     }
 
     // ---------------------------------------------------------------- harness
@@ -491,14 +637,87 @@ class RealOpenSshInteropRobolectricTest {
         append("\nframe:\n").append(drawn(hostId))
     }
 
-    private fun pumpUntil(timeoutMs: Long = SSH_TIMEOUT_MS, describe: () -> String, condition: () -> Boolean) {
-        val deadline = System.nanoTime() + timeoutMs * 1_000_000
-        while (System.nanoTime() < deadline && !condition()) {
+    /** Idles the looper for [ms] without waiting for anything in particular. */
+    private fun pumpFor(ms: Long) {
+        val deadline = System.nanoTime() + ms * 1_000_000
+        while (System.nanoTime() < deadline) {
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
+    }
+
+    private fun pumpUntil(timeoutMs: Long = SSH_TIMEOUT_MS, describe: () -> String, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        sampleStates()
+        while (System.nanoTime() < deadline && !condition()) {
+            Snapshot.sendApplyNotifications()
+            compose.mainClock.advanceTimeByFrame()
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
+            sampleStates()
+        }
+        sampleStates()
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /**
+     * Every state each tab has been seen in, in order, with repeats collapsed.
+     *
+     * The audit this suite belongs to is about a state the app passes *through*: connected, banner,
+     * "Reconnecting…", back. Sampling only at the end of a wait cannot see that - by then the app is
+     * connected again and the tab looks the way it did before. Every pump iteration adds to this trace,
+     * so a flip that lasted a frame is still on the record when the assertion runs.
+     */
+    private val statesSeen = mutableMapOf<String, MutableList<SessionConnectionState>>()
+
+    /**
+     * Drops what the trace holds for a host, called the moment its key is trusted.
+     *
+     * The first attempt against this sandbox always fails: the server's key has never been seen, so the
+     * app stops and asks. That attempt correctly reports ERROR - and correctly does *not* report
+     * RECONNECTING, which is the fault this suite is about - but it is a failed attempt all the same,
+     * and it belongs to a question the user has now answered rather than to the session under audit.
+     * Only the first test in the class sees it (the trust survives into the rest of the run), so
+     * leaving it in the trace would make the assertion depend on test order.
+     */
+    private fun restartStateTrace(hostId: String) {
+        statesSeen.remove(hostId)
+        // `acceptHostKey` dials again from the calling thread but the dial itself is a coroutine, so the
+        // tab still reports the failed attempt's state for now. Remember it, and ignore it until it
+        // changes, or the next sample would put back exactly what this call just removed.
+        tabFor(hostId)?.let { traceHoldover[it.hostId] = it.state }
+    }
+
+    private val traceHoldover = mutableMapOf<String, SessionConnectionState>()
+
+    private fun sampleStates() {
+        viewModel().uiState.value.tabs.forEach { tab ->
+            if (traceHoldover[tab.hostId] == tab.state) return@forEach
+            traceHoldover -= tab.hostId
+            val seen = statesSeen.getOrPut(tab.hostId) { mutableListOf() }
+            if (seen.lastOrNull() != tab.state) seen += tab.state
+        }
+    }
+
+    /**
+     * Asserts the tab only ever moved forwards through the state machine and is connected now.
+     *
+     * This is the audit's central claim, written as three assertions: the session is up, it was never
+     * reported as dropping, and - because the states are declared in lifecycle order - it never went
+     * backwards. The third is what catches the reported fault specifically: connected, then
+     * RECONNECTING, then connected again is a *decrease* in that order, and it stays in the trace even
+     * though the end state is the same as the start.
+     */
+    private fun assertNothingLookedLikeADrop(hostId: String) {
+        val seen = statesSeen[hostId].orEmpty()
+        assertThat(seen).isNotEmpty()
+        assertThat(seen).containsNoneOf(
+            SessionConnectionState.RECONNECTING,
+            SessionConnectionState.DISCONNECTED,
+            SessionConnectionState.ERROR,
+        )
+        assertThat(seen.map { it.ordinal }).isInStrictOrder()
+        assertThat(seen.last()).isEqualTo(SessionConnectionState.CONNECTED)
     }
 
     private companion object {
@@ -536,6 +755,9 @@ class RealOpenSshInteropRobolectricTest {
         /** Coarse on purpose: this suite shares two cores, and a spin loop here would take one. */
         const val IDLE_STEP_MS = 100L
 
+        /** How long the close futures get after the last tab has gone. */
+        const val CLOSE_SETTLE_MS = 500L
+
         /**
          * Longer than the idle timeout the app gives itself at [KEEP_ALIVE_SECONDS].
          *
@@ -561,12 +783,16 @@ class RealOpenSshInteropRobolectricTest {
         const val SILENT_SERVER_MARKER = "eclipse-outlived-the-silence"
 
         /**
-         * Ten minutes: the low end of the idle the bug reports describe, and four crossings of the
-         * 150-second idle deadline the shipped thirty-second keep-alive implies.
+         * The unit the idle matrix is written in, so a hold reads as the duration a report describes.
+         *
+         * The durations themselves are at the call sites: 30 s, 1, 5, 10 and 30 minutes. The shipped
+         * thirty-second keep-alive puts the app's own idle deadline at `30 * 3 + 60` = 150 seconds, so
+         * every hold from five minutes up crosses it repeatedly - which is the point.
          */
-        const val LONG_IDLE_HOLD_MS = 600_000L
+        const val MINUTE_MS = 60_000L
 
-        const val LONG_IDLE_MARKER = "eclipse-outlived-ten-minutes"
+        /** Each hold echoes its own marker, so a stale frame from another test cannot satisfy it. */
+        const val IDLE_MARKER_PREFIX = "eclipse-outlived"
 
         /** The sandbox `tools/local-sshd.sh` builds, found from wherever Gradle set the working directory. */
         fun sandbox(): File? {

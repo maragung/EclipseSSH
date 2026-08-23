@@ -125,20 +125,26 @@ jobs:
       - name: Assemble APKs
         run: ./gradlew --stacktrace assembleDebug assembleRelease
 
-      - name: Verify the release APK signature
+      # Every output, not the first one. The build is split per ABI, so `head -1` would
+      # have verified one APK out of five and reported the other four as checked.
+      - name: Verify the release APK signatures
         run: |
           set -euo pipefail
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -1)"
-          APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
-          echo "Verifying $APK"
-          "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
-          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
-            # The release key is configured for v2 + v3 and nothing else; a build that
-            # silently drops v3 could never rotate the key for installed copies.
-            "$APKSIGNER" verify --verbose --min-sdk-version 28 "$APK" | tee /tmp/sigs.txt
-            grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sigs.txt
-            grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
-          fi
+          mapfile -t APKS < <(find app/build/outputs/apk/release -name '*.apk' | sort)
+          # An empty list is a broken build, not a run with nothing to check.
+          test "${#APKS[@]}" -eq 5 || { echo "expected 5 release APKs, found ${#APKS[@]}: ${APKS[*]}"; exit 1; }
+          for APK in "${APKS[@]}"; do
+            echo "== Verifying $APK"
+            "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
+            if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+              # The release key is configured for v2 + v3 and nothing else; a build that
+              # silently drops v3 could never rotate the key for installed copies.
+              "$APKSIGNER" verify --verbose --min-sdk-version 28 "$APK" | tee /tmp/sigs.txt
+              grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sigs.txt
+              grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
+            fi
+          done
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -174,9 +180,12 @@ jobs:
           rm -f keystore.properties
           rm -rf keystore
 
-  # The long idle test, which does not belong in a gate that runs on every push: ten
-  # minutes of a genuinely silent session is ten minutes of a metered runner, and what
-  # it protects against changes only when the keep-alive or idle-timeout code does.
+  # The idle matrix, which does not belong in a gate that runs on every push: an hour of
+  # genuinely silent sessions is an hour of a metered runner, and what it protects against
+  # changes only when the keep-alive or idle-timeout code does. It holds one session at a
+  # time for 30s, 1, 5, 10 and 30 minutes, plus a compressed one and one with the keep-alive
+  # switched off - the case that proves switching it off also switches off the idle backstop
+  # derived from it, which would otherwise drop a healthy session 150 seconds after login.
   #
   # It is the one test open long enough to cross the idle deadline the *shipped* default
   # implies - 30s keep-alive means MINA closes an untouched transport after 30*3+60 =
@@ -187,7 +196,10 @@ jobs:
     name: Long idle stress test
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The matrix holds a silent session for 30s + 1 + 5 + 5 + 5 + 10 + 30 minutes, one after
+    # another, so the holds alone are just under an hour. 90 leaves room for the build and for
+    # a slow runner without leaving a hung job to burn two hours.
+    timeout-minutes: 90
 
     steps:
       - name: Check out
@@ -223,16 +235,23 @@ jobs:
           # own heartbeat is the only traffic and the only thing keeping the session up.
           test -f .tmp-build/sshd-test/port-silent
 
-      - name: Ten minutes of a silent session
+      # The whole interop class, not one test: with ECLIPSE_STRESS set, the idle matrix
+      # (30s / 1 / 5 / 10 / 30 minutes, keep-alive on and off, compression on and off) runs
+      # alongside the interop tests the push gate already covers, and they share one sandbox.
+      - name: The idle matrix against a real OpenSSH server
         env:
           ECLIPSE_STRESS: '1'
         run: |
+          set -euo pipefail
           ./gradlew --stacktrace :app:testDebugUnitTest \
-            --tests '*RealOpenSshInteropRobolectricTest.aDefaultSessionSurvivesTenMinutesOfSilence'
-          # A skipped test reads exactly like a passing one in the summary, and this job
-          # exists only to run this test, so an assumption that did not hold is a failure.
-          grep -q 'tests="1" skipped="0"' \
-            app/build/test-results/testDebugUnitTest/TEST-dev.eclipse.ssh.RealOpenSshInteropRobolectricTest.xml
+            --tests '*RealOpenSshInteropRobolectricTest'
+          RESULTS=app/build/test-results/testDebugUnitTest/TEST-dev.eclipse.ssh.RealOpenSshInteropRobolectricTest.xml
+          # A skipped test reads exactly like a passing one in the summary, and this job exists
+          # only to run these, so an assumption that did not hold is a failure. Every gate in the
+          # class is satisfied here - the sandbox is up, the silent port exists, ECLIPSE_STRESS is
+          # set - so nothing in it is allowed to skip.
+          grep -q 'skipped="0"' "$RESULTS"
+          sed -n 's/.*\(tests="[0-9]*"\).*\(failures="[0-9]*"\).*/\1 \2/p' "$RESULTS" | head -1
 
       - name: Stop the OpenSSH sandbox
         if: always()

@@ -104,4 +104,12 @@ class SessionEndTest {
         assertThat(describeSessionEnd(SessionEnd.TransportClosed)).isEqualTo("Disconnected from the remote host")
         assertThat(describeSessionEnd(SessionEnd.Released)).isEqualTo("Disconnected from the remote host")
     }
+
+    @Test
+    fun `a network that went away says so, and says the app is waiting for it`() {
+        // Distinct wording on purpose. "Disconnected from the remote host" invites the user to look at
+        // their server; the truth is that their phone lost its network and the app is already handling it.
+        assertThat(describeSessionEnd(SessionEnd.NetworkLost))
+            .isEqualTo("The network went away. Reconnecting when it comes back…")
+    }
 }

@@ -3,6 +3,7 @@ package dev.eclipse.ssh.ssh
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import dev.eclipse.ssh.data.model.HostKeyChallenge
+import dev.eclipse.ssh.data.model.HostKeyPolicy
 import com.google.common.truth.Truth.assertThat
 import java.lang.reflect.Proxy
 import java.net.InetSocketAddress
@@ -163,13 +164,110 @@ class KnownHostsVerifierTest {
         assertThat(challenges).isEmpty()
     }
 
-    private fun verifier(vararg tunnelled: TunnelledTarget) = KnownHostsVerifier(
+    @Test
+    fun `a host that trusts on first use pins the first key without asking`() {
+        val verifier = verifier(policy = HostKeyPolicy.ACCEPT_NEW)
+
+        val accepted = verifier.verifyServerKey(session(address = unresolved("edge.example", 2222)), null, KEY)
+
+        assertThat(accepted).isTrue()
+        assertThat(challenges).isEmpty()
+        // Pinned, not merely waved through: that is what makes the *second* key a detectable change.
+        assertThat(store.get("edge.example", 2222)).isEqualTo(KnownHostsVerifier.fingerprint(KEY))
+    }
+
+    @Test
+    fun `trust on first use still reports a key that changed`() {
+        store.save("edge.example", 2222, "SHA256:something-else-entirely")
+        val verifier = verifier(policy = HostKeyPolicy.ACCEPT_NEW)
+
+        val accepted = verifier.verifyServerKey(session(address = unresolved("edge.example", 2222)), null, KEY)
+
+        assertThat(accepted).isFalse()
+        assertThat(challenges.single().changed).isTrue()
+        // And the stored key is left alone, so declining the prompt leaves the pin intact.
+        assertThat(store.get("edge.example", 2222)).isEqualTo("SHA256:something-else-entirely")
+    }
+
+    @Test
+    fun `a strict host refuses an unknown key without asking or storing it`() {
+        val verifier = verifier(policy = HostKeyPolicy.STRICT)
+
+        val accepted = verifier.verifyServerKey(session(address = unresolved("edge.example", 2222)), null, KEY)
+
+        assertThat(accepted).isFalse()
+        // No prompt is the point: there is no answer the user could give that would let this through, so
+        // asking would be offering a choice that does not exist.
+        assertThat(challenges).isEmpty()
+        assertThat(store.all()).isEmpty()
+    }
+
+    @Test
+    fun `a strict host connects to the key it already pinned`() {
+        store.save("edge.example", 2222, KnownHostsVerifier.fingerprint(KEY))
+        val verifier = verifier(policy = HostKeyPolicy.STRICT)
+
+        assertThat(verifier.verifyServerKey(session(address = unresolved("edge.example", 2222)), null, KEY)).isTrue()
+    }
+
+    @Test
+    fun `a strict host refuses a changed key without a prompt either`() {
+        store.save("edge.example", 2222, "SHA256:something-else-entirely")
+        val verifier = verifier(policy = HostKeyPolicy.STRICT)
+
+        assertThat(verifier.verifyServerKey(session(address = unresolved("edge.example", 2222)), null, KEY)).isFalse()
+        assertThat(challenges).isEmpty()
+    }
+
+    @Test
+    fun `each host is judged by its own policy through the one shared verifier`() {
+        // One verifier serves every dial, so the policy has to travel with the session rather than sit
+        // in a field: two hosts connecting at once would otherwise each get the other's rules.
+        val policies = mapOf("trusting.example" to HostKeyPolicy.ACCEPT_NEW, "careful.example" to HostKeyPolicy.ASK)
+        val verifier = KnownHostsVerifier(
+            store = store,
+            tunnelledTarget = { null },
+            hostKeyPolicy = { session -> policies.getValue(session!!.username) },
+            onChallenge = challenges::add,
+        )
+
+        val trusting = verifier.verifyServerKey(
+            session(address = unresolved("trusting.example", 22), username = "trusting.example"),
+            null,
+            KEY,
+        )
+        val careful = verifier.verifyServerKey(
+            session(address = unresolved("careful.example", 22), username = "careful.example"),
+            null,
+            KEY,
+        )
+
+        assertThat(trusting).isTrue()
+        assertThat(careful).isFalse()
+        assertThat(challenges.single().host).isEqualTo("careful.example")
+    }
+
+    @Test
+    fun `a session with no policy recorded is asked about`() {
+        // The stub session answers nothing but the two questions the verifier asks, so this exercises
+        // the real default resolver with nothing to read - an adopted or restored session.
+        val verifier = KnownHostsVerifier(store = store, tunnelledTarget = { null }, onChallenge = challenges::add)
+
+        assertThat(verifier.verifyServerKey(session(address = unresolved("edge.example", 22)), null, KEY)).isFalse()
+        assertThat(challenges).hasSize(1)
+    }
+
+    private fun verifier(
+        vararg tunnelled: TunnelledTarget,
+        policy: HostKeyPolicy = HostKeyPolicy.ASK,
+    ) = KnownHostsVerifier(
         store = store,
         tunnelledTarget = { username ->
             tunnelled.filter { it.username == username }
                 .distinctBy { it.host to it.port }
                 .singleOrNull()
         },
+        hostKeyPolicy = { policy },
         onChallenge = challenges::add,
     )
 

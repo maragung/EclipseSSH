@@ -332,7 +332,7 @@ class AnsiTerminalBuffer(
         for (index in first until first + take) {
             val line = lines[index]
             window += line.toList()
-            val painted = paintedWidth(line)
+            val painted = terminalPaintedWidth(line)
             if (painted > content) content = painted
         }
         val relativeCursor = cursorRow - first
@@ -382,25 +382,6 @@ class AnsiTerminalBuffer(
     }
 
     private fun isBlank(line: List<TerminalCell>): Boolean = line.all { it == BLANK_CELL }
-
-    /**
-     * How many columns of [line] carry anything: a glyph, a background colour, or an inverse.
-     *
-     * The same test the renderer uses to find the last cell worth drawing, and it has to stay the
-     * same test - this is what [TerminalFrame.contentColumns] reports and therefore how far the view
-     * lets the user pan, so a cell that is painted but not pannable would be unreachable. Scanned
-     * backwards because the answer is near the end of the line: most of a terminal row is the run of
-     * blanks after the text.
-     */
-    private fun paintedWidth(line: List<TerminalCell>): Int {
-        var index = line.size
-        while (index > 0) {
-            val cell = line[index - 1]
-            if (cell.value != ' ' || !cell.style.background.isDefault || cell.style.inverse) return index
-            index--
-        }
-        return 0
-    }
 
     /**
      * The viewport height the buffer is sized to, without building a frame to find out.
@@ -1246,4 +1227,29 @@ class AnsiTerminalBuffer(
             return (red shl 16) or (green shl 8) or blue
         }
     }
+}
+
+/**
+ * How many columns of [line] carry anything: a glyph, a background colour, or an inverse.
+ *
+ * One function for the three places that need the answer - [TerminalFrame.contentColumns], the
+ * renderer's search for the last cell worth drawing, and [terminalLayout]'s decision about whether a
+ * line needs wrapping at all - because they have to agree. [TerminalFrame.contentColumns] is how far
+ * the view lets the user pan, so a cell that one of them counts as painted and another does not is
+ * either unreachable or a column of pannable emptiness.
+ *
+ * A blank counts when it has a background or an inverse: that is how a status bar's coloured padding
+ * and a highlighted row in `less` are drawn, and stopping short of them would clip the bar.
+ *
+ * Scanned backwards because the answer is near the end: most of a terminal row is the run of blanks
+ * after the text.
+ */
+internal fun terminalPaintedWidth(line: List<TerminalCell>): Int {
+    var index = line.size
+    while (index > 0) {
+        val cell = line[index - 1]
+        if (cell.value != ' ' || !cell.style.background.isDefault || cell.style.inverse) return index
+        index--
+    }
+    return 0
 }

@@ -3,6 +3,7 @@ package dev.eclipse.ssh.ssh
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.DEFAULT_AUTH_TIMEOUT_SECONDS
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.settings.SettingsRepository
@@ -246,11 +247,17 @@ class SshIntegrationTest {
 
     /**
      * Connects to [server] once with legacy compatibility off and once with it on, asserting the first
-     * is refused during negotiation and the second reaches an authenticated session.
+     * is refused during the handshake and the second reaches an authenticated session.
      *
-     * The refusal is checked for a negotiation message rather than just for being a failure: a connect
-     * that failed because the port was busy or the server had not finished starting would otherwise
-     * satisfy the same assertion and the test would pass while proving nothing.
+     * The refusal is checked for *where* it happened rather than just for being a failure: a connect that
+     * failed because the port was busy or the server had not finished starting would otherwise satisfy
+     * the same assertion and the test would pass while proving nothing. [failedDuringSshHandshake] is
+     * that check, and it is deliberately not a string match on MINA's negotiation text, because a server
+     * with no algorithm in common has two ways to say so - a disconnect packet naming the negotiation,
+     * and simply closing the socket, which on a loaded machine can beat the packet and surfaces as a
+     * connect future with no session attached. Both are the server refusing this proposal at the
+     * handshake; neither is a port that was busy, and asserting only the first made this test fail once
+     * in a while for a reason that had nothing to do with what it is about.
      */
     private suspend fun assertNeedsLegacyCompatibility(
         settings: SettingsRepository,
@@ -262,7 +269,7 @@ class SshIntegrationTest {
         settings.setLegacyAlgorithms(false)
         val refused = runCatching { trustedConnect(manager, profile, PASSWORD) }
         assertThat(refused.isFailure).isTrue()
-        assertThat(refused.exceptionOrNull()).hasMessageThat().ignoringCase().contains("negotiate")
+        assertThat(failedDuringSshHandshake(refused.exceptionOrNull())).isTrue()
 
         settings.setLegacyAlgorithms(true)
         val session = trustedConnect(manager, profile, PASSWORD)
@@ -313,7 +320,7 @@ class SshIntegrationTest {
             settings.setLegacyAlgorithms(false)
             val afterDisabling = runCatching { trustedConnect(manager, hostProfile().copy(port = server.port), PASSWORD) }
             assertThat(afterDisabling.isFailure).isTrue()
-            assertThat(afterDisabling.exceptionOrNull()).hasMessageThat().ignoringCase().contains("negotiate")
+            assertThat(failedDuringSshHandshake(afterDisabling.exceptionOrNull())).isTrue()
         }
     }
 
@@ -932,6 +939,12 @@ class SshIntegrationTest {
      * forwarded to something that is not sshd. TCP connect succeeds, the version exchange never
      * does, and the attempt can only end on the timeout — the one condition that distinguishes a
      * five-second budget from a fifteen-second one.
+     *
+     * It also pins which budget covers that silence. MINA's connect future resolves when the *socket*
+     * is up, so the wait for the version and key exchange belongs to nobody unless something claims
+     * it. The connect budget claims it, not the authentication one: this server never asks for a
+     * credential, and charging its silence to the time allowed for answering a password prompt would
+     * report a number the user chose for a phase the attempt never reached. See `awaitHandshake`.
      */
     @Test(timeout = 120_000)
     fun aPerHostTimeoutIsHonouredInsteadOfTheOldHardCodedFifteenSeconds() {
@@ -964,13 +977,17 @@ class SshIntegrationTest {
 
                     assertThat(error).isNotNull()
                     // The load-bearing assertion, and it is deliberately not a stopwatch reading:
-                    // MINA names the budget it was given in the failure it raises, so this reads the
-                    // number the engine actually used rather than inferring it from wall clock. On a
-                    // busy machine a 5-second wait can measure as 20; the message cannot drift.
+                    // the failure names the budget it was given, so this reads the number the engine
+                    // actually used rather than inferring it from wall clock. On a busy machine a
+                    // 5-second wait can measure as 20; the message cannot drift.
                     assertThat(error!!.toString())
                         .contains("timeout: ${shortTimeout * 1_000} msec")
-                    // And the number it must no longer be.
+                    // And the two numbers it must not be: the budget that was once hard-coded, and
+                    // the default authentication budget, which is what an unclaimed handshake falls
+                    // through to and would report for a server that never asked for anything.
                     assertThat(error.toString()).doesNotContain("15000 msec")
+                    assertThat(error.toString())
+                        .doesNotContain("${DEFAULT_AUTH_TIMEOUT_SECONDS * 1_000} msec")
                     // Only a lower bound, because load can lengthen the wait but never shorten it.
                     // It rules out the one thing that would fake a pass: an instant refusal, which
                     // is what an unbound port would give and would satisfy the message check never.

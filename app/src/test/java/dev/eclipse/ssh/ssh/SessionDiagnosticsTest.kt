@@ -309,5 +309,138 @@ class SessionDiagnosticsTest {
             assertThat(event.line()).contains(event.event.name)
             assertThat(event.session).isNotEmpty()
         }
+        // Every one of these was a handshake, so every one opened a transport of its own: no two lines
+        // may claim the same one. A get-then-increment would hand two threads the same number here.
+        assertThat(events.map { it.session to it.connection }.toSet()).hasSize(events.size)
+    }
+
+    /**
+     * Each of a host's connections is numbered, so a trace with several sockets in it can be read.
+     *
+     * The question a reconnect trace exists to answer is *which* connection a line belongs to, and a
+     * per-host label alone cannot answer it: forty lines saying `s1` across six sockets make "did the
+     * pty open on the session that then died, or on the one before it?" unanswerable - which is exactly
+     * the shape of the connect-disconnect-reconnect reports this trace was added for.
+     */
+    @Test
+    fun `each connection of a host is numbered so a trace can be read one socket at a time`() {
+        val diagnostics = diagnostics()
+
+        // One dial, one drop, one redial - the sequence a flapping host produces.
+        diagnostics.record(hostId, SessionEvent.CONNECT_REQUESTED)
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+        diagnostics.record(hostId, SessionEvent.AUTHENTICATE)
+        diagnostics.record(hostId, SessionEvent.SHELL_OPEN)
+        diagnostics.record(hostId, SessionEvent.ENDED)
+        diagnostics.record(hostId, SessionEvent.RECONNECT_SCHEDULED)
+        diagnostics.record(hostId, SessionEvent.RECONNECT_ATTEMPT)
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+        diagnostics.record(hostId, SessionEvent.SHELL_OPEN)
+
+        val events = diagnostics.events.value
+        // A request arrives before any transport exists and says so rather than borrowing the next
+        // one's number; everything from the handshake to the ending belongs to the first transport;
+        // the reconnect being armed and attempted still belongs to the connection that dropped, since
+        // that is what those lines are about; the second handshake starts the second.
+        assertThat(events.map { it.connection })
+            .containsExactly(0L, 1L, 1L, 1L, 1L, 1L, 1L, 2L, 2L)
+            .inOrder()
+        // One token in the text, so a whole connection is one `grep`.
+        assertThat(events[3].line()).contains("${events[3].session}.1 SHELL_OPEN")
+        assertThat(events.last().line()).contains("${events.last().session}.2 SHELL_OPEN")
+    }
+
+    @Test
+    fun `two hosts number their own connections`() {
+        val diagnostics = diagnostics()
+        val otherHost = "2f9e8d7c-6b5a-4938-8271-0a1b2c3d4e5f"
+
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+        diagnostics.record(otherHost, SessionEvent.HANDSHAKE)
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+
+        val events = diagnostics.events.value
+        assertThat(events[0].connection).isEqualTo(1L)
+        assertThat(events[1].connection).isEqualTo(1L)
+        assertThat(events[2].connection).isEqualTo(2L)
+        assertThat(events[2].session).isEqualTo(events[0].session)
+    }
+
+    /**
+     * The reconnect tally keeps growing where the ladder's own rung is reset.
+     *
+     * These are two different numbers and the trace needs both. `attempt` is the rung being climbed and
+     * it is deliberately reset - by a user asking to connect, and by a session that stayed up long
+     * enough to count as stable - which is right for deciding when to give up and useless for judging a
+     * host: a link that drops every four minutes all afternoon reports `attempt=1` every single time.
+     */
+    @Test
+    fun `the reconnect tally grows where the ladder rung resets`() {
+        val diagnostics = diagnostics()
+
+        repeat(3) {
+            // Every one of these is the first rung of a fresh ladder, as a stable session's drop is.
+            diagnostics.record(hostId, SessionEvent.RECONNECT_ATTEMPT, attempt = 1)
+            diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+            diagnostics.record(hostId, SessionEvent.SHELL_OPEN)
+        }
+
+        val events = diagnostics.events.value
+        assertThat(events.map { it.reconnects }).containsExactly(1L, 1L, 1L, 2L, 2L, 2L, 3L, 3L, 3L).inOrder()
+        assertThat(events.last().line()).contains("reconnects=3")
+        // And the rung it is not.
+        assertThat(events.filter { it.attempt != null }.map { it.attempt }).containsExactly(1, 1, 1)
+    }
+
+    @Test
+    fun `a host that has never been redialled prints no tally`() {
+        val diagnostics = diagnostics()
+
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+
+        assertThat(diagnostics.events.value.single().reconnects).isEqualTo(0L)
+        assertThat(diagnostics.events.value.single().line()).doesNotContain("reconnects=")
+    }
+
+    /**
+     * The channel's state and the age of the last output reach the line as fields of their own.
+     *
+     * Both used to exist only inside prose details on one of the probe's messages, which is where a
+     * `grep` cannot reach them and where three quarters of the events that need them never had them.
+     * Together they separate the two endings that look identical from the outside: a transport that
+     * died under a session which was streaming output a moment earlier, and one whose far end had gone
+     * quiet minutes before.
+     */
+    @Test
+    fun `a line carries the channel state and the age of the last output`() {
+        val diagnostics = diagnostics()
+
+        diagnostics.record(
+            hostId,
+            SessionEvent.ENDED,
+            state = SessionConnectionState.RECONNECTING,
+            channel = "closed",
+            idleForMs = 7_400,
+            pty = "100x30",
+        )
+        val line = diagnostics.events.value.single().line()
+
+        assertThat(line).contains("chan=closed")
+        // Seconds, like every other duration on the line.
+        assertThat(line).contains("idle=7s")
+        assertThat(line).contains("pty=100x30")
+
+        diagnostics.clear()
+        // Sub-second rounds down to zero, which is the answer that matters: output was arriving as
+        // this happened, so whatever ended the session, it was not the far end going quiet.
+        diagnostics.record(hostId, SessionEvent.ENDED, channel = "open", idleForMs = 120)
+        assertThat(diagnostics.events.value.single().line()).contains("idle=0s")
+
+        diagnostics.clear()
+        // And a recorder with no channel to look at prints neither field rather than guessing.
+        diagnostics.record(hostId, SessionEvent.ENDED)
+        val bare = diagnostics.events.value.single().line()
+        assertThat(bare).doesNotContain("chan=")
+        assertThat(bare).doesNotContain("idle=")
     }
 }

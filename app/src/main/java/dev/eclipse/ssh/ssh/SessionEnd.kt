@@ -56,6 +56,25 @@ sealed interface SessionEnd {
      */
     data class TransportFailed(val cause: Throwable) : SessionEnd
 
+    /**
+     * The network the session was bound to went away, and the app is the one that noticed.
+     *
+     * Distinct from [TransportFailed] because nothing failed: no exception was raised, no FIN arrived,
+     * and `isOpen` was still true at the moment this was decided. An SSH session is a TCP connection
+     * bound to one address on one interface, so when the platform reports that address gone - flight
+     * mode, walking out of Wi-Fi range, a handover that does not keep the old interface - the session is
+     * already over and simply has not been told. Left to MINA, the discovery costs three unanswered
+     * keep-alives, which at the default interval is a minute and a half of a terminal that looks
+     * perfectly connected and silently swallows every keystroke.
+     *
+     * Worth its own name rather than a synthesised [TransportFailed], because "Connection lost:
+     * Connection reset" and "the phone changed networks" ask entirely different things of the user, and
+     * because a trace line that says `NetworkLost` is a diagnosis where one that says `TransportFailed`
+     * is the start of an investigation. Reconnect-worthy, and the ladder it starts waits for
+     * connectivity rather than backing off blindly - see `awaitReconnectWindow`.
+     */
+    data object NetworkLost : SessionEnd
+
     /** The transport went away with nothing said about why — a bare socket close. */
     data object TransportClosed : SessionEnd
 
@@ -98,6 +117,7 @@ fun describeSessionEnd(end: SessionEnd): String = when (end) {
             ?: "reason ${end.reason}"
         if (end.byPeer) "The server disconnected: $reason" else "Disconnected: $reason"
     }
+    SessionEnd.NetworkLost -> "The network went away. Reconnecting when it comes back…"
     SessionEnd.TransportClosed, SessionEnd.Released -> "Disconnected from the remote host"
 }
 
@@ -139,6 +159,7 @@ val SessionEnd.isFault: Boolean
         is SessionEnd.ShellEnded -> signal != null
         is SessionEnd.Disconnected -> true
         is SessionEnd.TransportFailed -> true
+        SessionEnd.NetworkLost -> true
         SessionEnd.TransportClosed -> true
         SessionEnd.Released -> true
     }

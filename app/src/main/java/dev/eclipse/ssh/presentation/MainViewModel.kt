@@ -21,6 +21,7 @@ import dev.eclipse.ssh.data.saf.LocalFileBrowser
 import dev.eclipse.ssh.data.saf.LocalSyncIndex
 import dev.eclipse.ssh.data.saf.localDocumentLength
 import dev.eclipse.ssh.data.model.AppSettings
+import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
 import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.HostKeyChallenge
@@ -28,7 +29,7 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
-import dev.eclipse.ssh.data.model.isLive
+import dev.eclipse.ssh.data.model.isPastAuthentication
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.Snippet
@@ -54,7 +55,9 @@ import dev.eclipse.ssh.ssh.joinRemote
 import dev.eclipse.ssh.ssh.OpenSshConfigParser
 import dev.eclipse.ssh.background.NetworkMonitor
 import dev.eclipse.ssh.background.awaitReconnectWindow
+import dev.eclipse.ssh.background.ReconnectPolicy
 import dev.eclipse.ssh.background.backoffWindowMs
+import dev.eclipse.ssh.background.reconnectPolicyOf
 import dev.eclipse.ssh.ssh.SshConnectionManager
 import dev.eclipse.ssh.ssh.SshSessionStore
 import dev.eclipse.ssh.ssh.SshKeyLoader
@@ -217,6 +220,18 @@ class MainViewModel @Inject constructor(
      * Automatic reconnects waiting out their backoff, one per host. See [scheduleAutoReconnect].
      */
     private val reconnectJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * The reconnect rules each host was last dialled with, keyed by host id. See [ReconnectPolicy].
+     *
+     * Cached rather than read from the repository at the moment a session drops, for two reasons. The
+     * decision is needed *synchronously* - the tab has to go to RECONNECTING or to ERROR in the same
+     * update that reports the reason, and a Room read on the far side of a suspension is what used to
+     * make a genuine drop flash red before admitting it was already recovering. And a session should
+     * end under the rules it began under: editing a profile while its shell is open changes the next
+     * connection, not the ladder already running underneath the current one.
+     */
+    private val reconnectPolicies = ConcurrentHashMap<String, ReconnectPolicy>()
 
     /**
      * Consecutive automatic reconnects attempted per host, cleared as soon as one succeeds.
@@ -392,6 +407,18 @@ class MainViewModel @Inject constructor(
         networkMonitor.available
             .onEach { reconnectWake.trySend(Unit) }
             .launchIn(viewModelScope)
+        // Folded onto every tab rather than read separately by the UI, so that one function still
+        // answers "what does this session say" - a status line assembled from two sources in two places
+        // is how "Reconnecting…" and "Disconnected" ended up on screen at the same time. The flag is
+        // device-wide because the condition is: it is the phone that has no network, not one session.
+        livenessProbe.networkHeld
+            .onEach { held ->
+                tabs.update { current ->
+                    if (current.none { it.networkHeld != held }) current
+                    else current.map { if (it.networkHeld == held) it else it.copy(networkHeld = held) }
+                }
+            }
+            .launchIn(viewModelScope)
         adoptExistingSessions()
     }
 
@@ -431,7 +458,9 @@ class MainViewModel @Inject constructor(
                     SessionEvent.ADOPTED,
                     state = SessionConnectionState.CONNECTED,
                     detail = "view model recreated",
-                    pty = "${terminal.ptyColumns}x${terminal.ptyRows}",
+                    pty = terminal.ptyLabel,
+                    channel = terminal.channelLabel,
+                    idleForMs = terminal.idleForMs(),
                 )
                 terminalJobs.remove(hostId)?.cancelAndJoin()
                 terminalJobs[hostId] = launchTerminalCollector(hostId, terminal, buffer)
@@ -492,6 +521,9 @@ class MainViewModel @Inject constructor(
             // the host, or a rotated server password could not be used at all without editing the
             // profile first.
             val resolved = resolveCredentials(host, password, keyPair, keyBytes, keyPassphrase, resuming)
+            // Recorded before the first attempt, so even a host that never gets a shell open has its
+            // rules on file for the ladder that answers the failure.
+            reconnectPolicies[host.id] = reconnectPolicyOf(host)
             // Everything from here to the shell being on screen happens under this host's dial gate,
             // which is what stops two dials to the same account existing at once. The service's
             // restore pass takes the same gate, so the pass that used to run concurrently with this
@@ -505,7 +537,7 @@ class MainViewModel @Inject constructor(
                         // waited for it is one to use, not one to duplicate - and asked on every attempt,
                         // because a restore pass can install one between two of them. See
                         // [adoptStoredSession] for the two shapes that count.
-                        if (adoptStoredSession(host, resolved)) return@dialing
+                        if (adoptStoredSession(host, resolved, resuming)) return@dialing
                         val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair) { phase ->
                             onConnectPhase(host.id, phase, resuming, attempt)
                         }
@@ -518,7 +550,12 @@ class MainViewModel @Inject constructor(
                             return@dialing
                         }
                         val size = ptySizes[host.id]
-                        val terminal = sshConnectionManager.openTerminal(session, size?.first, size?.second)
+                        // Authenticated. Everything from here is the channel and the pty, and it is worth
+                        // saying so: a server that accepts the password and then cannot give out a pty
+                        // used to spend that whole time claiming to be connecting.
+                        markOpeningShell(host.id, resuming)
+                        val terminal =
+                            sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
                         // Never replaces a live session with this one: if another dialler installed one
                         // for this host while this handshake was in flight, that session is the one the
                         // app keeps and this one is the redundant half of a duplicate - the opposite of
@@ -532,7 +569,7 @@ class MainViewModel @Inject constructor(
                             // The incumbent may have no shell on it - a restore pass installs
                             // transport-only sessions - so adopting has to be able to open one. Going
                             // round the loop instead would only lose the same race again, forever.
-                            if (adoptStoredSession(host, resolved)) return@dialing
+                            if (adoptStoredSession(host, resolved, resuming)) return@dialing
                             continue
                         }
                         attachTerminal(host, terminal, resolved)
@@ -553,7 +590,15 @@ class MainViewModel @Inject constructor(
                         )
                         if (connectFailureIsFinal(error)) break
                         if (attempt < MAX_CONNECT_ATTEMPTS - 1) {
-                            updateTab(host.id) { it?.copy(state = SessionConnectionState.RECONNECTING, lastError = "Retrying connection…") }
+                            // Named by the phase it failed in, read off the tab before it is overwritten.
+                            // See [retryNotice] for why one message for all of them was actively
+                            // misleading.
+                            updateTab(host.id) { tab ->
+                                tab?.copy(
+                                    state = SessionConnectionState.RECONNECTING,
+                                    lastError = retryNotice(tab.state),
+                                )
+                            }
                             delay(RECONNECT_DELAY_MS * (attempt + 1))
                         }
                     }
@@ -600,7 +645,11 @@ class MainViewModel @Inject constructor(
      * on an adopted session is reported and retried like any other connect failure rather than
      * escaping the coroutine.
      */
-    private suspend fun adoptStoredSession(host: HostProfile, resolved: ResolvedCredentials): Boolean {
+    private suspend fun adoptStoredSession(
+        host: HostProfile,
+        resolved: ResolvedCredentials,
+        resuming: Boolean,
+    ): Boolean {
         sessionStore.adoptable(host.id)?.let { (_, existing) ->
             diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CONNECTED)
             attachTerminal(host, existing, resolved)
@@ -609,10 +658,11 @@ class MainViewModel @Inject constructor(
         val session = sessionStore.sessionAwaitingShell(host.id) ?: return false
         // Recorded before the shell is asked for, so a pty that never opens is attributable to the
         // session it was asked of rather than looking like a fresh handshake that stalled.
-        diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.AUTHENTICATING)
+        diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
         val size = ptySizes[host.id]
+        markOpeningShell(host.id, resuming)
         val terminal = try {
-            sshConnectionManager.openTerminal(session, size?.first, size?.second)
+            sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -683,7 +733,9 @@ class MainViewModel @Inject constructor(
             state = SessionConnectionState.CONNECTED,
             network = networkMonitor.describe(),
             keepAliveSeconds = host.keepAliveSeconds,
-            pty = "${terminal.ptyColumns}x${terminal.ptyRows}",
+            pty = terminal.ptyLabel,
+            channel = terminal.channelLabel,
+            idleForMs = terminal.idleForMs(),
         )
         // Credentials are no longer needed once the session is up.
         pendingConnection = null
@@ -900,10 +952,11 @@ class MainViewModel @Inject constructor(
             // overwrite the CONNECTED state the new session had just been given.
             //
             // Absent is not the same as replaced, and testing for `remove` returning true conflated
-            // them. A liveness check anywhere in the app prunes a dead session and takes its channel
-            // out of the registry with it, so on a real drop the pruner and this handler raced for the
-            // same entry - and when the pruner won, this returned early and the tab that had just lost
-            // its connection was left saying CONNECTED, with nothing scheduled to bring it back.
+            // them. Something else can legitimately have taken this channel out of the registry first -
+            // the liveness sweep discards the channel of a session it proved dead - so on a real drop
+            // that sweep and this handler raced for the same entry, and when the sweep won, this
+            // returned early and the tab that had just lost its connection was left saying CONNECTED,
+            // with nothing scheduled to bring it back.
             val current = channels[hostId]
             if (current == null || current === terminal) {
                 channels.remove(hostId, terminal)
@@ -915,6 +968,8 @@ class MainViewModel @Inject constructor(
                     diagnostics.record(
                         hostId,
                         SessionEvent.CLOSED_BY_USER,
+                        channel = terminal.channelLabel,
+                        idleForMs = terminal.idleForMs(),
                         upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it },
                     )
                     return@launch
@@ -923,6 +978,14 @@ class MainViewModel @Inject constructor(
                 // that ran and exited is finished, a transport that died under it failed. See
                 // [SessionEnd.isFault].
                 val reason = describeSessionEnd(end)
+                // The corpse comes out of the registry here, at the one moment the app is entitled to
+                // remove it: the ending has been published, so nothing can be reported over it, and this
+                // is the only path a dead session is guaranteed to reach - a redial replaces the entry
+                // itself, but a tab whose auto-reconnect is off, or whose ladder ran out, never dials
+                // again. Declines to touch a session that is still live, which is the ordinary case when
+                // a shell exits under a transport still carrying an SFTP transfer. See
+                // [SshSessionStore.reap].
+                val reaped = sessionStore.reap(hostId)
                 // Read once, here, because two things now depend on it: the trace, and whether this
                 // ending starts a new ladder or continues the one already running.
                 val upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it }
@@ -932,8 +995,12 @@ class MainViewModel @Inject constructor(
                 // say what happened, instead of reconnecting for as long as the app is open. See
                 // [STABLE_SESSION_MS] for why the threshold is minutes rather than seconds.
                 if (upForMs != null && upForMs >= STABLE_SESSION_MS) reconnectAttempts.remove(hostId)
-                val willReconnect =
-                    shouldAutoReconnect(end, tabIsOpen = tabs.value.any { it.hostId == hostId }, endedDeliberately = false)
+                val willReconnect = shouldAutoReconnect(
+                    end,
+                    tabIsOpen = tabs.value.any { it.hostId == hostId },
+                    endedDeliberately = false,
+                    autoReconnectEnabled = reconnectPolicies[hostId]?.enabled ?: true,
+                )
                 // A fault the ladder is about to answer is a *reconnecting* tab, not an error one.
                 // Writing ERROR here and RECONNECTING a moment later - from inside the scheduling
                 // coroutine, on the far side of a settings read from disk - made every genuine drop
@@ -951,8 +1018,14 @@ class MainViewModel @Inject constructor(
                     hostId,
                     SessionEvent.ENDED,
                     state = ended,
-                    detail = "${end::class.java.simpleName}: $reason",
+                    detail = "${end::class.java.simpleName}: $reason" + if (reaped) " · session reaped" else "",
                     network = networkMonitor.describe(),
+                    pty = terminal.ptyLabel,
+                    channel = terminal.channelLabel,
+                    // The evidence that separates "the transport died under a live session" from "the
+                    // far end had stopped talking long before". Recorded on the ending itself because
+                    // by the time anything else reads this channel it has been reaped.
+                    idleForMs = terminal.idleForMs(),
                     upForMs = upForMs,
                 )
                 if (willReconnect) {
@@ -1056,8 +1129,12 @@ class MainViewModel @Inject constructor(
      * loop.
      */
     private fun scheduleAutoReconnect(hostId: String, endReason: String) {
+        // The rules this host was dialled with, or the app-wide ones for a session nothing dialled -
+        // one the service restored, or one adopted from a previous process. See [reconnectPolicies].
+        val policy = reconnectPolicies[hostId] ?: ReconnectPolicy.DEFAULT
+        val maxAttempts = policy.maxAttempts
         val attempt = (reconnectAttempts[hostId] ?: 0) + 1
-        if (attempt > MAX_AUTO_RECONNECT_ATTEMPTS) {
+        if (attempt > maxAttempts) {
             updateTab(hostId) {
                 it?.copy(
                     state = SessionConnectionState.ERROR,
@@ -1066,7 +1143,7 @@ class MainViewModel @Inject constructor(
                     // behaviour and threw away what the *server* or the transport had said about why,
                     // which is the one thing a user chasing a session that will not stay up needs. The
                     // string comes from [describeSessionEnd] and interpolates no credential.
-                    lastError = "$endReason · gave up after $MAX_AUTO_RECONNECT_ATTEMPTS reconnect attempts",
+                    lastError = "$endReason · gave up after $maxAttempts reconnect attempts",
                 )
             }
             diagnostics.record(
@@ -1081,9 +1158,9 @@ class MainViewModel @Inject constructor(
         }
         reconnectAttempts[hostId] = attempt
         val job = viewModelScope.launch {
-            val baseSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
+            val globalSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
                 .getOrDefault(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
-            val window = backoffWindowMs(baseSeconds, attempt)
+            val window = backoffWindowMs(policy.backoffSeconds(globalSeconds), attempt)
             // Jitter on top of the deterministic window, matching the service's ladder.
             val waitMs = window + Random.nextLong(0, window / 2 + 1)
             updateTab(hostId) {
@@ -1097,7 +1174,7 @@ class MainViewModel @Inject constructor(
                     // the recovery is still running is the difference between a bug a user can describe
                     // and one they can only call "it keeps reconnecting".
                     lastError = "Reconnecting in ${waitMs / 1_000}s · attempt $attempt of " +
-                        "$MAX_AUTO_RECONNECT_ATTEMPTS · $endReason",
+                        "$maxAttempts · $endReason",
                 )
             }
             diagnostics.record(
@@ -1139,7 +1216,7 @@ class MainViewModel @Inject constructor(
             updateTab(hostId) {
                 it?.copy(
                     state = SessionConnectionState.RECONNECTING,
-                    lastError = "Reconnecting · attempt $attempt of $MAX_AUTO_RECONNECT_ATTEMPTS · $endReason",
+                    lastError = "Reconnecting · attempt $attempt of $maxAttempts · $endReason",
                 )
             }
             connect(host, resuming = true)
@@ -2377,6 +2454,7 @@ class MainViewModel @Inject constructor(
             diagnostics.record(tab.hostId, SessionEvent.RECONNECT_CANCELLED, detail = "tab closed")
         }
         reconnectAttempts.remove(tab.hostId)
+        reconnectPolicies.remove(tab.hostId)
         sessionStore.forget(tab.hostId)
         tabs.value = tabs.value.filterNot { it.hostId == tab.hostId }
         terminalOutput.update { it - tab.hostId }
@@ -2734,17 +2812,39 @@ class MainViewModel @Inject constructor(
      * less than the fact that the app is still trying, and flickering CONNECTING/AUTHENTICATING under
      * "attempt 3 of 5" reads as instability rather than as progress.
      *
-     * Never promotes a tab that is already live, because the callback crosses threads: an
-     * authentication that finishes instantly can have its AUTHENTICATING land behind the CONNECTED
-     * that [attachTerminal] wrote, and a connected session must not be told it is still logging in.
+     * Never demotes a tab that is already past authentication, because the callback crosses threads: an
+     * authentication that finishes instantly can have its AUTHENTICATING land behind the
+     * CHANNEL_PTY_INITIALIZING or CONNECTED that followed it, and a session with a pty must not be told
+     * it is still logging in. See [isPastAuthentication].
      */
+    /**
+     * Says that the login is done and the shell is being opened.
+     *
+     * Silent during a reconnect, for the same reason [onConnectPhase] is: a tab that is counting
+     * attempts should keep counting them rather than narrate the phases of each one. Silent, too, on a
+     * tab that is already live, which is what an adopted session's tab already is - there is no shell to
+     * wait for when the shell is the one already on screen.
+     */
+    private fun markOpeningShell(hostId: String, resuming: Boolean) {
+        if (resuming) return
+        updateTab(hostId) { tab ->
+            if (tab == null || tab.state.isPastAuthentication) {
+                tab
+            } else {
+                tab.copy(state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
+            }
+        }
+    }
+
     private fun onConnectPhase(hostId: String, phase: SshConnectPhase, resuming: Boolean, attempt: Int) {
         val state = when {
             resuming -> SessionConnectionState.RECONNECTING
             phase == SshConnectPhase.HANDSHAKE -> SessionConnectionState.CONNECTING
             else -> SessionConnectionState.AUTHENTICATING
         }
-        updateTab(hostId) { tab -> if (tab == null || tab.state.isLive) tab else tab.copy(state = state) }
+        updateTab(hostId) { tab ->
+            if (tab == null || tab.state.isPastAuthentication) tab else tab.copy(state = state)
+        }
         diagnostics.record(
             hostId,
             when (phase) {
@@ -2909,8 +3009,12 @@ data class MainUiState(
  * of outage — long enough to ride out
  * a train tunnel, a Wi-Fi handover or a server reboot, short enough that a host which is
  * genuinely gone stops being dialled while the phone is in a pocket.
+ *
+ * The same number as [DEFAULT_MAX_RECONNECT_ATTEMPTS] and deliberately defined as it: this is the
+ * allowance a host that has never been configured gets, and a host that raises its own ceiling in the
+ * Advanced section climbs its own ladder instead. Two independent fives would drift the day one moved.
  */
-internal const val MAX_AUTO_RECONNECT_ATTEMPTS = 5
+internal const val MAX_AUTO_RECONNECT_ATTEMPTS = DEFAULT_MAX_RECONNECT_ATTEMPTS
 
 /**
  * How long a session must last before it counts as having *stayed* up, handing back the reconnect
@@ -2957,8 +3061,41 @@ internal const val STABLE_SESSION_MS = 300_000L
  * Pure so the rule can be tested without a network, a server or a view model — the states this
  * has to get right are exactly the ones that are awkward to reproduce on demand.
  */
-internal fun shouldAutoReconnect(end: SessionEnd, tabIsOpen: Boolean, endedDeliberately: Boolean): Boolean {
-    if (!tabIsOpen || endedDeliberately) return false
+/**
+ * What a tab should say while a *connect* attempt that failed is being tried again.
+ *
+ * One message used to cover every attempt: "Retrying connection…", under the RECONNECTING state. On a
+ * host that refused the TCP connection that is exactly right. On a host that accepted the password and
+ * then failed to give out a pty it is false in the way that costs a user an evening - the login worked,
+ * nothing about the connection needs retrying, and the app is reporting the one thing the user can see
+ * is not the problem. It is also, word for word, what the reconnect ladder says after a genuine drop,
+ * so the single most-reported symptom of this app - *log in, then "Reconnecting…"* - had two completely
+ * different causes wearing one label, and no way to tell which one anybody was looking at.
+ *
+ * [phase] is the state the tab was in when the attempt failed, which is where that information already
+ * lives. See [SessionConnectionState.CHANNEL_PTY_INITIALIZING].
+ */
+internal fun retryNotice(phase: SessionConnectionState): String = when (phase) {
+    // Authenticated, so the credentials and the route are proven and neither is what to look at. A
+    // server at its MaxSessions limit, out of ptys, or running a ForceCommand that refuses one lands
+    // here, and all three are fixed on the server rather than in this app.
+    SessionConnectionState.CHANNEL_PTY_INITIALIZING -> "Logged in · the shell did not open · retrying"
+    else -> "Retrying connection…"
+}
+
+/**
+ * [autoReconnectEnabled] is the host's own switch, and it is checked here rather than at the top of
+ * the ladder so that a tab whose owner turned the feature off goes straight to the state that says what
+ * happened, instead of showing one frame of "Reconnecting" for a recovery that is not going to be
+ * attempted.
+ */
+internal fun shouldAutoReconnect(
+    end: SessionEnd,
+    tabIsOpen: Boolean,
+    endedDeliberately: Boolean,
+    autoReconnectEnabled: Boolean = true,
+): Boolean {
+    if (!tabIsOpen || endedDeliberately || !autoReconnectEnabled) return false
     return when (end) {
         // The far end is finished with this shell, however it phrased that: a status, a signal, or a
         // channel closed with neither. A fresh shell would meet the same end, so the tab says what
@@ -2967,6 +3104,9 @@ internal fun shouldAutoReconnect(end: SessionEnd, tabIsOpen: Boolean, endedDelib
         is SessionEnd.ShellEnded -> false
         // Everything else is the transport, and a transport is the one thing worth waiting out.
         is SessionEnd.TransportFailed, is SessionEnd.Disconnected -> true
+        // The one ending the app itself concluded. It is reconnect-worthy for the same reason as the
+        // rest, and more certainly than most: the session was proven to have lost its interface.
+        SessionEnd.NetworkLost -> true
         SessionEnd.TransportClosed, SessionEnd.Released -> true
     }
 }

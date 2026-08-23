@@ -26,7 +26,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isAltPressed
@@ -45,6 +44,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import dev.eclipse.ssh.terminal.TerminalKey
+import dev.eclipse.ssh.terminal.TerminalModifiers
 
 /**
  * The Ctrl / Alt / Shift latches on the on-screen key row.
@@ -225,10 +225,12 @@ private const val LINE_FEED = '\n'
 private const val CARRIAGE_RETURN = '\r'
 
 /**
- * Turns a hardware or IME key event into terminal input, or declines it.
+ * Hands a hardware or IME key event to [mapTerminalKeyEvent] and carries out what comes back.
  *
  * Returning true consumes the event, which is what stops the invisible field from also processing it
- * and reporting the same keystroke a second time as a text change.
+ * and reporting the same keystroke a second time as a text change. Nothing is decided here: the rules
+ * live in the pure mapper, and this reads the event and disarms the latches, which is all a composable
+ * is in a position to do.
  */
 private fun handleKeyEvent(
     event: KeyEvent,
@@ -236,62 +238,33 @@ private fun handleKeyEvent(
     onKey: (TerminalKey, Boolean, Boolean, Boolean) -> Unit,
     onChar: (Char, Boolean, Boolean) -> Unit,
 ): Boolean {
-    if (event.type != KeyEventType.KeyDown) return false
-    val armed = latches.consume()
-    val ctrl = event.isCtrlPressed || armed.first
-    val alt = event.isAltPressed || armed.second
-    val shift = event.isShiftPressed || armed.third
-    val named = NAMED_KEYS[event.key]
-    if (named != null) {
-        onKey(named, ctrl, alt, shift)
-        return true
-    }
-    // Only intercept a printable key when a modifier makes it something the field could not express.
-    if (ctrl || alt) {
-        val code = event.utf16CodePoint
-        if (code in PRINTABLE_RANGE) {
-            onChar(code.toChar(), ctrl, alt)
-            return true
+    val action = mapTerminalKeyEvent(
+        keyDown = event.type == KeyEventType.KeyDown,
+        key = event.key,
+        codePoint = event.utf16CodePoint,
+        held = TerminalModifiers(
+            ctrl = event.isCtrlPressed,
+            alt = event.isAltPressed,
+            shift = event.isShiftPressed,
+        ),
+        armed = TerminalModifiers(ctrl = latches.ctrl, alt = latches.alt, shift = latches.shift),
+    )
+    return when (action) {
+        // Declined, so the latches are left alone: they are armed for the key the user is about to
+        // type, and this was not it.
+        TerminalKeyAction.Decline -> false
+        is TerminalKeyAction.Named -> {
+            latches.consume()
+            onKey(action.key, action.modifiers.ctrl, action.modifiers.alt, action.modifiers.shift)
+            true
+        }
+        is TerminalKeyAction.Chord -> {
+            latches.consume()
+            onChar(action.char, action.modifiers.ctrl, action.modifiers.alt)
+            true
         }
     }
-    // Nothing matched, so re-arm what was read: the latch is meant for the next key, not this one.
-    if (armed.first) latches.toggleCtrl()
-    if (armed.second) latches.toggleAlt()
-    if (armed.third) latches.toggleShift()
-    return false
 }
-
-private val PRINTABLE_RANGE = 0x20..0x7E
-
-private val NAMED_KEYS: Map<Key, TerminalKey> = mapOf(
-    Key.Enter to TerminalKey.ENTER,
-    Key.NumPadEnter to TerminalKey.ENTER,
-    Key.Backspace to TerminalKey.BACKSPACE,
-    Key.Tab to TerminalKey.TAB,
-    Key.Escape to TerminalKey.ESCAPE,
-    Key.DirectionUp to TerminalKey.ARROW_UP,
-    Key.DirectionDown to TerminalKey.ARROW_DOWN,
-    Key.DirectionLeft to TerminalKey.ARROW_LEFT,
-    Key.DirectionRight to TerminalKey.ARROW_RIGHT,
-    Key.MoveHome to TerminalKey.HOME,
-    Key.MoveEnd to TerminalKey.END,
-    Key.PageUp to TerminalKey.PAGE_UP,
-    Key.PageDown to TerminalKey.PAGE_DOWN,
-    Key.Insert to TerminalKey.INSERT,
-    Key.Delete to TerminalKey.DELETE,
-    Key.F1 to TerminalKey.F1,
-    Key.F2 to TerminalKey.F2,
-    Key.F3 to TerminalKey.F3,
-    Key.F4 to TerminalKey.F4,
-    Key.F5 to TerminalKey.F5,
-    Key.F6 to TerminalKey.F6,
-    Key.F7 to TerminalKey.F7,
-    Key.F8 to TerminalKey.F8,
-    Key.F9 to TerminalKey.F9,
-    Key.F10 to TerminalKey.F10,
-    Key.F11 to TerminalKey.F11,
-    Key.F12 to TerminalKey.F12,
-)
 
 /** U+200B, written by code point because an invisible character in source is a trap. */
 private val SENTINEL_CHAR: Char = Char(0x200B)
@@ -332,7 +305,14 @@ fun TerminalKeyRow(
     }
 }
 
-private val NAMED_ROW: List<Pair<String, TerminalKey>> = listOf(
+/**
+ * The caps, in thumb order.
+ *
+ * `internal` so a test can hold the bar to the keys a terminal is unusable without: on a touch device
+ * there is no other way to reach Esc, Tab, the arrows or Page Up, so a cap quietly dropped from this
+ * list is a key that no longer exists on the device.
+ */
+internal val NAMED_ROW: List<Pair<String, TerminalKey>> = listOf(
     "ESC" to TerminalKey.ESCAPE,
     "TAB" to TerminalKey.TAB,
     "←" to TerminalKey.ARROW_LEFT,

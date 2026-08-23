@@ -165,6 +165,47 @@ class ConnectFailureTest {
     @Test
     fun `other failures are reported as they came`() {
         assertThat(describeConnectFailure(ConnectException("Connection refused"))).isEqualTo("Connection refused")
+        run {
+            // The one message that is replaced rather than passed through. MINA's text names an internal
+            // exception class and prints both socket addresses - the second of which is the device's own
+            // address on the local network - and says nothing a user can act on.
+            val raw = "DefaultConnectFuture[me@/10.1.2.3:22]: Failed (MissingAttachedSessionException) " +
+                "to execute: No session attached to Nio2Session[local=/192.168.1.24:41234, remote=/10.1.2.3:22]"
+            val described = describeConnectFailure(SshException(raw))
+            assertThat(described).contains("closed it during the SSH handshake")
+            assertThat(described).doesNotContain("192.168.1.24")
+            assertThat(described).doesNotContain("MissingAttachedSessionException")
+        }
+    }
+
+    /**
+     * Which failures happened *at* the handshake, as against on the way to it.
+     *
+     * The interoperability tests assert with this that a server configured to share no algorithm actually
+     * refused, so it has to hold the line in both directions: everything that means "reached the server
+     * and was turned away" is true, and everything that means "never got that far" is false. A refused
+     * port or an unstarted server passing here would let those tests go green while proving nothing.
+     */
+    @Test
+    fun `a refusal at the handshake is told apart from never reaching one`() {
+        assertThat(failedDuringSshHandshake(SshException("Unable to negotiate key exchange"))).isTrue()
+        assertThat(
+            failedDuringSshHandshake(
+                SshException(SshConstants.SSH2_DISCONNECT_KEY_EXCHANGE_FAILED, "no common cipher"),
+            ),
+        ).isTrue()
+        // The same refusal when the socket dies before the disconnect packet lands - the case that made
+        // a string match on "negotiate" flaky on a loaded machine.
+        assertThat(failedDuringSshHandshake(SshException("Failed (MissingAttachedSessionException) to execute"))).isTrue()
+        assertThat(failedDuringSshHandshake(IOException("wrapped", SshException("No session attached to Nio2Session")))).isTrue()
+
+        assertThat(failedDuringSshHandshake(ConnectException("Connection refused"))).isFalse()
+        assertThat(failedDuringSshHandshake(UnknownHostException("no.such.host"))).isFalse()
+        assertThat(failedDuringSshHandshake(SocketTimeoutException("connect timed out"))).isFalse()
+        assertThat(failedDuringSshHandshake(TimeoutException("timeout"))).isFalse()
+        // An authentication failure is past the handshake, not at it: the transport was built.
+        assertThat(failedDuringSshHandshake(SshException("No more authentication methods available"))).isFalse()
+        assertThat(failedDuringSshHandshake(null)).isFalse()
         assertThat(describeConnectFailure(null)).isEqualTo("Connection failed")
         // A message-less exception would otherwise put an empty status line where the error goes.
         assertThat(describeConnectFailure(IOException())).isEqualTo("Connection failed")

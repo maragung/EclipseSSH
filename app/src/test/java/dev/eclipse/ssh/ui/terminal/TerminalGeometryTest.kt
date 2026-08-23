@@ -140,6 +140,41 @@ class TerminalGeometryTest {
         assertThat(visible.atLeastColumns(80).columns).isEqualTo(80)
     }
 
+    /**
+     * A host's own width is a floor at the view, which is the only place it survives.
+     *
+     * The pty is resized by every viewport report, and the first one arrives within a frame of the
+     * terminal appearing - before any output. A width applied only when the shell opens is therefore
+     * overwritten before the user sees anything, which is what made the per-host setting look inert.
+     */
+    @Test
+    fun `a host's width and the app-wide floor combine into the wider of the two`() {
+        assertThat(minTerminalColumns(settingColumns = 80, hostColumns = 0)).isEqualTo(80)
+        assertThat(minTerminalColumns(settingColumns = 80, hostColumns = 132)).isEqualTo(132)
+        // A host asking for less than the app-wide floor does not lower it: both are floors, and the
+        // app-wide one says how narrow a terminal this user is willing to read anywhere.
+        assertThat(minTerminalColumns(settingColumns = 80, hostColumns = 40)).isEqualTo(80)
+        // "Match the screen" on both sides.
+        assertThat(minTerminalColumns(settingColumns = 0, hostColumns = 0)).isEqualTo(0)
+    }
+
+    @Test
+    fun `a host's height is honoured up to what the screen can show`() {
+        val visible = cell.gridIn(widthPx = 500f, heightPx = 400f)
+
+        assertThat(visible.rows).isEqualTo(20)
+        // Shorter than the screen is a real thing to want and is given exactly: the server is told the
+        // window is short, and the rows it does not use are left blank.
+        assertThat(visible.atMostRows(12).rows).isEqualTo(12)
+        // Taller is not, and quietly is not: a pty told it has 60 rows on a screen that fits 20 puts
+        // the prompt, and every full-screen program's status line, forty rows below the last pixel.
+        assertThat(visible.atMostRows(60)).isEqualTo(visible)
+        assertThat(visible.atMostRows(0)).isEqualTo(visible)
+        // Width is never touched by a height, and the centring is the visible window's either way.
+        assertThat(visible.atMostRows(12).columns).isEqualTo(visible.columns)
+        assertThat(visible.atMostRows(12).originY).isEqualTo(visible.originY)
+    }
+
     @Test
     fun `a stored width beyond what the pty accepts is bounded rather than obeyed`() {
         // A vault file is editable text; 4 000 columns in one would otherwise be sent to a server that

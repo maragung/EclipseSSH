@@ -178,8 +178,10 @@ class SshSessionStore @Inject constructor() {
         val channel = channels[hostId]
         if (channel != null) {
             if (channel.isOpen) return null
-            // Dead, so it is bookkeeping and not a decision: discard rather than close, exactly as
-            // [liveSession] does, so nothing reports an outage for a shell that has already ended.
+            // Dead, so it is bookkeeping and not a decision: the channel's own close future has
+            // already published why it ended, and [TerminalChannel.finish] is first-completion-wins, so
+            // discarding here reports nothing. `close` would be a claim - that the app meant this - on
+            // an ending the app had no part in.
             channels.remove(hostId, channel)
             runCatching { channel.discard() }
         }
@@ -187,28 +189,35 @@ class SshSessionStore @Inject constructor() {
     }
 
     /**
-     * The session for [hostId] if it is still usable, dropping it if it is not.
+     * The session for [hostId] if it is still usable. **A pure read: it changes nothing.**
      *
      * Both conditions are checked because both have been wrong in practice. A session whose peer went
      * away is `isOpen == false` but stays in the map until something looks, and a session that failed
-     * authentication is open without being usable. Pruning on read is what keeps a dead entry from
-     * making a host permanently un-reconnectable — the service's restore pass skips hosts it thinks
-     * are live, so a stale entry there is indistinguishable from a working session.
+     * authentication is open without being usable.
+     *
+     * This used to prune as it read - removing the session and calling `discard()` on its channel the
+     * first time either flag looked wrong - and that was the mechanism behind the oldest complaint
+     * about this app: **connect, see the banner, watch the tab flip to *Reconnecting…***. The chain was
+     * short and entirely internal. `discard()` deliberately does not mark a channel deliberate, so the
+     * collector reported [SessionEnd.Released]; `Released` is reconnect-worthy; and this function is
+     * reached from `isLive`, `liveHostIds`, `adoptableHostIds`, `adoptable`, `sessionAwaitingShell`,
+     * `install` and the liveness sweep - which is to say from the foreground service's restore pass and
+     * from every network event, on their own threads, concurrently with a login that had just
+     * succeeded. One transient `false` from a session MINA was still settling was therefore enough to
+     * kill a working shell **with no transport event anywhere behind it**, and the ladder would
+     * dutifully reconnect what had never actually broken.
+     *
+     * So: readers read. The authority on whether a transport died is the transport - MINA reports it
+     * through [TerminalChannel]'s session listener, which names a reason - and the authority on
+     * removing a corpse is whoever proved it was one, through [discard]. A dead entry left in the map
+     * costs nothing: it reads as not-live, so the restore pass dials, and [install] replaces it.
      */
-    fun liveSession(hostId: String): ClientSession? {
-        val session = sessions[hostId] ?: return null
-        if (session.isOpen && session.isAuthenticated) return session
-        sessions.remove(hostId, session)
-        // discard, not close: this is bookkeeping about a session that has already died, and saying the
-        // app meant it to end would suppress the reconnect the user is waiting for. See
-        // [TerminalChannel.discard].
-        channels.remove(hostId)?.let { channel -> runCatching { channel.discard() } }
-        return null
-    }
+    fun liveSession(hostId: String): ClientSession? =
+        sessions[hostId]?.takeIf { it.isOpen && it.isAuthenticated }
 
     fun isLive(hostId: String): Boolean = liveSession(hostId) != null
 
-    /** Host ids with a usable session, pruning any that have died. */
+    /** Host ids with a usable session. Reads only; the dead are removed by [reap] and [discard]. */
     fun liveHostIds(): Set<String> = sessions.keys.toList().filterTo(mutableSetOf()) { isLive(it) }
 
     /**
@@ -250,10 +259,54 @@ class SshSessionStore @Inject constructor() {
      * `close(true)` rather than `close(false)`, because there is nobody left to be graceful to. A
      * graceful close writes `SSH_MSG_DISCONNECT` and waits for the write to land, which on a socket
      * bound to an interface that no longer exists means blocking until the kernel gives up.
+     *
+     * [reason] names *how* it was found dead, for callers that know more than "it stopped answering" -
+     * a lost network, say. Passed to [TerminalChannel.discard], which records it only if the transport
+     * has not already reported something first-hand.
      */
-    fun discard(hostId: String) {
-        channels.remove(hostId)?.let { channel -> runCatching { channel.discard() } }
+    fun discard(hostId: String, reason: SessionEnd? = null) {
+        channels.remove(hostId)?.let { channel -> runCatching { channel.discard(reason) } }
         sessions.remove(hostId)?.let { session -> runCatching { session.close(true) } }
+    }
+
+    /**
+     * Removes an entry whose session is finished **and** whose channel has already said so.
+     *
+     * The counterpart to [liveSession] becoming a pure read. Pruning used to happen wherever anyone
+     * asked a question, which is what killed working sessions; taking it out left the opposite, smaller
+     * problem - a session that dies with no redial behind it (auto-reconnect off, or the ladder
+     * exhausted) stays in the map until the process ends. Nothing keeps a socket or a thread alive by
+     * then, because MINA released those when the transport failed, but a map that disagrees with reality
+     * is how the last round of bugs started and it is not worth keeping for the sake of one field.
+     *
+     * Three conditions, all of them required, and each ruling out one way this could repeat the bug it
+     * replaces:
+     *
+     *  - **The session is not live.** A shell can end while its transport is perfectly healthy - `exit`,
+     *    or a pty the server closed - and that transport may still be carrying an SFTP transfer. An
+     *    ending on the channel is not evidence about the session underneath it.
+     *  - **The channel has already reported its ending** ([TerminalChannel.hasEnded]). This is what
+     *    makes the removal unobservable: [TerminalChannel.finish] is first-completion-wins, so a release
+     *    after the fact cannot publish [SessionEnd.Released] over the real reason. Asking `isOpen`
+     *    instead would leave the window between a channel shutting and its close future naming why.
+     *  - **Nothing has replaced either entry.** Both removals compare-and-remove, so a dial that
+     *    installed a live session while this was deciding keeps it.
+     *
+     * Returns whether anything was removed, which the caller uses only for the trace: reaping nothing is
+     * the ordinary outcome and not a failure.
+     */
+    fun reap(hostId: String): Boolean {
+        val session = sessions[hostId] ?: return false
+        if (session.isOpen && session.isAuthenticated) return false
+        val channel = channels[hostId]
+        if (channel != null && !channel.hasEnded) return false
+        if (channel != null && channels.remove(hostId, channel)) runCatching { channel.discard() }
+        if (!sessions.remove(hostId, session)) return false
+        // Immediate: a graceful close writes SSH_MSG_DISCONNECT and waits for it, and this session has
+        // already gone. Ordinarily a no-op, since MINA closed it itself; kept because "not live" also
+        // covers a session that is open and unauthenticated, which nothing else will ever close.
+        runCatching { session.close(true) }
+        return true
     }
 
     /** [close], and forget the terminal state too. For a tab the user has closed. */

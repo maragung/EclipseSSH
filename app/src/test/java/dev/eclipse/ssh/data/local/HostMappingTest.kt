@@ -4,7 +4,9 @@ import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
 import dev.eclipse.ssh.data.model.DEFAULT_CONNECT_TIMEOUT_SECONDS
+import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
 import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
 import dev.eclipse.ssh.data.model.ProxyType
 import org.junit.Test
@@ -106,5 +108,111 @@ class HostMappingTest {
                 assertThat(host.toEntity().toDomain()).isEqualTo(host)
             }
         }
+    }
+
+    /**
+     * Every advanced column survives the mapping, set to something other than its default.
+     *
+     * One profile with all fourteen changed at once, rather than fourteen assertions on one field: a
+     * mapper written by hand fails by *dropping* a field, and a field that is dropped reads back as its
+     * default. A test that only ever compares defaults to defaults cannot see that happen.
+     */
+    @Test
+    fun `advanced per host options round trip through Room entity`() {
+        val tuned = HostProfile(
+            id = "h5",
+            name = "Tuned",
+            host = "tuned.example.com",
+            username = "root",
+            compression = true,
+            keepAliveEnabled = false,
+            serverAliveCountMax = 7,
+            authTimeoutSeconds = 120,
+            autoReconnect = false,
+            maxReconnectAttempts = 11,
+            reconnectBackoffSeconds = 20,
+            usePty = false,
+            terminalType = "vt100",
+            terminalColumns = 132,
+            terminalRows = 43,
+            keyboardInteractiveAuth = false,
+            legacyAlgorithms = true,
+            hostKeyPolicy = HostKeyPolicy.STRICT,
+        )
+
+        assertThat(tuned.toEntity().toDomain()).isEqualTo(tuned)
+    }
+
+    /**
+     * The defaults reproduce what the engine did before any of this was configurable.
+     *
+     * This is the half that matters for an install upgrading into version 12: `MIGRATION_11_12` fills
+     * these columns with literals, and the literals have to agree with the values here or an existing
+     * host changes behaviour on upgrade without anybody asking it to.
+     */
+    @Test
+    fun `advanced options default to the behaviour that used to be hard-coded`() {
+        val fresh = HostProfile(id = "h6", name = "Plain", host = "plain.example.com", username = "root")
+
+        assertThat(fresh.compression).isFalse()
+        assertThat(fresh.keepAliveEnabled).isTrue()
+        assertThat(fresh.serverAliveCountMax).isEqualTo(3)
+        assertThat(fresh.authTimeoutSeconds).isEqualTo(30)
+        assertThat(fresh.autoReconnect).isTrue()
+        assertThat(fresh.maxReconnectAttempts).isEqualTo(5)
+        // The inherit sentinel, so the app-wide reconnect delay keeps meaning something.
+        assertThat(fresh.reconnectBackoffSeconds).isEqualTo(INHERIT_RECONNECT_BACKOFF)
+        assertThat(fresh.usePty).isTrue()
+        assertThat(fresh.terminalType).isEqualTo("xterm-256color")
+        // Zero is "match the screen", which is the only geometry the app ever asked for.
+        assertThat(fresh.terminalColumns).isEqualTo(0)
+        assertThat(fresh.terminalRows).isEqualTo(0)
+        assertThat(fresh.keyboardInteractiveAuth).isTrue()
+        assertThat(fresh.legacyAlgorithms).isNull()
+        assertThat(fresh.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
+
+        val entity = fresh.toEntity()
+        assertThat(entity.hostKeyPolicy).isEqualTo("ASK")
+        assertThat(entity.legacyAlgorithms).isNull()
+        assertThat(entity.toDomain()).isEqualTo(fresh)
+    }
+
+    /**
+     * An unrecognised host-key policy in the database reads back as the one that asks.
+     *
+     * A TEXT column can hold anything - a hand-edited backup, a row written by a newer build that was
+     * then downgraded - and the two failure modes here are not equal. Falling back to "ask" costs a
+     * prompt; falling back to "trust on first use" would silently pin whatever answered.
+     */
+    @Test
+    fun `an unknown host key policy falls back to asking`() {
+        val entity = HostProfile(id = "h7", name = "P", host = "p.example.com", username = "root")
+            .toEntity()
+            .copy(hostKeyPolicy = "SOMETHING_ELSE")
+
+        assertThat(entity.toDomain().hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
+    }
+
+    /** No advanced value is redacted, but nothing here may leak a secret either. */
+    @Test
+    fun `the redacting toString reports advanced options and still hides secrets`() {
+        val tuned = HostProfile(
+            id = "h8",
+            name = "Tuned",
+            host = "tuned.example.com",
+            username = "root",
+            socksPassword = "socks-secret",
+            compression = true,
+            terminalType = "screen-256color",
+            hostKeyPolicy = HostKeyPolicy.ACCEPT_NEW,
+        )
+
+        val rendered = tuned.toString()
+
+        assertThat(rendered).doesNotContain("socks-secret")
+        assertThat(rendered).contains("socksPassword=***")
+        assertThat(rendered).contains("compression=true")
+        assertThat(rendered).contains("terminalType=screen-256color")
+        assertThat(rendered).contains("hostKeyPolicy=ACCEPT_NEW")
     }
 }

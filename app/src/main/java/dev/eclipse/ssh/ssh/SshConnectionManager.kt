@@ -1,11 +1,19 @@
 package dev.eclipse.ssh.ssh
 
+import dev.eclipse.ssh.data.model.AUTH_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
 import dev.eclipse.ssh.data.model.HostKeyChallenge
+import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
 import dev.eclipse.ssh.data.model.PORT_RANGE
 import dev.eclipse.ssh.data.model.ProxyType
+import dev.eclipse.ssh.data.model.SERVER_ALIVE_COUNT_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
+import dev.eclipse.ssh.data.model.isForcedTerminalSize
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.io.Closeable
 import java.io.IOException
@@ -17,6 +25,7 @@ import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.time.Duration
+import java.util.EnumSet
 import java.util.concurrent.TimeUnit
 import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -33,21 +42,29 @@ import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.config.hosts.HostConfigEntry
 import org.apache.sshd.common.AttributeRepository
 import org.apache.sshd.common.SshConstants
+import org.apache.sshd.common.SshException
 import org.apache.sshd.common.PropertyResolver
 import org.apache.sshd.common.util.net.SshdSocketAddress
+import org.apache.sshd.common.NamedFactory
 import org.apache.sshd.common.NamedResource
 import org.apache.sshd.common.OptionalFeature
 import org.apache.sshd.client.auth.keyboard.UserInteraction
 import org.apache.sshd.common.cipher.BuiltinCiphers
+import org.apache.sshd.common.cipher.Cipher
+import org.apache.sshd.common.compression.BuiltinCompressions
+import org.apache.sshd.common.compression.Compression
 import org.apache.sshd.common.io.IoSession
 import org.apache.sshd.core.CoreModuleProperties
 import org.apache.sshd.common.kex.BuiltinDHFactories
 import org.apache.sshd.common.kex.KeyExchangeFactory
 import org.apache.sshd.common.mac.BuiltinMacs
+import org.apache.sshd.common.mac.Mac
 import org.apache.sshd.common.session.helpers.CurrentService
 import org.apache.sshd.common.signature.BuiltinSignatures
+import org.apache.sshd.common.signature.Signature
 import org.apache.sshd.client.keyverifier.ServerKeyVerifier
 import org.apache.sshd.client.session.ClientSession
+import org.apache.sshd.client.session.ClientSession.ClientSessionEvent
 import org.apache.sshd.client.session.ClientSessionImpl
 import org.apache.sshd.client.session.SessionFactory
 import org.apache.sshd.sftp.client.SftpClient
@@ -218,7 +235,7 @@ class SshConnectionManager @Inject constructor(
     ): ClientSession = withContext(Dispatchers.IO) {
         onPhase(SshConnectPhase.HANDSHAKE)
         ensureStarted()
-        applyLegacyAlgorithmsIfEnabled()
+        val globalLegacy = applyLegacyAlgorithmsIfEnabled()
         // Clamped rather than trusted: the profile can also arrive from an imported vault backup or a
         // parsed ssh_config, neither of which the Add Host validation ever saw. A zero would make
         // `verify` time out instantly and look like an unreachable server.
@@ -251,8 +268,29 @@ class SshConnectionManager @Inject constructor(
         val globalKeepAlive = runCatching { settingsRepository.settings.first().keepAliveSeconds }
             .getOrDefault(DEFAULT_KEEP_ALIVE_SECONDS)
             .coerceIn(KEEP_ALIVE_RANGE.first, KEEP_ALIVE_RANGE.last)
-        val keepAlive = (profile.keepAliveSeconds ?: globalKeepAlive)
-            .coerceIn(KEEP_ALIVE_RANGE.first, KEEP_ALIVE_RANGE.last)
+        val keepAlive = resolveKeepAliveSeconds(profile, globalKeepAlive)
+        /*
+         * Everything the session has to be told before it finishes being built.
+         *
+         * Resolved here, in one object, for the same reason the keep-alive interval is: by the time
+         * `connect` holds a [ClientSession] the heartbeat, the authentication method list and the
+         * algorithm proposal are already fixed. See [LivenessClientSession].
+         */
+        val tuning = SessionTuning(
+            keepAliveSeconds = keepAlive,
+            serverAliveCountMax = profile.serverAliveCountMax
+                .coerceIn(SERVER_ALIVE_COUNT_RANGE.first, SERVER_ALIVE_COUNT_RANGE.last),
+            compression = profile.compression,
+            preferredAuths = preferredAuths(profile),
+            hostKeyPolicy = profile.hostKeyPolicy,
+            algorithms = algorithmsOverrideFor(profile.legacyAlgorithms, globalLegacy),
+        )
+        // Separate from the connect budget on purpose: a server can answer its socket in a millisecond
+        // and then spend a minute in a PAM stack or waiting for a hardware token. See
+        // [HostProfile.authTimeoutSeconds].
+        val authTimeout = profile.authTimeoutSeconds
+            .coerceIn(AUTH_TIMEOUT_RANGE.first, AUTH_TIMEOUT_RANGE.last)
+            .toLong()
         // Keeps the client-level fallback tracking the user's global preference rather than a
         // constant, for the one session that is built without a socket to carry the attribute: the
         // far end of a jump-host tunnel. Two connects can interleave here, and it does not matter -
@@ -267,7 +305,7 @@ class SshConnectionManager @Inject constructor(
          */
         val context = AttributeRepository.ofAttributesMap(
             buildMap<AttributeRepository.AttributeKey<*>, Any> {
-                put(LIVENESS_KEY, keepAlive)
+                put(TUNING_KEY, tuning)
                 when (profile.proxyType) {
                     ProxyType.SOCKS5 -> put(SocksProxyConfig.KEY, socksProxyConfig(profile, timeout))
                     ProxyType.HTTP_CONNECT -> put(HttpProxyConfig.KEY, httpProxyConfig(profile, timeout))
@@ -288,10 +326,11 @@ class SshConnectionManager @Inject constructor(
             // The underlying client owns the socket; this is the only thing this frame owns.
             tunnelled?.let(tunnelledTargets::remove)
         }
-        // The transport is up and the key exchange is done; everything from here is the server
-        // deciding whether to let this user in.
-        onPhase(SshConnectPhase.AUTHENTICATE)
         try {
+            awaitHandshake(session, timeout)
+            // The transport is up and the key exchange is done; everything from here is the server
+            // deciding whether to let this user in.
+            onPhase(SshConnectPhase.AUTHENTICATE)
             password?.takeIf(String::isNotEmpty)?.let { secret ->
                 session.addPasswordIdentity(secret)
                 session.setUserInteraction(object : UserInteraction {
@@ -304,14 +343,60 @@ class SshConnectionManager @Inject constructor(
             keyPair?.let(session::addPublicKeyIdentity)
             // The heartbeat itself was armed at construction (see [armHeartbeat]); this is only its
             // backstop, and it is the one liveness property MINA will still read after the fact.
-            configureIdleTimeout(session, keepAlive)
-            session.auth().verify(timeout, TimeUnit.SECONDS)
+            configureIdleTimeout(session, keepAlive, tuning.serverAliveCountMax)
+            // MINA's own authentication clock, which it checks against `authStart` on every idle sweep
+            // and which is otherwise a flat 30 seconds however long the user allowed. Set alongside the
+            // `verify` budget rather than instead of it: this one ends the *session* from MINA's side,
+            // the other ends the *wait* on this side, and a wait that outlives the session reports a
+            // closed transport instead of a timeout.
+            CoreModuleProperties.AUTH_TIMEOUT.set(session, Duration.ofSeconds(authTimeout))
+            session.auth().verify(authTimeout, TimeUnit.SECONDS)
             session
         } catch (error: Throwable) {
-            // Auth or pre-auth setup failed: close the socket so retries (the app
+            // The handshake, auth or pre-auth setup failed: close the socket so retries (the app
             // tries up to 3 times) do not accumulate half-open sessions.
             runCatching { session.close(false) }
             throw error
+        }
+    }
+
+    /**
+     * Waits up to [timeoutSeconds] for [session] to finish its SSH handshake.
+     *
+     * MINA's connect future resolves as soon as the *socket* is up, not when the handshake is done. Without
+     * this wait, a server that accepts the connection and then says nothing - a port held open by a
+     * firewall, a load balancer in front of a dead backend, a box being rebooted - is charged to the
+     * authentication budget, which exists for something else entirely: the server thinking about
+     * credentials it has already been sent, in a PAM stack or against a hardware token. The user would be
+     * told the connection timed out after a number they configured for a later phase, and the phase
+     * reported would be `AUTHENTICATE` on a server that never asked for a password.
+     *
+     * [ClientSessionEvent.WAIT_AUTH] is MINA's own name for the boundary between the two budgets: its
+     * session state adds it once the key exchange is `DONE` and no authentication has been attempted yet.
+     * [ClientSessionEvent.AUTHED] is accepted for the same reason - it can only mean the handshake is
+     * further along than this frame needs.
+     *
+     * [ClientSessionEvent.CLOSED] is waited for but deliberately not thrown on. A handshake that fails for
+     * a real reason - no key exchange in common, no cipher in common, a host key the verifier refused -
+     * closes the session carrying that reason, and the `auth()` call that follows reports it verbatim. A
+     * message invented here would replace a precise diagnostic with a vague one.
+     */
+    private fun awaitHandshake(session: ClientSession, timeoutSeconds: Long) {
+        val settled = EnumSet.of(
+            ClientSessionEvent.WAIT_AUTH,
+            ClientSessionEvent.AUTHED,
+            ClientSessionEvent.CLOSED,
+        )
+        // Returns as soon as the session's state has any of these in common with `settled`, and on expiry
+        // returns whatever the state is plus TIMEOUT - so "none of the three" is exactly "it expired",
+        // stated in terms of what was waited for rather than in terms of MINA's expiry marker.
+        val state = session.waitFor(settled, Duration.ofSeconds(timeoutSeconds))
+        // Phrased the way MINA phrases its own expiries, because this is the same kind of answer and the
+        // milliseconds are what a user compares against the number they typed.
+        if (state.none { it in settled }) {
+            throw SshException(
+                "Failed to complete the SSH handshake within specified timeout: ${timeoutSeconds * 1_000} msec",
+            )
         }
     }
 
@@ -326,9 +411,16 @@ class SshConnectionManager @Inject constructor(
         session: ClientSession,
         columns: Int? = null,
         rows: Int? = null,
+        profile: HostProfile? = null,
     ): TerminalChannel = withContext(Dispatchers.IO) {
+        val pty = ptyRequestFor(profile, columns, rows)
         val channel = TerminalChannel(session.createShellChannel())
-        if (columns != null && rows != null) channel.open(columns, rows) else channel.open()
+        channel.open(
+            columns = pty.columns ?: channel.ptyColumns,
+            rows = pty.rows ?: channel.ptyRows,
+            usePty = pty.enabled,
+            terminalType = pty.terminalType,
+        )
         channel
     }
 
@@ -432,11 +524,11 @@ class SshConnectionManager @Inject constructor(
      * than rebuilding four lists, and it runs immediately before the connect rather than from a
      * settings observer, so no session can be opened with the previous set still installed.
      */
-    private suspend fun applyLegacyAlgorithmsIfEnabled() {
+    private suspend fun applyLegacyAlgorithmsIfEnabled(): Boolean {
         val legacy = runCatching { settingsRepository.settings.first().legacyAlgorithms }.getOrDefault(false)
-        if (legacyApplied == legacy) return
+        if (legacyApplied == legacy) return legacy
         synchronized(this) {
-            if (legacyApplied == legacy) return
+            if (legacyApplied == legacy) return legacy
             if (legacy) {
                 client.cipherFactories = modernCipherFactories + legacyCiphers.supported()
                 client.macFactories = modernMacFactories + legacyMacs.supported()
@@ -449,6 +541,36 @@ class SshConnectionManager @Inject constructor(
                 client.keyExchangeFactories = modernKeyExchangeFactories.toList()
             }
             legacyApplied = legacy
+        }
+        return legacy
+    }
+
+    /**
+     * The four algorithm lists to install on one session, or null to leave it on the client's.
+     *
+     * A host only gets its own lists when it disagrees with the global switch, which keeps the common
+     * case - every host following one setting - on exactly the path it was on before, lists included.
+     * A disagreeing host gets *session*-level lists rather than a second write to the client's,
+     * because the client is a singleton shared by every connection: two hosts dialled at once with
+     * different answers would otherwise each get whichever set was installed last, and neither would
+     * be reproducible.
+     */
+    private fun algorithmsOverrideFor(hostPreference: Boolean?, global: Boolean): SessionAlgorithms? {
+        if (hostPreference == null || hostPreference == global) return null
+        return if (hostPreference) {
+            SessionAlgorithms(
+                ciphers = modernCipherFactories + legacyCiphers.supported(),
+                macs = modernMacFactories + legacyMacs.supported(),
+                signatures = modernSignatureFactories + legacySignatures.supported(),
+                keyExchange = modernKeyExchangeFactories + legacyKeyExchangeFactories,
+            )
+        } else {
+            SessionAlgorithms(
+                ciphers = modernCipherFactories.toList(),
+                macs = modernMacFactories.toList(),
+                signatures = modernSignatureFactories.toList(),
+                keyExchange = modernKeyExchangeFactories.toList(),
+            )
         }
     }
 
@@ -481,11 +603,17 @@ class SshConnectionManager @Inject constructor(
      *
      * Unlike the heartbeat properties this one can be set on a live session, because MINA re-reads it
      * on every idle check rather than caching it in a field at construction.
+     *
+     * With the keep-alive switched off it is switched off with it - [idleTimeoutSeconds] returns zero,
+     * which MINA's `checkIdleTimeout` treats as "no idle timeout" because it only acts on a positive
+     * duration. That coupling is the whole point: a backstop for a heartbeat that is not running is not
+     * a backstop, it is a timer that ends healthy idle sessions a couple of minutes after login, and it
+     * would fire on exactly the host whose owner asked for less traffic, not more.
      */
-    private fun configureIdleTimeout(session: ClientSession, keepAliveSeconds: Int) {
+    private fun configureIdleTimeout(session: ClientSession, keepAliveSeconds: Int, serverAliveCountMax: Int) {
         CoreModuleProperties.IDLE_TIMEOUT.set(
             session,
-            Duration.ofSeconds(keepAliveSeconds.toLong() * HEARTBEAT_NO_REPLY_MAX + IDLE_TIMEOUT_MARGIN_SECONDS),
+            Duration.ofSeconds(idleTimeoutSeconds(keepAliveSeconds, serverAliveCountMax)),
         )
     }
 
@@ -511,11 +639,11 @@ class SshConnectionManager @Inject constructor(
 
         /** Keep-alive interval used when neither the host nor the settings have an opinion. */
         const val DEFAULT_KEEP_ALIVE_SECONDS = 30
-
-        /** Slack between the last heartbeat that could arrive and the idle timeout firing. */
-        const val IDLE_TIMEOUT_MARGIN_SECONDS = 60L
     }
 }
+
+/** Slack between the last heartbeat that could arrive and the idle timeout firing. */
+private const val IDLE_TIMEOUT_MARGIN_SECONDS = 60L
 
 /**
  * The SOCKS5 leg of a proxied connection, built from [profile] and the connect budget the caller
@@ -628,12 +756,38 @@ internal class KnownHostsStore(context: Context) {
 /** The host a jump-host connection is for, for as long as that connection is being made. */
 internal class TunnelledTarget(val username: String, val host: String, val port: Int)
 
+/** What to do with a host key the store has not already accepted. */
+internal enum class HostKeyDecision { PIN, ASK, REFUSE }
+
+/**
+ * The rule applied to a host key that does not match what is pinned.
+ *
+ * Only a *first* sighting is a question, and only then does the policy get a say. A key that changed
+ * falls through to the challenge under [HostKeyPolicy.ACCEPT_NEW] as well, because trust-on-first-use
+ * means exactly that: the first use. Silently accepting the second, different key would turn pinning
+ * into decoration and hide the one event it exists to catch.
+ */
+internal fun hostKeyDecision(policy: HostKeyPolicy, keyChanged: Boolean): HostKeyDecision = when {
+    // Refuses either way: a strict host connects to a pinned key or it does not connect.
+    policy == HostKeyPolicy.STRICT -> HostKeyDecision.REFUSE
+    keyChanged -> HostKeyDecision.ASK
+    policy == HostKeyPolicy.ACCEPT_NEW -> HostKeyDecision.PIN
+    else -> HostKeyDecision.ASK
+}
+
 /** A host and port the verifier can name, and whether that host is this device. */
 internal class SocketIdentity(val host: String, val port: Int, val isLoopback: Boolean)
 
 internal class KnownHostsVerifier(
     private val store: KnownHostsStore,
     private val tunnelledTarget: (String?) -> TunnelledTarget?,
+    /**
+     * The policy of the host being dialled, read off the session because this verifier is a single
+     * object shared by every dial: a field would be whatever the last connect wrote.
+     */
+    private val hostKeyPolicy: (ClientSession?) -> HostKeyPolicy = { session ->
+        sessionTuning(session)?.hostKeyPolicy ?: HostKeyPolicy.ASK
+    },
     private val onChallenge: (HostKeyChallenge) -> Unit,
 ) : ServerKeyVerifier {
     override fun verifyServerKey(
@@ -654,6 +808,15 @@ internal class KnownHostsVerifier(
         val actual = fingerprint(serverKey)
         val expected = store.get(address.host, address.port)
         if (expected == actual) return true
+        // The key is not the pinned one; [hostKeyDecision] holds the rule for what that means here.
+        when (hostKeyDecision(hostKeyPolicy(clientSession), keyChanged = expected != null)) {
+            HostKeyDecision.REFUSE -> return false
+            HostKeyDecision.PIN -> {
+                store.save(address.host, address.port, actual)
+                return true
+            }
+            HostKeyDecision.ASK -> Unit
+        }
         onChallenge(
             HostKeyChallenge(
                 host = address.host,
@@ -741,12 +904,147 @@ private const val HEARTBEAT_NO_REPLY_MAX = 3
 private const val LIVENESS_PROBE_SECONDS = 6L
 
 /**
- * The host's keep-alive interval, in seconds, as carried on the connection context.
+ * Everything about a host that has to be applied while its session is still being built.
  *
  * MINA copies the [AttributeRepository] passed to `connect` onto the [IoSession] before the session
- * factory ever sees it, which makes it the one channel that reaches session construction.
+ * factory ever sees it, which makes it the one channel that reaches session construction - and
+ * construction is the only moment several of these values can still be read. See
+ * [LivenessClientSession] for why, and [applySessionTuning] for what is done with them.
+ *
+ * [hostKeyPolicy] rides along for a different reason: it is not needed early, but the host-key
+ * verifier is a single object shared by every dial, so the *session* has to carry the answer to "which
+ * host's rules apply to this key" rather than the manager holding it in a field two concurrent
+ * connects would fight over.
  */
-private val LIVENESS_KEY = AttributeRepository.AttributeKey<Int>()
+internal class SessionTuning(
+    val keepAliveSeconds: Int,
+    val serverAliveCountMax: Int,
+    val compression: Boolean,
+    val preferredAuths: String,
+    val hostKeyPolicy: HostKeyPolicy,
+    val algorithms: SessionAlgorithms?,
+)
+
+/**
+ * A complete algorithm proposal for one session.
+ *
+ * Per-session rather than per-client because [SshClient] is a singleton here: writing a host's
+ * preference onto the client would silently re-proposal every *other* dial in flight, and two hosts
+ * with opposite settings connecting at once would each get whichever list the other wrote last. MINA
+ * resolves these lists per session with the client as fallback, so setting them on the session is both
+ * correct and invisible to everyone else.
+ */
+internal class SessionAlgorithms(
+    val ciphers: List<NamedFactory<Cipher>>,
+    val macs: List<NamedFactory<Mac>>,
+    val signatures: List<NamedFactory<Signature>>,
+    val keyExchange: List<KeyExchangeFactory>,
+)
+
+/** [SessionTuning] as carried on the connection context. */
+private val TUNING_KEY = AttributeRepository.AttributeKey<SessionTuning>()
+
+/**
+ * The keep-alive interval to use for [profile], in seconds, or `0` for "no keep-alive at all".
+ *
+ * Three settings collapse into one number here. [HostProfile.keepAliveEnabled] is the switch,
+ * [HostProfile.keepAliveSeconds] is the host's own interval and a null there means "inherit", so
+ * [globalSeconds] - the value from Settings - is the fallback rather than a constant.
+ */
+internal fun resolveKeepAliveSeconds(profile: HostProfile, globalSeconds: Int): Int {
+    if (!profile.keepAliveEnabled) return 0
+    val requested = profile.keepAliveSeconds ?: globalSeconds
+    return requested.coerceIn(KEEP_ALIVE_RANGE.first, KEEP_ALIVE_RANGE.last)
+}
+
+/**
+ * How long a session may sit without traffic before MINA closes it, in seconds, or `0` for never.
+ *
+ * The margin matters. This clock is a *backstop for the heartbeat*, so it has to outlive the full run
+ * of missed replies the heartbeat is allowed - interval times count - or it fires first and reports an
+ * idle timeout for a session the heartbeat was still perfectly happy about. The extra minute covers the
+ * scheduling slop of a phone that was asleep for most of the interval.
+ *
+ * Returns `0` when the keep-alive is off, and that coupling is the point rather than an edge case: with
+ * no heartbeat running there are no missed replies to back up, so an idle timeout stops being a
+ * backstop and becomes the only thing in the system that ends healthy sessions - roughly two minutes
+ * after login, on exactly the host whose owner asked for *less* traffic. MINA reads a non-positive
+ * duration as "no idle timeout", so zero switches the timer off rather than setting it to instant.
+ */
+internal fun idleTimeoutSeconds(keepAliveSeconds: Int, serverAliveCountMax: Int): Long {
+    if (keepAliveSeconds <= 0) return 0L
+    val misses = serverAliveCountMax.coerceAtLeast(1).toLong()
+    return keepAliveSeconds.toLong() * misses + IDLE_TIMEOUT_MARGIN_SECONDS
+}
+
+/**
+ * The `PreferredAuthentications` list to offer for [profile].
+ *
+ * `publickey` leads whatever else is in the list because it is the one method that cannot leak a
+ * password to a server that turns out not to be the intended one, and a client that offers a password
+ * first has already sent it by the time it finds out.
+ *
+ * `keyboard-interactive` is what carries a one-time code, a PAM prompt or a 2FA challenge, so dropping
+ * it locks out any account that needs one - but leaving it in means a server that offers it gets asked
+ * for a password twice when the first answer was wrong, which is why it is a per-host switch rather
+ * than a constant. A profile that authenticates *by* keyboard-interactive keeps it regardless: the
+ * alternative is a profile that cannot log in with the method it was configured to use.
+ */
+internal fun preferredAuths(profile: HostProfile): String =
+    if (profile.keyboardInteractiveAuth || profile.authMethod == AuthMethod.KEYBOARD_INTERACTIVE) {
+        "publickey,keyboard-interactive,password"
+    } else {
+        "publickey,password"
+    }
+
+/**
+ * What to ask the server for when opening a shell: pty or no pty, terminal type, and geometry.
+ *
+ * A null [columns]/[rows] means "the caller has not measured the viewport yet", which is a different
+ * thing from a host that has *chosen* a size, and both differ again from a host that wants whatever the
+ * screen happens to be. That last case is why the stored size uses zero as its sentinel rather than a
+ * nullable column: a forced size has to survive a rotation, and "match the screen" has to lose to the
+ * measurement every time.
+ */
+internal class PtyRequest(
+    val enabled: Boolean,
+    val terminalType: String,
+    val columns: Int?,
+    val rows: Int?,
+)
+
+internal fun ptyRequestFor(profile: HostProfile?, measuredColumns: Int?, measuredRows: Int?): PtyRequest {
+    val forcedColumns = profile?.terminalColumns?.takeIf { it.isForcedTerminalSize() }
+        ?.coerceIn(TERMINAL_COLUMNS_RANGE.first, TERMINAL_COLUMNS_RANGE.last)
+    val forcedRows = profile?.terminalRows?.takeIf { it.isForcedTerminalSize() }
+        ?.coerceIn(TERMINAL_ROWS_RANGE.first, TERMINAL_ROWS_RANGE.last)
+    return PtyRequest(
+        enabled = profile?.usePty ?: true,
+        terminalType = profile?.terminalType?.takeIf(String::isNotBlank) ?: DEFAULT_TERMINAL_TYPE,
+        columns = forcedColumns ?: measuredColumns,
+        rows = forcedRows ?: measuredRows,
+    )
+}
+
+/**
+ * The compression proposal for a host, ordered best-first.
+ *
+ * `delayedZlib` (`zlib@openssh.com`) before plain `zlib` because it starts compressing only after
+ * authentication, which is what OpenSSH itself prefers and what keeps a password out of a compressed
+ * stream. `none` stays on the end of the enabled list as well: it is a *proposal*, and a server with no
+ * compression support would have nothing to agree to otherwise.
+ *
+ * Filtered by [BuiltinCompressions.isSupported] because the zlib factories need a JCE/JZlib provider
+ * that is not guaranteed on every Android image, and proposing an algorithm this client cannot actually
+ * instantiate fails the key exchange rather than the compression.
+ */
+internal fun compressionFactories(enabled: Boolean): List<NamedFactory<Compression>> {
+    val none = listOf(BuiltinCompressions.none)
+    if (!enabled) return none
+    val preferred = listOf(BuiltinCompressions.delayedZlib, BuiltinCompressions.zlib)
+        .filter(BuiltinCompressions::isSupported)
+    return preferred + none
+}
 
 /**
  * Arms the SSH keep-alive that both holds a NAT mapping open and detects a peer that has stopped
@@ -777,20 +1075,67 @@ private val LIVENESS_KEY = AttributeRepository.AttributeKey<Int>()
  * failure reply is still a reply - it proves the peer is alive and resets the counter - so this works
  * against servers that have never heard of the request name.
  *
- * Three missed replies before giving up, mirroring `ServerAliveCountMax`, so a single dropped packet
- * or one long garbage-collection pause on the server cannot end a working session.
+ * [noReplyMax] missed replies before giving up, mirroring `ServerAliveCountMax`, so a single dropped
+ * packet or one long garbage-collection pause on the server cannot end a working session.
  *
  * `HEARTBEAT_REPLY_WAIT` is deliberately not set: it is deprecated, and `configureMaxNoReply` ignores
  * it entirely whenever `HEARTBEAT_NO_REPLY_MAX` is set explicitly, as it is here.
+ *
+ * A non-positive [keepAliveSeconds] switches the heartbeat off instead of scheduling one, for the host
+ * whose owner turned it off - a metered link, or a server that logs every global request. MINA reads a
+ * non-positive `HEARTBEAT_INTERVAL` as "do not schedule", and the request name and miss limit are left
+ * unwritten so nothing downstream can mistake a disabled heartbeat for a configured one.
  */
-private fun armHeartbeat(resolver: PropertyResolver, keepAliveSeconds: Int) {
+private fun armHeartbeat(
+    resolver: PropertyResolver,
+    keepAliveSeconds: Int,
+    noReplyMax: Int = HEARTBEAT_NO_REPLY_MAX,
+) {
+    if (keepAliveSeconds <= 0) {
+        CoreModuleProperties.HEARTBEAT_INTERVAL.set(resolver, Duration.ZERO)
+        return
+    }
     CoreModuleProperties.HEARTBEAT_INTERVAL.set(resolver, Duration.ofSeconds(keepAliveSeconds.toLong()))
     CoreModuleProperties.HEARTBEAT_REQUEST.set(resolver, KEEPALIVE_REQUEST)
-    CoreModuleProperties.HEARTBEAT_NO_REPLY_MAX.set(resolver, HEARTBEAT_NO_REPLY_MAX)
+    CoreModuleProperties.HEARTBEAT_NO_REPLY_MAX.set(resolver, noReplyMax.coerceAtLeast(1))
 }
 
 /**
- * A client session that arms its heartbeat while it is still being constructed.
+ * Applies the part of [tuning] that has to be in place before the session finishes constructing.
+ *
+ * Called from [LivenessClientSession.initializeCurrentService], which runs inside `AbstractSession`'s
+ * constructor - before `ClientUserAuthService` reads [CoreModuleProperties.PREFERRED_AUTHS] into a
+ * field, and before `ClientSessionImpl` sends its `SSH_MSG_KEXINIT`. That is what makes the algorithm
+ * and compression lists take effect: written any later they read back exactly as set and change
+ * nothing, because the proposal has already gone out.
+ */
+private fun applySessionTuning(session: ClientSession, tuning: SessionTuning) {
+    armHeartbeat(session, tuning.keepAliveSeconds, tuning.serverAliveCountMax)
+    CoreModuleProperties.PREFERRED_AUTHS.set(session, tuning.preferredAuths)
+    session.compressionFactories = compressionFactories(tuning.compression)
+    tuning.algorithms?.let { algorithms ->
+        session.cipherFactories = algorithms.ciphers
+        session.macFactories = algorithms.macs
+        session.signatureFactories = algorithms.signatures
+        session.keyExchangeFactories = algorithms.keyExchange
+    }
+}
+
+/**
+ * The [SessionTuning] a session was dialled with, if it was dialled by this app.
+ *
+ * Read off the [IoSession] rather than through `getConnectionContext()`: MINA attaches the repository
+ * to the socket before the session is constructed, whereas the session's own accessor is populated by
+ * the connector afterwards - and the host-key verifier, the one caller that needs this, runs during the
+ * key exchange, which can start in between.
+ */
+private fun sessionTuning(session: ClientSession?): SessionTuning? {
+    val context = session?.ioSession?.getAttribute(AttributeRepository::class.java) as? AttributeRepository
+    return context?.getAttribute(TUNING_KEY)
+}
+
+/**
+ * A client session that applies its host's configuration while it is still being constructed.
  *
  * This exists because of *when* `ClientConnectionService` reads its configuration. MINA builds both
  * services - userauth and connection - inside `AbstractSession`'s constructor, by way of
@@ -800,8 +1145,10 @@ private fun armHeartbeat(resolver: PropertyResolver, keepAliveSeconds: Int) {
  * keeps whatever the client-level resolver happened to hold. That is not a detail worth working around
  * in the caller, because it is invisible - every property reads back exactly as it was written.
  *
- * Overriding [initializeCurrentService] puts the per-host interval on the session's own resolver one
- * step before the service is built, which is the last moment it can matter.
+ * Overriding [initializeCurrentService] puts the per-host configuration on the session's own resolver
+ * one step before the service is built, which is the last moment it can matter. The heartbeat is the
+ * clearest case but not the only one: the authentication-method list and the algorithm proposal are
+ * fixed in the same window. See [applySessionTuning].
  */
 private class LivenessClientSession(
     manager: ClientFactoryManager,
@@ -812,7 +1159,7 @@ private class LivenessClientSession(
         // Runs from the superclass constructor, so nothing declared by this class is initialised yet -
         // hence the attribute lookup rather than a constructor parameter.
         val context = getIoSession().getAttribute(AttributeRepository::class.java) as? AttributeRepository
-        context?.getAttribute(LIVENESS_KEY)?.let { armHeartbeat(this, it) }
+        context?.getAttribute(TUNING_KEY)?.let { applySessionTuning(this, it) }
         return super.initializeCurrentService()
     }
 }

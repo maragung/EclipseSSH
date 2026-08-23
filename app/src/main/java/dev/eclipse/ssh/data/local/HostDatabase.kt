@@ -9,6 +9,12 @@ import androidx.room.TypeConverters
 import dev.eclipse.ssh.data.TransferEntity
 import dev.eclipse.ssh.data.TransferDao
 import dev.eclipse.ssh.data.model.AuthMethod
+import dev.eclipse.ssh.data.model.DEFAULT_AUTH_TIMEOUT_SECONDS
+import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
+import dev.eclipse.ssh.data.model.DEFAULT_SERVER_ALIVE_COUNT_MAX
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
+import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
 import kotlinx.coroutines.flow.Flow
@@ -42,6 +48,27 @@ data class HostEntity(
      * successful connect.
      */
     val autoLoginSftp: Boolean = true,
+    /*
+     * The advanced per-host settings, added in [Migrations.MIGRATION_11_12].
+     *
+     * Every one is NOT NULL with a default that reproduces what the app did before the column
+     * existed, except [legacyAlgorithms], which is nullable because "follow the global switch" is a
+     * third state rather than a value - and is exactly what every upgraded row has to mean.
+     */
+    val compression: Boolean = false,
+    val keepAliveEnabled: Boolean = true,
+    val serverAliveCountMax: Int = DEFAULT_SERVER_ALIVE_COUNT_MAX,
+    val authTimeoutSeconds: Int = DEFAULT_AUTH_TIMEOUT_SECONDS,
+    val autoReconnect: Boolean = true,
+    val maxReconnectAttempts: Int = DEFAULT_MAX_RECONNECT_ATTEMPTS,
+    val reconnectBackoffSeconds: Int = INHERIT_RECONNECT_BACKOFF,
+    val usePty: Boolean = true,
+    val terminalType: String = DEFAULT_TERMINAL_TYPE,
+    val terminalColumns: Int = 0,
+    val terminalRows: Int = 0,
+    val keyboardInteractiveAuth: Boolean = true,
+    val legacyAlgorithms: Boolean? = null,
+    val hostKeyPolicy: String = "ASK",
 )
 
 class HostConverters {
@@ -69,10 +96,10 @@ interface HostDao {
     suspend fun count(): Int
 }
 
-// exportSchema is on so `app/schemas` records what version 11 actually looks like: every
+// exportSchema is on so `app/schemas` records what version 12 actually looks like: every
 // migration from here has to be written against a known starting point, and Room's migration
 // test helper reads those files. See the ksp `room.schemaLocation` argument in build.gradle.kts.
-@Database(entities = [HostEntity::class, TransferEntity::class], version = 11, exportSchema = true)
+@Database(entities = [HostEntity::class, TransferEntity::class], version = 12, exportSchema = true)
 @TypeConverters(HostConverters::class)
 abstract class EclipseDatabase : RoomDatabase() {
     abstract fun hostDao(): HostDao
@@ -101,6 +128,23 @@ fun HostEntity.toDomain() = HostProfile(
     connectTimeoutSeconds = connectTimeoutSeconds,
     keepAliveSeconds = keepAliveSeconds,
     autoLoginSftp = autoLoginSftp,
+    compression = compression,
+    keepAliveEnabled = keepAliveEnabled,
+    serverAliveCountMax = serverAliveCountMax,
+    authTimeoutSeconds = authTimeoutSeconds,
+    autoReconnect = autoReconnect,
+    maxReconnectAttempts = maxReconnectAttempts,
+    reconnectBackoffSeconds = reconnectBackoffSeconds,
+    usePty = usePty,
+    terminalType = terminalType,
+    terminalColumns = terminalColumns,
+    terminalRows = terminalRows,
+    keyboardInteractiveAuth = keyboardInteractiveAuth,
+    legacyAlgorithms = legacyAlgorithms,
+    // An unrecognised name falls back to asking, the same way [authMethod] and [proxyType] fall back
+    // to their safest value: a row written by a newer build, or edited by hand, must not silently
+    // become the policy that trusts whatever key turns up.
+    hostKeyPolicy = HostKeyPolicy.entries.firstOrNull { it.name == hostKeyPolicy } ?: HostKeyPolicy.ASK,
 )
 
 fun HostProfile.toEntity() = HostEntity(
@@ -125,6 +169,20 @@ fun HostProfile.toEntity() = HostEntity(
     connectTimeoutSeconds = connectTimeoutSeconds,
     keepAliveSeconds = keepAliveSeconds,
     autoLoginSftp = autoLoginSftp,
+    compression = compression,
+    keepAliveEnabled = keepAliveEnabled,
+    serverAliveCountMax = serverAliveCountMax,
+    authTimeoutSeconds = authTimeoutSeconds,
+    autoReconnect = autoReconnect,
+    maxReconnectAttempts = maxReconnectAttempts,
+    reconnectBackoffSeconds = reconnectBackoffSeconds,
+    usePty = usePty,
+    terminalType = terminalType,
+    terminalColumns = terminalColumns,
+    terminalRows = terminalRows,
+    keyboardInteractiveAuth = keyboardInteractiveAuth,
+    legacyAlgorithms = legacyAlgorithms,
+    hostKeyPolicy = hostKeyPolicy.name,
 )
 
 fun Flow<List<HostEntity>>.asDomain(): Flow<List<HostProfile>> = map { entities -> entities.map(HostEntity::toDomain) }

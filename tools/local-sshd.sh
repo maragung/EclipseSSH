@@ -44,6 +44,11 @@ start() {
     stop
     mkdir -p "$DIR"
     chmod 700 "$DIR"
+    # `stop` leaves the directory in place - it holds the log somebody may still want to read - so a
+    # second `start` finds yesterday's keys and ssh-keygen stops on an interactive overwrite prompt.
+    # A fresh key pair every start is also the honest thing for a throwaway sandbox.
+    rm -f "$DIR/host_ed25519" "$DIR/host_ed25519.pub" \
+          "$DIR/client_ed25519" "$DIR/client_ed25519.pub" "$DIR/known_hosts"
     ssh-keygen -t ed25519 -f "$DIR/host_ed25519" -N '' -q -C eclipse-test-host
     ssh-keygen -t ed25519 -f "$DIR/client_ed25519" -N '' -q -C eclipse-test-client
     cp "$DIR/client_ed25519.pub" "$DIR/authorized_keys"

@@ -104,7 +104,14 @@ data class TerminalSelection(
         fun wholeLine(line: Int, columns: Int): TerminalSelection =
             TerminalSelection(line, 0, line, (columns - 1).coerceAtLeast(0))
 
-        private fun isWordCharacter(char: Char): Boolean =
+        /**
+         * What counts as part of one word, here and in [terminalLayout].
+         *
+         * Shared rather than duplicated: wrapping a line and selecting a token have to agree on where a
+         * token ends, or the display contradicts itself - a path the user long-presses and gets whole,
+         * broken across two rows by the wrap.
+         */
+        internal fun isWordCharacter(char: Char): Boolean =
             char.isLetterOrDigit() || char in WORD_PUNCTUATION
 
         private const val WORD_PUNCTUATION = "/._-~:+@=%#$"
