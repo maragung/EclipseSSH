@@ -2637,8 +2637,12 @@ CI's verify step loops over **every** output — it previously checked `find …
 APK out of five and reported the other four as checked.
 
 The payoff, stated honestly rather than assumed: the only native libraries in this APK are two AndroidX
-shims totalling **60,292 bytes across all four ABIs**, against a **5,163,504-byte `classes.dex`**. A per-ABI
-APK therefore saves roughly 45 KB of 5.74 MB — about **0.8 %**. All five outputs keep **one versionCode**,
+shims totalling **60,292 bytes across all four ABIs**, against a **5,163,504-byte `classes.dex`**. By raw
+library bytes a per-ABI APK should therefore save around 45 KB of 5.74 MB — about **0.8 %**. Measured on the
+signed 1.1.0 outputs it saves rather more, **98,824 bytes of 5,793,213 (1.71 %)** for `arm64-v8a` and
+**102,916 (1.78 %)** for `armeabi-v7a`, because a `.so` is stored uncompressed and padded up to a 16 KiB page
+boundary: dropping three ABIs drops six alignment gaps along with the libraries themselves. Either way the
+number is small, and the reason to ship the split is not the size — see §27. All five outputs keep **one versionCode**,
 because distribution here is a GitHub release and a plain HTTP server rather than Play: distinct codes would
 make switching from the universal APK to a per-ABI one read as a downgrade, and would make "1.1.0" the name
 of five different version codes.

@@ -138,9 +138,12 @@ jobs:
             echo "== Verifying $APK"
             "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
-              # The release key is configured for v2 + v3 and nothing else; a build that
-              # silently drops v3 could never rotate the key for installed copies.
-              "$APKSIGNER" verify --verbose --min-sdk-version 28 "$APK" | tee /tmp/sigs.txt
+              # Both blocks must be there: v2 for anything below API 28 that ever installs a
+              # copy, v3 because without it the key could never be rotated for installed ones.
+              # Asked at min-sdk 24 deliberately - at 28 apksigner verifies through v3 alone and
+              # reports v2 as false even when its block is present, so the stricter-looking
+              # question is the one that cannot answer what is being asked.
+              "$APKSIGNER" verify --verbose --min-sdk-version 24 "$APK" | tee /tmp/sigs.txt
               grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sigs.txt
               grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
             fi
