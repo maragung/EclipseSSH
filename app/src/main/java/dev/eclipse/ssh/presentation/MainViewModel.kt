@@ -493,17 +493,14 @@ class MainViewModel @Inject constructor(
             // one - tapping Connect is what starts the service - now waits, finds the session this
             // attempt installed, and adopts it. See [SshSessionStore.dialing].
             sessionStore.dialing(host.id) {
-                // Asked again inside the gate, because a session that appeared while this attempt waited
-                // for it is one to use, not one to duplicate. Adopting also keeps the scrollback: the
-                // buffer, the pty and the socket are all still the ones the user was looking at.
-                sessionStore.adoptable(host.id)?.let { (_, existing) ->
-                    diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CONNECTED)
-                    attachTerminal(host, existing, resolved)
-                    return@dialing
-                }
                 var lastError: Throwable? = null
                 for (attempt in 0 until MAX_CONNECT_ATTEMPTS) {
                     try {
+                        // Asked again inside the gate, because a session that appeared while this attempt
+                        // waited for it is one to use, not one to duplicate - and asked on every attempt,
+                        // because a restore pass can install one between two of them. See
+                        // [adoptStoredSession] for the two shapes that count.
+                        if (adoptStoredSession(host, resolved)) return@dialing
                         val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair) { phase ->
                             onConnectPhase(host.id, phase, resuming, attempt)
                         }
@@ -527,10 +524,11 @@ class MainViewModel @Inject constructor(
                             // the app's decision rather than an outage the reconnect ladder would answer.
                             terminal.markDeliberate()
                             runCatching { terminal.close() }
-                            val survivor = sessionStore.adoptable(host.id)
-                            if (survivor == null) continue
-                            attachTerminal(host, survivor.second, resolved)
-                            return@dialing
+                            // The incumbent may have no shell on it - a restore pass installs
+                            // transport-only sessions - so adopting has to be able to open one. Going
+                            // round the loop instead would only lose the same race again, forever.
+                            if (adoptStoredSession(host, resolved)) return@dialing
+                            continue
                         }
                         attachTerminal(host, terminal, resolved)
                         return@dialing
@@ -571,6 +569,66 @@ class MainViewModel @Inject constructor(
         }
         connectJobs[host.id] = job
         job.invokeOnCompletion { connectJobs.remove(host.id, job) }
+    }
+
+    /**
+     * Attaches the terminal to a session that is already in the store, if there is one to use.
+     *
+     * Two kinds qualify, and both mean "do not dial again":
+     *
+     *  - a session with a live shell on it, which is handed back as it is. The scrollback, the pty and
+     *    the socket stay the ones the user was looking at.
+     *  - a live session with *no* shell, which gets one opened on it. The background service dials
+     *    exactly this shape when it restores a tracked host or resumes a transfer, and so does an
+     *    SFTP-only resume - a session worth keeping (closing it would drop a transfer in flight) that
+     *    the terminal cannot present until a pty exists on it.
+     *
+     * The second case is what [adoptExistingSessions] already promises - *"a session without a shell
+     * stays in the store and is reused by the next connect instead of being redialled"* - and what,
+     * before this existed, could not happen. [SshSessionStore.adoptable] rejected the session for
+     * having no channel and [SshSessionStore.install] refused to replace it with a fresh one, so every
+     * attempt authenticated against the server and then threw its own session away. The tab ran out of
+     * attempts and failed, the ladder retried, and each cycle put another login in the server's auth
+     * log: the connect - disconnect - reconnecting loop, with no network fault anywhere near it.
+     *
+     * Called inside the dial gate and inside the attempt loop's `try`, so a shell that fails to open
+     * on an adopted session is reported and retried like any other connect failure rather than
+     * escaping the coroutine.
+     */
+    private suspend fun adoptStoredSession(host: HostProfile, resolved: ResolvedCredentials): Boolean {
+        sessionStore.adoptable(host.id)?.let { (_, existing) ->
+            diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CONNECTED)
+            attachTerminal(host, existing, resolved)
+            return true
+        }
+        val session = sessionStore.sessionAwaitingShell(host.id) ?: return false
+        // Recorded before the shell is asked for, so a pty that never opens is attributable to the
+        // session it was asked of rather than looking like a fresh handshake that stalled.
+        diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.AUTHENTICATING)
+        val size = ptySizes[host.id]
+        val terminal = try {
+            sshConnectionManager.openTerminal(session, size?.first, size?.second)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            // A transport that cannot open a channel is not one to keep offering. A link that died
+            // silently is still `isOpen`, so adopting it again on the next attempt would spend the
+            // whole ladder waiting on the same corpse. Dropped as found-dead - discard rather than
+            // close, so nothing reports this as an ending the user asked for and the reconnect they
+            // are waiting for is not suppressed.
+            sessionStore.discard(host.id)
+            diagnostics.record(
+                host.id,
+                SessionEvent.ATTEMPT_FAILED,
+                detail = "no shell on the stored session: ${error.message ?: error::class.java.simpleName}",
+                network = networkMonitor.describe(),
+            )
+            // False rather than a rethrow: adopting is an optimisation, and its failure should cost a
+            // dial in this attempt rather than one of the three attempts the user gets.
+            return false
+        }
+        attachTerminal(host, terminal, resolved)
+        return true
     }
 
     /**
@@ -1024,7 +1082,16 @@ class MainViewModel @Inject constructor(
                 networkMonitor.online.first { it }
             }
             if (tabs.value.none { it.hostId == hostId }) return@launch
-            if (sessionStore.isLive(hostId)) return@launch
+            // Somebody else brought this host back while the ladder waited - a manual Reconnect, a UI
+            // that adopted the session, the service's restore pass - and there is nothing left to do.
+            //
+            // The test is the *shell*, not the session. `isLive` was true for a live transport with no
+            // pty on it, which is exactly what a background restore installs, so a restore pass landing
+            // during the backoff ended the ladder and left the tab saying "Reconnecting" over a session
+            // that only needed a shell opened on it - permanently, because nothing else was scheduled.
+            // Falling through hands it to [connect], which adopts it under the dial gate and opens that
+            // shell without a second login. See [adoptStoredSession].
+            if (sessionStore.adoptable(hostId) != null) return@launch
             val host = runCatching { hostRepository.hosts.first() }.getOrNull()?.firstOrNull { it.id == hostId }
             if (host == null) {
                 // The profile was deleted while the ladder was waiting: nothing left to reconnect to.
@@ -1084,7 +1151,11 @@ class MainViewModel @Inject constructor(
     private fun publishTerminalFrame(hostId: String, buffer: AnsiTerminalBuffer) {
         if (!isDisplaying(hostId, buffer)) return
         if (terminalFrames.subscriptionCount.value == 0) return
-        terminalFrames.update { it + (hostId to buffer.frame(scrollOffsets[hostId] ?: 0)) }
+        val frame = buffer.frame(scrollOffsets[hostId] ?: 0)
+        // Asked a second time, from inside the update: the check above only decides whether the frame
+        // is worth building. See [isDisplaying] for why the write is where the question has to be
+        // settled.
+        terminalFrames.update { if (isDisplaying(hostId, buffer)) it + (hostId to frame) else it }
     }
 
     /**
@@ -1127,7 +1198,12 @@ class MainViewModel @Inject constructor(
         val last = textPublishedAt[hostId]
         if (!force && last != null && now - last < TERMINAL_TEXT_MS) return false
         textPublishedAt[hostId] = now
-        terminalOutput.update { it + (hostId to buffer.plainText().takeLast(MAX_TERMINAL_CHARS)) }
+        val text = buffer.plainText().takeLast(MAX_TERMINAL_CHARS)
+        // Inside the update, for the reason [isDisplaying] gives: a whole scrollback is the largest
+        // thing a closed session can leave behind.
+        terminalOutput.update { if (isDisplaying(hostId, buffer)) it + (hostId to text) else it }
+        // And the throttle stamp with it, which is written above before the answer is known.
+        if (!isDisplaying(hostId, buffer)) textPublishedAt.remove(hostId)
         return true
     }
 
@@ -1145,6 +1221,18 @@ class MainViewModel @Inject constructor(
      * Identity rather than presence, because a reconnect deliberately keeps the same buffer so the
      * scrollback survives it; the outgoing collector and the incoming one share it, and a last
      * publication from the outgoing one is the same content the new one would publish anyway.
+     *
+     * Reliable only if it is asked *as part of* the write, which is why both publishers ask it inside
+     * their `update` lambda rather than only on the way in. Collectors run on [Dispatchers.Default]
+     * and [closeTab] runs on the main thread, so a check at the top of a publisher and the write at
+     * the bottom are two steps with a whole teardown able to fit between them: the publisher passed
+     * the check, `closeTab` dropped the buffer and then removed the host's frame and transcript, and
+     * the publisher put them straight back - permanently, since nothing runs after a close. Asking
+     * inside the lambda makes the answer part of the compare-and-set: a publisher that wins the race
+     * has its entry removed by the removal that follows, and one that loses it reads the map
+     * `closeTab` has already emptied and writes nothing. That leak was a viewport of cells and up to
+     * [MAX_TERMINAL_CHARS] of scrollback per closed tab, held for the life of the ViewModel, and it is
+     * what `repeatedConnectAndDisconnectCyclesLeaveNothingBehind` caught.
      */
     private fun isDisplaying(hostId: String, buffer: AnsiTerminalBuffer): Boolean =
         terminalBuffers[hostId] === buffer

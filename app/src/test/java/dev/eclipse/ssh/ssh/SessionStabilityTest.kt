@@ -598,6 +598,72 @@ class SessionStabilityTest {
     }
 
     /**
+     * A session with a transport and no pty is offered a shell rather than being redialled.
+     *
+     * That shape is not hypothetical: it is what every background restore installs. The service dials
+     * the transport, hands it to the transfer restorer and opens no channel, because a transfer needs
+     * no pty — and a resumed SFTP transfer does the same. It is also the session the app must keep, so
+     * [SshSessionStore.install] refuses to let a newcomer replace it.
+     *
+     * Both of those are right on their own and together they were a dead end, which is the bug this
+     * test exists for. The terminal asked [SshSessionStore.adoptable], was told no (no channel), dialled
+     * its own session, lost the install race to the incumbent it could not use, asked again, was told no
+     * again — three logins per tap and a tab that ended in an error, which the reconnect ladder answered
+     * by doing it all over again. On the device that is the connect → disconnect → reconnecting loop,
+     * with no network fault involved at all.
+     *
+     * The login count is asserted because it is the half that stays broken invisibly: a fix that opens
+     * the shell but still authenticates first would pass every state assertion here.
+     */
+    @Test
+    fun `a session with no shell is offered one instead of a second login`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile()
+            val loginsBefore = logins.get()
+            // Exactly what the restore pass leaves behind: install(), and no openTerminal().
+            val session = trustedConnect(manager, profile)
+            assertThat(store.install(profile.id, session)).isSameInstanceAs(session)
+
+            // The terminal cannot adopt this: there is no stream to attach a tab to. That much was
+            // always true and is deliberate.
+            assertThat(store.isLive(profile.id)).isTrue()
+            assertThat(store.adoptable(profile.id)).isNull()
+            assertThat(store.adoptableHostIds()).isEmpty()
+            // What was missing is the other answer - the session is still the one to use, it just
+            // needs a pty on it.
+            assertWithMessage("a live session with no shell must be offered for one")
+                .that(store.sessionAwaitingShell(profile.id))
+                .isSameInstanceAs(session)
+
+            val started = shells.size
+            val terminal = manager.openTerminal(session, 100, 30)
+            awaitShell(started)
+            store.channels[profile.id] = terminal
+            // The shell arrived on the session that was already there, so the server saw one login for
+            // the whole exchange - not one per attempt.
+            assertThat(logins.get() - loginsBefore).isEqualTo(1)
+            assertThat(store.adoptable(profile.id)?.second).isSameInstanceAs(terminal)
+            // And with a shell on it there is nothing awaiting one, so the next connect adopts the
+            // channel instead of opening a second pty on the same session.
+            assertThat(store.sessionAwaitingShell(profile.id)).isNull()
+
+            // A shell that ends leaves the transport perfectly usable. The store offers it again and
+            // drops the dead channel on the way out, so the host is not stuck behind a stream nobody
+            // can read - which is the same dead end reached from the other direction.
+            terminal.close()
+            assertThat(awaitTrue { !terminal.isOpen }).isTrue()
+            assertThat(store.sessionAwaitingShell(profile.id)).isSameInstanceAs(session)
+            assertThat(store.channels).doesNotContainKey(profile.id)
+            assertThat(logins.get() - loginsBefore).isEqualTo(1)
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
      * Two components dialling the same host at once cost one login and leave one session.
      *
      * This is the regression test for the app's most visible connection bug: a tab that said

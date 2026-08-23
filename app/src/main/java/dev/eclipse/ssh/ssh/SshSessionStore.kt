@@ -156,6 +156,37 @@ class SshSessionStore @Inject constructor() {
     }
 
     /**
+     * The live session for [hostId] that has no shell on it, if there is one.
+     *
+     * Not every session in the store carries a pty. The background service dials transport-only
+     * sessions when it restores a host (a transfer to resume, a tracked host after process death),
+     * and so does a resumed SFTP transfer; both install a session and open no channel. Such a
+     * session is the one the app should keep — closing it would drop a transfer in flight — but the
+     * terminal needs a shell on it, so [adoptable] deliberately rejects it.
+     *
+     * That rejection used to be a dead end: the terminal could neither adopt the session nor replace
+     * it (see [install], which keeps the incumbent), so every attempt authenticated again and the tab
+     * ended in an error the user saw as connect → disconnect → reconnecting. This is the missing half
+     * of the answer — the caller opens a shell on the session that is already there instead of
+     * dialling a second one.
+     *
+     * A stale closed channel is dropped on the way out, so a host whose shell died but whose
+     * transport survived is offered here rather than being stuck behind a channel nobody can use.
+     */
+    fun sessionAwaitingShell(hostId: String): ClientSession? {
+        val session = liveSession(hostId) ?: return null
+        val channel = channels[hostId]
+        if (channel != null) {
+            if (channel.isOpen) return null
+            // Dead, so it is bookkeeping and not a decision: discard rather than close, exactly as
+            // [liveSession] does, so nothing reports an outage for a shell that has already ended.
+            channels.remove(hostId, channel)
+            runCatching { channel.discard() }
+        }
+        return session
+    }
+
+    /**
      * The session for [hostId] if it is still usable, dropping it if it is not.
      *
      * Both conditions are checked because both have been wrong in practice. A session whose peer went

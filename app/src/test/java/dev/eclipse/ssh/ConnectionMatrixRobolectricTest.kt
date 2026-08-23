@@ -16,6 +16,8 @@ import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.security.StandInAndroidKeyStore
+import dev.eclipse.ssh.ssh.SshConnectionManager
+import dev.eclipse.ssh.ssh.SshSessionStore
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -26,6 +28,9 @@ import java.time.Duration
 import java.util.Base64
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.runBlocking
+import org.apache.sshd.client.session.ClientSession
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
@@ -332,6 +337,53 @@ class ConnectionMatrixRobolectricTest {
     }
 
     /**
+     * Closing a tab with output still on its way, which is when the teardown has something to race.
+     *
+     * The cycle test above closes tabs at a prompt, and it caught this once in about twenty runs: a
+     * frame holding the shell's banner survived a `closeTab`, in the release variant only, and stayed
+     * in the map for the life of the view model. The cause was a publisher and a teardown on two
+     * threads - collectors run on `Dispatchers.Default`, `closeTab` on the main thread - with the
+     * "is anyone still drawing this?" check at the top of the publisher and the write at the bottom.
+     * `closeTab` fitted between them and the publisher put the frame, and the whole scrollback with
+     * it, back after the removal. See `MainViewModel.isDisplaying`.
+     *
+     * This closes the tab while forty echoes are still arriving, so the publisher is inside that
+     * window rather than parked on a channel receive. It is a net rather than a proof - the window is
+     * microseconds wide and the fix is what makes it unhittable, not what makes it rare - so it is
+     * honest about being probabilistic: with the guard part of the compare-and-set it must pass every
+     * time, and without it this shape is what fails.
+     */
+    @Test
+    fun closingATabWhileOutputIsStillArrivingLeavesNothingBehind() {
+        val host = saveHostWithPassword()
+        val viewModel = viewModel()
+
+        repeat(MID_OUTPUT_CYCLES) { cycle ->
+            connectSaved(host.id, password = null)
+            compose.runOnUiThread {
+                repeat(MID_OUTPUT_LINES) { line -> viewModel.sendInput(host.id, "burst-$cycle-$line\n") }
+            }
+            // Deliberately no wait for the echoes: they are what has to be in flight.
+            compose.runOnUiThread { viewModel.closeTab(checkNotNull(tabFor(host.id))) }
+            pumpUntil(describe = { "cycle $cycle never closed its tab: " + diagnose(host.id) }) {
+                tabFor(host.id) == null
+            }
+            // The collector publishes one last frame and one last transcript on its way out, on
+            // purpose - see the `finally` in `launchTerminalCollector` - so these assertions have to
+            // let that land rather than run in front of it.
+            settle()
+            assertWithMessage("cycle $cycle left a frame behind")
+                .that(viewModel.frames.value).doesNotContainKey(host.id)
+            assertWithMessage("cycle $cycle left a transcript behind")
+                .that(viewModel.uiState.value.terminalOutput).doesNotContainKey(host.id)
+        }
+
+        awaitCount(shellsStarted, MID_OUTPUT_CYCLES, "shells the server started")
+        assertThat(viewModel.frames.value).doesNotContainKey(host.id)
+        assertThat(viewModel.uiState.value.terminalOutput).doesNotContainKey(host.id)
+    }
+
+    /**
      * Editing a host decides where its *next* connection goes.
      *
      * Both directions on purpose. Pointing a working profile at a dead port has to start failing, and
@@ -477,9 +529,149 @@ class ConnectionMatrixRobolectricTest {
         awaitCount(shellsStarted, 1, "shells the server started")
     }
 
+    /**
+     * A session the background restore left without a shell is given one, not dialled again.
+     *
+     * This is the regression test for the loop a user reported from a real VPS: connect, then
+     * *Reconnecting…*, then connect, forever, with a login in the server's auth log every cycle. No
+     * network fault is needed to produce it, which is why every earlier test passed while the device
+     * failed — the whole thing happens inside the app's own bookkeeping.
+     *
+     * The state it starts from is what [dev.eclipse.ssh.background.EclipseSessionService] installs on
+     * every restore pass: a live, authenticated transport with no pty on it, because a transfer needs
+     * no pty. Restore passes are common — a tracked host after process death, a transfer to resume, a
+     * new default network — and one used to run on the first Connect tap of every process, since
+     * tapping Connect is what starts the service.
+     *
+     * From there the terminal was stuck. `adoptable` said no, because there was no channel; `install`
+     * would not let the freshly dialled session replace the incumbent, correctly, because closing it
+     * would drop a transfer in flight; and the code then asked `adoptable` again and got the same no.
+     * Three logins and an ERROR tab per attempt, and the reconnect ladder made it a loop.
+     *
+     * Asserted here as the two numbers the server counts: **one** password offered for the whole test
+     * (the UI reused the session that was already there) and **one** shell started (it opened a pty on
+     * it). Either assertion alone would still pass with the bug present — three logins that eventually
+     * produce a working shell would satisfy the shell count, and a tab that stays disconnected would
+     * satisfy the login count.
+     */
+    @Test
+    fun aRestoredSessionWithNoShellIsGivenOneInsteadOfBeingRedialled() {
+        val host = saveHost(port = serverPort)
+        val viewModel = viewModel()
+        val saved = viewModel.uiState.value.hosts.first { it.id == host.id }
+        // The same two singletons the service holds - it is the shared store that makes a session
+        // survive a process, so the test has to reach the app's instances and not build its own.
+        // By reflection deliberately: exposing them for a test would put a way to reach every live
+        // session on the production API, and a Hilt @EntryPoint declared in this source set is not part
+        // of the production SingletonComponent these tests run against.
+        val store = injected(viewModel, "sessionStore", SshSessionStore::class.java)
+        val manager = injected(viewModel, "sshConnectionManager", SshConnectionManager::class.java)
+
+        val session = dialLikeARestorePass(manager, saved)
+        assertThat(store.install(host.id, session)).isSameInstanceAs(session)
+        awaitCount(authAttempts, 1, "passwords offered to the server")
+        assertWithMessage("a restore pass opens no shell").that(shellsStarted.get()).isEqualTo(0)
+
+        // And now the user taps Connect.
+        connectSaved(host.id, PASSWORD)
+
+        assertThat(tabFor(host.id)?.state).isEqualTo(SessionConnectionState.CONNECTED)
+        // The session the tab is on is the one that was already open: not a second login, and not the
+        // fourth attempt of a ladder that finally got through.
+        assertThat(store.liveSession(host.id)).isSameInstanceAs(session)
+        awaitCount(authAttempts, 1, "passwords offered to the server")
+        awaitCount(shellsStarted, 1, "shells the server started")
+        // A pty that is genuinely wired to the UI, rather than a tab that merely says CONNECTED.
+        assertThat(viewModel.frames.value).containsKey(host.id)
+    }
+
+    /**
+     * A transport restored while the reconnect ladder waits is finished, not mistaken for a recovery.
+     *
+     * The ladder skipped a host that already had a session, which is right when something else has
+     * genuinely brought it back and wrong for the one thing most likely to appear during an outage: a
+     * background restore pass, which installs a transport and no pty. The link dropping is what starts
+     * those passes - the service restores on every new default network - so the sequence here is not a
+     * contrivance, it is the common case.
+     *
+     * `isLive` said yes to that session, the ladder returned, and nothing else was scheduled: the tab
+     * sat on *Reconnecting…* for good over a live, authenticated session that only needed a shell
+     * opened on it. The manual Reconnect action was the only way out, and a user who was told the app
+     * was reconnecting had no reason to press it.
+     *
+     * The numbers are the assertion, as everywhere else in this class: two logins for the whole test -
+     * the first connect and the restore pass - and two shells, the second one opened on the restored
+     * transport rather than on a third session nobody asked for.
+     */
+    @Test
+    fun aTransportRestoredDuringTheBackoffIsGivenAShellRatherThanEndingTheLadder() {
+        val host = saveHostWithPassword()
+        connectSaved(host.id, password = null)
+        val viewModel = viewModel()
+        val saved = viewModel.uiState.value.hosts.first { it.id == host.id }
+        val store = injected(viewModel, "sessionStore", SshSessionStore::class.java)
+        val manager = injected(viewModel, "sshConnectionManager", SshConnectionManager::class.java)
+        awaitCount(authAttempts, 1, "passwords offered to the server")
+        awaitCount(shellsStarted, 1, "shells the server started")
+
+        // Dialled now and held, because [SshSessionStore.install] keeps a live incumbent: offering it
+        // while the user's session is still up would only close it again. This is the session the
+        // service will have in hand when the drop happens.
+        val restored = dialLikeARestorePass(manager, saved)
+        awaitCount(authAttempts, 2, "passwords offered to the server")
+        assertWithMessage("a restore pass opens no shell").that(shellsStarted.get()).isEqualTo(1)
+
+        // The drop: the transport goes without a word, which is what leaving Wi-Fi looks like to a
+        // client. Not through the store, so nothing marks it deliberate - this has to reach the app as
+        // an outage, which is what arms the ladder.
+        checkNotNull(store.liveSession(host.id)) { "the session never reached the store" }.close(true)
+        pumpUntil(describe = { "the drop never reached the tab: " + diagnose(host.id) }) {
+            tabFor(host.id)?.state == SessionConnectionState.RECONNECTING
+        }
+
+        // Installed while the ladder waits out its backoff, exactly as a restore pass would.
+        assertThat(store.install(host.id, restored)).isSameInstanceAs(restored)
+
+        pumpUntil(describe = { "the ladder gave up on a live session with no shell: " + diagnose(host.id) }) {
+            tabFor(host.id)?.state == SessionConnectionState.CONNECTED
+        }
+        assertThat(store.liveSession(host.id)).isSameInstanceAs(restored)
+        awaitCount(authAttempts, 2, "passwords offered to the server")
+        awaitCount(shellsStarted, 2, "shells the server started")
+        assertThat(viewModel.frames.value).containsKey(host.id)
+    }
+
     // ---------------------------------------------------------------- driving the app
 
+    /**
+     * Connects [saved] the way [dev.eclipse.ssh.background.EclipseSessionService] does on a restore
+     * pass: a transport, authenticated, with no pty on it, and nothing installed in the store yet.
+     *
+     * On its own thread, because that is where the service does it and because the looper has to keep
+     * running while it happens - the connect suspends on a real handshake, and the test is the only
+     * thing driving the main looper.
+     */
+    private fun dialLikeARestorePass(manager: SshConnectionManager, saved: HostProfile): ClientSession {
+        val dialed = AtomicReference<ClientSession?>(null)
+        val failed = AtomicReference<Throwable?>(null)
+        Thread({
+            runCatching { runBlocking { manager.connect(saved, PASSWORD, null) } }
+                .onSuccess(dialed::set)
+                .onFailure(failed::set)
+        }, "background-restore-dial").start()
+        pumpUntil(describe = { "the background dial never finished: " + (failed.get() ?: "still running") }) {
+            dialed.get() != null || failed.get() != null
+        }
+        return dialed.get() ?: throw AssertionError("the background dial failed", failed.get())
+    }
+
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
+
+    /** Reads one of the view model's injected singletons. See the test that explains the choice. */
+    private fun <T> injected(viewModel: MainViewModel, name: String, type: Class<T>): T =
+        type.cast(
+            MainViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(viewModel),
+        )!!
 
     private fun tabFor(hostId: String): SessionTab? =
         viewModel().uiState.value.tabs.firstOrNull { it.hostId == hostId }
@@ -706,6 +898,10 @@ class ConnectionMatrixRobolectricTest {
 
         /** How many connect/disconnect rounds the accumulation test does. */
         const val CYCLES = 4
+
+        /** Rounds of closing a tab with output still in flight, and lines of output per round. */
+        const val MID_OUTPUT_CYCLES = 3
+        const val MID_OUTPUT_LINES = 40
 
         /** Frames of quiet after a counter arrives, to catch a duplicate that lands just behind it. */
         const val SETTLE_ROUNDS = 20

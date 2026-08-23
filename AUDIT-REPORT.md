@@ -1,6 +1,6 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 4 / versionName 1.0.3 · minSdk 28, target/compileSdk 35
+`dev.eclipse.ssh` · versionCode 6 / versionName 1.0.5 · minSdk 28, target/compileSdk 35
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the current count is 0 errors and 51 warnings, and §16.2 says which are new and which are not.
 Kotlin 2.1.20 · AGP 8.9.1 · Gradle 8.11.1 · JDK 17 · Compose BOM 2025.04.01 · Hilt 2.56.1 · Room 2.7.1 · Apache MINA SSHD 2.14.0
@@ -1809,3 +1809,208 @@ code and not a re-wrapped 1.0.3.
 The same file is served over HTTP on port 19001 alongside 1.0.1, 1.0.2 and 1.0.3, and was fetched back from
 the public address to confirm the server hands over all 5,744,061 bytes with a matching digest. The
 directory behind that server holds the four APKs and a README and nothing else.
+
+## 21. The loop that had nothing to do with the network
+
+The report was a real device against a real VPS: *"masih error connect/disconnect/reconecting terus"* —
+connect, then *Reconnecting…*, then connect again, without end. Earlier answers narrowed it: the terminal
+did open, there was briefly text from the server, and then the tab went back to reconnecting. Everything
+in §19 was already in the build the phone was running, so whatever this was, the lifecycle rebuild had not
+touched it.
+
+### 21.1 What ConnectBot was read for
+
+ConnectBot was studied on request, and the useful part was not a technique to copy but a set of decisions
+to compare against:
+
+| ConnectBot | EclipseSSH | Verdict |
+|---|---|---|
+| No keepalive anywhere in the tree | `keepalive@openssh.com`, 3 unanswered = dead | Kept: without it a silently dead link is only noticed by the idle timeout, and §19.4 measures the difference |
+| 60-second grace period before a network loss disconnects | Immediate probe, session kept if the probe is answered | Equivalent in effect; the probe answers the same question with a fact instead of a timer |
+| `dispatchDisconnect` guarded by a `synchronized` flag so one ending is reported once | `TerminalChannel.markClosed` is idempotent and single-shot | Already equivalent |
+| Auto-reconnect only when the host is marked *stay connected*, and **never** after an auth failure — *"looping would lock accounts"* | `connectFailureIsFinal`, one attempt for a rejected credential | Already equivalent |
+
+So the comparison eliminated the reconnect policy as the cause rather than suggesting a change to it. The
+loop had to be somewhere else.
+
+### 21.2 Four theories that were wrong
+
+Each of these would have explained the symptom, and each was disproved rather than argued about:
+
+1. **MINA's stdin pump sends `SSH_MSG_CHANNEL_EOF`, so the remote `bash` exits.** Disproved by
+   decompiling `ChannelSession` from `sshd-core-2.14.0`: `pumpInputStream` sends EOF only when our own
+   `ChannelInputStream.read` returns < 0, which happens only on a deliberate `close()` or a thread
+   interrupt.
+2. **`IDLE_TIMEOUT` collapses to 60 s when keepalive is disabled.** Disproved: `KEEP_ALIVE_RANGE` is
+   `5..600`, so the configured floor is 75 s and the heartbeat always pre-empts it.
+3. **A spurious `NetworkMonitor.migrated` right after connect makes the liveness probe discard a healthy
+   session.** Weakened to nothing: `onAvailable` reports `migrated` only on a genuine replacement of the
+   default network, and `probeLiveness` treats *any* reply — including `SSH_MSG_REQUEST_FAILURE` — as
+   proof of life.
+4. **The reconnect ladder is arming itself on a non-fault.** Disproved by re-reading `SessionEnd.isFault`
+   and `shouldAutoReconnect` against the six endings in §19.2; they agree.
+
+### 21.3 The defect
+
+A live `ClientSession` in `SshSessionStore` with **no `TerminalChannel`** was a dead end for the terminal,
+and the app manufactured exactly that shape on purpose.
+
+`EclipseSessionService.dial` connects a transport and opens no pty, because what it restores is a
+*transfer*, which does not need one. That session is the right one to keep — closing it would drop a
+transfer in flight — so `install` refuses to let a newcomer replace it. Both halves are correct. Together
+they were a trap:
+
+```
+connect(host)
+  ├─ adoptable(host)          → null        (a session, but no channel)
+  ├─ dial a new session       → auth #2
+  ├─ install(host, new)       → keeps the incumbent, closes ours  (correct!)
+  ├─ adoptable(host)          → null        (still no channel)
+  └─ continue → attempt 2, attempt 3 → ERROR → ladder → repeat
+```
+
+Three logins per tap, a tab that ends in `ERROR`, and a reconnect ladder that answers by doing it again —
+with a fresh entry in the server's `auth.log` every cycle. Nothing about it needs a network fault, which
+is why no test that cut a link had ever caught it, and why it reproduced on a VPS and not on loopback: it
+needs a *registry entry*, and the registry persists across process death.
+
+`MainViewModel.adoptExistingSessions` had documented the missing behaviour all along — *"A session
+without a shell (an SFTP-only restore) stays in the store and is reused by the next connect instead of
+being redialled."* It could not happen. Two other paths install the same shape: a resumed transfer
+(`resumeTransfer`) and an SFTP-only restore.
+
+### 21.4 The fix
+
+`SshSessionStore.sessionAwaitingShell(hostId)` answers the question `adoptable` deliberately does not: is
+there a live session here that simply has no pty on it? A stale closed channel is dropped on the way out,
+so a host whose shell died but whose transport survived is offered rather than stuck behind a stream
+nobody can read.
+
+`MainViewModel.adoptStoredSession(host, resolved)` is the one place that decides not to dial. It takes a
+session with a shell as it is, and opens a shell on one without. It runs at the top of *every* attempt —
+not once before the loop — because a restore pass can install a session between two attempts, and inside
+the `try`, so a pty that fails to open is reported like any other connect failure instead of escaping the
+coroutine. A failure there discards the session as found-dead and returns `false`: a link that died
+silently is still `isOpen`, and adopting it again would spend the whole ladder waiting on a corpse.
+Adopting is an optimisation, so its failure costs a dial inside the attempt, not one of the user's three
+attempts. It also replaces the `survivor == null → continue` dead end after a lost `install` race, where
+going round the loop could only lose the same race again.
+
+No retry was added, no timeout lengthened, no feature removed: the change is that the session already in
+the store is now usable, which is what the code said it was.
+
+### 21.5 The same dead end, one level up
+
+The fix above was verified end to end, and the loop still had a second way to end badly — the same shape,
+in the code that answers a drop. `scheduleAutoReconnect` waits out its backoff and then asks whether the
+host still needs it:
+
+```
+if (tabs.value.none { it.hostId == hostId }) return@launch   // tab closed while waiting - correct
+if (sessionStore.isLive(hostId)) return@launch               // "somebody already brought it back"
+```
+
+`isLive` is true for a live *transport*, with or without a pty. A transport with no pty is what a restore
+pass installs — and a link dropping is itself what starts restore passes, so the five seconds of backoff
+is the likeliest moment in the app's life for one to land. When it did, the ladder decided the host had
+recovered, returned, and scheduled nothing further. The tab was left saying *Reconnecting…* over a
+perfectly good session that needed one shell opened on it, and nothing was ever going to open it: the
+ladder was gone, and the user's only way out was to close the tab.
+
+The guard now asks the question it meant to ask — `sessionStore.adoptable(hostId) != null`, is there a
+session here **with a shell on it** — and falls through when there is not. Falling through hands the host
+to `connect(host, resuming = true)`, which adopts the stored session under the dial gate and opens the
+missing shell without a second login. One line, and it turns the more common of the two restore races from
+a permanent *Reconnecting…* into a connect that costs nothing.
+
+The service's own use of `isLive` was checked and left alone: what it asks is whether a transfer can run,
+and a transfer needs no pty.
+
+### 21.6 The second dialler, and why only one of the two went
+
+The channel-less session had to come from somewhere, and on the first tap of every process it came from
+the service that the tap itself starts. Two restore passes ran at creation, not one:
+
+* `onCreate` launches `restoreSessions("Service active")`. **Kept.** It is the only path that reconnects
+  the hosts the persistent registry still calls active after the process was killed — every other trigger
+  is a genuine network change, an explicit `ACTION_REFRESH`/`ACTION_RESTORE`, boot's `RetryTransferWorker`,
+  or a `START_STICKY` restart with a null intent. Deleting it would have removed a feature to make a
+  symptom go away, which is the one move this pass is not allowed to make. With 21.4 in place it is no
+  longer a second dialler in any sense that matters: the dial gate serialises it against the UI's attempt,
+  and whichever of the two wins, the other can now use the session it finds.
+* `registerDefaultNetworkCallback` replays `onAvailable` for the network that is *already* the default, so
+  a second, identical pass over the whole registry ran immediately afterwards — for news that had not
+  happened. **Removed**, and narrowly: the first callback is ignored only when it names the network that
+  was already default at registration time, read before the call and compared by identity. A phone that
+  starts with no default network gets no replay at all, and there the first `onAvailable` is a link
+  genuinely arriving — exactly when a dropped session should be restored. A plain "skip the first one"
+  flag would have swallowed that.
+
+`ACTION_TRACK` needed nothing: it has done nothing but keep the service alive since §19 — *"the UI dials
+its own session, so a restore pass here would only be a second dialler racing it"* — and tapping Connect
+sends that action precisely so the tap is not mistaken for a `START_STICKY` restart.
+
+### 21.7 A leak the hunt turned up
+
+`repeatedConnectAndDisconnectCyclesLeaveNothingBehind` failed once, in the release variant only, on an
+assertion that had held for weeks: a closed tab had left a frame — the shell's banner, in full — in the map
+the renderer reads. The same run passed in debug and passed again on a re-run, which is the signature of a
+race rather than a regression, and the race was real.
+
+Terminal collectors run on `Dispatchers.Default`; `closeTab` runs on the main thread. Both publishers
+checked *"is this host still being displayed?"* on the way in and wrote on the way out, and a whole
+teardown fits between the two:
+
+```
+collector (Default)              closeTab (main)
+  isDisplaying → true
+                                   terminalBuffers.remove(hostId)
+                                   terminalFrames.update  { it - hostId }
+                                   terminalOutput.update  { it - hostId }
+  terminalFrames.update { it + … }     ← back after the removal, for good
+```
+
+Nothing runs after a close, so what landed late stayed: a viewport of cells and up to `MAX_TERMINAL_CHARS`
+of scrollback per closed tab, held for the life of the ViewModel. `isDisplaying`'s contract was sound —
+both callers drop the buffer *before* they cancel anything — but the answer was being read a moment before
+it was acted on.
+
+The check now happens **inside** the `update` lambda, which makes it part of the compare-and-set instead
+of a prelude to it. Because `closeTab` removes the buffer before it removes the frame, the two orderings
+converge: a publisher that wins the race has its entry removed by the removal that follows, and one that
+loses reads a map the teardown has already emptied and writes nothing. The throttle stamp that
+`publishTerminalText` writes before it knows the answer is cleaned up the same way. The expensive part —
+building the frame, walking the scrollback — still happens outside the lambda and still behind the fast
+check, so a session that is not on screen costs exactly what it did before.
+
+### 21.8 What holds it
+
+| Test | Asserts |
+|---|---|
+| `SessionStabilityTest.a session with no shell is offered one instead of a second login` | Against a real MINA server: `adoptable` still says no, `sessionAwaitingShell` says yes, a pty opens on that session, the server counts **one** login for the whole exchange, and a shell that ends leaves the transport offered again with the dead channel dropped |
+| `ConnectionMatrixRobolectricTest.aRestoredSessionWithNoShellIsGivenOneInsteadOfBeingRedialled` | The whole app, driven by a tap: a background restore installs a session the way the service installs it, then Connect — tab `CONNECTED`, **one** password offered, **one** shell started, the tab on the same `ClientSession` object, and a frame published, so the pty is genuinely wired and not just a green label |
+| `ConnectionMatrixRobolectricTest.aTransportRestoredDuringTheBackoffIsGivenAShellRatherThanEndingTheLadder` | §21.5, in the order the phone hits it: connect, kill the transport from underneath, wait for the tab to say `RECONNECTING`, install a restore-shaped session during the backoff — and the tab has to reach `CONNECTED` on *that* session, with the server counting **two** logins and **two** shells for the whole story rather than a third of either |
+| `ConnectionMatrixRobolectricTest.closingATabWhileOutputIsStillArrivingLeavesNothingBehind` | §21.7: three rounds of closing a tab with forty echoes still on the wire, each round asserting no frame and no transcript survives. A net over a microsecond-wide window rather than a proof — the guard is what makes it unhittable — and the shape that caught the leak in the first place |
+
+The two that pin the dead end were made to fail on purpose before being trusted. With
+`sessionAwaitingShell` stubbed back to `null` behind an environment flag, the end-to-end test reproduced
+the phone's report exactly and in the predicted numbers: `timed out after 90000ms: the session never
+reached CONNECTED`, the tab in `ERROR` with `lastError=Connection failed`, `authAttempts=4` — one
+background restore plus the three the ladder spends — and `shellsStarted=3`, three shells opened and
+thrown away. The stub was then removed, and `grep` over the tree confirms the flag left nothing behind.
+
+One diagnostic was added rather than a fix, and it is worth saying why. A single gate run had
+`aScrolledBackViewStaysStillWhileOutputArrives` time out with a blank frame while its transcript showed
+twenty-four lines of server output — so the collector was running with the buffer installed, and the only
+thing that can suppress a frame in that state is the subscription gate: `publishTerminalFrame` builds
+nothing while nothing is drawing, and the terminal screen's collector is lifecycle-bound. On a phone that
+gate is the deliberate power optimisation, and the trip back fires `republishFrames`, which a sibling test
+in the same suite exercises on purpose and passes. Re-run alone, the test took 0.639 s; in the gate that
+followed, 0.428 s. The suite's failure message now prints `frameCollectors=` alongside `frameRevision=`, so
+if it recurs the message names the cause instead of implying the output never arrived. The test was not
+weakened and the gate was not made to skip it.
+
+With the fix, all three suites pass against real servers: `SessionStabilityTest` 24 tests,
+`ConnectionMatrixRobolectricTest` 19 tests and `TerminalSessionLifecycleRobolectricTest` 18 tests, no
+failures and no errors in any of them, on both the debug and the release variant. The whole gate is
+694 tests per variant, 0 failures and 0 errors on each, with `lintRelease` reporting no errors.

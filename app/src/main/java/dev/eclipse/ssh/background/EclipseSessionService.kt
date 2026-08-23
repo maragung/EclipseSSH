@@ -27,6 +27,7 @@ import dev.eclipse.ssh.ssh.SessionLivenessProbe
 import dev.eclipse.ssh.ssh.SshConnectionManager
 import dev.eclipse.ssh.ssh.SshKeyLoader
 import dev.eclipse.ssh.ssh.SshSessionStore
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineScope
@@ -71,12 +72,39 @@ class EclipseSessionService : LifecycleService() {
      * one thing. See [awaitReconnectWindow].
      */
     private val reconnectWake = Channel<Unit>(Channel.CONFLATED)
+
+    /**
+     * True until the first [ConnectivityManager.NetworkCallback.onAvailable] arrives.
+     *
+     * Atomic because it is read on a ConnectivityManager thread and written once, and `getAndSet`
+     * makes "was this the first" a single decision even if two callbacks arrive together.
+     */
+    private val startupNetworkCallbackPending = AtomicBoolean(true)
+
+    /**
+     * The default network at the moment the callback was registered, if there was one.
+     *
+     * `registerDefaultNetworkCallback` reports the current default network straight away, so the first
+     * callback usually describes the link the service was started on rather than a change to react to.
+     * Compared by identity rather than trusted by position, because when the phone starts with no
+     * network at all there is no replay, and then the first callback *is* news - a link arriving is
+     * exactly when a dropped session should be restored.
+     */
+    @Volatile
+    private var initialDefaultNetwork: Network? = null
+
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             // Both, and in this order. The signal releases a backoff that is already sleeping —
             // which is the case that used to cost minutes — while the launch covers the service
             // sitting idle with no loop running to wake.
             reconnectWake.trySend(Unit)
+            // The registration replay is not a network change: it reports the link the service was
+            // just started on, and [onCreate] already runs one pass for that. Acting on it made every
+            // service creation run two identical restore passes over the whole registry, one of them
+            // for news that had not happened. Only the network that was already default is skipped,
+            // and only once - see [initialDefaultNetwork] for the case where there was none.
+            if (startupNetworkCallbackPending.getAndSet(false) && network == initialDefaultNetwork) return
             serviceScope.launch { restoreSessions("Network available") }
         }
 
@@ -119,11 +147,18 @@ class EclipseSessionService : LifecycleService() {
             return
         }
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        // Read before registering, so the replay that arrives during registration can be recognised.
+        initialDefaultNetwork = runCatching { connectivityManager.activeNetwork }.getOrNull()
         runCatching { connectivityManager.registerDefaultNetworkCallback(networkCallback) }
         // A network that was *replaced* has already broken every live socket, and nothing on the
         // connection itself says so. Started here as well as from the view model because the service is
         // what is alive while the app is in the background, which is when a phone changes networks.
         livenessProbe.start()
+        // Kept, and kept here: this is the pass that restores the hosts the registry still calls active
+        // after the process was killed, and the first Connect tap is the only thing that creates the
+        // service. It is no longer the second dialler it used to be - the dial gate serialises it with
+        // the UI's own attempt, and [MainViewModel.adoptStoredSession] can now use whichever session it
+        // finds, with or without a shell on it.
         serviceScope.launch { restoreSessions("Service active") }
         serviceScope.launch {
             transferRepository.transfers.collect { transfers ->

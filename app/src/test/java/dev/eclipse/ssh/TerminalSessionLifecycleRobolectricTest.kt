@@ -30,6 +30,7 @@ import java.nio.file.Files
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.common.util.buffer.Buffer
@@ -1050,6 +1051,15 @@ class TerminalSessionLifecycleRobolectricTest {
             append(" transcript=").append(viewModel.uiState.value.terminalOutput[hostId]?.length)
             append(" frameRows=").append(frame?.lines?.size)
             append(" frameRevision=").append(frame?.revision)
+            // Whether anything is *collecting* frames, which decides whether any get built at all:
+            // `publishTerminalFrame` skips the whole render while nothing is drawing, and the terminal
+            // screen's subscription is lifecycle-bound. A stale revision-0 frame next to a transcript
+            // that kept growing means this went to zero and never came back, which is a different
+            // fault from output that never arrived - and telling them apart from the message is the
+            // point of printing it.
+            // Read through the mutable type the view model exposes read-only, because the count
+            // lives on `MutableSharedFlow` and this is the same object.
+            append(" frameCollectors=").append((viewModel.frames as? MutableStateFlow<*>)?.subscriptionCount?.value)
             append("\nframe:\n").append(frame?.text() ?: "no frame")
         }
     }
