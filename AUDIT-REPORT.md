@@ -2061,3 +2061,344 @@ the kind of mistake a release note should pre-empt.
 The same file is served over HTTP on port 19001 alongside 1.0.1 through 1.0.4, and was fetched back from
 the public address to confirm the server hands over all 5,744,061 bytes with a matching digest. The
 directory behind that server holds the five APKs and a README and nothing else.
+
+## 23. What the reconnect loop actually was, and the two tests that can see it
+
+1.0.5 shipped three fixes for *Reconnecting…* and the report came back unchanged: **"perbaiki lagi
+masih reconnecting terus."** So this section starts by throwing away the previous diagnosis and asking
+what evidence would distinguish the remaining candidates, because three plausible fixes that changed
+nothing is itself a finding — it means the mechanism had not been identified.
+
+### 23.1 The architectural fact that narrows it
+
+A *failed* connect cannot start a ladder. `connect`'s attempt loop ends at `updateTab(… ERROR …)` plus
+`SessionEvent.CONNECT_FAILED`, and nothing on that path calls `scheduleAutoReconnect`. An endless
+*Reconnecting…* therefore cannot be a server refusing logins, a wrong password, an unreachable host or
+a DNS failure — all of those stop. It requires the opposite: **logins that keep succeeding, followed by
+sessions that keep dying.** That matches what the user described (*"Sempat ada teks server"* — server
+text appeared) and it is why "connecting works" never ruled anything out.
+
+Two things follow, and both were wrong in 1.0.5.
+
+### 23.2 The allowance was refilled by the wrong event
+
+`MAX_AUTO_RECONNECT_ATTEMPTS` is 5, but `attachTerminal` cleared `reconnectAttempts` on every
+successful attach. A session that authenticated and then died two seconds later returned the whole
+allowance before spending any of it, so five attempts never accumulated and the ladder ran for as long
+as the app was open. The counter was real and could not be reached.
+
+The allowance now returns on two events, neither of which is a login:
+
+* **`STABLE_SESSION_MS` (five minutes) of uptime**, measured from attach to the collector's `closer`.
+  A session that stood up and later dropped is a new outage and is entitled to the full ladder. Five
+  minutes is above both the 90-second heartbeat death (three missed 30-second probes) and the
+  150-second idle backstop, so neither of those can be mistaken for stability.
+* **A manual connect.** `connect(resuming = false)` clears it; the ladder's own attempt passes
+  `resuming = true` and clears nothing, which is the whole point of counting. `PendingConnection`
+  carries `resuming` so that a host-key prompt answered mid-ladder resumes as a ladder attempt rather
+  than laundering itself into a fresh allowance.
+
+### 23.3 The reason was overwritten by the progress line
+
+`describeSessionEnd` produces the sentence that says *why* — "The server disconnected: …", "Connection
+lost: Detected IdleTimeout after 150123/150000 ms" — and `scheduleAutoReconnect` immediately overwrote
+`lastError` with its own "Reconnecting in 5s". For the whole ladder, the only thing on screen was that
+it was retrying. **That is why the report could only ever be "it keeps reconnecting": the app knew the
+cause and hid it.** The reason now rides along on both waiting messages, on the give-up message, and in
+the `RECONNECT_EXHAUSTED` diagnostic:
+
+```
+Reconnecting in 5s · attempt 2 of 5 · The server disconnected: Timeout, your session not responding
+… gave up after 5 reconnect attempts
+```
+
+### 23.4 A harness that reproduced the bug by itself
+
+`aFlappingSessionStopsReconnectingAndSaysWhy` was written to prove the bound, and it failed:
+`shellsStarted=258`, tab still `CONNECTED`, `lastError=null`. 258 logins is far more, and far faster,
+than a five-attempt backoff ladder permits, which read as a second redial path bypassing the counter
+entirely.
+
+It was not. `pumpUntil` advances Robolectric's virtual clock as fast as the CPU allows — deliberately,
+so a `delay` costs no wall time — and `STABLE_SESSION_MS` is measured with `SystemClock.elapsedRealtime`,
+which Robolectric drives from that same clock. A session that lived 400 ms of real time looked to the
+app as though it had been up the better part of an hour, so **every flap satisfied the stability rule
+and refilled the ladder**. The harness manufactured the exact bug under test.
+
+The fix is a second pump, `pumpInStepUntil`, that advances one frame of virtual time per frame of real
+time. It costs this test the ~31 s of backoff the app really waits, and the test now passes in 57 s with
+five attempts and a stop. The lesson generalises: *a test whose subject is a duration cannot run on a
+clock it is also driving.* Both pumps are documented against each other so the next such test picks the
+right one.
+
+The test also now fails **on the spot** past `FLAP_SHELL_CEILING` rather than at its deadline. An
+unbounded ladder dials as fast as the server answers, and leaving it running for the whole budget left
+hundreds of live sessions in a JVM the rest of the suite shares — so the regression this test exists to
+catch used to surface as a timeout in some later, innocent test.
+
+### 23.5 Two hypotheses killed with evidence rather than argument
+
+Neither of these is the bug, and both are recorded because "we checked" is worth as much as a fix:
+
+* **The app answering the server's probes.** Every hardened VPS sets `ClientAliveInterval`; a client
+  that ignores it is dropped a few minutes after login with nothing wrong at either end. Proven fine by
+  holding a session against a real `sshd` at `ClientAliveInterval 5`/`ClientAliveCountMax 2` — three
+  chances to be killed — and then using the shell.
+* **The app sending its own heartbeat.** This one had *no* coverage, and the gap was invisible: both
+  interop tests ran against a port with `ClientAliveInterval` set, where the server's probes and the
+  client's replies are traffic, and traffic is what an idle timer watches. A heartbeat that never left
+  the client would have passed both. It matters because `ClientAliveInterval 0` — a server that sends
+  nothing and waits forever — is OpenSSH's **default**, so a stock VPS is exactly that, and there the
+  app's heartbeat is the only thing between an idle session and MINA's `IDLE_TIMEOUT` of
+  `keepAlive * 3 + 60`. A broken heartbeat would not hang: it would drop a healthy session ~2.5 minutes
+  after login at the default interval, redial, and do it again — with a successful login every time.
+
+  So `tools/local-sshd.sh` now opens a **second port on the same sshd** whose only difference is
+  `ClientAliveInterval 0`, via `Match LocalPort`, and the sandbox runs at `LogLevel DEBUG` because
+  sshd names every inbound global request at `debug1`.
+  `aServerThatNeverProbesCannotOutwaitThisClientsOwnHeartbeat` holds an idle session there past the
+  deadline and asserts both halves: the tab is still
+  `CONNECTED` (the behaviour, which another test's leftovers cannot fake) and the server logged the
+  app's `keepalive@openssh.com` requests (the mechanism, which distinguishes "the heartbeat fired" from
+  "the deadline happened not to be reached"). Result: **42 probes logged, session held.** The heartbeat
+  works.
+
+### 23.6 The stress test the shipped defaults need
+
+Every keep-alive test above compresses the interval to 5 s so three strikes fit inside a test's
+patience. That is the right trade for the *rule* and the wrong one for the *number*: what ships is a
+30-second default, putting the app's own idle deadline at 150 s — a figure **no other test in this
+repository stays open long enough to reach.**
+
+`aDefaultSessionSurvivesTenMinutesOfSilence` closes that gap: the shipped default, the silent port,
+nothing typed, ten minutes. It asserts the three distinct ways it can fail — the tab leaving
+`CONNECTED`; the *server* logging a second `Accepted publickey`, which catches a session that died and
+came back inside a sampling gap and is the one witness the app cannot fake; and the shell not answering
+at the end. It is skipped unless `ECLIPSE_STRESS=1`, and CI has a `stress` job that sets it, checks that
+the test did not skip, and is triggered by hand before a release.
+
+It passes. `tests="1" skipped="0" failures="0" errors="0" time="619.091"` — ten minutes and nineteen
+seconds of a session nobody touched, on a server configured the way an untouched VPS is configured, with
+one `Accepted publickey` for the whole run and 62 of the app's own `keepalive@openssh.com` requests in
+the server's log. **So the shipped default does not drop an idle session, and idleness is not what the
+user is hitting.** That is worth as much as a fix: it removes the most intuitive explanation for
+"Reconnecting terus" from the list, and it does so with the server as the witness rather than the app.
+
+### 23.7 Where this leaves the report
+
+The loop is bounded and now explains itself, and the two mechanisms most likely to have caused it are
+measured rather than assumed. What is *not* yet known is which ending the user's server actually sends —
+that is a fact about their VPS, and 1.0.6 is the first build that puts it on screen instead of hiding it
+behind "Reconnecting". The give-up message names it, and Settings → Workspace → Connection diagnostics
+holds the full trace, which carries no credential.
+
+## 24. The lifecycle architecture, audited against the request that asked for it
+
+Section 23 is about one bug. This section answers the wider request behind it: *refactor and repair the
+whole SSH lifecycle, do not just patch the reconnect*. Every item below is either a place in the code
+that already satisfies it — named, so it can be checked rather than believed — or a test added for this
+pass because nothing held it to account.
+
+### 24.1 The layers, and the single rule that keeps them apart
+
+    MainActivity (Compose)  →  MainViewModel  →  SshSessionStore  →  SshConnectionManager
+                                     ↑                 ↑                TerminalChannel (transport + pty)
+                            EclipseSessionService ─────┘
+
+The rule that makes this a layering rather than a diagram: **`MainActivity.kt` contains no reference to
+`SshConnectionManager`, `SshSessionStore`, `TerminalChannel` or `ClientSession` at all.** Not one, across
+the whole UI. Every connect, disconnect, resize, keystroke and reconnect the user asks for is a method
+call on the ViewModel. Grep is the audit here, and it is worth re-running after any UI change, because
+the failure this prevents is precisely the one the request describes: a screen that dials for itself
+dials again every time it is rebuilt.
+
+`SshSessionStore` is the single source of truth, and it is a `@Singleton` — so sessions, channels and
+scrollback buffers outlive the Activity, the ViewModel, and the composition. Two consumers share it
+without coordinating: the ViewModel when the UI is up, and `EclipseSessionService` when it is not.
+Neither owns a session; the store does.
+
+### 24.2 The state machine
+
+`SessionConnectionState` is exactly the seven states asked for — IDLE, CONNECTING, AUTHENTICATING,
+CONNECTED, RECONNECTING, DISCONNECTED, ERROR — and one place writes them: `updateTab`. A reconnect stays
+RECONNECTING for the whole attempt rather than flickering back through CONNECTING, so "attempt 2 of 5"
+survives on screen for as long as it is true.
+
+### 24.3 What must never cause a reconnect, and what proves it does not
+
+A real rotation does not recreate this Activity: the manifest declares
+`orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize`
+in `configChanges`, so turning the phone is a resize. `neitherResizeNorKeyboardNorBackgroundingReconnects`
+drives all four of the things that merely *look* like a disconnection — a resize pair the size of an IME
+opening and closing, focus lost and regained, navigation off the terminal and back, and the activity
+moved to CREATED and back to RESUMED — and asserts `shellsStarted == 1` on the far side of the wire
+throughout, then types into the shell to prove it still carries input.
+
+What that test could not cover is the Activity actually dying, which the system does under memory
+pressure, on every switch away with "Don't keep activities" on, and after process death.
+**`anActivityDestroyedAndRebuiltAdoptsItsSessionInsteadOfDiallingAgain`** (new) does: it recreates the
+activity with a live session and a line of scrollback, then requires four things — one shell for the
+whole test, the tab CONNECTED rather than RECONNECTING, the pre-rebuild output still in the frame, and
+the shell still answering afterwards. `MainViewModel.adoptExistingSessions` is what has to make that
+true, and until now nothing at this level asserted that it ran.
+
+### 24.4 The stress list, item by item
+
+The request lists what to stress. Each item, and what covers it:
+
+| Asked for | Covered by |
+| --- | --- |
+| login then idle 10–30 minutes | `aDefaultSessionSurvivesTenMinutesOfSilence` — shipped default keepalive, a server that never probes, ten minutes, one login |
+| large output | `SessionStabilityTest`'s flood: 120 000 lines, ≥1 MB, against a 2 000-line scrollback bound |
+| interactive `top`/`htop`/`vim`/`nano`/`less` | single keystrokes with no newline reach the pty (`SessionStabilityTest`); `AnsiTerminalBufferTest` drives the real alternate-screen sequence an editor sends, including the shell underneath surviving it |
+| screen rotation | `neitherResizeNorKeyboardNorBackgroundingReconnects` (a resize, which is what rotation is here) |
+| keyboard open/close | same test — the resize pair and the focus round trip |
+| app background/foreground | same test — CREATED and back to RESUMED |
+| screen lock/unlock | the same transition at the Activity level, plus `EclipseSessionService` holding the sessions while nothing is drawing |
+| Wi-Fi ↔ mobile data | **new**: the two `SessionLivenessProbe` tests in 24.5 |
+| network loss and recovery | `aTypedPasswordThatWasNeverSavedStillRecoversTheSessionAfterAnOutage`, and the heartbeat noticing a black-holed socket |
+| server disconnect | `theRemoteShellExitingEndsTheSessionAndTheTabSaysSo`, `aShellThatClosesWithoutSayingWhyIsReportedRatherThanRedialled`, `aShellKilledBySignalNamesTheSignalAndIsNotRedialled` |
+| manual disconnect / reconnect | `repeatedConnectAndDisconnectCyclesLeaveNothingBehind`, `reconnectingKeepsTheTabConnectedAndItsScrollback`, `disconnectAllClosesEverySession` |
+| multiple sessions | `twoHostsConnectSideBySideAndClosingOneLeavesTheOther`, `twoSessionsOpenAsSeparateTabsAndBothStayOpen` |
+
+### 24.5 The network handover, which had no test at all
+
+`SessionLivenessProbe` is the only production path left that can drop a *live* session on purpose, and
+it ran on trust: the store's `adoptableHostIds` and `probeLiveness` were both tested, the class that
+decides what to do with their answers was not. Two tests now hold its two properties, and they pull in
+opposite directions on purpose:
+
+- **`a session that still answers survives the network moving underneath it`** — the safety half, and
+  the more important one. A probe that assumes the worst turns every Wi-Fi-to-mobile switch, every VPN
+  coming up, every tethering change into an unexplained reconnect. The session is swept, then required
+  to be the *same* session, still open, with a shell that still accepts a line.
+- **`a session the handover killed is dropped by the probe and asks to come back`** — the speed half,
+  through the existing `FreezableRelay`, which black-holes a connection in both directions with every
+  socket left open. The keepalive is set to 600 s so three unanswered heartbeats could not possibly land
+  inside the test: the sweep is provably what noticed. It then asserts the *manner* of the drop —
+  `discard`, not `close`, so the channel's ending is one `shouldAutoReconnect` acts on. Had that been
+  `close`, every session the probe correctly identified as dead would have been left behind a silent tab
+  that never came back: a worse bug than the latency the probe removes, and invisible to a test that
+  only checked the session was gone.
+
+### 24.6 Diagnostics, and what they may not contain
+
+`SessionDiagnostics` records the whole lifecycle — connect, adopt, attempt, failure, network change,
+liveness probe, reconnect, exhaustion, ending — with state, reason, network description, keepalive, pty
+geometry, attempt number and session duration. Host ids never reach it: each host gets one opaque
+per-process label. Twelve tests in `SessionDiagnosticsTest` cover the parts that could leak — a private
+key in an exception message, a named password or passphrase, an unlabelled long token, an oversized
+detail, a quoted detail that could break the field it sits in — and the ring's own concurrency. That is
+what makes it safe to ask a user to send the trace, which is the fastest way to learn what their server
+actually does.
+
+### 24.7 The other half of the ladder: stopping when told to
+
+A bounded ladder answers *"it retries forever"*. It does not answer *"I told it to stop"*, and the
+request names that case on its own: **cancel reconnect when the user taps Disconnect**. The production
+code does it — `closeTab` cancels the pending job and records `RECONNECT_CANCELLED` with
+`detail = "tab closed"`, and `connect` does the same with `"connect requested"` — and neither line had a
+test at any level. `closeTab` is exercised a dozen times across the suite, always on a *connected*
+session; nothing had ever closed a tab in the one state where a cancel is the whole behaviour.
+
+`closingTheTabWhileAReconnectIsPendingCancelsIt` closes it in exactly that state. The server keeps
+answering throughout, which is what makes the assertion mean something: an armed ladder would succeed,
+and a successful reconnect is visible on the far side of the wire as a second shell. It counts shells
+rather than watching the tab, so the variant where a session comes back and re-registers itself with no
+tab to show it is caught too — a reconnect loop that outlives its own UI is worse than the bounded one,
+because there is nothing left to press. The wait is pumped in step with the wall clock up to the tap
+(see `pumpInStepUntil`): the thing being interrupted is a duration, and a flat-out pump would spend the
+whole first backoff window inside the loop that waits for RECONNECTING, leaving nothing to cancel.
+
+### 24.8 A defect in the suite itself: one preference store, no promised order
+
+Two runs of the gate failed on tests that had nothing to do with the change under test:
+
+- `SettingsRepositoryTest > 01 defaults are returned before anything is written` read
+  `reconnectBaseSeconds = 1` where it asserts 5;
+- `MainActivitySecureWindowTest > the window is not secured unless the user asks for it` found
+  `FLAG_SECURE` set, from a `blockScreenshots = true` it never wrote.
+
+Same cause both times, and it is worth recording because it is a property of the *harness* that can
+condemn any commit at random. `preferencesDataStore` caches one store per delegate for the whole
+classloader, so the store outlives each test method and each test *class*; Gradle promises no order for
+test classes, and the order it happens to pick moves when the set of recompiled classes moves. So any
+class that writes a setting and does not put it back is a landmine for whichever class runs next — and
+the failure surfaces in the innocent class, naming a value the failing test cannot see written anywhere
+near itself.
+
+Fixed on the writing side in both cases, which is the only side that can be fixed without weakening an
+assertion:
+
+- `TerminalSessionLifecycleRobolectricTest` drops the reconnect base to its minimum so five doubling
+  backoffs fit inside one test. It now restores it in `@After` — in `@After` rather than a `finally`
+  inside the test, because a failed assertion must not be able to skip it: a test that fails should cost
+  one red test, not two.
+- `SettingsRepositoryTest` writes ten settings in `02` and a PIN in `04`. It now restores the whole set
+  after every method, from the same list `01` asserts, in the same file, so the pristine state and the
+  reset to it cannot drift apart. The PIN matters most: `pinEnabled` gates the entire app, so a PIN left
+  in the store would meet the next class with a lock screen it has no code to answer — which that class
+  would report as its own UI never appearing.
+
+The two ad-hoc single-field restores already in `SettingsRepositoryTest` (`07`, `09`) were the same
+realisation arrived at one field at a time; the `@After` covers the fields nobody had noticed were
+leaking. Four test classes in the tree write a setting, and all four now put it back.
+
+### 24.9 A blank terminal that nothing would ever repaint
+
+The gate that proved §24.8 came back with one failure left, and it was not a settings leak:
+
+```
+theRemoteShellAttachesItselfAfterAuthenticationAndItsOutputArrivesUntyped
+timed out after 90000ms: "eclipse-scripted-shell" never reached the frame.
+  … state=CONNECTED … shellsStarted=1 serverWrote=26 appSent=0
+  transcript=24 frameRows=40 frameRevision=0 frameCollectors=1
+frame:
+  (forty blank rows)
+```
+
+Read that line by line and it describes something that cannot happen by accident. The server wrote its
+greeting (`serverWrote=26`) and the app parsed it, because the transcript holds 24 characters of it.
+Something *is* drawing frames (`frameCollectors=1`), so the publish gate was open. And yet the frame on
+screen was built when the buffer had never been written to at all: `AnsiTerminalBuffer.revision` counts
+mutations, and the published frame's revision is `0`.
+
+So the frame was not missing. It was **overwritten by an older one**.
+
+Publishing a frame is two steps — build a snapshot of the viewport, then write it into the map the UI
+collects — and the writers do not share a thread. The output collector runs on `Dispatchers.Default`;
+`attachTerminal`, session adoption, every scroll and every resize run on the main thread. The map write
+was a plain overwrite, so a writer preempted between its two steps put a stale snapshot on top of a
+newer one. `MutableStateFlow.update` made the write atomic, which is what made this look safe: the
+compare-and-set was never the problem, the *age of the value* was.
+
+The interleaving that fired here is the ordinary one, not an exotic one:
+
+1. `attachTerminal` publishes the frame of a session that has just come up. That call exists on purpose
+   — a reconnect and an adopted session keep their scrollback, and without it the user stares at an
+   empty screen until they press a key — but the buffer of a *fresh* session is empty, revision 0.
+2. The collector feeds the login banner and publishes it. Revision 1.
+3. Step 1's write lands.
+
+And then nothing. A shell sitting at its prompt sends nothing more, so there is no next frame to correct
+the screen; the republish that runs when something starts drawing again is edge-triggered on the
+subscription count, and the subscription never went away. The terminal stays blank with a live session
+behind it, until the user types.
+
+That is a user-visible bug, not a test artefact: *terminal opens, shows nothing, works as soon as you
+touch it*. It needs a slow moment between two instructions to appear, which is why a loaded four-core
+box found it and an idle one had not in twenty runs.
+
+The fix is an ordering rule, `newerTerminalFrame`, applied inside both publishers' `update` lambdas: a
+frame built from an older revision of the buffer never replaces the frame already published. The
+ordering is sound because `revision` never goes backwards and because a host's frame and its buffer are
+dropped together by `closeTab` and `deleteHost` — so a later session's revision 0 is never weighed
+against an earlier session's revision 900. Equal revisions keep the incoming frame, which is what keeps
+scrolling, resizing and the foreground republish working: those rebuild an *unchanged* buffer for a new
+viewport, and they are all built on the main thread in the order they were asked for.
+
+Reproducing the race on demand would mean winning it deliberately, which no test can promise, so the
+rule is tested where it is deterministic — `TerminalFramePublishOrderTest`, four cases against real
+revisions from a real buffer rather than hand-written numbers, because the property being leaned on
+belongs to the buffer. The integration stays covered by the lifecycle suite, which is where the fault
+surfaced in the first place.

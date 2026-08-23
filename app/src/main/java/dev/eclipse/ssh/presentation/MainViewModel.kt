@@ -452,7 +452,12 @@ class MainViewModel @Inject constructor(
         resuming: Boolean = false,
     ) {
         selectedHostId.value = host.id
-        pendingConnection = PendingConnection(host, password, keyPair, keyBytes, keyPassphrase)
+        pendingConnection = PendingConnection(host, password, keyPair, keyBytes, keyPassphrase, resuming)
+        // Asking for this session by hand is a fresh start, whatever the last one did: the allowance
+        // is only spent by the ladder's own attempts, and a user who has just tapped Connect (or
+        // Reconnect on a tab that gave up) is entitled to all of it. The ladder's own attempt passes
+        // `resuming` and must not reset anything - that is the whole point of counting.
+        if (!resuming) reconnectAttempts.remove(host.id)
         // A reconnect stays RECONNECTING for the whole attempt, keeping the sentence the ladder wrote
         // ("attempt 2 of 5"). Overwriting it with CONNECTING each time round would tell the user the
         // app had started something new, when what is happening is that it has not given up yet.
@@ -682,9 +687,13 @@ class MainViewModel @Inject constructor(
         )
         // Credentials are no longer needed once the session is up.
         pendingConnection = null
-        // The ladder is per outage, not per session: a host that reconnects gets its full allowance
-        // back for the next one.
-        reconnectAttempts.remove(host.id)
+        // Deliberately *not* resetting the reconnect allowance here. Coming up is not the same thing
+        // as staying up, and treating it as one is what made "Reconnecting..." endless: a session that
+        // died a few seconds after every login reset the counter on each of those logins, so the ladder
+        // never reached its limit, never reported anything, and never stopped. The allowance is handed
+        // back where the evidence for it exists - in the collector, once a session has actually lasted
+        // [STABLE_SESSION_MS] - and by a user asking for a connection themselves. See
+        // [scheduleAutoReconnect].
         runCatching { hostRepository.save(host.copy(lastConnectedAt = System.currentTimeMillis())) }
         // Still `runCatching`: a vault that cannot store the credential is not a reason to fail a
         // session that is already up. But it is said out loud in the trace, because the consequence
@@ -914,6 +923,15 @@ class MainViewModel @Inject constructor(
                 // that ran and exited is finished, a transport that died under it failed. See
                 // [SessionEnd.isFault].
                 val reason = describeSessionEnd(end)
+                // Read once, here, because two things now depend on it: the trace, and whether this
+                // ending starts a new ladder or continues the one already running.
+                val upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it }
+                // A session that stood up for a while and then dropped is a *new* outage and gets the
+                // full allowance back. One that died shortly after coming up is flapping, and its
+                // allowance carries over so that five of those in a row reach the end of the ladder and
+                // say what happened, instead of reconnecting for as long as the app is open. See
+                // [STABLE_SESSION_MS] for why the threshold is minutes rather than seconds.
+                if (upForMs != null && upForMs >= STABLE_SESSION_MS) reconnectAttempts.remove(hostId)
                 val willReconnect =
                     shouldAutoReconnect(end, tabIsOpen = tabs.value.any { it.hostId == hostId }, endedDeliberately = false)
                 // A fault the ladder is about to answer is a *reconnecting* tab, not an error one.
@@ -935,10 +953,10 @@ class MainViewModel @Inject constructor(
                     state = ended,
                     detail = "${end::class.java.simpleName}: $reason",
                     network = networkMonitor.describe(),
-                    upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it },
+                    upForMs = upForMs,
                 )
                 if (willReconnect) {
-                    scheduleAutoReconnect(hostId)
+                    scheduleAutoReconnect(hostId, reason)
                 } else {
                     // A shell that exited is finished with its session; nothing is going to use the
                     // transport again, and leaving it open would hold a socket and a heartbeat for a
@@ -1010,9 +1028,15 @@ class MainViewModel @Inject constructor(
      *  - **Only after a real drop.** The caller decides with [shouldAutoReconnect], which reconnects
      *    only when the shell never sent an exit status. A user typing `exit` gets a closed tab, not a
      *    session that springs back to life.
-     *  - **Bounded.** [MAX_AUTO_RECONNECT_ATTEMPTS] consecutive attempts, counted per host in
-     *    [reconnectAttempts] and reset by the first success. Past that the tab says so and stops; the
-     *    Reconnect action in the UI is still there, and pressing it starts a fresh ladder.
+     *  - **Bounded, and bounded across a flap.** [MAX_AUTO_RECONNECT_ATTEMPTS] consecutive attempts,
+     *    counted per host in [reconnectAttempts]. The allowance comes back when a session proves it can
+     *    *stay* up — [STABLE_SESSION_MS] of uptime, measured in the collector — and when the user asks
+     *    for a connection by hand. It deliberately does not come back merely because a login succeeded:
+     *    resetting on every attach is what made *Reconnecting…* endless, because a server that hangs up
+     *    a few seconds after each login handed the ladder a clean slate every time round, so it never
+     *    reached its limit, never reported the reason, and never stopped. Past the limit the tab shows
+     *    what actually ended the session and stops; the Reconnect action in the UI is still there, and
+     *    pressing it starts a fresh ladder.
      *  - **Backed off, not hammered.** [backoffWindowMs] doubles the wait per attempt with the same
      *    ceiling the service uses, plus jitter so several hosts recovering together do not retry in
      *    lockstep — and the wait ends early when a network appears.
@@ -1031,19 +1055,25 @@ class MainViewModel @Inject constructor(
      * [connectFailureIsFinal] treats as final, so this cannot turn a missing password into a retry
      * loop.
      */
-    private fun scheduleAutoReconnect(hostId: String) {
+    private fun scheduleAutoReconnect(hostId: String, endReason: String) {
         val attempt = (reconnectAttempts[hostId] ?: 0) + 1
         if (attempt > MAX_AUTO_RECONNECT_ATTEMPTS) {
             updateTab(hostId) {
                 it?.copy(
                     state = SessionConnectionState.ERROR,
-                    lastError = "Disconnected · gave up after $MAX_AUTO_RECONNECT_ATTEMPTS reconnect attempts",
+                    // The reason first, because it is the only part of this sentence anybody can act
+                    // on. "Disconnected - gave up after 5 reconnect attempts" described the app's own
+                    // behaviour and threw away what the *server* or the transport had said about why,
+                    // which is the one thing a user chasing a session that will not stay up needs. The
+                    // string comes from [describeSessionEnd] and interpolates no credential.
+                    lastError = "$endReason · gave up after $MAX_AUTO_RECONNECT_ATTEMPTS reconnect attempts",
                 )
             }
             diagnostics.record(
                 hostId,
                 SessionEvent.RECONNECT_EXHAUSTED,
                 state = SessionConnectionState.ERROR,
+                detail = endReason,
                 network = networkMonitor.describe(),
                 attempt = attempt - 1,
             )
@@ -1059,7 +1089,15 @@ class MainViewModel @Inject constructor(
             updateTab(hostId) {
                 it?.copy(
                     state = SessionConnectionState.RECONNECTING,
-                    lastError = "Reconnecting in ${waitMs / 1_000}s · attempt $attempt of $MAX_AUTO_RECONNECT_ATTEMPTS",
+                    // The reason stays on screen for the whole ladder. It used to be overwritten the
+                    // moment a reconnect was scheduled, so the *only* thing a user watching a session
+                    // that would not stay up ever saw was "Reconnecting - attempt 2 of 5": the app knew
+                    // the server had said "Timeout, your session not responding", or that the socket had
+                    // been reset, and hid it behind its own progress report. Reporting the cause while
+                    // the recovery is still running is the difference between a bug a user can describe
+                    // and one they can only call "it keeps reconnecting".
+                    lastError = "Reconnecting in ${waitMs / 1_000}s · attempt $attempt of " +
+                        "$MAX_AUTO_RECONNECT_ATTEMPTS · $endReason",
                 )
             }
             diagnostics.record(
@@ -1101,7 +1139,7 @@ class MainViewModel @Inject constructor(
             updateTab(hostId) {
                 it?.copy(
                     state = SessionConnectionState.RECONNECTING,
-                    lastError = "Reconnecting · attempt $attempt of $MAX_AUTO_RECONNECT_ATTEMPTS",
+                    lastError = "Reconnecting · attempt $attempt of $MAX_AUTO_RECONNECT_ATTEMPTS · $endReason",
                 )
             }
             connect(host, resuming = true)
@@ -1154,9 +1192,14 @@ class MainViewModel @Inject constructor(
         val frame = buffer.frame(scrollOffsets[hostId] ?: 0)
         // Asked a second time, from inside the update: the check above only decides whether the frame
         // is worth building. See [isDisplaying] for why the write is where the question has to be
-        // settled.
-        terminalFrames.update { if (isDisplaying(hostId, buffer)) it + (hostId to frame) else it }
+        // settled. [newerTerminalFrame] settles the other question the write has to answer: whether
+        // this frame is still the newest one anybody built.
+        terminalFrames.update { current ->
+            if (!isDisplaying(hostId, buffer)) current
+            else current + (hostId to newerTerminalFrame(current[hostId], frame))
+        }
     }
+
 
     /**
      * Rebuilds every live terminal's frame, for the moment something starts drawing them again.
@@ -1173,7 +1216,9 @@ class MainViewModel @Inject constructor(
         if (terminalBuffers.isEmpty()) return
         terminalFrames.update { current ->
             current + terminalBuffers.entries.associate { (hostId, buffer) ->
-                hostId to buffer.frame(scrollOffsets[hostId] ?: 0)
+                // Same guard as the collector's publish, for the same reason: this builds one snapshot
+                // per open session and a session that is printing can publish a newer one in between.
+                hostId to newerTerminalFrame(current[hostId], buffer.frame(scrollOffsets[hostId] ?: 0))
             }
         }
     }
@@ -1251,7 +1296,9 @@ class MainViewModel @Inject constructor(
         // see `SshConnectionManager.challengeHandled`.
         sshConnectionManager.challengeHandled()
         knownHostsState.value = sshConnectionManager.knownHosts()
-        pendingConnection?.let { connect(it.host, it.password, it.keyPair, it.keyBytes, it.keyPassphrase) }
+        pendingConnection?.let {
+            connect(it.host, it.password, it.keyPair, it.keyBytes, it.keyPassphrase, resuming = it.resuming)
+        }
     }
 
     fun refreshKnownHosts() {
@@ -2732,6 +2779,16 @@ class MainViewModel @Inject constructor(
         val keyPair: KeyPair?,
         val keyBytes: ByteArray?,
         val keyPassphrase: String?,
+        /**
+         * Whether the attempt that raised the host-key question was the reconnect ladder's.
+         *
+         * Carried so that trusting a key does not silently turn a reconnect into a fresh connection.
+         * Without it the retry lost the flag: the tab jumped from "Reconnecting - attempt 3 of 5" to
+         * "Connecting...", dropped the reason it was showing, and handed the ladder a clean allowance -
+         * a reset that belongs to a user asking for a *connection*, not to one answering a question the
+         * recovery asked them.
+         */
+        val resuming: Boolean,
     )
 
     /** What [resolveCredentials] settled on: the caller's values, with the saved ones filling gaps. */
@@ -2856,6 +2913,22 @@ data class MainUiState(
 internal const val MAX_AUTO_RECONNECT_ATTEMPTS = 5
 
 /**
+ * How long a session must last before it counts as having *stayed* up, handing back the reconnect
+ * allowance in [MAX_AUTO_RECONNECT_ATTEMPTS].
+ *
+ * Five minutes, and the floor under that number is the keepalive arithmetic rather than taste. With the
+ * default 30 s keepalive a heartbeat death is declared after three unanswered probes — `keepAlive * 3`
+ * = 90 s, see `HEARTBEAT_NO_REPLY_MAX` in [dev.eclipse.ssh.ssh.SshConnectionManager] — and the idle
+ * backstop it configures alongside is `keepAlive * 3 + 60` = 150 s. A threshold shorter than
+ * those would let a session that never carried a byte, and was only ever waiting to be declared dead,
+ * count as stable and refill the ladder; the loop would then be unbounded again for exactly the case
+ * this guards. Five minutes clears both with room to spare while still being short enough that an
+ * ordinary working session — one that has been usable for minutes and then hits a tunnel — gets the
+ * full allowance for that outage, which is what the allowance is for.
+ */
+internal const val STABLE_SESSION_MS = 300_000L
+
+/**
  * Whether a session that just ended should be brought back automatically.
  *
  * One question decides it: *was the shell taken away, or was it finished?* A transport that died —
@@ -2897,3 +2970,34 @@ internal fun shouldAutoReconnect(end: SessionEnd, tabIsOpen: Boolean, endedDelib
         SessionEnd.TransportClosed, SessionEnd.Released -> true
     }
 }
+
+/**
+ * Whichever of the two frames was built from the later state of the buffer.
+ *
+ * Publishing is two steps - build a snapshot, then write it - and the writers run on different
+ * threads: the output collector on [Dispatchers.Default], `attachTerminal`,
+ * `adoptExistingSessions` and every scroll and resize on the main thread. A writer preempted
+ * between its two steps writes a snapshot that has since gone stale, and a plain map overwrite
+ * lets that stale snapshot *replace* a newer frame.
+ *
+ * That is not a cosmetic ordering nicety, because nothing is scheduled to correct it. The case
+ * that exposed it: `attachTerminal` publishes the frame of a session that has just come up - an
+ * empty buffer, revision 0 - so the scrollback of a reconnect or an adopted session is on screen
+ * before any new output arrives. Let the collector feed the login banner and publish it while
+ * that build is in flight, and the empty frame lands last. A shell sitting at its prompt then
+ * sends nothing more, so there is no next frame: the terminal stays blank, the transcript behind
+ * it holds the banner, and the only way out is to type something. `frameRevision=0` beside a
+ * transcript that has content is the signature, and it is what
+ * `theRemoteShellAttachesItselfAfterAuthenticationAndItsOutputArrivesUntyped` caught once the box
+ * was loaded enough to lose that race.
+ *
+ * [AnsiTerminalBuffer.revision] is the ordering, and it is a sound one here: it never goes
+ * backwards, and every frame a host publishes is built from the one buffer it keeps for as long as
+ * it has a published frame at all - [MainViewModel.closeTab] and [MainViewModel.deleteHost] drop
+ * the buffer and the frame together, so a later session's revision 0 is never compared against an
+ * earlier session's revisions. Equal revisions keep the incoming frame, because a rebuild of an unchanged buffer is
+ * a new *viewport* of it - a scroll, a resize, a foreground republish - and those are built on the
+ * main thread in the order they were asked for.
+ */
+internal fun newerTerminalFrame(published: TerminalFrame?, built: TerminalFrame): TerminalFrame =
+    if (published != null && published.revision > built.revision) published else built

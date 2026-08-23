@@ -5,7 +5,9 @@ import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.TerminalTheme
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import org.junit.After
 import org.junit.FixMethodOrder
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -29,6 +31,42 @@ import org.robolectric.annotation.Config
 class SettingsRepositoryTest {
 
     private val repository get() = SettingsRepository(RuntimeEnvironment.getApplication())
+
+    /**
+     * Puts every setting this class writes back to its default, so the store it shares with the rest
+     * of the suite is pristine on the way out as well as on the way in.
+     *
+     * The cache described above is not scoped to this class, and Gradle promises no order for test
+     * classes: `02` writes ten settings and restores none, so a sibling class that happens to run
+     * afterwards reads *those* values where it asserts the defaults. That is not hypothetical - it
+     * failed exactly that way, as `MainActivitySecureWindowTest`'s "the window is not secured unless
+     * the user asks for it" finding `blockScreenshots = true`, a value that test never sets and could
+     * not see written. The two restores further down (`07`, `09`) were the same realisation applied one
+     * field at a time; this covers the whole set, including the fields nobody had noticed were leaking.
+     *
+     * The values are the ones `01` asserts, deliberately: the pristine state and the reset to it are
+     * one list in one file, so they cannot drift apart. `clearPin` is here because `04` sets a PIN, and
+     * a PIN left in the store gates the *whole app* - a sibling class rendering `MainActivity` would
+     * meet a lock screen it has no code to answer, and report that as its own UI never appearing.
+     */
+    @After
+    fun restoreTheDefaults() {
+        runBlocking {
+            val repo = repository
+            repo.setBiometricUnlock(true)
+            repo.setDarkTheme(true)
+            repo.setClipboardSeconds(30)
+            repo.setKeepAliveSeconds(30)
+            repo.setReconnectBaseSeconds(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+            repo.setTerminalFontSize(SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE)
+            repo.setTerminalKeyRowVisible(true)
+            repo.setTerminalMinColumns(SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS)
+            repo.setLegacyAlgorithms(false)
+            repo.setTerminalTheme(TerminalTheme.DARK.name)
+            repo.setBlockScreenshots(false)
+            repo.clearPin()
+        }
+    }
 
     @Test
     fun `01 defaults are returned before anything is written`() = runTest {

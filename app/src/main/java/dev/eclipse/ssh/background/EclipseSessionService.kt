@@ -430,10 +430,17 @@ class EclipseSessionService : LifecycleService() {
      * guaranteed crash for exactly this service's purpose — keeping SSH sessions alive is the case
      * that reaches six hours.
      *
-     * The sessions are closed cleanly by [onDestroy] and the user is told, because the app cannot
-     * restart the service from the background afterwards; bringing the app to the foreground resets
-     * the budget. Deliberately does not call `super`: the base method exists only from API 35, and
-     * its implementation there is a no-op anyway.
+     * The sessions are deliberately **left open**, and the notification says so rather than claiming
+     * they were closed - which is what it used to say, and what [onDestroy] has not done since sessions
+     * moved into [SshSessionStore]. Closing them here would be the worse of the two outcomes: an
+     * activity on screen holds the process at foreground importance all by itself, so a user who is
+     * actually using the app keeps every shell they are typing into, and only a process Android later
+     * reclaims loses them. What the app cannot do is promote itself again from the background until the
+     * budget resets, so the notification's job is to say that the sessions are now only as durable as
+     * the app being open - and to offer the tap that makes it so.
+     *
+     * Deliberately does not call `super`: the base method exists only from API 35, and its
+     * implementation there is a no-op anyway.
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
         postAlert(

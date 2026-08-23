@@ -2,6 +2,7 @@ package dev.eclipse.ssh.ssh
 
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import dev.eclipse.ssh.background.NetworkMonitor
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
@@ -111,6 +112,16 @@ class SessionStabilityTest {
          * deadline is already covered by the bound in the black-hole test.
          */
         private const val PROBE_TIMEOUT_SECONDS = 3L
+
+        /**
+         * A keep-alive long enough that it cannot be what noticed anything.
+         *
+         * The two liveness-probe tests need the probe to be the *only* possible detector: at ten
+         * minutes between heartbeats, three unanswered requests are half an hour away and the idle
+         * timeout MINA derives from it is further still. It is also the top of [KEEP_ALIVE_RANGE], so
+         * it is a value the app itself would accept from a user.
+         */
+        private const val PROBE_ONLY_KEEP_ALIVE = 600
 
         /**
          * Lines in the flood test, chosen so the payload is over a megabyte.
@@ -557,6 +568,117 @@ class SessionStabilityTest {
             relay.close()
         }
     }
+
+    /**
+     * The network moving is not, by itself, a reason to drop a session that still answers.
+     *
+     * This is the safety half of [SessionLivenessProbe] and the more important one. The probe exists to
+     * shorten the minute and a half the keep-alive needs to notice a handover has killed a socket, and
+     * the cheap way to shorten it is to assume the worst and redial - which turns every Wi-Fi-to-mobile
+     * switch, every VPN coming up, every tethering change into a reconnect the user did not need and
+     * cannot explain. A phone hands its default network over more often than anyone thinks.
+     *
+     * So: a healthy session, a sweep, and it is still in the store afterwards, still open, and the
+     * shell it carries still answers. `sweep` is called directly rather than through
+     * [dev.eclipse.ssh.background.NetworkMonitor.migrated] because what is under test is the decision,
+     * not the platform callback that delivers it - and a test that drove the flow would pass just as
+     * well with the collector wired to nothing.
+     */
+    @Test
+    fun `a session that still answers survives the network moving underneath it`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile(keepAlive = PROBE_ONLY_KEEP_ALIVE)
+            val session = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(session)
+            val shell = awaitShell(started)
+            store.sessions[profile.id] = session
+            store.channels[profile.id] = terminal
+            assertThat(store.isLive(profile.id)).isTrue()
+
+            probe(store, manager).sweep()
+
+            // Kept, and kept as the same session: a probe that answered must not cost a login.
+            assertThat(store.isLive(profile.id)).isTrue()
+            assertThat(store.liveSession(profile.id)).isSameInstanceAs(session)
+            assertThat(session.isOpen).isTrue()
+            assertThat(terminal.isOpen).isTrue()
+            // And it is a working shell, not one that survived on paper. This is the assertion a
+            // half-torn-down session fails.
+            val line = "still-here-after-the-handover\n"
+            terminal.write(line)
+            assertThat(awaitTrue { shell.received().size >= line.length }).isTrue()
+        } finally {
+            runCatching { store.closeAll() }
+            manager.close()
+        }
+    }
+
+    /**
+     * A session the handover killed is found in seconds, and found in a way that reconnects.
+     *
+     * The speed half. The keep-alive test above ("a transport that silently stops delivering is
+     * noticed closed and offered for reconnect") proves the keep-alive eventually notices a black-holed
+     * socket; this proves the probe does not wait for it. The keep-alive here is [PROBE_ONLY_KEEP_ALIVE] seconds, so three unanswered
+     * requests could not land inside this test and the idle timeout configured alongside it is over half
+     * an hour away: nothing except the sweep can be what noticed, which is what makes the elapsed time
+     * below evidence rather than a coincidence.
+     *
+     * The second assertion is the one that decides what the user sees. [SshSessionStore.discard] tears
+     * the channel down *without* marking it deliberate, so the collector reports an ending that
+     * [shouldAutoReconnect] agrees to act on. Had the probe used `close`, every session it correctly
+     * identified as dead would have been left sitting behind a tab that says nothing and never comes
+     * back - a worse bug than the latency this removes, and invisible to a test that only checked the
+     * session was gone from the store.
+     */
+    @Test
+    fun `a session the handover killed is dropped by the probe and asks to come back`() = runBlocking {
+        val relay = FreezableRelay(serverPort)
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile(port = relay.port, keepAlive = PROBE_ONLY_KEEP_ALIVE)
+            val session = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(session)
+            awaitShell(started)
+            store.sessions[profile.id] = session
+            store.channels[profile.id] = terminal
+
+            // The handover: both sockets stay open, nothing crosses them again.
+            relay.freeze()
+            val frozenAt = System.nanoTime()
+            probe(store, manager).sweep()
+            val elapsedSeconds = (System.nanoTime() - frozenAt) / 1_000_000_000L
+
+            assertThat(store.isLive(profile.id)).isFalse()
+            assertThat(store.liveHostIds()).isEmpty()
+            // Sooner than the keep-alive could possibly have managed, which is the whole point.
+            assertThat(elapsedSeconds).isLessThan(PROBE_ONLY_KEEP_ALIVE.toLong())
+
+            // Dropped as found-dead: the tab reports an outage and the ladder brings it back.
+            val closed = withTimeoutOrNull(WAIT_MS) { listOf(terminal.awaitClosed()) }
+            assertThat(closed).isNotNull()
+            assertThat(terminal.endedDeliberately).isFalse()
+            assertThat(
+                shouldAutoReconnect(closed!!.single(), tabIsOpen = true, endedDeliberately = terminal.endedDeliberately),
+            ).isTrue()
+        } finally {
+            runCatching { store.closeAll() }
+            manager.close()
+            relay.close()
+        }
+    }
+
+    /** A probe wired to the real store and manager, with nothing stubbed but the trigger. */
+    private fun probe(store: SshSessionStore, manager: SshConnectionManager) = SessionLivenessProbe(
+        sessionStore = store,
+        connectionManager = manager,
+        networkMonitor = NetworkMonitor(RuntimeEnvironment.getApplication()),
+        diagnostics = SessionDiagnostics(),
+    )
 
     @Test
     fun `the store offers a live session for adoption instead of a second login`() = runBlocking {

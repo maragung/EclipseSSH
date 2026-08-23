@@ -19,6 +19,8 @@ import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
+import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.presentation.MAX_AUTO_RECONNECT_ATTEMPTS
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.terminal.TerminalFrame
@@ -31,6 +33,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.runBlocking
 import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.common.util.buffer.Buffer
@@ -51,6 +54,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
@@ -89,6 +93,7 @@ class TerminalSessionLifecycleRobolectricTest {
     @Before
     fun resetServerRecording() {
         received.clear()
+        flapEveryShell.set(false)
         liveTransport.set(null)
         windowSize.set(null)
         ptyRequests.clear()
@@ -116,6 +121,35 @@ class TerminalSessionLifecycleRobolectricTest {
     fun endEverySession() {
         runCatching { compose.runOnUiThread { viewModel().disconnectAll() } }
     }
+
+    /**
+     * Puts back any preference a test in here changed, even when that test failed.
+     *
+     * `preferencesDataStore` caches one store per delegate for the whole classloader, so a setting
+     * written by one test class is still there for the next one - and one class next door is
+     * specifically about what a *fresh install* reads. This is not hypothetical: the flap test below
+     * drops the reconnect base to its minimum so five doubling backoffs fit in a test, and the leaked
+     * `1` failed `SettingsRepositoryTest`'s pristine-defaults check in a later class, turning one
+     * deliberate change into someone else's red test. [MainActivitySecureWindowTest] documents the same
+     * trap from the other side.
+     *
+     * In `@After` rather than a `finally` inside the test, because a failed assertion must not be able
+     * to skip it: a test that fails should cost one red test, not two.
+     */
+    @After
+    fun restoreChangedSettings() {
+        if (!reconnectBaseChanged) return
+        reconnectBaseChanged = false
+        runCatching {
+            runBlocking {
+                SettingsRepository(RuntimeEnvironment.getApplication())
+                    .setReconnectBaseSeconds(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+            }
+        }
+    }
+
+    /** Set by the one test that writes a preference, so [restoreChangedSettings] knows to undo it. */
+    private var reconnectBaseChanged = false
 
     // ---------------------------------------------------------------- the tests
 
@@ -813,6 +847,154 @@ class TerminalSessionLifecycleRobolectricTest {
     }
 
     /**
+     * A session that dies seconds after every login must stop reconnecting, and say what killed it.
+     *
+     * This is the bug behind every report of *"it keeps reconnecting"*, and it was not the reconnecting
+     * that was wrong - it was that the ladder could never finish. The allowance in
+     * [MAX_AUTO_RECONNECT_ATTEMPTS] was handed back on every successful attach, so a server that hung
+     * up a few seconds after each login reset the counter on each of those logins: attempt 1 of 5,
+     * forever. The app dialled for as long as it was open, never reached the end of the ladder, and so
+     * never ran the one piece of code that reports *why* - while the tab, whose `lastError` was
+     * overwritten with "Reconnecting - attempt 1 of 5" the moment each retry was scheduled, could not
+     * show the cause either. A user watching that had nothing to tell anybody except that it keeps
+     * reconnecting, which is exactly what we were told.
+     *
+     * Both halves are asserted, because either one alone leaves the bug reportable:
+     *
+     *  - it **stops**, at ERROR, after a bounded number of shells - proof the allowance now survives a
+     *    flap rather than being refilled by the login at the start of it;
+     *  - it **says why**, naming the ending from [dev.eclipse.ssh.ssh.describeSessionEnd] and not only
+     *    the app's own retry count, both while retrying and in the message it settles on.
+     *
+     * The base delay is dropped to its minimum so five doubling backoffs fit in one test. They come due
+     * on the looper's virtual clock, which [pumpUntil] advances far faster than wall time, so what this
+     * costs in real seconds is the five logins - not the 31 seconds of backoff the app thinks it waited.
+     */
+    @Test
+    fun aFlappingSessionStopsReconnectingAndSaysWhy() {
+        val viewModel = viewModel()
+        compose.runOnUiThread {
+            viewModel.setReconnectBaseSeconds(SettingsRepository.MIN_RECONNECT_BASE_SECONDS)
+        }
+        reconnectBaseChanged = true
+        pumpUntil(describe = { "the reconnect base never took: ${viewModel.uiState.value.settings}" }) {
+            viewModel.uiState.value.settings.reconnectBaseSeconds == SettingsRepository.MIN_RECONNECT_BASE_SECONDS
+        }
+
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        assertThat(tabFor(hostId)?.state).isEqualTo(SessionConnectionState.CONNECTED)
+
+        // From here every shell greets and then loses its transport, including the one that is up: a
+        // flap is not one bad session followed by good ones, it is the same thing happening each time.
+        flapEveryShell.set(true)
+        checkNotNull(liveTransport.get()) { "the server never recorded its session" }.close(true)
+
+        pumpInStepUntil(
+            timeoutMs = FLAP_TIMEOUT_MS,
+            describe = { "the ladder never stopped. " + diagnose(hostId) },
+        ) {
+            // Sampled on the way past, because the reason has to be visible *while* it is retrying and
+            // not only at the end - the RECONNECTING line is all a user sees for the whole ladder.
+            tabFor(hostId)?.let { tab ->
+                if (tab.state == SessionConnectionState.RECONNECTING) tab.lastError?.let(reconnectingSaid::add)
+            }
+            // Fail on the spot rather than at the deadline. An unbounded ladder dials as fast as the
+            // server will answer, and letting it run for the whole budget leaves hundreds of live
+            // sessions in a JVM the rest of this suite has to share - so the regression this test exists
+            // to catch would be reported as a timeout in some later, innocent test. The number is
+            // deliberately loose: the assertions below hold the ladder to its exact allowance, this only
+            // decides how much evidence is enough to stop collecting.
+            check(shellsStarted.get() <= FLAP_SHELL_CEILING) {
+                "the reconnect ladder is unbounded: ${shellsStarted.get()} shells and still going. " +
+                    diagnose(hostId)
+            }
+            tabFor(hostId)?.state == SessionConnectionState.ERROR
+        }
+
+        val settled = tabFor(hostId)?.lastError.orEmpty()
+        assertWithMessage("the tab must say the ladder is over, not go on counting: $settled")
+            .that(settled)
+            .contains("gave up after $MAX_AUTO_RECONNECT_ATTEMPTS reconnect attempts")
+        assertWithMessage("the give-up message must name the ending, not only the retry count: $settled")
+            .that(settled.substringBefore(" · gave up").trim())
+            .isNotEmpty()
+        // Only the lines that count attempts: "Waiting for a network..." is a different sentence with
+        // nothing to add, and this test does not stage an outage for it.
+        val counting = reconnectingSaid.filter { it.contains("attempt ") }
+        assertWithMessage("the ladder never said it was retrying: $reconnectingSaid")
+            .that(counting)
+            .isNotEmpty()
+        assertWithMessage("a Reconnecting line has to end in the reason, not in the retry count: $counting")
+            .that(counting.all { line -> line.substringAfterLast(" · ").let { it.isNotBlank() && !it.startsWith("attempt ") } })
+            .isTrue()
+
+        // The count on the far side of the wire is what makes "it stopped" mean it: one shell for the
+        // first login, and at most one per attempt of the allowance. Unbounded is what this test exists
+        // to catch, and an unbounded ladder runs until the harness gives up rather than stopping here.
+        assertWithMessage("the ladder never retried the flapping session")
+            .that(shellsStarted.get())
+            .isGreaterThan(1)
+        assertWithMessage("the ladder outran its allowance")
+            .that(shellsStarted.get())
+            .isAtMost(1 + MAX_AUTO_RECONNECT_ATTEMPTS)
+    }
+
+    /** Every RECONNECTING line the tab showed during the flap, for the assertions above. */
+    private val reconnectingSaid: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    /**
+     * Closing the tab while a reconnect is waiting cancels it, and nothing dials again.
+     *
+     * The other half of the ladder: it has to give up when it is *told* to, not only when it runs out
+     * of attempts. A user watching a session try to come back and deciding they have had enough taps
+     * Disconnect, and the wait already scheduled must die with the tab - otherwise the app reappears a
+     * few seconds later holding a session nobody asked for, on a network the user may have chosen to
+     * stop using, with no tab on screen to close it again. That is the shape of a reconnect loop that
+     * outlives its own UI, and it is worse than the bounded one because there is nothing left to press.
+     *
+     * The server keeps answering throughout, which is what makes the assertion mean something: if the
+     * ladder were still armed it would succeed, and a successful reconnect is visible on the far side
+     * of the wire as a second shell. Counting shells rather than watching the tab also rules out the
+     * variant where the session comes back and quietly re-registers itself with no tab to show it.
+     *
+     * Pumped in step with the wall clock up to the tap, because the thing being interrupted is a
+     * duration - the first backoff window is seconds, and a flat-out pump would spend all of it inside
+     * the wait-for-RECONNECTING loop, leaving nothing to cancel.
+     */
+    @Test
+    fun closingTheTabWhileAReconnectIsPendingCancelsIt() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        assertThat(shellsStarted.get()).isEqualTo(1)
+
+        // One drop, not a flap: `flapEveryShell` stays off, so the next login would succeed.
+        checkNotNull(liveTransport.get()) { "the server never recorded its session" }.close(true)
+        pumpInStepUntil(
+            timeoutMs = SSH_TIMEOUT_MS,
+            describe = { "the drop never armed a reconnect. " + diagnose(hostId) },
+        ) {
+            tabFor(hostId)?.state == SessionConnectionState.RECONNECTING
+        }
+        // Read before the tap, not assumed to be 1: an attempt that had already begun is legitimate
+        // timing, and what this test is about is that no *further* dialling happens after the close.
+        val dialled = shellsStarted.get()
+
+        compose.runOnUiThread { viewModel().closeTab(checkNotNull(tabFor(hostId))) }
+        compose.waitForIdle()
+        assertWithMessage("closing a tab has to remove it").that(tabFor(hostId)).isNull()
+
+        holdWhileTheLadderWouldHaveFired(
+            describe = {
+                "the reconnect outlived the tab that wanted it: shells=${shellsStarted.get()} " +
+                    "(was $dialled), tab=${tabFor(hostId)}"
+            },
+        ) {
+            shellsStarted.get() == dialled && tabFor(hostId) == null
+        }
+    }
+
+    /**
      * None of the things that merely *look* like a disconnection may cause one.
      *
      * Every trigger here was a way the app used to throw away a perfectly good session, and each is
@@ -879,6 +1061,69 @@ class TerminalSessionLifecycleRobolectricTest {
         assertThat(shellsStarted.get()).isEqualTo(1)
     }
 
+    /**
+     * The activity being destroyed and rebuilt adopts the session it left behind rather than dialling.
+     *
+     * The harder half of [neitherResizeNorKeyboardNorBackgroundingReconnects]. That test covers what a
+     * rotation actually does to *this* app - the manifest declares `orientation|screenSize|...` in
+     * `configChanges`, so turning the phone is a resize and the activity lives - and what backgrounding
+     * does, which stops the composition but keeps the activity. Neither destroys the ViewModel.
+     *
+     * This does. `recreate` is the platform's own teardown: `onDestroy`, a new activity, a new
+     * ViewModel with empty maps and no tabs. It is what the system does under memory pressure, what
+     * "Don't keep activities" does on every switch away, and what a restore after process death looks
+     * like from the app's side. The session itself is in [dev.eclipse.ssh.ssh.SshSessionStore], which
+     * is a singleton and outlives all of that, so `MainViewModel.adoptExistingSessions` has to find it
+     * on the way up - and until this test there was nothing at this level asserting that it does. The
+     * store's half is covered by `SessionStabilityTest`; what only a rebuilt activity can show is that
+     * the app *uses* the answer.
+     *
+     * Four things are asserted, and each fails differently:
+     *
+     *  - `shellsStarted` stays at 1, counted on the far side of the wire. A rebuilt UI that dialled
+     *    again would leave the user with two logins for one tap and one of them orphaned;
+     *  - the tab is `CONNECTED`, not `RECONNECTING` - a session adopted but reported as recovering is
+     *    the "Reconnecting..." the user sees for no reason;
+     *  - the scrollback from before the rebuild is still in the frame. Buffers live in the store next
+     *    to the sessions for exactly this, and a ViewModel-local map would pass the other three;
+     *  - the shell still answers. A tab restored over a dead channel passes everything above.
+     *
+     * The terminal is expected back on screen by itself: `openSessionHostId` in `MainActivity` is
+     * `rememberSaveable` so the shell the user was in is where they come back to, which is a promise
+     * nothing else in the suite holds to account with a live session behind it.
+     */
+    @Test
+    fun anActivityDestroyedAndRebuiltAdoptsItsSessionInsteadOfDiallingAgain() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        compose.runOnUiThread { viewModel().sendInput(hostId, "before-rebuild\n") }
+        waitForFrameText(hostId, "echo: before-rebuild")
+        assertThat(shellsStarted.get()).isEqualTo(1)
+
+        compose.activityRule.scenario.recreate()
+        compose.waitForIdle()
+
+        pumpUntil(describe = { "the session never came back after the rebuild. " + diagnose(hostId) }) {
+            tabFor(hostId)?.state == SessionConnectionState.CONNECTED
+        }
+        assertWithMessage("the rebuilt activity dialled a second session instead of adopting the one it had")
+            .that(shellsStarted.get())
+            .isEqualTo(1)
+        assertThat(tabFor(hostId)?.lastError).isNull()
+
+        // Back in the shell the user was in, with everything they had already read still there.
+        pumpUntil(describe = { "the terminal did not come back on screen. " + diagnose(hostId) }) {
+            compose.onAllNodesWithContentDescription("Terminal input").fetchSemanticsNodes().isNotEmpty()
+        }
+        waitForFrameText(hostId, "echo: before-rebuild")
+
+        // And it is the session, not a picture of it.
+        clearRecording()
+        compose.runOnUiThread { viewModel().sendInput(hostId, "after-rebuild\n") }
+        waitForFrameText(hostId, "echo: after-rebuild")
+        assertThat(shellsStarted.get()).isEqualTo(1)
+    }
+
     private fun tabFor(hostId: String) = viewModel().uiState.value.tabs.firstOrNull { it.hostId == hostId }
 
     // ---------------------------------------------------------------- the on-screen key row
@@ -938,6 +1183,33 @@ class TerminalSessionLifecycleRobolectricTest {
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
+        }
+        check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /**
+     * [pumpUntil], but with the looper's clock kept in step with the wall clock.
+     *
+     * Every other wait in this suite wants the opposite. `pumpUntil` advances virtual time as fast as
+     * the CPU allows precisely so a `delay` does not cost real seconds - and that is right up to the
+     * moment the thing under test is itself a *duration*. The reconnect ladder is one: it hands its
+     * allowance back after [dev.eclipse.ssh.presentation.STABLE_SESSION_MS] of uptime, measured with
+     * `SystemClock.elapsedRealtime`, which Robolectric drives from this same clock. Pumped flat out, a
+     * session that lived 400ms of real time looked to the app as though it had been up for the better
+     * part of an hour, so every flap refilled the ladder and the test watched 258 logins go by with the
+     * tab still saying CONNECTED - a perfect reproduction of the bug, produced entirely by the harness.
+     *
+     * A frame of virtual time per frame of real time keeps the two readings of "how long was it up"
+     * within a small factor of each other, which is all the ladder's thresholds need. It costs this test
+     * the ~31s of backoff the app really waits, and [FLAP_TIMEOUT_MS] is sized for that.
+     */
+    private fun pumpInStepUntil(timeoutMs: Long, describe: () -> String, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        while (System.nanoTime() < deadline && !condition()) {
+            Snapshot.sendApplyNotifications()
+            compose.mainClock.advanceTimeByFrame()
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(FRAME_MS))
+            Thread.sleep(FRAME_MS)
         }
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
     }
@@ -1198,6 +1470,26 @@ class TerminalSessionLifecycleRobolectricTest {
         /** Long enough for a real re-dial to have shown up on the server, if one were coming. */
         const val REAL_DIAL_GRACE_NANOS = 1_000_000_000L
 
+        /**
+         * Budget for the whole five-attempt flap ladder.
+         *
+         * Longer than [SSH_TIMEOUT_MS] because this one waits on five real logins rather than one, and
+         * the box it runs on is shared. The backoffs themselves are virtual and nearly free.
+         */
+        const val FLAP_TIMEOUT_MS = 240_000L
+
+        /** One frame, as both clocks count it, for [pumpInStepUntil]. */
+        const val FRAME_MS = 16L
+
+        /**
+         * Shells after which a flapping ladder is unbounded beyond argument, and this test stops.
+         *
+         * Twice the allowance plus its first login: comfortably above anything a correct ladder can do,
+         * far below the hundreds an unbounded one reaches, and low enough that a regression leaves the
+         * shared JVM with a dozen dead sessions rather than a few hundred live ones.
+         */
+        const val FLAP_SHELL_CEILING = 2 * (1 + MAX_AUTO_RECONNECT_ATTEMPTS)
+
         /** Lines of history above the view, so scrolling back provably has somewhere to go. */
         const val SCROLLBACK_MARGIN_LINES = 40
 
@@ -1212,6 +1504,27 @@ class TerminalSessionLifecycleRobolectricTest {
 
         /** The server's side of the newest session, for the test that takes the network away. */
         val liveTransport = AtomicReference<org.apache.sshd.common.session.Session?>(null)
+
+        /**
+         * When set, every shell greets its client and then loses its transport a moment later.
+         *
+         * This is the server half of a *flap*, and it is the shape of the bug users kept reporting as
+         * "it keeps reconnecting": the login works, the banner arrives, and the session is gone again
+         * seconds later - a `ClientAliveInterval` the client is failing to satisfy, a middlebox
+         * dropping the flow, an `sshd` being restarted in a loop. One drop is
+         * [aDroppedTransportIsNeverSilent]; this is the same drop happening to every session the
+         * reconnect ladder manages to establish. See [aFlappingSessionStopsReconnectingAndSaysWhy].
+         */
+        val flapEveryShell = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /**
+         * How long a flapping shell stays up before its transport goes.
+         *
+         * Long enough that the client has finished attaching - a transport that dies *during* the
+         * handshake is a connect failure and travels a different, already-covered path - and short
+         * enough that five of them plus their backoffs fit inside one test.
+         */
+        const val FLAP_UPTIME_MS = 400L
 
         /** The last window size the remote pty was told about, columns to rows. */
         val windowSize = AtomicReference<Pair<Int, Int>?>(null)
@@ -1331,6 +1644,19 @@ class TerminalSessionLifecycleRobolectricTest {
             out.write(greeting)
             out.flush()
             serverWrote.addAndGet(greeting.size)
+            if (flapEveryShell.get()) {
+                // The greeting first, then the drop, because "some server text and then Reconnecting"
+                // is the report this reproduces. `close(true)` on the *session* rather than the
+                // channel: no exit status and no SSH_MSG_DISCONNECT, which is what a link that stops
+                // forwarding looks like from the client - and the one ending the ladder answers.
+                Thread {
+                    runCatching {
+                        Thread.sleep(FLAP_UPTIME_MS)
+                        channel.session.close(true)
+                    }
+                }.also { it.isDaemon = true }.start()
+                return
+            }
             Thread {
                 runCatching {
                     val line = StringBuilder()

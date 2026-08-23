@@ -173,3 +173,77 @@ jobs:
         run: |
           rm -f keystore.properties
           rm -rf keystore
+
+  # The long idle test, which does not belong in a gate that runs on every push: ten
+  # minutes of a genuinely silent session is ten minutes of a metered runner, and what
+  # it protects against changes only when the keep-alive or idle-timeout code does.
+  #
+  # It is the one test open long enough to cross the idle deadline the *shipped* default
+  # implies - 30s keep-alive means MINA closes an untouched transport after 30*3+60 =
+  # 150 seconds - so a heartbeat that stopped reaching the wire would drop a healthy
+  # session about two and a half minutes after login and be invisible to every other
+  # test here. Run it by hand from the Actions tab before cutting a release.
+  stress:
+    name: Long idle stress test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
+
+      - name: Cache Robolectric runtime jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
+          restore-keys: robolectric-${{ runner.os }}-
+
+      - name: Start the isolated OpenSSH sandbox
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          tools/local-sshd.sh start
+          # The silent port is what this job needs: `ClientAliveInterval 0`, so the app's
+          # own heartbeat is the only traffic and the only thing keeping the session up.
+          test -f .tmp-build/sshd-test/port-silent
+
+      - name: Ten minutes of a silent session
+        env:
+          ECLIPSE_STRESS: '1'
+        run: |
+          ./gradlew --stacktrace :app:testDebugUnitTest \
+            --tests '*RealOpenSshInteropRobolectricTest.aDefaultSessionSurvivesTenMinutesOfSilence'
+          # A skipped test reads exactly like a passing one in the summary, and this job
+          # exists only to run this test, so an assumption that did not hold is a failure.
+          grep -q 'tests="1" skipped="0"' \
+            app/build/test-results/testDebugUnitTest/TEST-dev.eclipse.ssh.RealOpenSshInteropRobolectricTest.xml
+
+      - name: Stop the OpenSSH sandbox
+        if: always()
+        run: tools/local-sshd.sh clean
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          retention-days: 14
