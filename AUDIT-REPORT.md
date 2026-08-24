@@ -3326,3 +3326,72 @@ it. There is no Files tab to tap until the shell is left, and the way out is Bac
 `BackHandler(enabled = terminalImmersive)` binds to "stop watching this session" rather than to "close the
 app". The test now goes through `onBackPressedDispatcher` and waits for the bar, so it takes the route a user
 takes instead of reaching past the UI for the state it wanted.
+
+## 32. Releasing 1.1.2
+
+Same process as §20, §22, §25, §27 and §30: GitHub Actions assembles from the commit on `main`, this host
+does nothing but re-sign. Workflow run `32739412046` built commit `02aa94e` — the per-session file browser
+and the four off-the-UI-thread writers of §31.
+
+| | |
+| --- | --- |
+| `lintRelease` | **0 errors, 51 warnings** — 44 `GradleDependency`, 4 `ConfigurationScreenWidthHeight`, 2 `AndroidGradlePluginVersion`, 1 `OldTargetApi`: the same 51 as 1.1.0 and 1.1.1, so this round added none |
+| Unit and integration tests | **868 per variant across 69 classes, 0 failures, 0 errors**, on debug *and* release — 10 more tests and 2 more classes than 1.1.1 |
+| Skipped | **7, and exactly the 7 intended** — the long idle matrix behind `ECLIPSE_STRESS=1`. So 861 ran |
+| Instrumentation sources | compiled |
+| APKs | **five**, the five-output count asserted in CI |
+
+The ten new tests are §31's: five pure ones over `fileBrowserHostId` in `FileBrowserHostTest`, and the five
+Robolectric ones in `FilesSessionSwitchRobolectricTest` that drive two live sessions through the switcher.
+
+**Local `--offline` lint reported 4 warnings, CI reported 51, and both are right.** `GradleDependency` and
+`AndroidGradlePluginVersion` ask whether a newer version of a dependency exists, which cannot be answered
+without the network, so `--offline` silently drops all 46 of them. The 4 that survive offline are the
+`ConfigurationScreenWidthHeight` advisories at `MainActivity.kt:1895-1896`. CI is the number to quote.
+
+### 32.1 The five files
+
+| file | bytes | SHA-256 |
+| --- | --- | --- |
+| `EclipseSSH-1.1.2-universal-release.apk` | 5,793,213 | `7f4f6b26033bd0ec2e1eb677ed3be6a0c8ae8fdeef21e1f70ff9d4abdc8156d6` |
+| `EclipseSSH-1.1.2-arm64-v8a-release.apk` | 5,694,389 | `8f99b621bede9deff9462dad095edaa57b065d696218e7fd459c8348d41f0e28` |
+| `EclipseSSH-1.1.2-armeabi-v7a-release.apk` | 5,690,297 | `f259b7a54df4365c6798c382a0a256f32c62b96f3c8a67245f51ba6f1045012d` |
+| `EclipseSSH-1.1.2-x86-release.apk` | 5,694,377 | `eba95690aadcc4e22d4011269ed10d750df1bd6090e3eaeede8c884d8790697a` |
+| `EclipseSSH-1.1.2-x86_64-release.apk` | 5,694,383 | `92818fd050a39882865ee622c8af627a0d91101354dc2fee9fcc5b3b4cf2b703` |
+
+versionCode 10 for all five, signer certificate SHA-256
+`a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e` — the same key as every release since
+1.0.0, so any of these installs straight over 1.1.1. `apksigner verify` reports v3 alone at minSdk 28 and
+v2 as well once asked with `--min-sdk-version 24`, which is §12.8's finding, not a missing signature.
+
+**For the third release running, every file is exactly as long as its predecessor.** Same explanation as
+§30, measured again rather than assumed: the dex grew by 4,772 bytes (5,211,544 → 5,216,316 in the arm64
+file) and the page-aligned padding in front of the uncompressed native libraries absorbed all of it. All
+five SHA-256 sums differ from their 1.1.1 counterparts, and `aapt2 dump badging` reads `versionName='1.1.2'`
+`versionCode='10'` on all five.
+
+### 32.2 What CI verified and what it could not
+
+CI's signature step asserts the output count unconditionally, but its stricter dual-scheme check is guarded
+by `if [ "${{ steps.signing.outputs.signed }}" = "true" ]`. No signing secrets are set on the repository —
+deliberately, per §20 — so the runner signs with the debug key, that guard is false, and the v2+v3
+assertion does not run there. It ran here instead, on all five, after re-signing with the real key: `v3:
+true` at minSdk 28, `v2: true` and `v3: true` at minSdk 24, `zipalign -c 4` clean.
+
+This is the division of labour the release process was built around, and it is worth stating plainly because
+the log looks alarming out of context: the runner's five APKs carry the debug key and report `v3: false`.
+They are build-shape evidence, not artifacts anybody installs. The published five were signed on this host
+with a key that has never been a repository secret and has never entered a runner.
+
+### 32.3 Published and verified
+
+Tag `v1.1.2` (annotated object `574f055`) on `02aa94e`, release
+`https://github.com/maragung/EclipseSSH/releases/tag/v1.1.2`, five assets uploaded. Each was then
+**downloaded back** from `https://api.github.com/repos/maragung/EclipseSSH/releases/assets/<id>` with
+`Accept: application/octet-stream` and its SHA-256 compared against the local signed file: all five
+identical. The same five are served from port 19001, where the arm64 file fetched over HTTP hashes to
+`8f99b621…` as well, and `README.txt` now leads with 1.1.2 as entry 1 of nine.
+
+Signing passwords went to `apksigner` through mode-600 files in a mode-700 directory, shredded by an `EXIT`
+trap; `/proc/<pid>/cmdline` is world-readable on this host, so they were never arguments. No `sign.*`
+directory survived the run.
