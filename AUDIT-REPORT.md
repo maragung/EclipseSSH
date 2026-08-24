@@ -2806,6 +2806,46 @@ number, and the reason to ship the split is that it was asked for and that it co
 block, one CI loop over five outputs instead of one, and no second version code to manage. If a future
 dependency brings real native code, the mechanism is already in place and already verified.
 
+### 27.6 The idle matrix, measured
+
+Run `32697224297` on commit `93f609d` — 1.1.1's tree, §30 — is the first run where the whole class ran:
+`skipped="0"`, which the job checks before it is allowed to pass, so the matrix cannot quietly report
+success by not running. **12 tests, 0 failures, 0 errors, 3,574.9 s** against a real OpenSSH server on one
+runner, `runnervm76f27`; the Gradle step took 3,607 s of the job's 3,640 s, so essentially the whole job is
+the holds themselves.
+
+| test | held | keep-alive | compression |
+| --- | --- | --- | --- |
+| `aSessionSurvivesThirtyMinutesOfSilence` | 1,801.2 s | 30 s (shipped default) | off |
+| `aDefaultSessionSurvivesTenMinutesOfSilence` | 601.3 s | 30 s (shipped default) | off |
+| `aSessionSurvivesFiveMinutesOfSilence` | 301.4 s | 30 s | off |
+| `aCompressedSessionSurvivesFiveMinutesOfSilence` | 301.1 s | 30 s | **on** |
+| `aSessionWithKeepAliveOffSurvivesPastTheDeadlineItWouldHaveHad` | 301.1 s | **off** | off |
+| `aSessionSurvivesOneMinuteOfSilence` | 61.1 s | 30 s | off |
+| `aSessionSurvivesThirtySecondsOfSilence` | 31.5 s | 30 s | off |
+| `aServerThatNeverProbesCannotOutwaitThisClientsOwnHeartbeat` | 97.1 s | 5 s, silent port | off |
+| `aRealOpenSshSessionSurvivesTheMotdTheKeyboardAndItsHeartbeats` | 33.5 s | 5 s | off |
+| `aRealOpenSshServerCannotTimeOutASessionThisClientIsAnswering` | 31.6 s | 600 s — deliberately silent | off |
+| `realFullScreenProgramsPaintThroughThisEmulatorAndGiveTheScreenBack` | 12.8 s | 5 s | off |
+| `realServerOutputWrapsWithoutSplittingATokenApart` | 1.3 s | 5 s | off |
+
+The 600-second row is the inverse test and the interval is the point of it: at the longest interval the
+settings allow, the app sends nothing for the whole hold, so what keeps the session up is its **reply** to
+sshd's own `ClientAliveInterval` probes. A client heartbeat would keep the server's timer from ever expiring
+and the test would prove nothing.
+
+Every hold from five minutes up crosses the app's own idle deadline of `30 * 3 + 60` = 150 s repeatedly, and
+the thirty-minute one crosses it twelve times. What each hold proves is not "it did not crash": the tab is
+sampled throughout and must read `CONNECTED` at every sample; the **server's** log must show exactly one
+authentication for the whole hold, so a session that died and was redialled between two samples fails rather
+than passing as a session that never dropped; the heartbeat count is bounded on both sides from interval ×
+hold, which is §27.4's fix; and after the hold the shell must still answer `echo` with the marker, so the
+session is proved usable rather than merely still labelled up.
+
+The keep-alive-off row is the one that matters most for §26's coupling: **0 heartbeats asserted exactly**, not
+"few", and the session still alive at 301 s — twice the deadline it would have had if switching off the
+chatter had left MINA's idle timer running. Off means off, and off no longer kills the session.
+
 ## 28. The five programs as binaries, and the one that is not on the alternate screen
 
 Section 17.5 tested `top`, `htop`, `vim`, `nano` and `less` as the byte streams they send: the emulator was
@@ -3125,6 +3165,10 @@ the repaint fix of §28, so 1.1.1 carries both.
 | Skipped | **7, and exactly the 7 intended** — the long idle matrix behind `ECLIPSE_STRESS=1`. So 851 ran |
 | Instrumentation sources | compiled |
 | APKs | **five**, all five signatures checked |
+
+The idle matrix is not in this run — a push does not carry it — and ran instead on the dispatched run
+`32697224297`, recorded in §27.6. That run's commit `93f609d` differs from the published `3c08b2e` in
+`AUDIT-REPORT.md` alone, so the matrix measured the code these five files contain.
 
 **Five real-OpenSSH tests now run on every push, not three.** §27 recorded three; `realFullScreenProgramsPaint`
 `ThroughThisEmulatorAndGiveTheScreenBack` and `realServerOutputWrapsWithoutSplittingATokenApart` joined them,
