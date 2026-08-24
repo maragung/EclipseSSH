@@ -48,15 +48,20 @@ class TerminalLayout(
 /**
  * Lays [frame] out for a window [width] columns wide and [maxRows] rows tall.
  *
- * Wrapping is on for ordinary shell output and off on the alternate screen, and that is the whole rule -
- * there is no setting, because there is no answer that suits both. Ordinary output is a stream of
+ * Wrapping is on for output that flowed and off for a screen that was painted, and that is the whole
+ * rule - there is no setting, because there is no answer that suits both. Flowed output is a stream of
  * sentences and paths that the reader wants whole: a URL, a sha256 or a `/very/long/path` printed at 80
  * columns on a phone that fits 46 is currently reachable only by dragging the text sideways, one screen
- * at a time, which is the complaint this exists to answer. The alternate screen is the opposite: `top`,
- * `htop`, `vim`, `nano` and `less` address every cell positionally and draw their own borders, status
+ * at a time, which is the complaint this exists to answer. A painted screen is the opposite: `htop`,
+ * `vim`, `nano`, `less` and `top` address every cell positionally and draw their own borders, status
  * lines and columns to the width they were told they had, so wrapping row 3 into two rows shifts
- * everything below it and the display is simply wrong. There the existing horizontal pan is right, and
- * the frame already reports which mode it is in on every frame.
+ * everything below it and the display is simply wrong. There the existing horizontal pan is right.
+ *
+ * Two flags say "painted", because one of them was not enough. [TerminalFrame.alternateScreen] catches
+ * the four programs that switch screens, and it was originally the whole condition here; probing the
+ * real binaries through a real pty showed that `top` is not one of them - procps repaints the *primary*
+ * screen in place - so the emulator now also reports [TerminalFrame.positionalScreen], and the program
+ * this file's own documentation used as its example of the alternate screen is the reason it exists.
  *
  * A token wider than the window is never broken. It goes on a row of its own, over-wide, and stays
  * reachable by panning - because breaking it is exactly the damage being avoided: a hostname, a hash, a
@@ -65,7 +70,7 @@ class TerminalLayout(
  */
 fun terminalLayout(frame: TerminalFrame, width: Int, maxRows: Int): TerminalLayout {
     if (frame.lines.isEmpty() || maxRows <= 0) return TerminalLayout.EMPTY
-    val wrap = width > 0 && !frame.alternateScreen
+    val wrap = width > 0 && !frame.alternateScreen && !frame.positionalScreen
     val rows = ArrayList<TerminalVisualRow>(frame.lines.size)
     frame.lines.forEachIndexed { index, line ->
         val extent = paintedExtent(frame, index, line)

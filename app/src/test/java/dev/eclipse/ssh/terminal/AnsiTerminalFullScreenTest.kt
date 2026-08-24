@@ -404,6 +404,88 @@ class AnsiTerminalFullScreenTest {
         assertThat(buffer.plainText()).isEmpty()
     }
 
+    // --- Painting in place on the primary screen, which is what `top` actually does ---
+
+    /**
+     * `top` never asks for the alternate screen, and the display has to notice anyway.
+     *
+     * Probed against the real binary through a real pty at 80x12: procps emits `ESC [ H` and rewrites
+     * the screen where it stands, with exactly eleven newlines per frame on a twelve-row screen so that
+     * it never scrolls, and `ESC [ ? 1049 h` appears nowhere in its output. That makes every one of its
+     * rows positional on the *primary* screen - the load averages are on row one because row one is
+     * where they were put - and re-wrapping row three into two rows on a phone whose view is narrower
+     * than the pty would push the rest of its screen down. `alternateScreen` cannot see this, so the
+     * buffer reports an upward cursor move, which is the thing output that flows never does.
+     */
+    @Test
+    fun `homing the cursor to repaint marks the primary screen as painted`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 12, scrollbackLimit = 50)
+        buffer.feed("$ top\n")
+
+        assertThat(buffer.frame().positionalScreen).isFalse()
+
+        // One of top's frames, ending where the real one ends: on the last row, with no newline after
+        // it, which is how it avoids scrolling itself off the screen.
+        buffer.feed("${ESCAPE}[Htop - 09:41:02 up 3 days\n${ESCAPE}[KTasks: 84 total\n")
+        repeat(9) { buffer.feed("${ESCAPE}[Krow $it\n") }
+        buffer.feed("${ESCAPE}[K  PID USER")
+
+        assertThat(buffer.frame().positionalScreen).isTrue()
+        assertThat(buffer.frame().alternateScreen).isFalse()
+    }
+
+    /**
+     * And it has to let go, or wrapping would be off for the rest of the session.
+     *
+     * The release is the opposite tell: output that reaches the bottom row and pushes the screen up is a
+     * stream behaving like one. `top`'s own exit does it - it addresses the row below its display and
+     * newlines - and so does the first screenful of anything after a `clear`, which homes the cursor too
+     * and is the one false positive this rule has.
+     */
+    @Test
+    fun `output that scrolls the screen takes the mark off again`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 4, scrollbackLimit = 50)
+        buffer.feed("one\ntwo\n")
+        buffer.feed("${ESCAPE}[Hpainted")
+
+        assertThat(buffer.frame().positionalScreen).isTrue()
+
+        // Four rows, so the fourth newline is the one that scrolls.
+        buffer.feed("a\nb\nc\nd\n")
+
+        assertThat(buffer.frame().positionalScreen).isFalse()
+    }
+
+    /** Ordinary output is never mistaken for a repaint, however long it runs. */
+    @Test
+    fun `flowing output never marks the screen as painted`() {
+        val buffer = AnsiTerminalBuffer(columns = 40, rows = 6, scrollbackLimit = 50)
+
+        // Colour, erase-to-end-of-line and a carriage return: what a progress bar and a coloured `ls`
+        // send, none of which moves the cursor up a row.
+        repeat(12) { buffer.feed("${ESCAPE}[32mfile $it${ESCAPE}[0m${ESCAPE}[K\n") }
+        buffer.feed("  10%\r  20%\r 100%\n")
+        buffer.feed("${ESCAPE}[2Bdown two${ESCAPE}[4Gcolumn four")
+
+        assertThat(buffer.frame().positionalScreen).isFalse()
+    }
+
+    /** Leaving the alternate screen hands back a primary screen that is the shell's again. */
+    @Test
+    fun `the two screens do not inherit each other's mark`() {
+        val buffer = AnsiTerminalBuffer(columns = 40, rows = 6, scrollbackLimit = 50)
+        buffer.feed("$ vi notes\n")
+        // Homed from the second row, because entering the alternate screen already put the cursor on the
+        // first one and a move to the row it is on is not a move up.
+        buffer.feed("${ESCAPE}[?1049h~ one\n~ two\n${ESCAPE}[H~ file")
+
+        assertThat(buffer.frame().positionalScreen).isTrue()
+
+        buffer.feed("${ESCAPE}[?1049l")
+
+        assertThat(buffer.frame().positionalScreen).isFalse()
+    }
+
     // --- Scrollback ownership: clear must not throw away what the user scrolled back to read ---
 
     @Test

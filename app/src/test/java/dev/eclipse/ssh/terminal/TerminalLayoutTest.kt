@@ -132,7 +132,8 @@ class TerminalLayoutTest {
     }
 
     /**
-     * `top`, `htop`, `vim`, `nano` and `less` are the reason wrapping is not unconditional.
+     * `htop`, `vim`, `nano` and `less` are the reason wrapping is not unconditional. `top` is the reason
+     * one flag was not enough; that case is below.
      *
      * Every cell on the alternate screen is positional: the program drew its header on row 1 and its
      * status line on the last row because it was told how many rows and columns it had. Wrapping one row
@@ -151,6 +152,25 @@ class TerminalLayoutTest {
         // One row per line, so a full-screen program's rows stay where it put them, and the pan extent
         // is the whole line - which is how the rest of it is reached.
         assertThat(alternate.contentColumns).isEqualTo(line.length)
+    }
+
+    /**
+     * The same protection for a screen painted in place, which is the only kind `top` draws.
+     *
+     * Its header row is the case: `top` was in the list above as an example of the alternate screen, and
+     * probing the real binary through a real pty showed it never asks for one - it homes the cursor and
+     * repaints the primary screen. With the shipped default of an eighty-column pty on a phone that
+     * fits about forty-six, every row of it reflowed, so its summary rows moved down the display on
+     * every refresh and a redraw of "row 12" landed somewhere else. The emulator marks such a screen
+     * and this is where the mark is honoured.
+     */
+    @Test
+    fun `a screen painted in place is never wrapped either`() {
+        val line = "  PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND"
+        val painted = layoutOf(listOf(line), width = 40, positionalScreen = true)
+
+        assertThat(painted.rows).containsExactly(TerminalVisualRow(0, 0, line.length))
+        assertThat(painted.contentColumns).isEqualTo(line.length)
     }
 
     @Test
@@ -267,8 +287,16 @@ class TerminalLayoutTest {
     }
 }
 
-private fun layoutOf(lines: List<String>, width: Int, alternateScreen: Boolean = false): TerminalLayout =
-    terminalLayout(frameOf(lines, alternateScreen = alternateScreen), width = width, maxRows = 24)
+private fun layoutOf(
+    lines: List<String>,
+    width: Int,
+    alternateScreen: Boolean = false,
+    positionalScreen: Boolean = false,
+): TerminalLayout = terminalLayout(
+    frameOf(lines, alternateScreen = alternateScreen, positionalScreen = positionalScreen),
+    width = width,
+    maxRows = 24,
+)
 
 /** The text of each visual row, which is what a reader would see. */
 private fun textOf(layout: TerminalLayout, line: String): List<String> =
@@ -281,6 +309,7 @@ private fun frameOf(
     cursorColumn: Int = 0,
     cursorVisible: Boolean = true,
     alternateScreen: Boolean = false,
+    positionalScreen: Boolean = false,
 ): TerminalFrame = cellFrameOf(
     cells = lines.map { text -> (text + " ".repeat((columns - text.length).coerceAtLeast(0))).map { TerminalCell(it) } },
     columns = columns,
@@ -288,6 +317,7 @@ private fun frameOf(
     cursorColumn = cursorColumn,
     cursorVisible = cursorVisible,
     alternateScreen = alternateScreen,
+    positionalScreen = positionalScreen,
 )
 
 /**
@@ -303,6 +333,7 @@ private fun cellFrameOf(
     cursorColumn: Int = 0,
     cursorVisible: Boolean = true,
     alternateScreen: Boolean = false,
+    positionalScreen: Boolean = false,
 ): TerminalFrame = TerminalFrame(
     lines = cells,
     firstLine = 0,
@@ -315,4 +346,5 @@ private fun cellFrameOf(
     cursorVisible = cursorVisible,
     revision = 1,
     alternateScreen = alternateScreen,
+    positionalScreen = positionalScreen,
 )

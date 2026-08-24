@@ -129,6 +129,14 @@ data class TerminalFrame(
     val revision: Long,
     val title: String? = null,
     val alternateScreen: Boolean = false,
+    /**
+     * Whether this frame is a screen a program painted by address on the *primary* screen.
+     *
+     * `top` is why this exists rather than [alternateScreen] being the whole test; the reasoning is on
+     * `AnsiTerminalBuffer`'s own flag of the same name. Like [alternateScreen] it tells the display that
+     * the geometry carries the meaning and that re-wrapping would destroy it.
+     */
+    val positionalScreen: Boolean = false,
     /** DECCKM. Decides whether an arrow key sends `ESC [ A` or `ESC O A`; see [TerminalKeys]. */
     val applicationCursorKeys: Boolean = false,
     /** DECKPAM. Some full-screen apps expect the keypad to send SS3 sequences. */
@@ -187,6 +195,26 @@ class AnsiTerminalBuffer(
      * off to draw a full-width status bar had its last column pushed onto the next row.
      */
     private var wrapPending = false
+
+    /**
+     * Whether the program on the other end is painting this screen by address instead of streaming it.
+     *
+     * The alternate screen was supposed to be the whole answer to "may this frame be re-wrapped", and
+     * it is not, because `top` does not use it: procps homes the cursor with `ESC [ H` and rewrites the
+     * screen in place on the primary one, exactly eleven newlines on a twelve-row screen so that it
+     * never scrolls. A frame like that is a grid whose meaning is its geometry - the load averages are
+     * on row one because row one is where the program put them - so re-wrapping row three into two rows
+     * pushes everything below it down and the reader is looking at a screen the program never drew. On
+     * a phone this is not hypothetical: the pty is eighty columns wide by default, whatever the screen
+     * shows, and the view fits about half that - so every one of `top`'s rows would have reflowed.
+     *
+     * Set by an upward cursor move that a sequence asked for, which is the tell: output that flows only
+     * ever goes down. Cleared when the screen scrolls under flowing output, which is the opposite tell
+     * and is how the flag lets go - `top`'s own exit does it, and so does the first screenful after a
+     * `clear`, which homes the cursor too and is the one false positive this rule has. Wrapping stays
+     * off for that screenful and the reader sees what 1.0.6 showed them; nothing is corrupted by it.
+     */
+    private var positionalScreen = false
 
     private var savedRow = 0
     private var savedColumn = 0
@@ -350,6 +378,7 @@ class AnsiTerminalBuffer(
             revision = revision,
             title = title,
             alternateScreen = primary != null,
+            positionalScreen = positionalScreen,
             applicationCursorKeys = applicationCursorKeys,
             applicationKeypad = applicationKeypad,
             bracketedPaste = bracketedPaste,
@@ -597,16 +626,16 @@ class AnsiTerminalBuffer(
         val private = prefix == '?'
         revision++
         when (final) {
-            'A' -> { setCursorRow(cursorRow - first); wrapPending = false }
-            'B', 'e' -> { setCursorRow(cursorRow + first); wrapPending = false }
+            'A' -> { moveCursorRow(cursorRow - first); wrapPending = false }
+            'B', 'e' -> { moveCursorRow(cursorRow + first); wrapPending = false }
             'C', 'a' -> setCursorColumn(cursorColumn + first)
             'D' -> setCursorColumn(cursorColumn - first)
-            'E' -> { setCursorRow(cursorRow + first); setCursorColumn(0) }
-            'F' -> { setCursorRow(cursorRow - first); setCursorColumn(0) }
+            'E' -> { moveCursorRow(cursorRow + first); setCursorColumn(0) }
+            'F' -> { moveCursorRow(cursorRow - first); setCursorColumn(0) }
             'G', '`' -> setCursorColumn((params.firstOrNull() ?: 1) - 1)
-            'd' -> setScreenRow((params.firstOrNull() ?: 1) - 1)
+            'd' -> addressScreenRow((params.firstOrNull() ?: 1) - 1)
             'H', 'f' -> {
-                setScreenRow((params.getOrNull(0) ?: 1) - 1)
+                addressScreenRow((params.getOrNull(0) ?: 1) - 1)
                 setCursorColumn((params.getOrNull(1) ?: 1) - 1)
             }
             'I' -> tabForward(first)
@@ -700,6 +729,7 @@ class AnsiTerminalBuffer(
         cursorRow = 0
         cursorColumn = 0
         wrapPending = false
+        positionalScreen = false
         topMargin = 0
         bottomMargin = rows - 1
     }
@@ -718,6 +748,7 @@ class AnsiTerminalBuffer(
         cursorRow = saved.cursorRow.coerceIn(0, lines.lastIndex)
         cursorColumn = saved.cursorColumn.coerceIn(0, columns - 1)
         wrapPending = false
+        positionalScreen = false
         if (withCursor) restoreCursor()
     }
 
@@ -832,6 +863,27 @@ class AnsiTerminalBuffer(
      */
     private fun setCursorRow(row: Int) { cursorRow = row.coerceIn(0, lines.lastIndex) }
 
+    /**
+     * A row move a sequence asked for, as opposed to one the output caused.
+     *
+     * Only the sequences a program uses to place its cursor go through here and through
+     * [addressScreenRow]; DECOM, DECSTBM and DECRC call [setCursorRow]/[setScreenRow] directly, because
+     * those move the cursor as a side effect of something else and a shell drawing a two-line prompt
+     * with `ESC 7`/`ESC 8` is not a program painting a screen.
+     */
+    private fun moveCursorRow(row: Int) {
+        val from = cursorRow
+        setCursorRow(row)
+        if (cursorRow < from) positionalScreen = true
+    }
+
+    /** [setScreenRow], recording that a program placed its cursor there. See [moveCursorRow]. */
+    private fun addressScreenRow(row: Int) {
+        val from = cursorRow
+        setScreenRow(row)
+        if (cursorRow < from) positionalScreen = true
+    }
+
     private fun setCursorColumn(column: Int) {
         cursorColumn = column.coerceIn(0, columns - 1)
         wrapPending = false
@@ -944,6 +996,9 @@ class AnsiTerminalBuffer(
     private fun index() {
         val bottom = screenTop() + bottomMargin
         if (cursorRow >= bottom) {
+            // Output has reached the bottom and pushed the screen up, which is a stream behaving like
+            // one: whatever was painted by address is now history and the next line may be wrapped.
+            positionalScreen = false
             scrollRegionUp()
         } else if (cursorRow < lines.lastIndex) {
             cursorRow++
@@ -1100,6 +1155,7 @@ class AnsiTerminalBuffer(
         cursorRow = 0
         cursorColumn = 0
         wrapPending = false
+        positionalScreen = false
         style = TerminalStyle()
         savedStyle = TerminalStyle()
         savedRow = 0

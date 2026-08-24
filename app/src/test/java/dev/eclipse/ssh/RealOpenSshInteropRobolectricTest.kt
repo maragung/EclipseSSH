@@ -6,12 +6,17 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
+import dev.eclipse.ssh.terminal.TerminalLayout
+import dev.eclipse.ssh.terminal.TerminalVisualRow
+import dev.eclipse.ssh.terminal.terminalLayout
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -377,6 +382,183 @@ class RealOpenSshInteropRobolectricTest {
     }
 
     /**
+     * The programs the brief names, as the binaries they are rather than as the bytes they send.
+     *
+     * Section 17 of the audit tested `top`, `htop`, `vim`, `nano` and `less` by feeding the emulator the
+     * sequences those programs use, and said so plainly, because at the time nothing here could run a
+     * login shell: the scripted server is a test double and this host cannot boot an Android image. The
+     * sandbox removed that limit without anybody noticing it had. A real `sshd` runs a real login shell
+     * on a real pty on the loopback, so the programs can simply be started, and what arrives is then
+     * whatever they actually send at this terminal type and this window - including anything the
+     * hand-written sequences got subtly wrong, which is the other half of the reason to do it this way
+     * round as well.
+     *
+     * One session for all five, because handing the screen back is the part worth checking: each program
+     * takes the window, paints it, and returns it, and the shell underneath has to still be there
+     * afterwards. `top` is in the list precisely because it is the one that does *not* use the alternate
+     * screen - procps clears and repaints in place - so it is the case the wrapping rule cannot key off
+     * that flag to protect. What is asserted for it here is only what is true of it: it paints, the
+     * shell comes back, and the session never flickers.
+     *
+     * Skipped rather than failed for a program the image does not have: which binaries exist is the
+     * runner's business, not this app's.
+     */
+    @Test
+    fun realFullScreenProgramsPaintThroughThisEmulatorAndGiveTheScreenBack() {
+        val sandbox = sandbox()
+        assumeTrue("no local sshd sandbox: run tools/local-sshd.sh start", sandbox != null)
+        val port = File(sandbox, "port").readText().trim().toInt()
+        assumeTrue("local sshd sandbox is not listening on $port", listening(port))
+
+        val viewModel = viewModel()
+        val saved = logInWithAShell("real-openssh-fullscreen", sandbox!!, port)
+        // The pty the app asks for on a phone: 80 columns whatever the screen fits, which is
+        // `AppSettings.terminalMinColumns` and the reason a full-screen program's rows are wider than
+        // the view they are drawn into.
+        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, PHONE_COLUMNS, PHONE_ROWS) }
+
+        // Text of this test's own, wide enough that a phone-width view has to do something about it,
+        // rather than whatever this machine happens to keep in /etc.
+        val paged = File(sandbox, "pager.txt")
+        paged.writeText((1..PAGER_LINES).joinToString("\n") { "$PAGER_MARKER line $it " + "=".repeat(50) } + "\n")
+
+        val ran = mutableListOf<String>()
+
+        // A pager: alternate screen up, the file painted into it, the shell's screen back on `q`.
+        onPath("less")?.let { less ->
+            runFullScreenProgram(
+                hostId = saved.id,
+                command = "$less ${paged.absolutePath}",
+                paints = PAGER_MARKER,
+                alternateScreen = true,
+                quit = { compose.runOnUiThread { viewModel.sendText(saved.id, "q") } },
+            )
+            ran += "less"
+        }
+
+        // An editor. `vi` here is Vim, which is what the brief's `vim` is on a Debian-family image -
+        // and `vim` by that name too, for an image that installs the binary without the alternatives
+        // symlink, since the requirement below is an editor rather than a particular spelling of one.
+        (onPath("vi") ?: onPath("vim"))?.let { vi ->
+            runFullScreenProgram(
+                hostId = saved.id,
+                command = "$vi ${paged.absolutePath}",
+                paints = PAGER_MARKER,
+                alternateScreen = true,
+                quit = {
+                    compose.runOnUiThread { viewModel.sendText(saved.id, ":q!") }
+                    compose.runOnUiThread { viewModel.sendKey(saved.id, TerminalKey.ENTER) }
+                },
+            )
+            ran += "vi"
+        }
+
+        // The other editor, and the only one of the five quit by a control chord rather than a letter -
+        // so this is also the shortcut bar's Ctrl row reaching a real program through a real pty.
+        onPath("nano")?.let { nano ->
+            runFullScreenProgram(
+                hostId = saved.id,
+                command = "$nano ${paged.absolutePath}",
+                paints = "GNU nano",
+                alternateScreen = true,
+                quit = { compose.runOnUiThread { viewModel.sendChar(saved.id, 'x', ctrl = true) } },
+            )
+            ran += "nano"
+        }
+
+        // procps `top`: no alternate screen, a full repaint every interval instead. `-d 9` so it paints
+        // once and then waits, because this host shares two cores with other tenants.
+        onPath("top")?.let { top ->
+            runFullScreenProgram(
+                hostId = saved.id,
+                command = "$top -d 9",
+                paints = "Tasks:",
+                alternateScreen = false,
+                quit = { compose.runOnUiThread { viewModel.sendText(saved.id, "q") } },
+            )
+            ran += "top"
+        }
+
+        // And ncurses' own: alternate screen, meters, and a function-key bar.
+        onPath("htop")?.let { htop ->
+            runFullScreenProgram(
+                hostId = saved.id,
+                command = "$htop -d 100",
+                paints = "Tasks:",
+                alternateScreen = true,
+                quit = { compose.runOnUiThread { viewModel.sendText(saved.id, "q") } },
+            )
+            ran += "htop"
+        }
+
+        // A pager and an editor at the least, or this test passed without testing anything.
+        check(ran.containsAll(listOf("less", "vi"))) {
+            "this image has neither a pager nor an editor to run: found $ran"
+        }
+        assertThat(tabFor(saved.id)?.lastError).isNull()
+        // Five programs, five alternate-screen switches, and one connection underneath all of it.
+        assertNothingLookedLikeADrop(saved.id)
+    }
+
+    /**
+     * Real output from real programs, wrapped by the display and never through a token.
+     *
+     * The wrapping tests under `terminal/` are pure functions over frames this suite builds, which is
+     * the right way to test the rule and no way at all to test the assumption underneath it: that what a
+     * server actually sends looks like what those tests assume. Here the URL is echoed by the sandbox's
+     * own shell, the hash is produced by the sandbox's own `sha256sum`, and both travel the whole path -
+     * pty, transport, decoder, emulator, layout - before anything is asserted about where the line was
+     * broken.
+     *
+     * The width is the interesting part: the pty is 80 columns because that is what
+     * `AppSettings.terminalMinColumns` gives it, and the view is [NARROW_COLUMNS], which is roughly what
+     * a phone fits. Every one of these tokens is longer than the view and shorter than the pty, so the
+     * server sends it whole and the display is the only thing that could break it.
+     */
+    @Test
+    fun realServerOutputWrapsWithoutSplittingATokenApart() {
+        val sandbox = sandbox()
+        assumeTrue("no local sshd sandbox: run tools/local-sshd.sh start", sandbox != null)
+        val port = File(sandbox, "port").readText().trim().toInt()
+        assumeTrue("local sshd sandbox is not listening on $port", listening(port))
+
+        val viewModel = viewModel()
+        val saved = logInWithAShell("real-openssh-wrapping", sandbox!!, port)
+        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, PHONE_COLUMNS, PHONE_ROWS) }
+
+        // A URL and a path, which is what the complaint that started this was about: reachable only by
+        // dragging the text sideways, and unreadable if broken at column 46.
+        echoAndAssertWhole(saved.id, "https://mirror.example.invalid/pool/e/eclipsessh_1.1.0_arm64.deb")
+        echoAndAssertWhole(saved.id, "/usr/lib/jvm/temurin-17-jdk-amd64/lib/security/cacerts.2026-08-24")
+        // Quoted, because an unquoted brace is the shell's to expand and this is meant to arrive as JSON.
+        //
+        // A blob is not a token, and asking for it whole was this test's own mistake before it was
+        // anything else. `{`, `}`, `,` and `"` are deliberately not word characters - long-pressing a
+        // value in a line like this gives the value, not the line - so a 58-column blob in a 46-column
+        // view is broken, after `22022`, at the comma, which is where a reader would break it too. What
+        // must survive is every key and every value: a hostname, a port or a boolean cut in half reads as
+        // a different value, and a reader cannot tell that cut from one the server sent.
+        echoAndAssertWhole(
+            hostId = saved.id,
+            token = """{"host":"eclipse.example.invalid","port":22022,"pty":true}""",
+            typed = """echo '{"host":"eclipse.example.invalid","port":22022,"pty":true}'""",
+            whole = listOf(""""host"""", """"eclipse.example.invalid"""", "22022", """"pty"""", "true"),
+        )
+
+        // Not a token this test invented: a real digest from a real program, which is the case where a
+        // break is worst - two halves of a hash are indistinguishable from a different hash.
+        compose.runOnUiThread { viewModel.sendText(saved.id, "sha256sum ${File(sandbox, "port").absolutePath}") }
+        compose.runOnUiThread { viewModel.sendKey(saved.id, TerminalKey.ENTER) }
+        pumpUntil(describe = { "sha256sum printed no digest. " + diagnose(saved.id) }) {
+            SHA256.containsMatchIn(drawn(saved.id))
+        }
+        assertWholeOnOneVisualRow(saved.id, SHA256.find(drawn(saved.id))!!.value)
+
+        assertThat(tabFor(saved.id)?.lastError).isNull()
+        assertNothingLookedLikeADrop(saved.id)
+    }
+
+    /**
      * Ten minutes of a genuinely idle session, at the settings a real install actually uses.
      *
      * The other tests compress the keep-alive to five seconds so that three strikes fit inside a test's
@@ -655,6 +837,226 @@ class RealOpenSshInteropRobolectricTest {
         append("\nframe:\n").append(drawn(hostId))
     }
 
+    /**
+     * Saves a host, trusts the sandbox's key, connects, and waits for a shell with output in it.
+     *
+     * The two terminal tests need the same four things and neither is about how they happen - the tests
+     * above cover that in detail, including what the first, untrusted attempt reports. Returns the saved
+     * profile because the id the app stored is what addresses the session.
+     */
+    private fun logInWithAShell(id: String, sandbox: File, port: Int): HostProfile {
+        val viewModel = viewModel()
+        val profile = HostProfile(
+            id = id,
+            name = id,
+            host = LOOPBACK,
+            username = File(sandbox, "user").readText().trim(),
+            port = port,
+            authMethod = AuthMethod.SSH_KEY,
+            connectTimeoutSeconds = 60,
+            keepAliveSeconds = KEEP_ALIVE_SECONDS,
+            // Off, so the only channel on this session is the one the terminal is on: an SFTP channel
+            // opening underneath a full-screen program is a second thing to explain in a failure.
+            autoLoginSftp = false,
+        )
+        compose.runOnUiThread { viewModel.saveHost(profile) }
+        pumpUntil(describe = { "the host was never saved" }) {
+            viewModel.uiState.value.hosts.any { it.id == profile.id }
+        }
+        val saved = viewModel.uiState.value.hosts.first { it.id == profile.id }
+        val key = File(sandbox, "client_ed25519").readBytes()
+        compose.runOnUiThread { viewModel.connect(saved, keyBytes = key) }
+        pumpUntil(describe = { "the session never connected. " + diagnose(saved.id) }) {
+            if (viewModel.uiState.value.hostKeyChallenge != null) {
+                compose.runOnUiThread { viewModel.acceptHostKey() }
+                restartStateTrace(saved.id)
+            }
+            tabFor(saved.id)?.state == SessionConnectionState.CONNECTED
+        }
+        pumpUntil(describe = { "the shell never took the window. " + diagnose(saved.id) }) {
+            compose.onAllNodesWithContentDescription("Terminal input").fetchSemanticsNodes().isNotEmpty()
+        }
+        pumpUntil(describe = { "the login shell printed nothing. " + diagnose(saved.id) }) {
+            drawn(saved.id).isNotBlank()
+        }
+        return saved
+    }
+
+    /**
+     * Runs [command], waits for it to paint [paints], checks the screen it painted, and quits it.
+     *
+     * Two things are asserted about the painting itself. The screen mode has to be the one the program
+     * actually uses - `true` for anything built on the alternate screen, `false` for `top`, and getting
+     * that wrong in either direction is a bug in the emulator's handling of `1049` rather than a detail.
+     * And while a program owns the alternate screen, the layout has to hand back one visual row per grid
+     * row: those rows are positional, the program drew its own borders and columns to the width it was
+     * told it had, and reflowing row 3 into two rows moves everything below it. The rows here are wider
+     * than [NARROW_COLUMNS] - checked, not assumed, because an assertion that nothing was wrapped proves
+     * nothing about a screen with nothing wide enough to wrap.
+     *
+     * Then the program is quit and the shell has to answer for itself, which is the other half of the
+     * claim: a full-screen program is something a session comes back from.
+     */
+    private fun runFullScreenProgram(
+        hostId: String,
+        command: String,
+        paints: String,
+        alternateScreen: Boolean,
+        quit: () -> Unit,
+    ) {
+        val viewModel = viewModel()
+        val program = command.substringAfterLast('/').substringBefore(' ')
+        compose.runOnUiThread { viewModel.sendText(hostId, command) }
+        compose.runOnUiThread { viewModel.sendKey(hostId, TerminalKey.ENTER) }
+        pumpUntil(describe = { "`$command` never painted \"$paints\". " + diagnose(hostId) }) {
+            val frame = frame(hostId)
+            drawn(hostId).contains(paints) &&
+                frame.alternateScreen == alternateScreen &&
+                (frame.alternateScreen || frame.positionalScreen)
+        }
+
+        val painted = frame(hostId)
+        assertThat(painted.alternateScreen).isEqualTo(alternateScreen)
+        val widest = visualRows(painted, painted.columns).maxOf { it.trimEnd().length }
+        check(widest > NARROW_COLUMNS) {
+            "$program painted nothing wider than the $NARROW_COLUMNS-column view, so this proves " +
+                "nothing about wrapping: widest row is $widest columns. " + diagnose(hostId)
+        }
+        // Whichever way the program took the screen, the display leaves it alone: one visual row per grid
+        // row, every one of them starting at column zero, in a view narrower than the pty. Not gated on
+        // the alternate screen, because `top` never asks for one - it homes the cursor and repaints the
+        // primary screen, and until the emulator marked that, this narrow layout reflowed every row of
+        // it in the configuration a phone actually ships with.
+        assertThat(painted.alternateScreen || painted.positionalScreen).isTrue()
+        val layout = layoutOf(painted, NARROW_COLUMNS)
+        assertThat(layout.rows.map { it.line }).isEqualTo(painted.lines.indices.toList())
+        assertThat(layout.rows.filter { it.from != 0 }).isEmpty()
+
+        quit()
+        val marker = "$AFTER_MARKER_PREFIX-$program"
+        // The shell answering and *both* marks coming off, in one wait. Both, because a mark that stuck
+        // would leave word wrapping off for the rest of the session, and `top` is the program that would
+        // do it - it is on the primary screen the whole time, so nothing switches back on its behalf and
+        // only flowing output releases it. Asked for after the echo rather than before it precisely
+        // because that output is the release: a restored screen is a full one, so the answer scrolls it.
+        //
+        // Typed again on every retry rather than once, because a program that is exiting can eat what is
+        // typed at it - and one of these does. Probed on this machine through a real pty, with `q` and
+        // the command written as one chunk: `less` runs the command, `top` never sees it. procps restores
+        // the terminal it borrowed with a flush, so input already in the buffer is discarded, and how
+        // much of it is there depends on how long procps takes to get out - which on a host sharing two
+        // cores is long enough. Retrying is what a person does when a keystroke vanishes into a
+        // program's exit, and it weakens nothing: the shell still has to run the command, and both marks
+        // still have to come off before this returns.
+        pumpUntilTyping(
+            describe = { "$program did not hand the screen back to a shell. " + diagnose(hostId) },
+            type = {
+                compose.runOnUiThread { viewModel.sendText(hostId, "echo $marker") }
+                compose.runOnUiThread { viewModel.sendKey(hostId, TerminalKey.ENTER) }
+            },
+        ) {
+            drawn(hostId).lineSequence().any { it.trimEnd() == marker } &&
+                frame(hostId).let { !it.alternateScreen && !it.positionalScreen }
+        }
+    }
+
+    /**
+     * Types `echo [typed]`, waits for [token] to be printed, and checks [whole] survived the display.
+     *
+     * [whole] defaults to [token] itself, which is the case for anything that is one token - a URL, a
+     * path, a digest. A line made of several tokens passes its own pieces instead, because the display is
+     * allowed to break such a line and only promises not to break through what it is made of.
+     */
+    private fun echoAndAssertWhole(
+        hostId: String,
+        token: String,
+        typed: String = "echo $token",
+        whole: List<String> = listOf(token),
+    ) {
+        val viewModel = viewModel()
+        compose.runOnUiThread { viewModel.sendText(hostId, typed) }
+        compose.runOnUiThread { viewModel.sendKey(hostId, TerminalKey.ENTER) }
+        // Waits for the line the shell *printed* - a row that is nothing but the token - and not for two
+        // copies of the token, which is what this asked for first and is not something a terminal owes
+        // it. The echoed copy of what was typed is preceded by the prompt, and prompt plus command is
+        // longer than the pty is wide, so the pty hard-wraps the echo and the token arrives split across
+        // two grid rows. That split belongs to the terminal, at the pty's width, and is not the wrap
+        // layer's to undo; the row the shell printed starts at column zero and is what this is about.
+        pumpUntil(describe = { "the shell never printed $token on a line of its own. " + diagnose(hostId) }) {
+            drawn(hostId).lineSequence().any { it.trimEnd() == token }
+        }
+        assertWholeOnOneVisualRow(hostId, token, whole)
+    }
+
+    /**
+     * Asserts every piece of [whole] survives on one visual row of the line the server printed [token] on,
+     * in a [NARROW_COLUMNS]-wide view that is demonstrably wrapping.
+     *
+     * Anchored on that one line rather than on the screen, because the screen holds a second, broken copy
+     * of every token here: the command was echoed by the pty at its own eighty columns, prompt included,
+     * and that copy is not the display's doing and not what is being asked about. The last assertion is
+     * what stops the rest from being vacuous - a layout that wrapped nothing at all would keep every token
+     * whole and would also be the bug this feature exists to fix.
+     */
+    private fun assertWholeOnOneVisualRow(hostId: String, token: String, whole: List<String> = listOf(token)) {
+        val painted = frame(hostId)
+        val printed = painted.lines.indices.firstOrNull { gridText(painted, it).contains(token) }
+        checkNotNull(printed) { "the server's own copy of $token left the screen. " + diagnose(hostId) }
+        val layout = layoutOf(painted, NARROW_COLUMNS)
+        val rows = layout.rows.filter { it.line == printed }.map { textOf(painted, it) }
+        for (piece in whole) {
+            assertWithMessage(
+                "the $NARROW_COLUMNS-column display broke $piece apart; the line it printed lays out as\n" +
+                    rows.joinToString(separator = "\n") { "|$it|" },
+            ).that(rows.filter { it.contains(piece) }).isNotEmpty()
+        }
+        assertThat(layout.rows.groupBy { it.line }.values.filter { it.size > 1 }).isNotEmpty()
+    }
+
+    /**
+     * Every row [frame] lays out at [width], however many that is.
+     *
+     * Deliberately not the view's row budget. Wrapping turns twelve grid rows into about twenty at this
+     * width and the layout is bottom-anchored, exactly as a terminal should be - so asking for twelve
+     * back drops the earliest of them, and which ones survive depends on where the shell happened to be
+     * when the frame was sampled. That made a flake out of an assertion that is not about scrolling: the
+     * question here is whether the display *breaks* a token, not whether that token is on screen this
+     * frame.
+     */
+    private fun layoutOf(frame: TerminalFrame, width: Int): TerminalLayout =
+        terminalLayout(frame, width = width, maxRows = Int.MAX_VALUE)
+
+    /** The frame as the view would lay it out at [width] columns, one string per drawn row. */
+    private fun visualRows(frame: TerminalFrame, width: Int): List<String> =
+        layoutOf(frame, width).rows.map { textOf(frame, it) }
+
+    /** The characters [row] paints, which is the substring of its line the view would draw. */
+    private fun textOf(frame: TerminalFrame, row: TerminalVisualRow): String {
+        val line = frame.lines[row.line]
+        val to = row.to.coerceAtMost(line.size)
+        return if (row.from >= to) "" else line.subList(row.from, to).joinToString("") { it.value.toString() }
+    }
+
+    /** Line [index] of [frame] as one string, trailing blanks and all. */
+    private fun gridText(frame: TerminalFrame, index: Int): String =
+        frame.lines[index].joinToString(separator = "") { it.value.toString() }
+
+    private fun frame(hostId: String): TerminalFrame =
+        viewModel().frames.value[hostId] ?: TerminalFrame.EMPTY
+
+    /**
+     * The absolute path of [program] on this machine, or null when the image does not have it.
+     *
+     * The sandbox is this machine, so the JVM's own PATH is a fair place to look - and the command is
+     * built from the absolute path it finds, so what the login shell has in *its* PATH cannot change
+     * which binary runs or make the test fail for a reason that has nothing to do with the app.
+     */
+    private fun onPath(program: String): String? =
+        System.getenv("PATH").orEmpty().split(File.pathSeparatorChar)
+            .map { File(it, program) }
+            .firstOrNull { it.canExecute() }
+            ?.absolutePath
+
     /** Idles the looper for [ms] without waiting for anything in particular. */
     private fun pumpFor(ms: Long) {
         val deadline = System.nanoTime() + ms * 1_000_000
@@ -669,6 +1071,39 @@ class RealOpenSshInteropRobolectricTest {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
         sampleStates()
         while (System.nanoTime() < deadline && !condition()) {
+            Snapshot.sendApplyNotifications()
+            compose.mainClock.advanceTimeByFrame()
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
+            sampleStates()
+        }
+        sampleStates()
+        check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /**
+     * [pumpUntil], for a wait whose input can be lost rather than merely late.
+     *
+     * [type] runs immediately and then again every [retryMs] until [condition] holds. That is for the
+     * one case in this suite where sending once is not enough: a program that is exiting can discard
+     * what has already been typed at it, so the first send can land in a buffer nobody will read.
+     * Only the sending repeats - the condition is whatever the caller asked for, and still has to be
+     * satisfied by the server.
+     */
+    private fun pumpUntilTyping(
+        timeoutMs: Long = SSH_TIMEOUT_MS,
+        retryMs: Long = RETYPE_MS,
+        describe: () -> String,
+        type: () -> Unit,
+        condition: () -> Boolean,
+    ) {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000
+        var nextType = System.nanoTime()
+        sampleStates()
+        while (System.nanoTime() < deadline && !condition()) {
+            if (System.nanoTime() >= nextType) {
+                type()
+                nextType = System.nanoTime() + retryMs * 1_000_000
+            }
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
@@ -772,6 +1207,25 @@ class RealOpenSshInteropRobolectricTest {
 
         /** Coarse on purpose: this suite shares two cores, and a spin loop here would take one. */
         const val IDLE_STEP_MS = 100L
+
+        /** Wide enough that a phone-width view has to wrap it, narrow enough for an 80-column pty. */
+        const val PAGER_MARKER = "eclipse-pager"
+        const val PAGER_LINES = 40
+
+        /** Roughly what a phone fits of legible monospace, and what the view is when the pty is 80. */
+        const val NARROW_COLUMNS = 46
+
+        const val AFTER_MARKER_PREFIX = "eclipse-after"
+
+        /**
+         * How long [pumpUntilTyping] waits before typing again. Long enough that a shell which did get
+         * the command is answering, not being interrupted; short enough that several attempts fit in
+         * [SSH_TIMEOUT_MS] on a host where a program can take seconds to finish exiting.
+         */
+        const val RETYPE_MS = 3_000L
+
+        /** A digest as `sha256sum` prints one. */
+        val SHA256 = Regex("[0-9a-f]{64}")
 
         /** How long the close futures get after the last tab has gone. */
         const val CLOSE_SETTLE_MS = 500L

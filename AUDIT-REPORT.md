@@ -1584,7 +1584,9 @@ scripted shell is a test double rather than a login shell. What is asserted is t
 the exact sequences those programs use: in-place repaint, the alternate screen with a hidden cursor,
 `DECSTBM` with `ESC D` and `ESC M`, `DECCKM` arrows, 256-colour and true-colour SGR, and rewriting a row
 without an erase. The 10-minute idle case is likewise tested as four keep-alive periods against a server
-that counts the keep-alives it received, rather than by waiting ten minutes.
+that counts the keep-alives it received, rather than by waiting ten minutes. **Superseded in §28**, which
+runs all five as the real binaries through a real pty on a real `sshd` and found that one of the
+assumptions in this paragraph was wrong.
 
 ## 18. Releasing 1.0.3
 
@@ -2803,3 +2805,138 @@ up to a 16 KiB page boundary: dropping three ABIs drops six alignment gaps with 
 number, and the reason to ship the split is that it was asked for and that it costs nothing — one `splits`
 block, one CI loop over five outputs instead of one, and no second version code to manage. If a future
 dependency brings real native code, the mechanism is already in place and already verified.
+
+## 28. The five programs as binaries, and the one that is not on the alternate screen
+
+Section 17.5 tested `top`, `htop`, `vim`, `nano` and `less` as the byte streams they send: the emulator was
+fed the exact sequences those programs use, which is a fair test of a parser and no test at all of the
+assumption underneath it. This section runs the binaries. Two new tests log into the local `sshd` sandbox
+over the app's own transport, take a real pty, and drive real programs through it, and one of them found
+that a claim this report has been making since 17.5 is wrong.
+
+### 28.1 What runs
+
+`realFullScreenProgramsPaintThroughThisEmulatorAndGiveTheScreenBack` (17.6 s measured) runs `less` over a
+forty-line file, `vi`, `nano`, `top -d 9` and `htop -d 100`, each by the absolute path it is found at on
+this machine so the login shell's own `PATH` cannot change which binary runs, and each skipped
+individually if the image does not have it — with `less` and `vi` required, so the test cannot quietly
+become a no-op. For every one of them it asserts that the program painted something wider than a phone's
+view, that the display did not re-wrap what it painted, that quitting gives the screen back, and that the
+shell answers afterwards on the same session.
+
+`realServerOutputWrapsWithoutSplittingATokenApart` (12.9 s measured) is the other half: a 64-character URL, a
+65-character path, a 58-character JSON blob and a real 64-character `sha256sum` digest, each printed by the
+server and each asserted to reach a 46-column view without the display breaking through a token — the URL,
+the path and the digest whole on one visual row, the blob broken only between its values — with the layout
+also asserted to have wrapped *something*, because a display that wrapped nothing would satisfy the first
+half and be the bug. §28.4 is what those assertions cost to get right.
+
+### 28.2 `top` does not use the alternate screen
+
+Probed against the real binary through a bare pty at 80x12, outside the app entirely:
+
+| Program | `ESC [ ? 1049 h` | How it paints |
+| --- | --- | --- |
+| `less`, `vi`, `nano`, `htop` | sent | alternate screen |
+| `top` | **never sent** | `ESC [ H` and rewrites the primary screen in place |
+
+Four refreshes of `top` produced four `ESC [ H` sequences, one `ESC [ ? 25 l`, no `1049`, and **exactly
+eleven newlines per frame on a twelve-row screen** — procps is careful never to newline off its own last
+row, so the screen never scrolls. Its exit sequence is `ESC [ 13 ; 1 H` followed by a newline, which does.
+
+That matters because the wrap rule shipped in 1.1.0 was `!frame.alternateScreen`, and this file's own
+documentation named `top` as an example of the alternate screen. It is not one, so in the configuration a
+phone actually ships with — an eighty-column pty, `terminalMinColumns` at 80, a view that fits about
+forty-six — every row of `top` was being re-wrapped: twelve positional rows became twenty visual ones,
+bottom-anchored, so its summary block was pushed off the top of the view and moved again on every refresh.
+`less`, `vi`, `nano` and `htop` were never affected. The bug was in the one program whose name was being
+used to justify the rule.
+
+### 28.3 The mark, and how it lets go
+
+`AnsiTerminalBuffer` now reports a second flag, `positionalScreen`, and `terminalLayout` suppresses
+wrapping for either it or `alternateScreen`.
+
+* **Set** by an upward row move that a sequence asked for — `CUU`, `CPL`, `VPA`, `CUP`/`HVP` — because
+  output that flows only ever goes down. `DECOM`, `DECSTBM` and `DECRC` move the cursor as a side effect of
+  something else and deliberately do not set it: a shell drawing a two-line prompt with `ESC 7`/`ESC 8` is
+  not a program painting a screen.
+* **Cleared** when output reaches the bottom row and scrolls the screen, which is the opposite tell and is
+  a stream behaving like one. `top`'s own exit does exactly that, so the mark cannot outlive the program.
+  Both screen switches and both resets clear it too, so neither screen inherits the other's mode.
+* **One false positive, stated plainly:** `clear` homes the cursor as well, so wrapping is off for the
+  screenful that follows it and comes back with the first scroll. That screenful looks the way 1.0.6 looked
+  — pannable, not corrupted — and on a twelve-row phone screen it lasts twelve lines of output.
+
+A per-line flag would have no false positive at all, and was not chosen: it needs line metadata carried
+through resize, scroll and history trimming, and a visual row that can span two grid lines, which is the
+one thing selection and copy coordinates depend on not happening. Four emulator tests pin the set and
+clear rules, one layout test pins the suppression, and the interop test above now asserts the mark on a
+real `top`, no reflow of it at 46 columns, and that both marks come off when it exits.
+
+### 28.4 What the wrap test asked for, and did not get
+
+The token test failed first time, and the app was right and the test was wrong. It waited for **two**
+contiguous copies of each token — the echo of what was typed, then the shell's output — and got one. The
+prompt on this sandbox is 28 columns wide, so `prompt + echo + a 65-character path` is longer than the pty,
+and the pty hard-wraps the echoed copy at column 80 exactly as a desktop terminal does. That split belongs
+to the terminal, at the pty's width, and is not the wrap layer's to undo: the emulator keeps no
+continuation flag, so two grid rows that were one logical line cannot be rejoined by the display — the same
+reason a desktop terminal shows the same split until something reflows it. The test now waits for the row
+the shell printed, which starts at column zero and is what the assertion was about.
+
+So the guarantee is exact rather than absolute: **a token the server prints on a line of its own is never
+broken by the display, at any view width.** A token the *pty* has already broken at its own width arrives
+broken, and no display layer above it can tell.
+
+The same test found one more thing about itself, worth writing down because it is a property of the
+feature and not of the test: wrapping costs rows. Twelve grid rows of eighty-column output become about
+twenty visual rows at 46, and the layout is bottom-anchored like any terminal, so a view with twelve rows
+to spend shows the last twelve of the twenty. The assertion had been asking the layout for the frame's own
+row count back, which quietly dropped the earliest wrapped rows and made which ones survived depend on
+where the shell happened to be when the frame was sampled — a flake in an assertion that is not about
+scrolling at all. It now lays out every row and asks only whether the token was broken.
+
+Then it failed a third time, on the JSON line, and again the test was the thing that was wrong — this time
+about what the feature promises. `{"host":"eclipse.example.invalid","port":22022,"pty":true}` is 58 columns
+in a 46-column view, and it is **not one token**: `{`, `}`, `,` and `"` are deliberately absent from the
+word set that `TerminalSelection.isWordCharacter` defines and the wrap rule shares, so the display breaks
+the line after `22022`, at the comma — which is where a reader would break it too. Every key and every
+value survives whole on one row. Asking for the blob itself on one row would have meant adding the quote
+and the comma to the word set, which is not a wrapping change at all: it would mean that long-pressing a
+value in a JSON line selected the whole line instead of the value. The feature is right and the assertion
+was over-stated; it now names the pieces that must survive — `"host"`, `"eclipse.example.invalid"`,
+`22022`, `"pty"`, `true` — and checks them against the visual rows of the one line the server printed,
+rather than against the whole screen, which also holds the pty's own broken copy of every token typed.
+
+The claim in this section's second paragraph therefore has one word doing a lot of work, and it is the
+right word: a **token** the server prints on a line of its own is never broken. A *line* of several tokens
+is broken between them, on purpose, and that is the difference between wrapping and damage.
+
+### 28.5 A program that eats what you type at it while it leaves
+
+The same test then failed in a full-suite run, and this time nothing in the app was wrong. `top` painted,
+the shell's prompt came back on the last row — and the marker typed straight after `q` was nowhere, for
+ninety seconds. It had passed on its own many times; it failed on a host whose process table read
+`2926 total, 2661 zombie`, with 216 MiB free. Load changing an outcome usually means a timeout is too
+short. Here it meant something else.
+
+Probed directly rather than guessed at, with a real pty — `pty.fork()`, `bash --norc --noprofile -i`,
+the program started, its paint waited for, then the quit key and `echo FLUSHPROBE-OK\n` written as **one**
+chunk so both are in the pty buffer before the program can react:
+
+| program | painted | ran the command typed with its quit key |
+| --- | --- | --- |
+| `top` | yes | **no** |
+| `less` | yes | yes |
+
+procps restores the terminal it borrowed with a flushing `tcsetattr`, so whatever is still in the input
+buffer when it exits is discarded — and how much is in there depends on how long procps takes to get out,
+which on two shared cores is long enough to swallow a keystroke the app sent milliseconds after `q`. `less`
+restores without the flush and runs the command. This is not the app's behaviour and not the emulator's; it
+is what a desktop terminal does too, and a person meeting it types the command again.
+
+So the wait now types again every three seconds until the shell answers, and nothing else about it moved:
+the shell still has to run the command, and both the alternate-screen and positional-screen marks still
+have to come off before the test returns. A retry loop around a *send* is honest; the same loop around an
+*assertion* would not have been, which is the line this fix stays on the right side of.
