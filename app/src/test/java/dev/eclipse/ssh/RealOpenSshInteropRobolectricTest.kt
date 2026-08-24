@@ -265,6 +265,7 @@ class RealOpenSshInteropRobolectricTest {
             drawn(saved.id).contains(SERVER_PROBE_MARKER)
         }
         assertThat(tabFor(saved.id)?.lastError).isNull()
+        assertNothingLookedLikeADrop(saved.id)
     }
 
     /**
@@ -372,6 +373,7 @@ class RealOpenSshInteropRobolectricTest {
             drawn(saved.id).contains(SILENT_SERVER_MARKER)
         }
         assertThat(tabFor(saved.id)?.lastError).isNull()
+        assertNothingLookedLikeADrop(saved.id)
     }
 
     /**
@@ -566,8 +568,24 @@ class RealOpenSshInteropRobolectricTest {
 
         val probes = clientProbes(log, logOffset)
         if (keepAliveEnabled) {
-            // The heartbeat must have been the traffic keeping it up, at roughly the configured rate.
-            assertThat(probes).isAtLeast(MIN_CLIENT_PROBES)
+            // What "roughly the configured rate" means has to come from the interval and the hold, and
+            // cannot be a constant: this matrix runs a thirty-second hold and a half-hour one at the
+            // same thirty-second interval, and the short one has room for exactly one heartbeat. A fixed
+            // floor of two therefore asked the app to beat twice as fast as it had been told to, and it
+            // passed anyway - because a session an earlier test had left open was beating into this
+            // window and being counted here. [closeEverySession] stopped that, and the assertion it had
+            // been propping up failed on the next run, which is the honest order of events.
+            val interval = viewModel.uiState.value.settings.keepAliveSeconds
+            val allowed = (holdMs / 1000) / (keepAliveSeconds ?: interval)
+            // Half of what the window allows, because MINA's timer restarts on traffic and a shared
+            // runner may lose a beat, and only when there is room for two: below that the count says
+            // nothing about the rate in either direction.
+            if (allowed >= 2) assertThat(probes).isAtLeast((allowed / 2).toInt())
+            // Bounded above as well, because an interval is a promise in both directions. A client
+            // beating ten times as often as it was asked to would hold every session up and satisfy
+            // every assertion above this one, while costing a metered connection real money and waking
+            // the radio on a phone that was trying to sleep.
+            assertThat(probes).isAtMost((allowed * 2 + 1).toInt())
         } else {
             // "Off" means nothing was sent. Without this the test would also pass on a session that was
             // quietly still beating, which is the opposite of what the setting promises.

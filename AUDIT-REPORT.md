@@ -2670,3 +2670,136 @@ Apache MINA SSHD 2.14.0 or about Android rather than an omission:
   that changes whether a real server can be reached at all is offered instead, as a switch with a plain
   explanation: **legacy algorithms** — CBC ciphers, `ssh-rsa`, truncated HMACs, SHA-1 key exchange — off by
   default, and `SshIntegrationTest` proves both directions against servers that accept nothing else.
+
+## 27. Releasing 1.1.0
+
+Same process as §20, §22 and §25, and for the same reason: GitHub Actions assembles the APKs from the
+commit on `main`, and this host does nothing but re-sign them. The release key is in no repository secret
+and never enters a runner, so a compromised workflow file cannot reach it. `Restore release signing
+material` finds no secrets, says so, and CI's own release APKs carry the debug key — which is why the
+artifact is re-signed here rather than published as it arrives.
+
+Workflow run `32670319691` built commit `8c4cca6`:
+
+| | |
+| --- | --- |
+| `lintRelease` | **0 errors, 51 warnings** — 44 `GradleDependency`, 4 `ConfigurationScreenWidthHeight`, 2 `AndroidGradlePluginVersion`, 1 `OldTargetApi`. `lintAnalyzeRelease` ran for two minutes rather than coming back `FROM-CACHE`, so those numbers are about this code |
+| Unit and integration tests | **846 per variant across 66 classes, 0 failures, 0 errors**, on debug *and* release |
+| Skipped | **7, and exactly the 7 intended** — the long idle matrix behind `ECLIPSE_STRESS=1`. So 839 ran |
+| Instrumentation sources | compiled |
+| APKs | **five**, and the verify step checks all five signatures rather than the first one it finds |
+
+The three real-OpenSSH tests that are *not* behind `ECLIPSE_STRESS` ran on the runner, on every push:
+`aRealOpenSshSessionSurvivesTheMotdTheKeyboardAndItsHeartbeats`,
+`aRealOpenSshServerCannotTimeOutASessionThisClientIsAnswering` and
+`aServerThatNeverProbesCannotOutwaitThisClientsOwnHeartbeat`. The first of those is the reported bug's own
+shape — log in, take the banner and the motd, keep typing — and it is now a gate on every commit.
+
+### 27.1 The five files
+
+| File | Bytes | ABI | SHA-256 |
+| --- | --- | --- | --- |
+| `EclipseSSH-1.1.0-universal-release.apk` | 5,793,213 | all four | `d6b6097b2b01aa53375d49fc8cf7897d48f2a80df4c7b05f1ad1f30844e9f2bc` |
+| `EclipseSSH-1.1.0-arm64-v8a-release.apk` | 5,694,389 | `arm64-v8a` | `9a44f39cfec5b2275a2ee0e4f9cdf0316a7fd7e48285e3061be12cff6c01fb00` |
+| `EclipseSSH-1.1.0-armeabi-v7a-release.apk` | 5,690,297 | `armeabi-v7a` | `403ce24bb6061d9e83729d9148611597655f18fa298aa805b679a72e742627ac` |
+| `EclipseSSH-1.1.0-x86-release.apk` | 5,694,377 | `x86` | `ad1ffe488cd1cae2aeaf44c64d9930cd19e170dcf7a774ccea1227d6ad155940` |
+| `EclipseSSH-1.1.0-x86_64-release.apk` | 5,694,383 | `x86_64` | `01a0ce43adaa7b2f081a1630fb16a4f02ebbbb0ea76338e0582f4eb54604aa8e` |
+
+All five: `versionCode 8`, `versionName 1.1.0`, minSdk 28, targetSdk 35, one `classes.dex` of 5,210,608
+bytes, `zipalign -c 4` clean, one signer, certificate SHA-256
+`a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e` — the same certificate as 1.0.1 through
+1.0.6, so any of these installs over any of those as an upgrade. `aapt2 dump badging` reports
+`native-code: 'arm64-v8a'` for the arm64 file and all four ABIs for the universal one, which is the split
+working rather than five copies of the same thing.
+
+**One versionCode across all five.** The usual scheme adds 1, 2, 3, 4 to the base so a store can prefer the
+right one, but distribution here is a GitHub release and a plain HTTP server: distinct codes would make
+switching from the universal file to a per-ABI one read as a downgrade, and would make "1.1.0" the name of
+five different version codes.
+
+### 27.2 A signature check that was asking the wrong question
+
+CI's verify step asserted `Verified using v2 scheme … true` from a run of `apksigner verify
+--min-sdk-version 28`. At min-sdk 28 apksigner verifies through v3 alone and reports v2 as `false` **whether
+or not the v2 block is present** — so with the optional signing secrets set, that step would have failed a
+correctly signed APK. Asked at `--min-sdk-version 24`, both come back `true` for every 1.1.0 file and for
+1.0.6 before them; the block was always there. The check now asks at 24, where the answer means what the
+assertion says.
+
+The same subtlety is already written on the download page: `apksigner verify --print-certs` on its own
+prints "v2 scheme: false" here, and that is not a missing signature.
+
+### 27.3 Verifying what is actually published
+
+All five assets were downloaded back and compared: **byte-identical**, SHA-256 for SHA-256, to the files
+signed on this host and served from port 19001.
+
+Recorded because it cost a wrong turn: the repository is private, so the `browser_download_url` on a release
+asset returns a 9-byte `Not Found` to an unauthenticated `curl`. The first verification pass compared five
+of those against five APKs and reported five mismatches, which looked like a corrupted upload and was
+nothing of the kind. Private-release assets have to be fetched from
+`/repos/{owner}/{repo}/releases/assets/{id}` with `Accept: application/octet-stream`, which is how the
+comparison above was made. Anyone the user sends to the release page will hit the same 404 until the
+repository is public — the port-19001 copy is the link that works for them today, and it is byte-identical.
+
+### 27.4 The idle matrix, and one number that was measuring the wrong sessions
+
+Run on this host against a real `sshd` — port 22022 with `ClientAliveInterval 5`, port 22023 with
+`ClientAliveInterval 0` so that nothing but the app's own keepalive ever touches the connection:
+
+| Test | Wall clock | Result |
+| --- | --- | --- |
+| `aRealOpenSshSessionSurvivesTheMotdTheKeyboardAndItsHeartbeats` | 47.4 s | passed |
+| `aServerThatNeverProbesCannotOutwaitThisClientsOwnHeartbeat` | 100.2 s | passed |
+| `aRealOpenSshServerCannotTimeOutASessionThisClientIsAnswering` | 31.5 s | passed |
+| `aSessionSurvivesThirtySecondsOfSilence` | 31.4 s | passed |
+| `aSessionSurvivesOneMinuteOfSilence` | 60.9 s | passed |
+| `aSessionSurvivesFiveMinutesOfSilence` | 301.4 s | passed |
+| `aCompressedSessionSurvivesFiveMinutesOfSilence` | 301.9 s | passed |
+| `aDefaultSessionSurvivesTenMinutesOfSilence` | 601.3 s | passed |
+| `aSessionSurvivesThirtyMinutesOfSilence` | 1802.3 s | passed |
+| `aSessionWithKeepAliveOffSurvivesPastTheDeadlineItWouldHaveHad` | 301.8 s | passed, after the harness was fixed |
+
+Every one of them holds the session open with nothing to say and samples the tab's state about ten times a
+second, asserting that the trace contains no `RECONNECTING`, `DISCONNECTED` or `ERROR`, that it never
+decreases in lifecycle order, and that it ends on `CONNECTED`. Sampling only at the end cannot see the
+reported bug: `CONNECTED → RECONNECTING → CONNECTED` leaves the tab looking untouched. The two server-probe
+tests were re-run after that assertion was added to them as well, which is where their times above come
+from; the rest are from the matrix run.
+
+One thing the trace assertion caught immediately, and it is a correctness result rather than a harness one:
+the *first* attempt against a brand-new sandbox host legitimately fails, because the host key has never been
+seen and the app stops to ask. The state it reports for that is `ERROR` — not `RECONNECTING`, and not a
+silent retry — which is the fault classification the request asked for. The trace is restarted when the key
+is accepted, so what the assertion then measures is the session, not the question that preceded it.
+
+The keepalive-off test failed the first time it ran, and the failure was worth keeping rather than
+weakening. It asserts that a host with keepalive off sends **zero** keepalives — the point of the setting —
+and it counted **thirty**. The arithmetic gave it away: the app-wide default is 30 s, a five-minute hold is
+ten intervals, and thirty is three sessions' worth. The `sshd` log confirmed it, with six connections
+closing simultaneously at the very end of the run: **sessions from earlier test methods were still alive and
+still beating while this one was being measured**, and the log-based counter cannot tell whose heartbeat is
+whose.
+
+That is the app behaving exactly as designed — a session deliberately outlives the activity, which is what
+makes a rotation adopt a shell instead of dialling again — so the fix belongs in the harness, and is an
+`@After` that closes every session between methods. The server's own log, per login, afterwards:
+
+| Login | Test | Client keepalive requests |
+| --- | --- | --- |
+| port 57204 | motd + keyboard, short interval | 6 |
+| port 48800 | compressed, 5 min idle, 30 s default | 10 |
+| port 53110 | **keepalive off, 5 min idle** | **0** |
+
+Each session is closed before the next test logs in — 48800 closes at log line 344, 53110 logs in at 462 —
+so each window belongs to one session. The assertion was not touched.
+
+### 27.5 What the split actually saves
+
+Measured on the signed outputs rather than estimated: **98,824 bytes (1.71 %)** for `arm64-v8a` and
+**102,916 (1.78 %)** for `armeabi-v7a`, against a universal APK of 5,793,213. That is more than the 60,292
+bytes of native library the four ABIs hold between them, because a `.so` is stored uncompressed and padded
+up to a 16 KiB page boundary: dropping three ABIs drops six alignment gaps with them. It is still a small
+number, and the reason to ship the split is that it was asked for and that it costs nothing — one `splits`
+block, one CI loop over five outputs instead of one, and no second version code to manage. If a future
+dependency brings real native code, the mechanism is already in place and already verified.
