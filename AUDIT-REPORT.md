@@ -1,6 +1,6 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 6 / versionName 1.0.5 · minSdk 28, target/compileSdk 35
+`dev.eclipse.ssh` · versionCode 9 / versionName 1.1.1 · minSdk 28, target/compileSdk 35
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the current count is 0 errors and 51 warnings, and §16.2 says which are new and which are not.
 Kotlin 2.1.20 · AGP 8.9.1 · Gradle 8.11.1 · JDK 17 · Compose BOM 2025.04.01 · Hilt 2.56.1 · Room 2.7.1 · Apache MINA SSHD 2.14.0
@@ -3109,3 +3109,56 @@ the harness now prints, on any failure of these tests, the two things whose abse
 `exportDiagnostics()`. A ladder that never offered anything and a ladder that offered the wrong thing are one
 counter apart; `CREDENTIAL_NOT_STORED` in the trace would name the vault; and the `RECONNECT_*` lines say which
 rung reached the wire. None of them can print a secret — `SessionDiagnosticsTest` holds that.
+
+---
+
+## 30. Releasing 1.1.1
+
+Same process as §20, §22, §25 and §27: GitHub Actions assembles from the commit on `main`, this host does
+nothing but re-sign. Workflow run `32686703916` built commit `3c08b2e` — the credential fix of §29 on top of
+the repaint fix of §28, so 1.1.1 carries both.
+
+| | |
+| --- | --- |
+| `lintRelease` | **0 errors, 51 warnings** — the same 44 `GradleDependency`, 4 `ConfigurationScreenWidthHeight`, 2 `AndroidGradlePluginVersion` and 1 `OldTargetApi` as 1.1.0, so this round added none |
+| Unit and integration tests | **858 per variant across 67 classes, 0 failures, 0 errors**, on debug *and* release — 12 more tests and one more class than 1.1.0 |
+| Skipped | **7, and exactly the 7 intended** — the long idle matrix behind `ECLIPSE_STRESS=1`. So 851 ran |
+| Instrumentation sources | compiled |
+| APKs | **five**, all five signatures checked |
+
+**Five real-OpenSSH tests now run on every push, not three.** §27 recorded three; `realFullScreenProgramsPaint`
+`ThroughThisEmulatorAndGiveTheScreenBack` and `realServerOutputWrapsWithoutSplittingATokenApart` joined them,
+which is how §28's two CI-only harness faults were found in the first place. The class took 164 s of the run.
+
+### 30.1 The five files
+
+| file | bytes | SHA-256 |
+| --- | --- | --- |
+| `EclipseSSH-1.1.1-universal-release.apk` | 5,793,213 | `b2e0bfddb4fa2cd97b9ae5675f9a1ba6c150cf5223e701f7236b259572c4d90d` |
+| `EclipseSSH-1.1.1-arm64-v8a-release.apk` | 5,694,389 | `ea70234addb553572bb8249345a60cbc73cf45b588a268561139ab779e8e1672` |
+| `EclipseSSH-1.1.1-armeabi-v7a-release.apk` | 5,690,297 | `8f80d1fa458e94857a11780cc53a3c0d2dec790953af64692f89dccf98422c22` |
+| `EclipseSSH-1.1.1-x86-release.apk` | 5,694,377 | `189668f25dd2b1d85110661199c52a87ef8288a7af7ac1cfa76d130589fb92a1` |
+| `EclipseSSH-1.1.1-x86_64-release.apk` | 5,694,383 | `9d3f090a9fa8aa673e60bf220b51be7ea72adefa653094143a1fa08a58cbd1fb` |
+
+versionCode 9 for all five, signer certificate SHA-256
+`a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e` — the same key as every release since
+1.0.0, so any of these installs straight over 1.1.0. `apksigner verify` reports v3 alone at minSdk 28 and
+v2 as well once asked with `--min-sdk-version 24`, which is §12.8's finding, not a missing signature.
+
+**Every one of the five is exactly as long as its 1.1.0 counterpart**, which looked at first like five stale
+artifacts. It is not: the dex grew by 936 bytes (5,210,608 → 5,211,544 in the arm64 file) and the
+page-aligned padding in front of the uncompressed native libraries absorbed it, the same quantization §22
+measured on the 1.0.x files. All five SHA-256 sums differ, and `aapt2 dump badging` reads `versionName='1.1.1'`
+on the new files and `'1.1.0'` on the old.
+
+### 30.2 Verifying what is published, again through the API
+
+Each published asset was pulled back down from
+`https://api.github.com/repos/…/releases/assets/<id>` with `Accept: application/octet-stream` and hashed
+against the copy being served: all five identical. §27.3's reason for using the API rather than
+`browser_download_url` still holds — the repository is private, so the browser URL answers 404 to an
+authenticated `curl` as readily as to an anonymous one.
+
+The five files are served at `http://152.53.102.150:19001/`, whose `README.txt` now leads with 1.1.1, carries
+its sums, and says in plain terms what the two fixes were. The eight releases and sixteen files it lists are
+what that directory holds; nothing else is exposed there.
