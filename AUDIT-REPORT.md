@@ -2864,11 +2864,11 @@ wrapping for either it or `alternateScreen`.
 * **Cleared** when output reaches the bottom row and scrolls the screen, which is the opposite tell and is
   a stream behaving like one. `top`'s own exit does exactly that, so the mark cannot outlive the program.
   Both screen switches and both resets clear it too, so neither screen inherits the other's mode.
-* **One false positive, stated plainly:** `clear` homes the cursor as well, so wrapping is off for the
-  screenful that follows it and comes back with the first scroll. That screenful looks the way 1.0.6 looked
-  — pannable, not corrupted — and on a twelve-row phone screen it lasts twelve lines of output.
+* **Also cleared** by `ESC [ 3 J`, the "and drop the scrollback too" that `clear` sends and a repainting
+  program never does — which is what keeps `clear` from costing a screenful of unwrapped text. §28.6 has the
+  measurement that picked that sequence and rejected the obvious one.
 
-A per-line flag would have no false positive at all, and was not chosen: it needs line metadata carried
+A per-line flag would be exact rather than inferred, and was not chosen: it needs line metadata carried
 through resize, scroll and history trimming, and a visual row that can span two grid lines, which is the
 one thing selection and copy coordinates depend on not happening. Four emulator tests pin the set and
 clear rules, one layout test pins the suppression, and the interop test above now asserts the mark on a
@@ -2940,3 +2940,42 @@ So the wait now types again every three seconds until the shell answers, and not
 the shell still has to run the command, and both the alternate-screen and positional-screen marks still
 have to come off before the test returns. A retry loop around a *send* is honest; the same loop around an
 *assertion* would not have been, which is the line this fix stays on the right side of.
+
+### 28.6 Two sequences that start identically, and the one byte that separates them
+
+§28.3 shipped with a bounded false positive: `clear` homes the cursor, so the mark went on and wrapping
+stayed off until the screen next scrolled. On the twelve-row phone view that is up to twelve lines — a
+partial return of the exact complaint word wrapping exists to answer, and one that appears every time
+somebody clears the screen, which is often.
+
+The obvious tightening is "an erase of the whole display releases the mark": `clear` erases, `top` paints.
+That was probed before being believed, with `.tmp-build/edprobe.py` — a real 80×12 pty, the real binaries,
+every CSI sequence recorded:
+
+```
+--- top -b -n1 >/dev/null; top -d 1 -n 3
+    first 14: ['ESC[?1h', 'ESC[?25l', 'ESC[H', 'ESC[2J', 'ESC[m', ...]
+    ED2 present: True   ED2 count: 1   ED3 count: 0
+--- clear; echo after-clear
+    first 14: ['ESC[H', 'ESC[2J', 'ESC[3J']
+    ED2 present: True   ED2 count: 1   ED3 count: 1
+```
+
+So the obvious rule is wrong, and wrong in the direction that matters: `top`'s startup opens with
+`ESC[H ESC[2J`, byte for byte the first two sequences `clear` sends. An ED2-based release would have taken
+the mark off in the middle of `top`'s own initialisation and reflowed its first frame — the grid, on a
+phone — for a whole refresh interval, which is worse than the false positive it set out to remove.
+
+`ESC [ 3 J` is what actually separates them: one occurrence from `clear`, none from `top` across three full
+frames. It is also the honest signal rather than a convenient one. Dropping the scrollback is a statement
+that nothing on the way out needs preserving, which is the opposite of what a program repainting a screen
+it means to keep would ever say. So `eraseDisplay`'s case `3` — the only branch allowed to discard history —
+now clears `positionalScreen` as well, and two emulator tests pin both halves: `clear`'s three sequences
+release the mark with the shell's next line already wrapping, and `top`'s ED2-only startup keeps it while it
+paints downward.
+
+The reverse risk — something that repaints in place *and* drops the scrollback, which would now be wrapped
+where it must not be — was probed too, with `.tmp-build/edprobe3.py`. `watch -n 1 date`, the other program
+that repaints a fixed screen, turns out to take the alternate screen (`ESC[?1049h`, ED3 count 0), so it was
+already covered; `tput clear` sends the same three sequences `clear` does. Nothing probed repaints in place
+and sends ED3. The false positive is gone with no new one taking its place.

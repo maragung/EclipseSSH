@@ -439,8 +439,7 @@ class AnsiTerminalFullScreenTest {
      *
      * The release is the opposite tell: output that reaches the bottom row and pushes the screen up is a
      * stream behaving like one. `top`'s own exit does it - it addresses the row below its display and
-     * newlines - and so does the first screenful of anything after a `clear`, which homes the cursor too
-     * and is the one false positive this rule has.
+     * newlines.
      */
     @Test
     fun `output that scrolls the screen takes the mark off again`() {
@@ -454,6 +453,50 @@ class AnsiTerminalFullScreenTest {
         buffer.feed("a\nb\nc\nd\n")
 
         assertThat(buffer.frame().positionalScreen).isFalse()
+    }
+
+    /**
+     * `clear` takes the mark off at once, rather than after a screenful.
+     *
+     * Measured at 80x12 on a real pty: `clear` writes `ESC[H ESC[2J ESC[3J` and `top`'s startup writes
+     * `ESC[H ESC[2J`, one ED2 and never an ED3 in a whole run. The home is common to both and the erase
+     * is common to both, so only the scrollback drop separates them - and it is the right signal to read,
+     * because a program that means to keep repainting does not throw the history away first. Without this
+     * every line of the screenful after a `clear` was laid out unwrapped.
+     */
+    @Test
+    fun `clearing the screen and its scrollback takes the mark off at once`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 12, scrollbackLimit = 50)
+        buffer.feed("one\ntwo\nthree\n")
+
+        // Exactly what `clear` sends, in that order.
+        buffer.feed("${ESCAPE}[H${ESCAPE}[2J${ESCAPE}[3J")
+
+        assertThat(buffer.frame().positionalScreen).isFalse()
+
+        // And the shell's next line, well short of the bottom row that would have scrolled the mark off.
+        buffer.feed("$ echo hello\nhello\n")
+
+        assertThat(buffer.frame().positionalScreen).isFalse()
+    }
+
+    /**
+     * The erase on its own is not enough, which is why the rule reads the scrollback drop instead.
+     *
+     * This is `top`'s startup byte for byte: home, erase, then a frame painted downward. If ED2 released
+     * the mark, this frame - a grid - would be laid out wrapped on a phone until the next repaint.
+     */
+    @Test
+    fun `erasing the screen without dropping the scrollback keeps the mark`() {
+        val buffer = AnsiTerminalBuffer(columns = 80, rows = 12, scrollbackLimit = 50)
+        buffer.feed("$ top\n")
+        buffer.feed("${ESCAPE}[H${ESCAPE}[2J")
+
+        assertThat(buffer.frame().positionalScreen).isTrue()
+
+        buffer.feed("top - 09:41:02 up 3 days\n${ESCAPE}[KTasks: 84 total")
+
+        assertThat(buffer.frame().positionalScreen).isTrue()
     }
 
     /** Ordinary output is never mistaken for a repaint, however long it runs. */

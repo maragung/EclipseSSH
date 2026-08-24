@@ -210,9 +210,15 @@ class AnsiTerminalBuffer(
      *
      * Set by an upward cursor move that a sequence asked for, which is the tell: output that flows only
      * ever goes down. Cleared when the screen scrolls under flowing output, which is the opposite tell
-     * and is how the flag lets go - `top`'s own exit does it, and so does the first screenful after a
-     * `clear`, which homes the cursor too and is the one false positive this rule has. Wrapping stays
-     * off for that screenful and the reader sees what 1.0.6 showed them; nothing is corrupted by it.
+     * and is how the flag lets go - `top`'s own exit does it.
+     *
+     * And cleared by `ESC [ 3 J`, which is what makes `clear` not a false positive. Measured on this
+     * machine at 80x12: `clear` writes `ESC[H ESC[2J ESC[3J`, and `top`'s startup writes `ESC[H ESC[2J`
+     * and nothing else of the kind - one ED2, never an ED3, in a whole run. So the erase cannot tell
+     * the two apart and the home is common to both, but dropping the scrollback separates them exactly,
+     * and it is the honest signal: a program that means to keep repainting a screen does not throw the
+     * history away first. Without this the screenful after every `clear` was laid out unwrapped, which
+     * is what 1.0.6 did to every line and the thing this feature exists to stop.
      */
     private var positionalScreen = false
 
@@ -1083,8 +1089,13 @@ class AnsiTerminalBuffer(
             0 -> { eraseLine(0); for (row in cursorRow + 1 until lines.size) lines[row].fill(TerminalCell()) }
             1 -> { eraseLine(1); for (row in top until cursorRow) lines[row].fill(TerminalCell()) }
             // `ESC [ 3 J` is the explicit "and drop the scrollback too" that `clear` sends on a modern
-            // system, and the only sequence allowed to discard history.
-            3 -> while (lines.size > rows) { lines.removeAt(0); cursorRow = (cursorRow - 1).coerceAtLeast(0) }
+            // system, and the only sequence allowed to discard history. It also releases
+            // [positionalScreen]: throwing the history away is a statement that nothing on the way out
+            // needs preserving, which is the opposite of a program repainting a screen it means to keep.
+            3 -> {
+                while (lines.size > rows) { lines.removeAt(0); cursorRow = (cursorRow - 1).coerceAtLeast(0) }
+                positionalScreen = false
+            }
         }
         wrapPending = false
         revision++
