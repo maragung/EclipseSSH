@@ -14,6 +14,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.eclipse.ssh.security.SecureVault
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -114,8 +115,17 @@ class SessionRegistry @Inject constructor(
      * Cancellation is not swallowed, only deferred - the caller observes it as soon as the write
      * returns, having lost nothing.
      */
+    /**
+     * DataStore runs an `edit` transform with `withContext(callerContext)`, so the transform inherits
+     * the dispatcher of whoever called us. Every transform here encrypts a credential through
+     * [SecureVault] and then writes the preferences file, so it must never run on the main thread:
+     * [register] is called from the connect path while the UI is live. [Dispatchers.IO] is therefore
+     * part of the contract, not an optimisation -- DataStore serialises writes through a single
+     * actor, so a transform parked on a stalled dispatcher blocks every later write to this store.
+     * [NonCancellable] keeps a credential write atomic when the caller's scope is cancelled mid-write.
+     */
     private suspend fun write(block: suspend (MutablePreferences) -> Unit) {
-        withContext(NonCancellable) { context.sessionRegistryDataStore.edit(block) }
+        withContext(NonCancellable + Dispatchers.IO) { context.sessionRegistryDataStore.edit(block) }
     }
 
     private fun credentialKey(hostId: String) = stringPreferencesKey("credential_$hostId")

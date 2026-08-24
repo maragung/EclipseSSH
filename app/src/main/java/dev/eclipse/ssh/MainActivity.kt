@@ -83,6 +83,7 @@ import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Upload
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -485,6 +486,19 @@ private fun EclipseWorkspace(
             // drawing a shell for a session that is not there.
             openSessionHostId = null
         }
+    }
+    // The file browser follows the sessions rather than the host list. It needs an authenticated
+    // transport to show anything at all, so arriving on Files with a host selected that has no session
+    // - the first saved host on a clean install, or whichever one was last tapped in Hosts - pointed
+    // the browser at a server it could not read and left "Not connected" on screen while a working
+    // session sat one tab away. Keyed on the set of open sessions so it also runs when one appears.
+    //
+    // It only ever moves the selection *onto* a session and never off one, so a session chosen in the
+    // switcher stays chosen, including while it is reconnecting. See [fileBrowserHostId].
+    LaunchedEffect(destination, state.selectedHostId, state.tabs.map(SessionTab::hostId)) {
+        if (destination != Destination.FILES) return@LaunchedEffect
+        val browse = fileBrowserHostId(state.selectedHostId, state.tabs) ?: return@LaunchedEffect
+        if (browse != state.selectedHostId) state.hosts.firstOrNull { it.id == browse }?.let(viewModel::selectHost)
     }
     LaunchedEffect(destination, state.selectedHostId) {
         // announce = false: this fires because the user navigated here, not because they asked to
@@ -1596,7 +1610,7 @@ private fun WorkspaceScaffold(
                 Destination.HOSTS -> HostsScreen(state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost)
                 // Handled above, outside the scrolling column.
                 Destination.TERMINAL -> Unit
-                Destination.FILES -> FilesScreen(state, onRefreshFiles, onUpload, onDownloadFile, onNavigateRemote, onCreateFolder, onDeleteFile, onDeleteFiles, onRenameFile, onChmodFile, onCopyFile, onCopyFiles, onMoveFile, onMoveFiles, onPickLocalFolder, onNavigateLocal, onNavigateLocalUp, onUploadLocal, onScheduleDownload, onScheduleUpload, onSync, onSendToHost)
+                Destination.FILES -> FilesScreen(state, onSelectHost, onRefreshFiles, onUpload, onDownloadFile, onNavigateRemote, onCreateFolder, onDeleteFile, onDeleteFiles, onRenameFile, onChmodFile, onCopyFile, onCopyFiles, onMoveFile, onMoveFiles, onPickLocalFolder, onNavigateLocal, onNavigateLocalUp, onUploadLocal, onScheduleDownload, onScheduleUpload, onSync, onSendToHost)
                 Destination.TRANSFERS -> TransfersScreen(state.transfers, onClearCompleted, onPauseTransfer, onResumeTransfer, onCancelTransfer)
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
@@ -2812,6 +2826,7 @@ private fun SaveSnippetDialog(initialCommand: String, label: String, onLabelChan
 @Composable
 private fun FilesScreen(
     state: MainUiState,
+    onSelectHost: (HostProfile) -> Unit,
     onRefresh: () -> Unit,
     onUpload: () -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
@@ -2872,6 +2887,10 @@ private fun FilesScreen(
     LaunchedEffect(path) { selectedRemote = emptySet() }
     LaunchedEffect(state.localDirUri) { selectedLocal = emptySet() }
 
+    if (state.tabs.isNotEmpty()) {
+        FilesSessionSwitcher(state, host.id, onSelectHost)
+        Spacer(Modifier.height(10.dp))
+    }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(Icons.Default.FolderOpen, null, tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.width(10.dp))
@@ -3090,6 +3109,93 @@ private fun FilesScreen(
             },
             dismissButton = { TextButton(onClick = { batchDelete = false }) { Text("Cancel") } },
         )
+    }
+}
+
+/**
+ * Which session the file browser should be pointed at, given the host the rest of the app has selected.
+ *
+ * Pure so the rule is readable in one place and testable without a screen. Two rules, in order:
+ *
+ *  1. A selected host that has a session of its own keeps the browser, whatever state that session is
+ *     in. A session the user picked in the switcher - including one that is reconnecting, or one whose
+ *     SFTP failed - is a deliberate choice, and moving the browser off it would be the app arguing.
+ *  2. Otherwise the first *live* session takes it, because a host with no session at all cannot show a
+ *     directory: SFTP is a channel on an authenticated transport, so with nothing connected the screen
+ *     has only "Not connected" to say. Live rather than merely open - a session still authenticating
+ *     has no more to offer than no session at all.
+ *
+ * Null means "nothing to move to": no session is worth switching to, so whatever the screen already
+ * resolved stays. That is the clean-install case, and the case where every session is still connecting.
+ */
+internal fun fileBrowserHostId(selectedHostId: String?, tabs: List<SessionTab>): String? = when {
+    tabs.any { it.hostId == selectedHostId } -> selectedHostId
+    else -> tabs.firstOrNull { it.state.isLive }?.hostId
+}
+
+/**
+ * The open sessions, as one tappable chip each: which server the file browser is reading, and the way
+ * to any of the others.
+ *
+ * The screen used to name no host at all. It showed a path - "/root", "/var/log" - for whichever host
+ * happened to be selected somewhere else in the app, with no way to tell which server that was and no
+ * way to change it without going back to Hosts and tapping a row. With several sessions open, which is
+ * the case this app is built for, the file browser was effectively stuck on one of them.
+ *
+ * Deliberately the same shape as [TerminalTabStrip]: a status dot in [statusColor] and the host's name,
+ * the current one filled in. A chip is enabled only while its host profile is still around, since it is
+ * the profile - not the tab - that every file operation is addressed to.
+ */
+@Composable
+private fun FilesSessionSwitcher(state: MainUiState, browsedHostId: String, onSelectHost: (HostProfile) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        state.tabs.forEach { tab ->
+            val sessionHost = state.hosts.firstOrNull { it.id == tab.hostId }
+            val label = sessionHost?.name ?: tab.title
+            val browsing = tab.hostId == browsedHostId
+            Surface(
+                modifier = Modifier
+                    .clickable(enabled = sessionHost != null, role = Role.Tab) { sessionHost?.let(onSelectHost) }
+                    // One description per chip, naming the server, so the row is navigable by a screen
+                    // reader as a list of servers rather than of coloured dots.
+                    .semantics { contentDescription = if (browsing) "Browsing files on $label" else "Browse files on $label" },
+                shape = RoundedCornerShape(12.dp),
+                color = if (browsing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(7.dp).clip(RoundedCornerShape(50))
+                            .background(statusColor(tab.state, tab.networkHeld)),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 168.dp),
+                    )
+                    // The one thing worth saying about a session before it is tapped: its shell is fine
+                    // and its file browser is not, which is a state this app deliberately allows.
+                    if (tab.sftpState == SftpSessionState.FAILED) {
+                        Spacer(Modifier.width(6.dp))
+                        Icon(
+                            Icons.Default.Warning,
+                            "SFTP unavailable",
+                            modifier = Modifier.size(14.dp),
+                            tint = EclipseWarning,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 

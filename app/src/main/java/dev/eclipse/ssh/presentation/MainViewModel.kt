@@ -176,8 +176,25 @@ class MainViewModel @Inject constructor(
     private val typedLines = ConcurrentHashMap<String, StringBuilder>()
 
     private val commandHistory = MutableStateFlow<Map<String, List<String>>>(emptyMap())
-    private val remoteFiles = MutableStateFlow<List<RemoteFile>>(emptyList())
-    private val remotePath = MutableStateFlow<String?>(null)
+    /**
+     * What each host is showing in the file browser - its directory and that directory's contents -
+     * keyed by host id.
+     *
+     * Per host rather than one listing for the whole app, because the browser is switched between live
+     * sessions and each of them is somewhere different. One slot made the last listing to arrive the
+     * one on screen no matter who had asked for it: a reconnect's own SFTP login, or a refresh on the
+     * host the user had just switched away from, replaced the contents under the header while the
+     * header kept naming the other server. That is not only confusing to read - the file rows are what
+     * Download, Rename, Chmod and Delete resolve their paths from, and every one of those runs against
+     * the *selected* host, so acting on a row that belonged to a different session sent an absolute
+     * path to a server that had never listed it. Keyed by host, a listing can only reach the screen
+     * that asked for it, and switching back to a session restores the directory it was left in.
+     *
+     * Directory and contents in one value so the two cannot disagree: written as two flows, a
+     * recomposition landing between the writes drew the new directory's name over the old directory's
+     * files.
+     */
+    private val remoteListings = MutableStateFlow<Map<String, RemoteListing>>(emptyMap())
     private val localFiles = MutableStateFlow<List<LocalFile>>(emptyList())
     private val localDirUri = MutableStateFlow<String?>(null)
     private val forwardings = MutableStateFlow<List<ForwardEntry>>(emptyList())
@@ -351,22 +368,23 @@ class MainViewModel @Inject constructor(
         TerminalState(output = output, history = history, diagnostics = events)
     }
 
-    private val remoteState = combine(remoteFiles, remotePath) { files, path ->
-        RemoteState(files = files, path = path)
-    }
-
     private val localState = combine(localFiles, localDirUri) { files, dir ->
         LocalState(files = files, dirUri = dir)
     }
 
-    val uiState: StateFlow<MainUiState> = combine(baseUiState, transferRepository.transfers, terminalState, remoteState, localState) { state, activeTransfers, terminal, remote, local ->
+    val uiState: StateFlow<MainUiState> = combine(baseUiState, transferRepository.transfers, terminalState, remoteListings, localState) { state, activeTransfers, terminal, listings, local ->
+        // The browser shows the session the rest of the app is pointed at, so what reaches the screen
+        // is that host's own listing and never another session's - see [remoteListings]. A host that
+        // has not listed anything yet has no entry, which the Files screen draws as the directory it
+        // expects rather than as an empty one.
+        val browsing = state.selectedHostId?.let(listings::get)
         state.copy(
             transfers = activeTransfers,
             terminalOutput = terminal.output,
             commandHistory = terminal.history,
             diagnostics = terminal.diagnostics,
-            remoteFiles = remote.files,
-            remotePath = remote.path,
+            remoteFiles = browsing?.files.orEmpty(),
+            remotePath = browsing?.path,
             localFiles = local.files,
             localDirUri = local.dirUri,
         )
@@ -1654,10 +1672,11 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Lists [path] on [host]. When [path] is null the server's own home directory is used,
-     * resolved once per host by canonicalising "." over SFTP and cached in [homePaths].
-     * The old "/home/$username" guess pointed at a non-existent directory for root and for
-     * every server that does not lay out home directories under /home.
+     * Lists [path] on [host]. When [path] is null the directory this host is already showing is listed
+     * again, and a host that is showing nothing yet gets the server's own home directory - resolved by
+     * canonicalising "." over SFTP and cached per host in [homePaths]. The old "/home/$username" guess
+     * pointed at a non-existent directory for root and for every server that does not lay out home
+     * directories under /home.
      *
      * A host that is not connected is reported when the user asked for this listing — pull-to-refresh,
      * tapping a directory, or returning from a file operation — because otherwise the button does
@@ -1675,7 +1694,12 @@ class MainViewModel @Inject constructor(
                 return@launch
             }
             try {
-                listRemote(host, path)
+                // path ?: where this host already is. Null means "list again", which is what the
+                // Refresh button, arriving on the Files tab and switching sessions all ask for - and
+                // every one of them used to land in the home directory instead, because null was
+                // resolved to the home path further down. Refresh navigated away from the directory
+                // it was refreshing, and a session the user came back to had forgotten where it was.
+                listRemote(host, path ?: remoteListings.value[host.id]?.path)
                 // A listing that worked is the same proof the auto-login looks for, so a host whose
                 // SFTP failed earlier — or one that never tried, because the switch is off — stops
                 // claiming to be broken the moment the user gets a directory out of it.
@@ -1686,15 +1710,26 @@ class MainViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                remoteFiles.value = emptyList()
-                remotePath.value = path ?: homePaths[host.id] ?: fallbackHome(host.username)
+                // Emptied for this host only, and left standing where it was: a listing that failed
+                // says nothing about any other session's directory, and nothing about this one either
+                // beyond "the contents could not be read". Keeping the path means the header still
+                // names the directory the error is about instead of teleporting the user home.
+                val stranded = path ?: remoteListings.value[host.id]?.path ?: homePaths[host.id]
+                    ?: fallbackHome(host.username)
+                remoteListings.update { it + (host.id to RemoteListing(stranded, emptyList())) }
                 report("Could not list directory", error)
             }
         }
     }
 
     /**
-     * Opens an SFTP channel on [host]'s existing session and lists the remote home directory.
+     * Opens an SFTP channel on [host]'s existing session and lists [path], or the remote home directory
+     * when [path] is null.
+     *
+     * Null means home here rather than "wherever this host was", which is the resolution [refreshFiles]
+     * applies before it calls: a login starts at home even when a previous session of the same host had
+     * been browsing somewhere else, because that directory can be gone by the time the host comes back,
+     * and a listing that fails is recorded as SFTP being broken.
      *
      * The one place both the auto-login and pull-to-refresh go through, so they cannot disagree about
      * what "SFTP works" means or about which directory is showing. Throws rather than reporting: the
@@ -1706,8 +1741,8 @@ class MainViewModel @Inject constructor(
         sshConnectionManager.openSftp(session).use { sftp ->
             val target = path ?: homePaths[host.id] ?: sftpDirectoryService.homeDirectory(sftp, host.username)
                 .also { homePaths[host.id] = it }
-            remoteFiles.value = sftpDirectoryService.list(sftp, target)
-            remotePath.value = target
+            val listing = sftpDirectoryService.list(sftp, target)
+            remoteListings.update { it + (host.id to RemoteListing(target, listing)) }
         }
     }
 
@@ -1745,9 +1780,15 @@ class MainViewModel @Inject constructor(
         job.invokeOnCompletion { sftpJobs.remove(host.id, job) }
     }
 
-    /** Directory the file browser is currently pointing at for [host]. */
+    /**
+     * Directory the file browser is currently pointing at for [host].
+     *
+     * [host]'s own directory. Read from the single global path, this returned whichever host had
+     * listed last, so an upload started on one session could be addressed to a directory that only
+     * existed on another.
+     */
     private fun currentRemoteDir(host: HostProfile): String =
-        remotePath.value ?: homePaths[host.id] ?: fallbackHome(host.username)
+        remoteListings.value[host.id]?.path ?: homePaths[host.id] ?: fallbackHome(host.username)
 
     fun navigateRemote(host: HostProfile, path: String) = refreshFiles(host, path)
 
@@ -2491,6 +2532,7 @@ class MainViewModel @Inject constructor(
         typedLines.remove(tab.hostId)
         commandHistory.value = commandHistory.value - tab.hostId
         serverStats.value = serverStats.value - tab.hostId
+        remoteListings.update { it - tab.hostId }
         homePaths.remove(tab.hostId)
         ptySizes.remove(tab.hostId)
         connectedAt.remove(tab.hostId)
@@ -2571,6 +2613,7 @@ class MainViewModel @Inject constructor(
             typedLines.remove(host.id)
             commandHistory.value = commandHistory.value - host.id
             serverStats.value = serverStats.value - host.id
+            remoteListings.update { it - host.id }
             homePaths.remove(host.id)
             stopForwardingsFor(host.id)
             runCatching { sessionRegistry.unregister(host.id) }
@@ -2937,9 +2980,10 @@ class MainViewModel @Inject constructor(
         val credentials: Map<String, StoredCredentials>,
     )
 
-    private data class RemoteState(
+    /** One host's file-browser position: the directory it is showing, and what is in it. */
+    private data class RemoteListing(
+        val path: String,
         val files: List<RemoteFile>,
-        val path: String?,
     )
 
     private data class LocalState(

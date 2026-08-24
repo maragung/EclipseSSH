@@ -2,6 +2,8 @@ package dev.eclipse.ssh.data.settings
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.MutablePreferences
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
@@ -11,8 +13,10 @@ import dev.eclipse.ssh.data.model.Snippet
 import dev.eclipse.ssh.security.SecretCipher
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 /** Same reasoning as the settings store: an unparseable file resets rather than bricking the screen. */
 private val Context.snippetsDataStore by preferencesDataStore(
@@ -44,17 +48,28 @@ class SnippetRepository @Inject constructor(
 
     suspend fun save(snippet: Snippet) {
         val clean = snippet.copy(label = sanitize(snippet.label), command = sanitize(snippet.command))
-        context.snippetsDataStore.edit { prefs ->
+        editPrefs { prefs ->
             val current = read(prefs[snippetsKey]).filterNot { it.id == clean.id }
             prefs[snippetsKey] = write(current + clean)
         }
     }
 
     suspend fun delete(id: String) {
-        context.snippetsDataStore.edit { prefs ->
+        editPrefs { prefs ->
             prefs[snippetsKey] = write(read(prefs[snippetsKey]).filterNot { it.id == id })
         }
     }
+
+    /**
+     * Every write goes through here so none of them runs on the caller's dispatcher.
+     *
+     * DataStore invokes an `edit` transform with `withContext(callerContext)`, so a transform started
+     * from `viewModelScope` runs on the main thread -- AES encryption plus a file write on the UI thread. Worse, writes are
+     * serialised through a single actor, so one transform parked on a stalled dispatcher blocks every
+     * later write to this store for the life of the process.
+     */
+    private suspend fun editPrefs(block: suspend (MutablePreferences) -> Unit): Preferences =
+        withContext(Dispatchers.IO) { context.snippetsDataStore.edit(block) }
 
     /**
      * Encrypts the whole list as one payload rather than field by field.

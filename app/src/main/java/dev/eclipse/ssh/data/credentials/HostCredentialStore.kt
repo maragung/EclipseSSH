@@ -12,10 +12,12 @@ import dev.eclipse.ssh.security.SecretCipher
 import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 
 /**
  * Everything the UI is allowed to know about a host's saved credentials: that they exist, what the
@@ -169,7 +171,7 @@ class HostCredentialStore @Inject constructor(
     suspend fun apply(hostId: String, update: HostCredentialUpdate) {
         require(hostId.isNotBlank()) { "Cannot store credentials for a host with no id" }
         if (update.isNoop) return
-        dataStore.edit { prefs ->
+        editPrefs { prefs ->
             applySecret(prefs, passwordKey(hostId), update.password)
             applyKey(prefs, hostId, update.key)
             applySecret(prefs, passphraseKey(hostId), update.passphrase)
@@ -194,7 +196,7 @@ class HostCredentialStore @Inject constructor(
 
     /** Removes everything stored for [hostId]. Called when a host profile is deleted. */
     suspend fun forget(hostId: String) {
-        dataStore.edit { prefs ->
+        editPrefs { prefs ->
             prefs.remove(passwordKey(hostId))
             prefs.remove(keyKey(hostId))
             prefs.remove(passphraseKey(hostId))
@@ -205,7 +207,7 @@ class HostCredentialStore @Inject constructor(
 
     /** Removes every stored credential, for the Settings "forget all saved credentials" action. */
     suspend fun forgetAll() {
-        dataStore.edit { prefs ->
+        editPrefs { prefs ->
             prefs.asMap().keys.filter { it.name.isCredentialKey() }.forEach { key ->
                 @Suppress("UNCHECKED_CAST")
                 prefs.remove(key as Preferences.Key<Any>)
@@ -222,6 +224,17 @@ class HostCredentialStore @Inject constructor(
      * attempt down with it; returning null falls back to asking the user, which is what the app did
      * before the credential was saved.
      */
+    /**
+     * Every write goes through here so none of them runs on the caller's dispatcher.
+     *
+     * DataStore invokes an `edit` transform with `withContext(callerContext)`, so a transform started
+     * from `viewModelScope` runs on the main thread -- AES encryption plus a file write on the UI thread. Worse, writes are
+     * serialised through a single actor, so one transform parked on a stalled dispatcher blocks every
+     * later write to this store for the life of the process.
+     */
+    private suspend fun editPrefs(block: suspend (MutablePreferences) -> Unit): Preferences =
+        withContext(Dispatchers.IO) { dataStore.edit(block) }
+
     private suspend fun secret(key: Preferences.Key<String>): String? {
         val payload = dataStore.data
             .catch { error -> if (error is IOException) emit(emptyPreferences()) else throw error }

@@ -56,20 +56,26 @@ class SessionRegistryRobolectricTest {
 
     @Test
     fun `a credential asked for by an already cancelled attempt is still stored`() = runBlocking<Unit> {
-        var deferredCancellation: Throwable? = null
+        var reported: Throwable? = null
         val attempt = launch(start = CoroutineStart.UNDISPATCHED) {
             // What the reconnect ladder does to the attempt that is in the middle of this write.
             coroutineContext.job.cancel()
-            registry.register("host-cancelled", "hunter2")
-            // Deferred, not dropped: the caller still learns its attempt has been replaced, at the
-            // next point it suspends - which is what stops it going on to present a session.
-            runCatching { yield() }.onFailure { deferredCancellation = it }
+            // Not dropped: the caller still learns its attempt has been replaced, which is what stops
+            // it going on to present a session. Where it learns is deliberately not asserted. The write
+            // is dispatched to Dispatchers.IO (it encrypts, so it may not run on the UI thread - see
+            // SessionRegistry.write), and resuming a cancelled coroutine after a real dispatch delivers
+            // its cancellation there rather than at the next suspension point. Both orders satisfy the
+            // guarantee; pinning one would be asserting which dispatcher the write happens to use.
+            reported = runCatching {
+                registry.register("host-cancelled", "hunter2")
+                yield()
+            }.exceptionOrNull()
         }
         attempt.join()
 
         assertThat(registry.credential("host-cancelled")).isEqualTo("hunter2")
         assertThat(registry.activeHostIds.first()).contains("host-cancelled")
-        assertThat(deferredCancellation).isInstanceOf(CancellationException::class.java)
+        assertThat(reported).isInstanceOf(CancellationException::class.java)
     }
 
     @Test

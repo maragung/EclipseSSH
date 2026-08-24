@@ -3206,3 +3206,123 @@ authenticated `curl` as readily as to an anonymous one.
 The five files are served at `http://152.53.102.150:19001/`, whose `README.txt` now leads with 1.1.1, carries
 its sums, and says in plain terms what the two fixes were. The eight releases and sixteen files it lists are
 what that directory holds; nothing else is exposed there.
+
+## 31. Switching sessions in the file browser, and the DataStore write that stopped the next login
+
+The request was one sentence: **"untuk Files harusnya bisa switch diantara sesion yang aktif"** — the Files
+screen should let the user switch between active sessions. What it uncovered was a defect in every
+preferences write in the app.
+
+### 31.1 What the Files screen actually was
+
+It never named a host. It showed a path — `/root`, `/var/log` — belonging to whichever host happened to be
+`selectedHostId`, which is set from the *Hosts* screen. With several sessions open, the case this app exists
+for, the file browser was pinned to one of them, with nothing on screen saying which server the listing came
+from and no way to move it without navigating back to Hosts and tapping a row.
+
+Worse, the browser state was global: one `remoteFiles` list and one `remotePath`. A listing that arrived for
+host B overwrote what was on screen for host A, so a background `refreshFiles` or an auto-`loginSftp` could
+silently repaint the browser with another server's directory under the first server's name.
+
+### 31.2 The fix in three parts
+
+* **Per-host browser state.** `MainViewModel` keeps `remoteListings: Map<hostId, RemoteListing>` where
+  `RemoteListing` is `(path, files)`. `remoteFiles`/`remotePath` are derived for `selectedHostId` only, so a
+  listing that arrives for another host cannot reach the screen. `refreshFiles` re-lists *where that host
+  already is* rather than at home, and a closed tab drops its entry beside the existing `homePaths.remove`.
+* **A switcher.** `FilesSessionSwitcher` renders one chip per open session — status dot in `statusColor`,
+  host name, and a warning glyph when that session's shell is fine but its SFTP is not — deliberately the
+  same shape as `TerminalTabStrip`, with a per-chip `contentDescription` so the row reads as a list of
+  servers to a screen reader.
+* **A pure resolution rule.** `fileBrowserHostId(selectedHostId, tabs)` decides which session owns the
+  browser: a selected host with a session of its own keeps it *whatever state that session is in* (a
+  reconnecting session the user picked is a deliberate choice, and moving off it would be the app arguing);
+  otherwise the first **live** session takes it; otherwise nothing moves. Five unit tests, no socket.
+
+### 31.3 The defect the new tests found
+
+`FilesSessionSwitchRobolectricTest` drives two real MINA SSHD servers with distinct directory trees, so
+"alpha's listing is on screen and beta's is not" is a claim about bytes off a particular socket rather than
+about which state happened to be set. Run one method at a time, every test passed. Run as a class, **the
+first passed and the rest timed out at 90 s**, each with its tab frozen at `CHANNEL_PTY_INITIALIZING`.
+
+Three signals, none of them from guessing:
+
+| evidence | what it rules out |
+| --- | --- |
+| both `DefaultDispatcher-worker` threads `TIMED_WAITING` in `tryPark`; every `sshd-*` pool thread in `getTask` | nothing was running and nothing was blocked in MINA — not IO starvation, not a blocking `Command.start()` |
+| `sshd-ClientInputStreamPump[…]-thread-1` alive, blocked in `TerminalChannel$ChannelInputStream.read` | the shell channel **had** opened, so `openTerminal` had already returned |
+| the app's own diagnostics ended at `AUTHENTICATE`, with no `SHELL_OPEN` and no failure | the coroutine was suspended inside `attachTerminal`, before the line that sets `CONNECTED` |
+
+`attachTerminal`'s first suspending call is `rememberCredentials` → `SessionRegistry.register` →
+`DataStore.edit`. And `SessionRegistry.write` was:
+
+```kotlin
+withContext(NonCancellable) { context.sessionRegistryDataStore.edit(block) }
+```
+
+`NonCancellable` replaces the job, **not the dispatcher**, so the caller's dispatcher — `Main`, via
+`viewModelScope` — was still in effect. Decompiling `datastore-core-android` 1.1.4 settles what that means:
+`DataStoreImpl$transformAndWrite$2` calls `BuildersKt.withContext($callerContext, …)`, so **the transform
+runs on the dispatcher of whoever called `edit`**. Every credential encryption and preferences file write in
+this app was therefore happening on the UI thread — and DataStore serialises writes through a single actor,
+so one transform parked on a dispatcher that has stopped running blocks *every later write to that store for
+the life of the process*.
+
+That is exactly what the class did to itself. `closeTab` ends with a fire-and-forget
+`viewModelScope.launch { sessionRegistry.unregister(...) }`; a Robolectric test's main looper stops being
+pumped the moment the method returns, so two of those writes per test were abandoned half-done. Since
+`preferencesDataStore` caches one store per delegate for the whole classloader, the wedge outlived the
+application instance and froze the *next* test's login at the one point that needs a credential write.
+
+### 31.4 What changed
+
+Every preferences write now names its dispatcher, and the KDoc at each site says why it is a contract rather
+than an optimisation:
+
+| file | writes | work that was on the UI thread |
+| --- | --- | --- |
+| `background/SessionRegistry.kt` | 1 helper | AES encryption of password, key and passphrase, plus the file write |
+| `data/credentials/HostCredentialStore.kt` | 3 sites → 1 helper | the same encryption, for saved credentials |
+| `data/settings/SnippetRepository.kt` | 2 sites → 1 helper | encryption of the whole snippet list |
+| `data/settings/SettingsRepository.kt` | 13 sites → 1 helper | the preferences file write |
+
+The harness was made honest in the same pass rather than made lenient: `@After` now *waits* for
+`tabs.isEmpty()` instead of firing `disconnectAll()` and walking away, so each test's cleanup completes
+inside the test that started it. No assertion was relaxed, no test was disabled, and the temporary thread-dump
+instrumentation used to find this was removed — `diagnose()` keeps the app's own diagnostic trace, which is
+what actually located the suspension point.
+
+The production consequence is the part worth keeping in mind: this was never only a test artefact. On a
+device, the first `AndroidKeyStore` key generation — hundreds of milliseconds, once per install — sat inside
+that transform, on the main thread, on the connect path.
+
+### 31.5 The one assertion that had to change, and why it is not a weakening
+
+Across 868 debug tests the dispatcher change broke exactly one assertion, in
+`SessionRegistryRobolectricTest > a credential asked for by an already cancelled attempt is still stored`.
+Its first two assertions — the credential *is* stored, the host *is* registered, both after the caller
+cancelled itself mid-write — still pass, and they are the guarantee the test exists for and the whole subject
+of section 29. What failed was a third assertion about **which line** reports the cancellation.
+
+Before, `withContext(NonCancellable)` did not change dispatcher, so the block ran undispatched and `register`
+returned normally; the caller then learned of its cancellation at the next `yield()`. Dispatched to
+`Dispatchers.IO` there is a real suspension, and `DispatchedTask.run` resumes a coroutine whose job is no
+longer active *with that job's cancellation* — so `register` itself throws. The assertion now covers both
+lines and states the guarantee instead: the write completes, and the caller does not return normally and go on
+to present a session. Which of the two delivers it was never a requirement — it is a fact about the
+dispatcher, and pinning it is what made a correct fix look like a regression.
+
+Production is unaffected either way. The only caller is `rememberCredentials`, which rethrows
+`CancellationException` and is followed immediately by `currentCoroutineContext().ensureActive()`, so both
+orders abort at the same place. `unregister`'s callers wrap it in `runCatching` and discard.
+
+### 31.6 One more thing the chip test had to learn
+
+With the wedge gone, four of the five passed and the fifth — the one that taps the chip rather than calling
+the view model — could not find the "Files" tab. Not a defect: connecting takes the app **straight into the
+shell full screen**, and `terminalImmersive` removes the navigation bar entirely, which is the whole point of
+it. There is no Files tab to tap until the shell is left, and the way out is Back, which
+`BackHandler(enabled = terminalImmersive)` binds to "stop watching this session" rather than to "close the
+app". The test now goes through `onBackPressedDispatcher` and waits for the bar, so it takes the route a user
+takes instead of reaching past the UI for the state it wanted.

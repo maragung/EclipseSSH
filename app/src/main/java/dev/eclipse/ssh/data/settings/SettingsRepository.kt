@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
@@ -113,18 +114,29 @@ class SettingsRepository(private val context: Context) {
         if (error is IOException) emit(emptyPreferences()) else throw error
     }.map(::settingsFrom)
 
-    suspend fun setBiometricUnlock(enabled: Boolean) = context.settingsDataStore.edit { it[Keys.biometricUnlock] = enabled }
-    suspend fun setBlockScreenshots(enabled: Boolean) = context.settingsDataStore.edit { it[Keys.blockScreenshots] = enabled }
-    suspend fun setDarkTheme(enabled: Boolean) = context.settingsDataStore.edit { it[Keys.darkTheme] = enabled }
-    suspend fun setClipboardSeconds(seconds: Int) = context.settingsDataStore.edit { it[Keys.clipboardSeconds] = seconds }
-    suspend fun setKeepAliveSeconds(seconds: Int) = context.settingsDataStore.edit { it[Keys.keepAliveSeconds] = seconds }
+    /**
+     * Every write goes through here so none of them runs on the caller's dispatcher.
+     *
+     * DataStore invokes an `edit` transform with `withContext(callerContext)`, so a transform started
+     * from `viewModelScope` runs on the main thread -- a file write on the UI thread. Worse, writes are
+     * serialised through a single actor, so one transform parked on a stalled dispatcher blocks every
+     * later write to this store for the life of the process.
+     */
+    private suspend fun editPrefs(block: suspend (MutablePreferences) -> Unit): Preferences =
+        withContext(Dispatchers.IO) { context.settingsDataStore.edit(block) }
+
+    suspend fun setBiometricUnlock(enabled: Boolean) = editPrefs { it[Keys.biometricUnlock] = enabled }
+    suspend fun setBlockScreenshots(enabled: Boolean) = editPrefs { it[Keys.blockScreenshots] = enabled }
+    suspend fun setDarkTheme(enabled: Boolean) = editPrefs { it[Keys.darkTheme] = enabled }
+    suspend fun setClipboardSeconds(seconds: Int) = editPrefs { it[Keys.clipboardSeconds] = seconds }
+    suspend fun setKeepAliveSeconds(seconds: Int) = editPrefs { it[Keys.keepAliveSeconds] = seconds }
 
     /**
      * Base delay for the reconnect backoff, clamped to a range that keeps retries useful:
      * below 1 s the service would hammer an unreachable host, above 60 s the first retry
      * arrives long after the user gave up.
      */
-    suspend fun setReconnectBaseSeconds(seconds: Int) = context.settingsDataStore.edit {
+    suspend fun setReconnectBaseSeconds(seconds: Int) = editPrefs {
         it[Keys.reconnectBaseSeconds] = seconds.coerceIn(MIN_RECONNECT_BASE_SECONDS, MAX_RECONNECT_BASE_SECONDS)
     }
     /**
@@ -135,11 +147,11 @@ class SettingsRepository(private val context: Context) {
      * fingers can get would otherwise store a font size that leaves one column on screen with no way
      * back except the settings slider.
      */
-    suspend fun setTerminalFontSize(size: Int) = context.settingsDataStore.edit {
+    suspend fun setTerminalFontSize(size: Int) = editPrefs {
         it[Keys.terminalFontSize] = normalizeFontSize(size)
     }
 
-    suspend fun setTerminalKeyRowVisible(visible: Boolean) = context.settingsDataStore.edit {
+    suspend fun setTerminalKeyRowVisible(visible: Boolean) = editPrefs {
         it[Keys.terminalKeyRowVisible] = visible
     }
 
@@ -152,11 +164,11 @@ class SettingsRepository(private val context: Context) {
      * would not be the value in force; above its maximum it would be silently lowered, and the user
      * would be panning across a grid the server never had.
      */
-    suspend fun setTerminalMinColumns(columns: Int) = context.settingsDataStore.edit {
+    suspend fun setTerminalMinColumns(columns: Int) = editPrefs {
         it[Keys.terminalMinColumns] = normalizeMinColumns(columns)
     }
-    suspend fun setLegacyAlgorithms(enabled: Boolean) = context.settingsDataStore.edit { it[Keys.legacyAlgorithms] = enabled }
-    suspend fun setTerminalTheme(name: String) = context.settingsDataStore.edit { it[Keys.terminalTheme] = name }
+    suspend fun setLegacyAlgorithms(enabled: Boolean) = editPrefs { it[Keys.legacyAlgorithms] = enabled }
+    suspend fun setTerminalTheme(name: String) = editPrefs { it[Keys.terminalTheme] = name }
 
     suspend fun setPin(pin: String) {
         // PBKDF2 at 60k iterations is deliberately expensive — hundreds of milliseconds, more on a
@@ -164,7 +176,7 @@ class SettingsRepository(private val context: Context) {
         // viewModelScope, which is Dispatchers.Main, so it ran on the UI thread and froze the frame.
         val salt = PinHasher.newSalt()
         val hash = withContext(Dispatchers.Default) { PinHasher.hash(pin, salt) }
-        context.settingsDataStore.edit {
+        editPrefs {
             it[Keys.pinSalt] = Base64.getEncoder().encodeToString(salt)
             it[Keys.pinHash] = hash
             it[Keys.pinEnabled] = true
@@ -180,7 +192,7 @@ class SettingsRepository(private val context: Context) {
         return withContext(Dispatchers.Default) { PinHasher.verify(pin, salt, hash) }
     }
 
-    suspend fun clearPin() = context.settingsDataStore.edit {
+    suspend fun clearPin() = editPrefs {
         it.remove(Keys.pinHash)
         it.remove(Keys.pinSalt)
         it[Keys.pinEnabled] = false
