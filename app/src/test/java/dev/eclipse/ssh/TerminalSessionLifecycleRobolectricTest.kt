@@ -1319,6 +1319,11 @@ class TerminalSessionLifecycleRobolectricTest {
             append(" shellsStarted=").append(shellsStarted.get())
             append(" serverWrote=").append(serverWrote.get())
             append(" appSent=").append(sentBytes().size)
+            // Whether a login was even attempted, and whether the server turned one down. A resume
+            // that arrives with nothing to authenticate with produces neither, which is a different
+            // fault from offering the wrong password and is otherwise indistinguishable from it in a
+            // timeout message - see [passwordsAccepted].
+            append(" logins=").append(passwordsAccepted.get()).append("+/").append(passwordsRejected.get()).append("-")
             append(" window=").append(windowSize.get())
             append(" transcript=").append(viewModel.uiState.value.terminalOutput[hostId]?.length)
             append(" frameRows=").append(frame?.lines?.size)
@@ -1333,6 +1338,12 @@ class TerminalSessionLifecycleRobolectricTest {
             // lives on `MutableSharedFlow` and this is the same object.
             append(" frameCollectors=").append((viewModel.frames as? MutableStateFlow<*>)?.subscriptionCount?.value)
             append("\nframe:\n").append(frame?.text() ?: "no frame")
+            // The app's own account of what it did, which is the only thing that can tell a ladder that
+            // never ran from one that ran with no credential: CREDENTIAL_NOT_STORED says the vault
+            // refused the live session's password at install, and the RECONNECT_* lines say which rung
+            // reached the wire. Printed only on the way to a failure, and safe to print - every field
+            // is scrubbed of secrets, which [SessionDiagnosticsTest] asserts.
+            append("\ntrace:\n").append(viewModel.exportDiagnostics())
         }
     }
 

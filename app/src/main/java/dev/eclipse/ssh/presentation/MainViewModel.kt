@@ -710,6 +710,15 @@ class MainViewModel @Inject constructor(
      *    and its teardown does no I/O.
      */
     private suspend fun attachTerminal(host: HostProfile, terminal: TerminalChannel, resolved: ResolvedCredentials) {
+        // First of everything here, and deliberately ahead of the collector below: the credential is
+        // what the reconnect ladder answers an ending with, and the collector is what reports one. Left
+        // where it used to be - after the tab was already CONNECTED - the two raced on every session
+        // that died young, and the write lost. See [rememberCredentials].
+        rememberCredentials(host, resolved)
+        // That write cannot be abandoned halfway, so a cancellation arriving during it is deferred to
+        // here. Honoured now, before anything below runs: the rest of this function presents a session
+        // to the user, and an attempt that has been replaced by another has none to present.
+        currentCoroutineContext().ensureActive()
         terminalJobs.remove(host.id)?.cancelAndJoin()
         channels.put(host.id, terminal)?.let { previous ->
             // Never the channel just installed: adopting hands back the channel that is already in
@@ -747,20 +756,9 @@ class MainViewModel @Inject constructor(
         // [STABLE_SESSION_MS] - and by a user asking for a connection themselves. See
         // [scheduleAutoReconnect].
         runCatching { hostRepository.save(host.copy(lastConnectedAt = System.currentTimeMillis())) }
-        // Still `runCatching`: a vault that cannot store the credential is not a reason to fail a
-        // session that is already up. But it is said out loud in the trace, because the consequence
-        // lands much later and looks like something else - the reconnect ladder then has nothing to
-        // authenticate with, and an outage ends the session with a credential error instead of
-        // recovering. Only the failure class is recorded; the message could name what it was given.
-        runCatching { sessionRegistry.register(host.id, resolved.password, resolved.keyBytes, resolved.keyPassphrase) }
-            .onFailure { failure ->
-                diagnostics.record(
-                    host.id,
-                    SessionEvent.CREDENTIAL_NOT_STORED,
-                    state = SessionConnectionState.CONNECTED,
-                    detail = failure.javaClass.simpleName,
-                )
-            }
+            // A cancellation is not a failed save, and everything below it presents a session that an
+            // attempt replaced by another no longer has. See [rememberCredentials].
+            .onFailure { if (it is CancellationException) throw it }
         // Auto Login SFTP. Off means SSH only — nothing opens a second channel on this host until the
         // user asks for a listing — which is the point of the switch: an account with a shell and no
         // sftp-server subsystem otherwise greets every successful login with a failure about a feature
@@ -770,6 +768,35 @@ class MainViewModel @Inject constructor(
         } else {
             updateTab(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
         }
+    }
+
+    /**
+     * Puts the credential that just authenticated on file for the reconnect ladder and the service.
+     *
+     * Still `runCatching`: a vault that cannot store the credential is not a reason to fail a session
+     * that is already up. But it is said out loud in the trace, because the consequence lands much
+     * later and looks like something else - the ladder then has nothing to authenticate with, and an
+     * outage ends the session with a credential error instead of recovering. Only the failure class is
+     * recorded; the message could name what it was given.
+     *
+     * A cancellation is not one of those failures and is rethrown instead of filed as one. The write
+     * cannot be cancelled halfway - [SessionRegistry] holds it to that - so a cancellation arriving
+     * here means the attempt this call belongs to has already been replaced by another, and everything
+     * after it is about presenting that attempt's session. Swallowed, as it was, it let a cancelled
+     * attempt carry on to the SFTP login and report "lifecycle is not connected" against a transport
+     * that was already gone - the failure that made the real fault look like an SFTP problem.
+     */
+    private suspend fun rememberCredentials(host: HostProfile, resolved: ResolvedCredentials) {
+        runCatching { sessionRegistry.register(host.id, resolved.password, resolved.keyBytes, resolved.keyPassphrase) }
+            .onFailure { failure ->
+                if (failure is CancellationException) throw failure
+                diagnostics.record(
+                    host.id,
+                    SessionEvent.CREDENTIAL_NOT_STORED,
+                    state = SessionConnectionState.CONNECTED,
+                    detail = failure.javaClass.simpleName,
+                )
+            }
     }
 
     /**

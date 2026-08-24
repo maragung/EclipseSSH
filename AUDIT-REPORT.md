@@ -3016,3 +3016,96 @@ Neither fix was taken on trust. The concurrency was reproduced here on purpose �
 variants, `--parallel` restored and `--max-workers=2`, which is the one configuration this host normally
 forbids — and the two suites overlapped by **102.9 seconds** with `failures="0" errors="0"` on both sides.
 That is the same overlap CI had, with the same two editors running, and nothing collided.
+
+## 29. The credential the reconnect ladder was handed, and the write that never finished
+
+The 1.1.1 bump failed CI's `verify` job in a shape this host would not produce: **one test per variant, a
+different test in each**, both timing out at the harness's 90-second deadline with the same tab state.
+
+| variant | test | tab at the deadline |
+| --- | --- | --- |
+| debug | `aTypedPasswordThatWasNeverSavedStillRecoversTheSessionAfterAnOutage` | `state=ERROR`, `lastError=No more authentication methods available` |
+| release | `aReconnectAsksForThePtySizeTheUserWasWorkingAt` | the same two, verbatim |
+
+Both tests stage an outage and wait for the session to come back; both also carried
+`sftpState=FAILED, sftpError=lifecycle is not connected` and `shellsStarted=1 serverWrote=26 appSent=0` — one
+shell for the whole test, the greeting from it, and **not one byte offered by the app on the way back**.
+
+### 29.1 Two false starts, both mine
+
+The first reading of the CI results named a third test in both variants,
+`aShellKilledBySignalNamesTheSignalAndIsNotRedialled`, which turned out to be innocent: I had matched
+`<testcase name="([^"]+)"[^>]*>(.*?)</testcase>` against the JUnit XML, and `[^>]*>` happily consumes the `/>`
+of a self-closing `<testcase/>` and then swallows the *next* case's `<failure>` body. Every attribution was one
+test out. Parsed with `xml.etree.ElementTree` instead, the failures are the two in the table.
+
+The second false start was expecting this host to reproduce it. Three rounds of both suites, with CI's own
+concurrency restored (`org.gradle.parallel` on, `--max-workers=2`, `--rerun` on each test task so Gradle
+cannot call them up to date) passed. The fault is a race whose losing side is slower on a runner than here.
+
+### 29.2 What actually happens
+
+Nothing about the vault, and nothing about the password.
+
+A connect attempt runs in a job kept in `connectJobs`. When its session is up, `attachTerminal` stores the
+credential that just worked in `SessionRegistry`, which is what the reconnect ladder and the foreground
+service authenticate with later. And the first thing the ladder does, on its way to reconnecting, is
+`connectJobs.remove(host.id)?.cancel()` — cancelling the attempt that brought the session up.
+
+That cancellation and the credential write are therefore racing, and the write is by far the slower of the
+two. `DataStore.edit` reads the file, encrypts through the vault, writes a scratch copy, fsyncs and renames —
+a suspending round trip on a background thread, and slowest exactly when the machine is busiest, which on a
+runner is *always*. Losing that race abandoned the write mid-flight. The reconnect the cancellation existed
+to start then arrived with nothing to authenticate with, and MINA said so: **"No more authentication methods
+available"** — the words a wrong password produces, on a password that was right.
+
+The window is wide open on a device, too, and it is at its widest for the fault this whole audit is about: a
+session that dies seconds after login is precisely the case where the ladder's cancel lands on a write that
+has barely started. It is also the case where a first key generation in `AndroidKeyStore` — hundreds of
+milliseconds, once per install — sits inside the same `edit`.
+
+One detail in the failure text is consistent with the cancellation and with nothing else in the app: the tab
+reported an SFTP failure of `lifecycle is not connected`. The SFTP login is a *sibling* `viewModelScope.launch`,
+which a cancelled attempt does not take with it, and it is reached from the line directly after the credential
+write — a line that could only be reached because `runCatching` had swallowed the `CancellationException` and
+called it a vault failure. (Only consistent, not conclusive: the test closes the transport around the same
+moment, and a slow SFTP login would report the same string.)
+
+### 29.3 The fix
+
+Three changes, none of which touches what a test asserts:
+
+* **`SessionRegistry` no longer has a cancellable write.** `register`, `unregister` and `clear` all go through
+  one private `write` that runs the `edit` under `NonCancellable`. A write that has started finishes.
+  Cancellation is not swallowed, only deferred: the caller observes it as soon as the write returns, having
+  lost nothing. `unregister` and `clear` want this for the other reason — a half-done forget leaves a
+  credential on disk that the user asked the app to drop.
+* **The write happens before anything can report an ending.** It was the last of `attachTerminal`'s
+  bookkeeping, after the tab had already been marked `CONNECTED`; it is now the first thing that function
+  does, ahead of the collector that reports endings and therefore ahead of the ladder that answers them.
+  Immediately after it, `currentCoroutineContext().ensureActive()` honours a cancellation that arrived during
+  the write: everything below presents a session to the user, and an attempt that has been replaced has none
+  to present. That is also what stops a cancelled attempt reaching the SFTP login, so the misleading
+  `lifecycle is not connected` goes with it.
+* **A cancellation is no longer filed as a failure.** Both `runCatching`s in that block rethrow it instead of
+  recording `CREDENTIAL_NOT_STORED` — a diagnostic that said the vault refused a credential it had never been
+  asked for.
+
+`register` keeping its "a null value leaves the stored one alone" behaviour matters more than it looks:
+adopting a live session registers whatever the caller happens to hold, which for a session the background
+service dialled is nothing at all, and clearing on that would forget a working credential every time the app
+reused a session instead of dialling one. `SessionRegistryRobolectricTest` pins it, alongside the two halves
+of the durability contract — a credential asked for by an already cancelled coroutine is still stored, and a
+forget asked for by one still happens. Neither was trusted before being checked against the old code: with
+the `NonCancellable` removed and nothing else touched, both fail, and they fail with the CI failure's own
+symptom — `expected: hunter2 but was null` where the credential should be, and a credential still on disk
+after a forget.
+
+### 29.4 What the next run will say if this was not it
+
+The mechanism is established by construction and by the evidence above rather than by a local reproduction, so
+the harness now prints, on any failure of these tests, the two things whose absence made this diagnosis slow:
+`logins=<accepted>+/<rejected>-` straight off the test server, and the app's own scrubbed trace via
+`exportDiagnostics()`. A ladder that never offered anything and a ladder that offered the wrong thing are one
+counter apart; `CREDENTIAL_NOT_STORED` in the trace would name the vault; and the `RECONNECT_*` lines say which
+rung reached the wire. None of them can print a secret — `SessionDiagnosticsTest` holds that.
