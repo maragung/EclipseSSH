@@ -419,8 +419,22 @@ class RealOpenSshInteropRobolectricTest {
 
         // Text of this test's own, wide enough that a phone-width view has to do something about it,
         // rather than whatever this machine happens to keep in /etc.
-        val paged = File(sandbox, "pager.txt")
+        //
+        // A fresh name per JVM, not a fixed one, because two of the programs below are editors and CI
+        // runs the debug and release suites at the same time - `org.gradle.parallel` is on and the two
+        // task's timestamps overlap. Two `vi`s on one path meet `E325: ATTENTION` and a swap-file prompt
+        // instead of the file, which is vim being right and a harness sharing mutable state being wrong.
+        val paged = File.createTempFile("eclipse-pager", ".txt", sandbox)
+        paged.deleteOnExit()
         paged.writeText((1..PAGER_LINES).joinToString("\n") { "$PAGER_MARKER line $it " + "=".repeat(50) } + "\n")
+
+        // Opened by name from its own directory rather than by absolute path, because one of the markers
+        // below is a program's title bar and a title bar is only as wide as the screen. `nano` centres its
+        // version string next to the file name on one row and drops the version when the name crowds it
+        // out: measured on a real 80x12 pty, `GNU nano 8.4` is there at a 48-character path and gone by 60,
+        // and the runner's workspace makes that path 70. The assertion was passing here on the length of
+        // this machine's directory names, which is no kind of test.
+        val fromItsDirectory = "cd ${sandbox.absolutePath} &&"
 
         val ran = mutableListOf<String>()
 
@@ -428,7 +442,7 @@ class RealOpenSshInteropRobolectricTest {
         onPath("less")?.let { less ->
             runFullScreenProgram(
                 hostId = saved.id,
-                command = "$less ${paged.absolutePath}",
+                command = "$fromItsDirectory $less ${paged.name}",
                 paints = PAGER_MARKER,
                 alternateScreen = true,
                 quit = { compose.runOnUiThread { viewModel.sendText(saved.id, "q") } },
@@ -442,7 +456,7 @@ class RealOpenSshInteropRobolectricTest {
         (onPath("vi") ?: onPath("vim"))?.let { vi ->
             runFullScreenProgram(
                 hostId = saved.id,
-                command = "$vi ${paged.absolutePath}",
+                command = "$fromItsDirectory $vi ${paged.name}",
                 paints = PAGER_MARKER,
                 alternateScreen = true,
                 quit = {
@@ -458,7 +472,7 @@ class RealOpenSshInteropRobolectricTest {
         onPath("nano")?.let { nano ->
             runFullScreenProgram(
                 hostId = saved.id,
-                command = "$nano ${paged.absolutePath}",
+                command = "$fromItsDirectory $nano ${paged.name}",
                 paints = "GNU nano",
                 alternateScreen = true,
                 quit = { compose.runOnUiThread { viewModel.sendChar(saved.id, 'x', ctrl = true) } },

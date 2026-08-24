@@ -2979,3 +2979,40 @@ where it must not be — was probed too, with `.tmp-build/edprobe3.py`. `watch -
 that repaints a fixed screen, turns out to take the alternate screen (`ESC[?1049h`, ED3 count 0), so it was
 already covered; `tput clear` sends the same three sequences `clear` does. Nothing probed repaints in place
 and sends ED3. The false positive is gone with no new one taking its place.
+
+### 28.7 Two things the new test knew about this machine and not about a runner
+
+The full-screen test passed here and failed on CI the first time it ran there — 12 tests where the previous
+run had 10, so this was its first outing on a runner. Both failures were the harness's, and both were
+assumptions about the machine that this machine happened to satisfy.
+
+**`vi` met a swap file, because two suites were editing one file.** The frame in the failure message is
+vim's `E325: ATTENTION`, naming a `.pager.txt.swp` owned by process 3404, *still running*. The two suites'
+own timestamps explain it: `testReleaseUnitTest` started its interop class at 01:34:26 and ran for 248 s,
+`testDebugUnitTest` at 01:35:29 for 245 s — three minutes of overlap. `org.gradle.parallel=true` and
+`org.gradle.configuration-cache=true` are both in `gradle.properties`, and with the configuration cache
+Gradle will run two tasks of the *same* project concurrently; every local run passes `--no-parallel`, which
+is why this never appeared here. So two JVMs opened one path in two editors, and vim did exactly the right
+thing. The file is now created with `File.createTempFile` in the sandbox, one per JVM per run: nothing about
+the app changed, and the shared mutable state the test brought with it is gone.
+
+**`nano` did not print its own name, because the runner's path is longer.** The frame showed nano plainly
+painted — `[ Read 40 lines ]`, both shortcut rows — with a truncated path where `GNU nano 8.4` should be.
+nano centres its version string and the file name on one title row and drops the version when the name
+crowds it out. Measured on a real 80x12 pty rather than guessed at, with the same file opened by paths of
+different lengths:
+
+| absolute path length | `GNU nano` in the title |
+| --- | --- |
+| 48 — this machine's sandbox | yes |
+| 60 | no |
+| 70 — the runner's workspace | no |
+
+The assertion was passing on the length of this machine's directory names. The programs are now run from the
+file's own directory by its bare name, so the title bar is the same width wherever the workspace lives, and
+the assertion is on nano's title rather than on a path that fits.
+
+Neither fix was taken on trust. The concurrency was reproduced here on purpose — the interop class alone, both
+variants, `--parallel` restored and `--max-workers=2`, which is the one configuration this host normally
+forbids — and the two suites overlapped by **102.9 seconds** with `failures="0" errors="0"` on both sides.
+That is the same overlap CI had, with the same two editors running, and nothing collided.
