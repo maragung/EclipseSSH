@@ -3591,3 +3591,77 @@ interop class skipping — the sandbox was not running, so `assumeTrue` retired 
 including the five new ones. The five tests added since then account for the difference in the total; the
 difference in the skips is a live server, and it is the reason two genuine defects turned up between one green
 run and the next.
+
+## 34. Releasing 1.1.3
+
+Same process as §20, §22, §25, §27, §30 and §32: GitHub Actions assembles from the commit on `main`, this
+host does nothing but re-sign. Workflow run `32931282823` built commit `81288ce` — §33's per-host options on
+top of the Files tabs and the login relabelling.
+
+| | |
+| --- | --- |
+| `lintRelease` | **0 errors, 51 warnings** — 44 `GradleDependency`, 4 `ConfigurationScreenWidthHeight`, 2 `AndroidGradlePluginVersion`, 1 `OldTargetApi`: the same 51 as 1.1.0, 1.1.1 and 1.1.2, so three rounds of features have added none |
+| Unit and integration tests | **978 per variant across 73 classes, 0 failures, 0 errors**, on debug *and* release — 110 more tests and 4 more classes than 1.1.2 |
+| Skipped | **7, and exactly the 7 intended** — the long idle matrix behind `ECLIPSE_STRESS=1`. So 971 ran |
+| Interop | **10 of those talk to a real OpenSSH**, on the runner as well as here |
+| Instrumentation sources | compiled |
+| APKs | **five**, the five-output count asserted in CI |
+
+CI and this host agree exactly — `classes=73 tests=978 failures=0 errors=0 skipped=7` on both variants in
+both places, and the same seven skip names. That agreement is worth more than either number alone: the
+interop suite dials a server this host provisions itself, so the obvious failure mode was a suite that only
+passes where it was written. It passes on a runner that provisions the same server from the same script.
+
+**Local `--offline` lint reported 4 warnings, CI reported 51, and both are right** — §32's finding, unchanged:
+`GradleDependency` and `AndroidGradlePluginVersion` ask whether newer versions exist, which needs the
+network, so `--offline` drops all 46. The 4 that survive are the `ConfigurationScreenWidthHeight` advisories,
+now at `MainActivity.kt:1920-1921` after this round's insertions. CI is the number to quote.
+
+### 34.1 The five files
+
+| file | bytes | SHA-256 |
+| --- | --- | --- |
+| `EclipseSSH-1.1.3-universal-release.apk` | 5,858,749 | `92e9b4fbd90e05884f9687330e1a43b89f1d7e9407fa7a79d1dcb04988856653` |
+| `EclipseSSH-1.1.3-arm64-v8a-release.apk` | 5,759,925 | `60fa49a6cff677f8c2086f020bdf5613e664a682f434116298c6ff5c4de2fec5` |
+| `EclipseSSH-1.1.3-armeabi-v7a-release.apk` | 5,755,833 | `bc55cee52150ac513062f0e10e75e228eb9ca7c352044eb4b38978ca9380501f` |
+| `EclipseSSH-1.1.3-x86-release.apk` | 5,759,913 | `46d577e83dd29b90a5c00ef55d5e0c16db1634c40e94ed1318b1450403afa9c0` |
+| `EclipseSSH-1.1.3-x86_64-release.apk` | 5,759,919 | `1341eedc414e23ae2b45251b01e9d458e51c1f96c789879b6c9f285754b3b552` |
+
+versionCode 11 for all five, signer certificate SHA-256
+`a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e` — the same key as every release since
+1.0.0, so any of these installs straight over 1.1.2. `apksigner verify` reports v3 alone at minSdk 28 and
+v2 as well once asked with `--min-sdk-version 24`, which is §12.8's finding, not a missing signature;
+`zipalign -c 4` clean on all five.
+
+**The three-release run of identical file lengths ends here, and the arithmetic is worth writing down**
+because it is the same effect that produced the identical ones. Every 1.1.3 file is exactly 65,536 bytes
+longer than its 1.1.2 counterpart — all five by the same amount, measured rather than assumed:
+`classes.dex` is byte-for-byte the same in all five, it is stored uncompressed, it grew from 5,216,316 to
+5,283,892 (+67,576), every entry in the archive together grew by 67,649, and the file grew by 65,536. The
+2,113-byte difference is alignment padding in front of the native libraries being absorbed. For 1.1.0
+through 1.1.2 that padding absorbed *all* of the growth, which is why three releases came out the same
+length; this one exceeded it.
+
+### 34.2 What CI verified and what it could not
+
+Unchanged from §32.2, and restated because the log still looks alarming out of context: CI's signature step
+asserts the five-output count unconditionally, but its dual-scheme check is guarded on
+`steps.signing.outputs.signed`. No signing secrets are set on the repository — deliberately, per §20 — so
+the runner signs with the debug key, that guard is false, and the v2+v3 assertion does not run there. It ran
+here instead, on all five, after re-signing with the real key: `v3: true` at minSdk 28, `v2: true` and
+`v3: true` at minSdk 24, `zipalign -c 4` clean. The runner's five APKs carry the debug key and are
+build-shape evidence, not artifacts anybody installs.
+
+### 34.3 Published and verified
+
+Tag `v1.1.3` (annotated object `15cb5198`) on `81288ce`, release
+`https://github.com/maragung/EclipseSSH/releases/tag/v1.1.3`, five assets uploaded. Each was then
+**downloaded back** from `https://api.github.com/repos/maragung/EclipseSSH/releases/assets/<id>` with
+`Accept: application/octet-stream` and its SHA-256 compared against the local signed file: all five
+identical. The same five are served from port 19001, where the universal and arm64 files fetched over HTTP
+hash to `92e9b4fb…` and `60fa49a6…` as well, and `README.txt` now leads with 1.1.3 as entry 1 of ten.
+
+Signing passwords went to `apksigner` through mode-600 files in a mode-700 directory, shredded by an `EXIT`
+trap; `/proc/<pid>/cmdline` is world-readable on this host, so they were never arguments. No `sign.*`
+directory survived the run. The three deviations from the approved plan are recorded in §33.5 and the cipher
+the UI should never have been able to choose in §33.6.
