@@ -49,6 +49,7 @@ import dev.eclipse.ssh.ssh.SessionEnd
 import dev.eclipse.ssh.ssh.SessionEvent
 import dev.eclipse.ssh.ssh.SessionLivenessProbe
 import dev.eclipse.ssh.ssh.SshConnectPhase
+import dev.eclipse.ssh.ssh.isAppFault
 import dev.eclipse.ssh.ssh.isFault
 import dev.eclipse.ssh.ssh.describeConnectFailure
 import dev.eclipse.ssh.ssh.describeSessionEnd
@@ -85,6 +86,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -107,6 +110,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.plus
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.sshd.client.session.ClientSession
@@ -203,6 +207,45 @@ class MainViewModel @Inject constructor(
     private val localDirUri = MutableStateFlow<String?>(null)
     private val forwardings = MutableStateFlow<List<ForwardEntry>>(emptyList())
     private val forwardHandles = ConcurrentHashMap<String, ForwardingHandle>()
+
+    /**
+     * Where every coroutine that can reach an SSH transport runs. Not the main thread, ever.
+     *
+     * [viewModelScope] dispatches on `Dispatchers.Main.immediate`, and that is the wrong place for
+     * every line below that dials, lists, forwards or hangs up: an SSH call is a socket call, and a
+     * socket call on Android's main thread is [android.os.NetworkOnMainThreadException] - raised by
+     * BlockGuard *inside* MINA's write path, so the transport is already marked broken by the time the
+     * throw reaches whatever `runCatching` was meant to contain it. The app then reports its own
+     * threading mistake as `TransportFailed`, the tab reads "Connection lost:
+     * NetworkOnMainThreadException", and the reconnect ladder answers it - five rungs, up to half a
+     * minute apart, each one dying the same way a second after the shell opens, because the auto-SFTP
+     * login that triggered it runs on every shell open. That is the reconnect loop, and its cause was
+     * a missing dispatcher rather than anything about the network.
+     *
+     * It is a *named* scope rather than `Dispatchers.IO` repeated at each `launch` for the reason the
+     * defect existed at all: the rule is one decision, and fifteen copies of a decision is fourteen
+     * chances to forget it. `transportScope.launch` also says what kind of coroutine it is, so a
+     * `viewModelScope.launch` that starts touching the transport reads as a mistake.
+     *
+     * Shares [viewModelScope]'s job, so everything here is still cancelled with the view model, and
+     * the UI state it writes is safe from any thread: the flows are [MutableStateFlow]s and
+     * [updateTab] is atomic by design.
+     */
+    private val transportScope: CoroutineScope = viewModelScope + Dispatchers.IO
+
+    /**
+     * Where native resources are *released*, deliberately outliving [viewModelScope].
+     *
+     * Two properties teardown needs and [transportScope] cannot give it. It must be off the main
+     * thread, for the reason above - closing a port-forward tracker asks the server to cancel the
+     * forward, which is a write. And it must not be cancellable: a close that is cancelled halfway
+     * leaks the listening socket it was supposed to release, and the callers include [onCleared],
+     * where [viewModelScope] has already been cancelled and a coroutine launched in it would never
+     * run at all.
+     *
+     * Only ever handed work that finishes on its own in milliseconds, so nothing accumulates in it.
+     */
+    private val releaseScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val serverStats = MutableStateFlow<Map<String, ServerStats>>(emptyMap())
     private val hostKeyChallenge = MutableStateFlow<HostKeyChallenge?>(null)
     private val knownHostsState = MutableStateFlow<Map<String, String>>(emptyMap())
@@ -506,7 +549,7 @@ class MainViewModel @Inject constructor(
     private fun adoptExistingSessions() {
         val adoptable = sessionStore.adoptableHostIds()
         if (adoptable.isEmpty()) return
-        viewModelScope.launch {
+        transportScope.launch {
             val hosts = runCatching { hostRepository.hosts.first() }.getOrDefault(emptyList())
             adoptable.forEach { hostId ->
                 val terminal = channels[hostId] ?: return@forEach
@@ -584,7 +627,7 @@ class MainViewModel @Inject constructor(
                 diagnostics.record(host.id, SessionEvent.RECONNECT_CANCELLED, detail = "connect requested")
             }
         }
-        val job = viewModelScope.launch {
+        val job = transportScope.launch {
             // Anything the caller supplied wins; the profile's saved credentials only fill the gaps.
             // That order matters: a password typed into the auth prompt has to beat the one saved on
             // the host, or a rotated server password could not be used at all without editing the
@@ -916,7 +959,7 @@ class MainViewModel @Inject constructor(
         val rules = decodeForwardRules(host.savedForwards, host.id)
         updateTab(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size, forwardError = null) }
         if (rules.isEmpty()) return
-        val job = viewModelScope.launch {
+        val job = transportScope.launch {
             val session = sessions[host.id]
             if (session == null) {
                 // Not an error worth a message: the only way to get here is a session that ended between
@@ -929,7 +972,7 @@ class MainViewModel @Inject constructor(
             rules.forEach { entry ->
                 try {
                     forwardHandles[entry.id] = openForward(session, entry)
-                    forwardings.value = forwardings.value + entry
+                    forwardings.update { it + entry }
                     open++
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -980,12 +1023,35 @@ class MainViewModel @Inject constructor(
      */
     private fun stopSavedForwards(hostId: String) {
         val prefix = savedForwardIdPrefix(hostId)
-        forwardings.value.filter { it.id.startsWith(prefix) }.forEach { entry ->
-            // Guarded for the same reason as [stopForwarding]: closing a tracker asks the server to
-            // cancel the forward, and the usual reason this runs is that the server is no longer there.
-            forwardHandles.remove(entry.id)?.let { handle -> runCatching { handle.close() } }
-        }
-        forwardings.value = forwardings.value.filterNot { it.id.startsWith(prefix) }
+        releaseForwards(forwardings.value.filter { it.id.startsWith(prefix) }.map { it.id })
+    }
+
+    /**
+     * Drops the forward trackers for [ids], closing them off the main thread.
+     *
+     * Split in two on purpose. The bookkeeping - the entries leaving [forwardHandles] and
+     * [forwardings] - happens before this returns, because the list on screen and the tab's forward
+     * count must not still be claiming a forward the app has given up on. The close is a *network*
+     * operation: a tracker asks the server to cancel the forward on the way out, and all four callers
+     * reach this from the main thread - a click handler, a shell opening, a host being deleted, and
+     * [onCleared]. On the main thread that write is [android.os.NetworkOnMainThreadException] raised
+     * inside MINA, which breaks the transport the forward was riding on. Tidying up a forward must not
+     * cost the user the session.
+     *
+     * Still `runCatching` per handle, and for the reason it always was: closing a tracker talks to the
+     * server, so it throws once the session is gone - and the session dying is exactly when three of
+     * these four callers run. One handle that cannot be closed must not stop the others.
+     *
+     * [releaseScope] rather than [transportScope] because a cancelled close leaks a listening socket,
+     * and because [onCleared] runs after [viewModelScope] has been cancelled.
+     */
+    private fun releaseForwards(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        val dropped = ids.toSet()
+        val handles = dropped.mapNotNull { forwardHandles.remove(it) }
+        forwardings.update { entries -> entries.filterNot { it.id in dropped } }
+        if (handles.isEmpty()) return
+        releaseScope.launch { handles.forEach { handle -> runCatching { handle.close() } } }
     }
 
     /**
@@ -1892,7 +1958,7 @@ class MainViewModel @Inject constructor(
         }
         // sendWindowChange writes an SSH packet, which blocks when the transport is
         // congested; keep it off the main thread so a stalled link cannot cause an ANR.
-        viewModelScope.launch(Dispatchers.IO) { runCatching { channels[hostId]?.resize(columns, rows) } }
+        transportScope.launch { runCatching { channels[hostId]?.resize(columns, rows) } }
     }
 
     /**
@@ -1912,7 +1978,7 @@ class MainViewModel @Inject constructor(
      * never asked for.
      */
     fun refreshFiles(host: HostProfile, path: String? = null, announce: Boolean = true) {
-        viewModelScope.launch {
+        transportScope.launch {
             if (sessions[host.id] == null) {
                 if (announce) report("${host.name} is not connected")
                 return@launch
@@ -1962,7 +2028,7 @@ class MainViewModel @Inject constructor(
      */
     private suspend fun listRemote(host: HostProfile, path: String?) {
         val session = sessions[host.id] ?: throw IllegalStateException("${host.name} is not connected")
-        sshConnectionManager.openSftp(session).use { sftp ->
+        sshConnectionManager.withSftp(session) { sftp ->
             val target = path ?: homePaths[host.id] ?: sftpDirectoryService.homeDirectory(sftp, host.username)
                 .also { homePaths[host.id] = it }
             val listing = sftpDirectoryService.list(sftp, target)
@@ -1988,7 +2054,7 @@ class MainViewModel @Inject constructor(
     fun loginSftp(host: HostProfile) {
         sftpJobs.remove(host.id)?.cancel()
         updateTab(host.id) { it?.copy(sftpState = SftpSessionState.CONNECTING, sftpError = null) }
-        val job = viewModelScope.launch {
+        val job = transportScope.launch {
             try {
                 listRemote(host, null)
                 updateTab(host.id) { it?.copy(sftpState = SftpSessionState.READY, sftpError = null) }
@@ -2056,7 +2122,7 @@ class MainViewModel @Inject constructor(
             localUri = file.uri.toString(),
             totalBytes = file.size.takeIf { it > 0 },
         )
-        viewModelScope.launch {
+        transportScope.launch {
             transferRepository.save(item)
             startUploadJob(host, item, file.uri, target, file.size.takeIf { it > 0 })
         }
@@ -2089,13 +2155,13 @@ class MainViewModel @Inject constructor(
             return
         }
         val remoteRoot = currentRemoteDir(host)
-        viewModelScope.launch(Dispatchers.IO) {
+        transportScope.launch {
             val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
             val rootDoc = DocumentFile.fromTreeUri(context, rootUri)
                 ?: return@launch report("The local folder is no longer accessible")
             try {
                 val localTree = LocalSyncIndex.walk(rootDoc)
-                sshConnectionManager.openSftp(session).use { sftp ->
+                sshConnectionManager.withSftp(session) { sftp ->
                     val remoteTree = sftpDirectoryService.listTree(sftp, remoteRoot)
                     val remoteDirs = remoteTree.values.filter { it.isDirectory }.map { it.path }.toMutableSet()
                     val remoteFiles = remoteTree.values.filterNot { it.isDirectory }
@@ -2145,12 +2211,12 @@ class MainViewModel @Inject constructor(
             return
         }
         val remoteRoot = currentRemoteDir(host)
-        viewModelScope.launch(Dispatchers.IO) {
+        transportScope.launch {
             val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
             val rootDoc = DocumentFile.fromTreeUri(context, rootUri)
                 ?: return@launch report("The local folder is no longer accessible")
             try {
-                sshConnectionManager.openSftp(session).use { sftp ->
+                sshConnectionManager.withSftp(session) { sftp ->
                     val remoteTree = sftpDirectoryService.listTree(sftp, remoteRoot)
                     for (remote in remoteTree.values) {
                         if (remote.isDirectory) continue
@@ -2216,7 +2282,7 @@ class MainViewModel @Inject constructor(
      * nothing could find it to close and nothing on screen showed that it existed.
      */
     fun sendRemoteTo(sourceHost: HostProfile, file: RemoteFile, destHost: HostProfile, destPath: String) {
-        viewModelScope.launch(Dispatchers.IO) {
+        transportScope.launch {
             val source = sessions[sourceHost.id]
                 ?: return@launch report("${sourceHost.name} is not connected")
             // Only a session opened *here* may be closed here. An already-open one belongs to its tab.
@@ -2230,8 +2296,8 @@ class MainViewModel @Inject constructor(
                     sshConnectionManager.connect(destHost, password, keyPair).also { dialled = it }
                 }
                 val target = if (destPath.endsWith('/')) destPath + file.name else "$destPath/${file.name}"
-                sshConnectionManager.openSftp(source).use { from ->
-                    sshConnectionManager.openSftp(dest).use { to ->
+                sshConnectionManager.withSftp(source) { from ->
+                    sshConnectionManager.withSftp(dest) { to ->
                         sftpDirectoryService.copyAcross(from, to, file.path, target)
                     }
                 }
@@ -2336,7 +2402,7 @@ class MainViewModel @Inject constructor(
             localUri = localUri.toString(),
             totalBytes = remote.size,
         )
-        viewModelScope.launch {
+        transportScope.launch {
             transferRepository.save(item)
             startDownloadJob(host, item, localUri, remote.path)
         }
@@ -2347,7 +2413,7 @@ class MainViewModel @Inject constructor(
             report("Pick a local folder first")
             return
         }
-        viewModelScope.launch {
+        transportScope.launch {
             val target = runCatching {
                 DocumentFile.fromTreeUri(context, localDir)?.createFile("application/octet-stream", remote.name)
             }.getOrNull() ?: run {
@@ -2387,7 +2453,7 @@ class MainViewModel @Inject constructor(
             localUri = localUri.toString(),
             totalBytes = size,
         )
-        viewModelScope.launch {
+        transportScope.launch {
             transferRepository.save(item)
             startUploadJob(host, item, localUri, remotePath, size)
         }
@@ -2451,7 +2517,7 @@ class MainViewModel @Inject constructor(
      * and a failure that was really a dropped session should not leave a stale listing on screen.
      */
     private fun fileOperation(host: HostProfile, what: String, path: String? = null, operation: suspend (SftpClient) -> Unit) {
-        viewModelScope.launch {
+        transportScope.launch {
             val session = sessions[host.id]
             if (session == null) {
                 // Reachable: the sheet and its dialogs stay up across a disconnect, so the button is
@@ -2459,7 +2525,7 @@ class MainViewModel @Inject constructor(
                 report("$what failed", IllegalStateException("not connected to ${host.name}"))
                 return@launch
             }
-            runCatching { sshConnectionManager.openSftp(session).use { operation(it) } }
+            runCatching { sshConnectionManager.withSftp(session) { operation(it) } }
                 .onFailure { if (it is CancellationException) throw it else report("$what failed", it) }
             refreshFiles(host, path ?: currentRemoteDir(host))
         }
@@ -2554,17 +2620,17 @@ class MainViewModel @Inject constructor(
      */
     fun startLocalForward(host: HostProfile, localPort: Int, remoteHost: String, remotePort: Int) {
         val entry = ForwardEntry(type = ForwardType.LOCAL, localPort = localPort, remoteHost = remoteHost, remotePort = remotePort, hostId = host.id)
-        viewModelScope.launch {
+        transportScope.launch {
             val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
             runCatching { portForwardingManager.startLocal(session, "127.0.0.1", localPort, remoteHost, remotePort) }
-                .onSuccess { forwardHandles[entry.id] = it; forwardings.value = forwardings.value + entry }
+                .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
                 .onFailure { reportForwardFailure("Local forward on port $localPort failed", it) }
         }
     }
 
     fun startRemoteForward(host: HostProfile, remotePort: Int, localPort: Int) {
         val entry = ForwardEntry(type = ForwardType.REMOTE, localPort = localPort, remoteHost = null, remotePort = remotePort, hostId = host.id)
-        viewModelScope.launch {
+        transportScope.launch {
             val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
             // Bound on the server's loopback, not 0.0.0.0. The dialog only asks for two port numbers,
             // so nobody using it has chosen to publish anything; requesting all interfaces meant that
@@ -2574,17 +2640,17 @@ class MainViewModel @Inject constructor(
             // this went unnoticed — it only opened up on the servers where it mattered. Loopback is
             // also what `ssh -R` gives you unless you spell out a bind address.
             runCatching { portForwardingManager.startRemote(session, "127.0.0.1", remotePort, "127.0.0.1", localPort) }
-                .onSuccess { forwardHandles[entry.id] = it; forwardings.value = forwardings.value + entry }
+                .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
                 .onFailure { reportForwardFailure("Remote forward of port $remotePort failed", it) }
         }
     }
 
     fun startDynamicForward(host: HostProfile, localPort: Int) {
         val entry = ForwardEntry(type = ForwardType.DYNAMIC, localPort = localPort, hostId = host.id)
-        viewModelScope.launch {
+        transportScope.launch {
             val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
             runCatching { portForwardingManager.startDynamic(session, "127.0.0.1", localPort) }
-                .onSuccess { forwardHandles[entry.id] = it; forwardings.value = forwardings.value + entry }
+                .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
                 .onFailure { reportForwardFailure("SOCKS proxy on port $localPort failed", it) }
         }
     }
@@ -2606,12 +2672,10 @@ class MainViewModel @Inject constructor(
     }
 
     fun stopForwarding(id: String) {
-        // Guarded because closing a tracker talks to the server to cancel the forward, so it throws
-        // IOException once the session is gone — and the session dying is exactly when the user
-        // reaches for this button. Unwrapped, that propagated out of a Compose click handler. The
-        // entry is dropped either way: the forward is certainly not running if this failed.
-        forwardHandles.remove(id)?.let { handle -> runCatching { handle.close() } }
-        forwardings.value = forwardings.value.filterNot { it.id == id }
+        // Called straight from a Compose click handler, so the close cannot happen here: see
+        // [releaseForwards], which drops the entry now and says goodbye to the server off the main
+        // thread. The entry goes either way - the forward is certainly not running if the close failed.
+        releaseForwards(listOf(id))
     }
 
     /**
@@ -2623,7 +2687,7 @@ class MainViewModel @Inject constructor(
      * did not give anything usable back.
      */
     fun refreshStats(host: HostProfile) {
-        viewModelScope.launch {
+        transportScope.launch {
             val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
             val stats = try {
                 val hostname = sshConnectionManager.runCommand(session, "hostname")
@@ -2649,7 +2713,10 @@ class MainViewModel @Inject constructor(
             } catch (_: Throwable) {
                 ServerStats(hostname = host.name, uptime = "Unavailable", loadAverage = "—", memoryUsed = "—", memoryTotal = "—", diskUsed = "—", diskTotal = "—")
             }
-            serverStats.value = serverStats.value + (host.id to stats)
+            // `update`, not a read-modify-write: this body runs on [transportScope] now, so two hosts'
+            // cards refreshing at once - or one refreshing while a tab closes and removes its entry
+            // below - would lose whichever write finished second. Same reason as [updateTab].
+            serverStats.update { it + (host.id to stats) }
         }
     }
 
@@ -2663,7 +2730,7 @@ class MainViewModel @Inject constructor(
      * viewModelScope launch with no handler.
      */
     fun resumeTransfer(id: String) {
-        viewModelScope.launch {
+        transportScope.launch {
             val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launch
             val host = hostRepository.hosts.first().firstOrNull { it.id == item.hostId }
                 ?: return@launch report("The host for ${item.name} no longer exists")
@@ -2756,7 +2823,7 @@ class MainViewModel @Inject constructor(
         textPublishedAt.remove(tab.hostId)
         typedLines.remove(tab.hostId)
         commandHistory.value = commandHistory.value - tab.hostId
-        serverStats.value = serverStats.value - tab.hostId
+        serverStats.update { it - tab.hostId }
         remoteListings.update { it - tab.hostId }
         homePaths.remove(tab.hostId)
         ptySizes.remove(tab.hostId)
@@ -2829,8 +2896,12 @@ class MainViewModel @Inject constructor(
             connectJobs.remove(host.id)?.cancel()
             sftpJobs.remove(host.id)?.cancel()
             forwardJobs.remove(host.id)?.cancel()
-            channels.remove(host.id)?.close()
-            sessions.remove(host.id)?.close(false)
+            // Through the store, which marks the channel deliberate so its ending is not read as a
+            // fault, and which does the socket half off the main thread. Deleting a host used to close
+            // both here, on the caller's dispatcher — and `launchGuarded` is a `viewModelScope` body, so
+            // that was `SSH_MSG_DISCONNECT` written from the UI thread. The buffer is already gone,
+            // removed above for the reason recorded there, so this deliberately is not `forget`.
+            sessionStore.close(host.id)
             tabs.value = tabs.value.filterNot { it.hostId == host.id }
             terminalOutput.update { it - host.id }
             terminalFrames.update { it - host.id }
@@ -2838,7 +2909,7 @@ class MainViewModel @Inject constructor(
             textPublishedAt.remove(host.id)
             typedLines.remove(host.id)
             commandHistory.value = commandHistory.value - host.id
-            serverStats.value = serverStats.value - host.id
+            serverStats.update { it - host.id }
             remoteListings.update { it - host.id }
             homePaths.remove(host.id)
             stopForwardingsFor(host.id)
@@ -3048,8 +3119,10 @@ class MainViewModel @Inject constructor(
         reconnectJobs.clear()
         forwardJobs.values.forEach { it.cancel() }
         forwardJobs.clear()
-        forwardHandles.values.forEach { runCatching { it.close() } }
-        forwardHandles.clear()
+        // Every tracker, by key rather than through [forwardings]: a forward whose entry never made it
+        // onto the list - it failed after binding, or the list write lost a race - still holds a
+        // listening socket, and this is the last chance anything has to close it.
+        releaseForwards(forwardHandles.keys.toList())
         reconnectWake.close()
         // Sessions, shells and scrollback deliberately survive: they belong to [SshSessionStore] and
         // the foreground service is running to keep them. Closing them here is what used to kill every
@@ -3067,12 +3140,7 @@ class MainViewModel @Inject constructor(
     }
 
     private fun stopForwardingsFor(hostId: String) {
-        forwardings.value.filter { it.hostId == hostId }.forEach { entry ->
-            // Same reason as stopForwarding: this runs *because* the host is going away, so the
-            // cancel round-trip to the server is the most likely thing in the app to throw.
-            forwardHandles.remove(entry.id)?.let { handle -> runCatching { handle.close() } }
-        }
-        forwardings.value = forwardings.value.filterNot { it.hostId == hostId }
+        releaseForwards(forwardings.value.filter { it.hostId == hostId }.map { it.id })
     }
 
     /**
@@ -3474,6 +3542,11 @@ internal fun shouldAutoReconnect(
     autoReconnectEnabled: Boolean = true,
 ): Boolean {
     if (!tabIsOpen || endedDeliberately || !autoReconnectEnabled) return false
+    // A bug in this app is not an outage, and the ladder cannot fix one: the next session runs the same
+    // code and dies the same way, so the only thing five rungs buy is a minute of a user's evening and a
+    // message blaming their server. Ends at ERROR instead, saying whose fault it is - see [isAppFault],
+    // and the threading fix it is a net behind.
+    if (end.isAppFault) return false
     return when (end) {
         // The far end is finished with this shell, however it phrased that: a status, a signal, or a
         // channel closed with neither. A fresh shell would meet the same end, so the tab says what

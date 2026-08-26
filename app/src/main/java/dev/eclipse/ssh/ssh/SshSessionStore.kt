@@ -4,6 +4,10 @@ import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.apache.sshd.client.session.ClientSession
@@ -237,14 +241,14 @@ class SshSessionStore @Inject constructor() {
      * MINA sends `SSH_MSG_DISCONNECT` and lets the server tidy up.
      */
     fun close(hostId: String) {
-        channels.remove(hostId)?.let { channel ->
+        val channel = channels.remove(hostId)?.also {
             // Marked before either close, so the shell's own close listener - which may run on a MINA
             // thread while this call is still in flight - reports the app's decision rather than an
             // outage, and nothing schedules a reconnect to a session the user asked to end.
-            channel.markDeliberate()
-            runCatching { channel.close() }
+            it.markDeliberate()
         }
-        sessions.remove(hostId)?.let { session -> runCatching { session.close(false) } }
+        val session = sessions.remove(hostId)
+        release(channel, session) { runCatching { it.close(false) } }
     }
 
     /**
@@ -265,8 +269,9 @@ class SshSessionStore @Inject constructor() {
      * has not already reported something first-hand.
      */
     fun discard(hostId: String, reason: SessionEnd? = null) {
-        channels.remove(hostId)?.let { channel -> runCatching { channel.discard(reason) } }
-        sessions.remove(hostId)?.let { session -> runCatching { session.close(true) } }
+        val channel = channels.remove(hostId)
+        val session = sessions.remove(hostId)
+        release(channel, session, releaseChannel = { runCatching { it.discard(reason) } }) { runCatching { it.close(true) } }
     }
 
     /**
@@ -318,6 +323,54 @@ class SshSessionStore @Inject constructor() {
     /** Closes every session. For "Stop sessions", and for the app being torn down deliberately. */
     fun closeAll() {
         sessions.keys.toList().forEach(::close)
+    }
+
+    /**
+     * The scope every teardown's socket work runs on.
+     *
+     * Its own scope, deliberately never cancelled, because teardown is exactly the work that must not be
+     * interrupted: a cancelled close leaks the socket, the file descriptors and the heartbeat it was
+     * supposed to release, and the callers include a service that is stopping and a view model that has
+     * already been cleared.
+     */
+    private val releaseScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Where the socket half of a teardown runs: never on the thread that asked for it.
+     *
+     * Ending an SSH session writes to the network. `session.close(false)` sends `SSH_MSG_DISCONNECT`
+     * and waits for the write to land, and closing a shell channel sends `SSH_MSG_CHANNEL_CLOSE` -
+     * so every caller of [close] and [discard] is a caller that must not be on Android's main thread.
+     * Three of them were: closing a tab, deleting a host, and the notification's Stop action all run
+     * straight from the UI. What that produces is not a slow frame but
+     * [android.os.NetworkOnMainThreadException], raised by BlockGuard from inside MINA's write path -
+     * which marks the transport broken and reports it as a fault, so the app's own teardown could
+     * arrive at the collector looking like an outage worth reconnecting.
+     *
+     * The bookkeeping stays on the calling thread, and only the socket work moves. That split is the
+     * point: [isLive], [liveSession] and [adoptableHostIds] answer from the maps, and every caller
+     * expects them to have changed by the time it returns - a tab it just closed must not be
+     * adoptable, and a host being deleted must not be dialled by the restore pass a moment later.
+     * The entry is gone before this is called; what is deferred is the goodbye to a server that is
+     * either gone already or about to be.
+     *
+     * [releaseChannel] defaults to a graceful channel close and is overridden by [discard], which has
+     * a dead transport to release rather than a live one to say goodbye on.
+     */
+    private fun release(
+        channel: TerminalChannel?,
+        session: ClientSession?,
+        releaseChannel: (TerminalChannel) -> Unit = { runCatching { it.close() } },
+        releaseSession: (ClientSession) -> Unit,
+    ) {
+        if (channel == null && session == null) return
+        releaseScope.launch {
+            // In this order, and in one coroutine rather than two: a shell that says goodbye after the
+            // transport carrying it has gone is a write into a closed socket, and the server learns
+            // less from it than it would from being told about the channel first.
+            channel?.let(releaseChannel)
+            session?.let(releaseSession)
+        }
     }
 }
 

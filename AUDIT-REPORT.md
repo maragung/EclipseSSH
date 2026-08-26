@@ -3665,3 +3665,176 @@ Signing passwords went to `apksigner` through mode-600 files in a mode-700 direc
 trap; `/proc/<pid>/cmdline` is world-readable on this host, so they were never arguments. No `sign.*`
 directory survived the run. The three deviations from the approved plan are recorded in §33.5 and the cipher
 the UI should never have been able to choose in §33.6.
+
+## 35. The reconnect loop that was this app writing to a socket on the UI thread
+
+The report was a diagnostic trace, and it named its own cause on every third line:
+
+```
+1787723830855 s2.0 SHELL_OPEN state=CONNECTED net=cell pty=24x29 chan=open
+1787723832895 s2.0 ENDED state=RECONNECTING net=cell pty=24x8 chan=closed idle=0s up=2s
+                   detail="J: Connection lost: NetworkOnMainThreadException · session reaped"
+1787723832903 s2.0 RECONNECT_SCHEDULED state=RECONNECTING attempt=1 net=cell detail="waiting 7371ms"
+```
+
+Three times, ending at `attempt 3 of 5` with a 29,595 ms wait. `NetworkOnMainThreadException` is not
+something a server or a carrier can do to a phone. It is Android's BlockGuard refusing a socket operation on
+the UI thread, and it means the app broke its own threading rule and then blamed the network for it.
+
+### 35.1 Reading the trace before changing anything
+
+Four things in it narrow the cause to one line of code.
+
+**The interval.** `SHELL_OPEN` → `ENDED` was 2.04 s, then 1.58 s, then 1.69 s. Not instant, not a minute:
+about the time a round trip to an SFTP subsystem takes.
+
+**The resizes are not it.** `s2.0` had six `PTY_RESIZED` events between opening and dying — the keyboard
+appearing — which made the resize path the obvious suspect. `s2.1` and `s2.2` had none at all and died the
+same way at the same interval. Whatever this was, it happened automatically on every shell open.
+
+**The session was healthy when it died.** `idle=0s up=2s`: the far end had spoken within the last second.
+Nothing was timing out.
+
+**The exception had no message.** `transportMessage` walks the cause chain for the innermost sentence and
+falls back to the class name only when there is no message anywhere in it. So the trace was printing a class
+name, which is what a BlockGuard throw looks like.
+
+Something automatic, on every shell open, on an adopted transport and a freshly dialled one alike, taking
+about two seconds and touching a socket. That is the Auto Login SFTP feature.
+
+### 35.2 The defect: `withContext` returns to its caller
+
+```kotlin
+// MainViewModel.listRemote — reached from loginSftp, which attachTerminal launches on every shell open
+sshConnectionManager.openSftp(session).use { sftp -> … }
+```
+
+`openSftp` is `withContext(Dispatchers.IO) { … }`, so the client was created off the main thread. That is not
+where the problem is. **A `withContext` resumes its caller on the caller's dispatcher**, so the client was
+handed back on `viewModelScope`'s dispatcher — `Dispatchers.Main.immediate` — and `use`'s `finally` closed it
+there. Closing an SFTP client tears down a channel. Tearing down a channel writes to the socket. Writing to a
+socket on Android's main thread is a `NetworkOnMainThreadException`, thrown with no message.
+
+Two consequences, and the second is why this survived three releases of bug reports:
+
+* BlockGuard raises **inside MINA's write path**, so the transport is marked broken before `loginSftp`'s own
+  `try`/`catch` can contain it. The app's threading mistake was therefore delivered to the state machine as
+  `SessionEnd.TransportFailed` — the one ending most worth waiting out.
+* `shouldAutoReconnect` then did exactly what it is designed to do, and every rung of the ladder re-ran the
+  identical code. 7.4 s, 12.0 s, 29.6 s, five rungs, on a link that never failed.
+
+No test in this repository could have caught it. BlockGuard is an Android runtime facility; the unit and
+integration suites run on a JVM, where the same code closes the same client on the same wrong dispatcher and
+simply succeeds.
+
+### 35.3 Nine more of the same mistake, fixed at three owners
+
+`listRemote` was not the only one. Auditing every socket operation reachable from a `viewModelScope` body
+found nine such sites in all — two closing an SFTP client, three closing a session or a shell channel, four
+closing a listening socket — and patching nine call sites would have left the tenth to be written next month.
+So each class of mistake got one owner instead:
+
+| owner | what it now owns | what was wrong |
+| --- | --- | --- |
+| `SshConnectionManager.withSftp` | the whole bounded SFTP lifetime — open, work, and the close in `use`'s `finally`, which is the same coroutine frame and so cannot be anywhere else | seven `openSftp(…).use { }` sites; two of them — `listRemote` and `fileOperation` — closed on the UI thread, and `listRemote` is the one in the trace |
+| `SshSessionStore.release` | the socket half of every teardown, on a scope that is never cancelled | `close`, `forget` and `discard` said goodbye to the server on the calling thread; three callers reached them from the main thread — closing a tab, deleting a host, and `connect` discarding a dead session before redialling |
+| `MainViewModel.transportScope` | every coroutine in the view model that touches the transport | nineteen `launch` bodies, fifteen of them with no dispatcher named at all |
+| `MainViewModel.releaseForwards` | dropping port-forward handles | four hand-rolled loops closing listening sockets on the calling thread — `stopForwarding`, called straight from a Compose click handler, and `onCleared` are the main thread outright |
+
+`openSftp` survives, documented as a hand-off for the one caller that legitimately owns its client's lifetime
+past the end of a function: `TransferCoordinator`, which closes it on its own IO scope in a `finally`.
+
+The bookkeeping did **not** move. `SshSessionStore` still removes the map entries synchronously, because
+`isLive`, `liveSession` and `adoptableHostIds` are read immediately afterwards by callers that depend on the
+answer having changed — a tab just closed must not be adoptable, and a host being deleted must not be dialled
+by the restore pass a moment later. Only the goodbye to the server is deferred.
+
+Moving nineteen bodies onto an IO dispatcher is not free, and three smaller faults surfaced in the audit of
+what that exposed. All three are fixed.
+
+**Read-modify-writes that were only safe by accident.** `forwardings.value = forwardings.value + entry` at
+four sites, and `serverStats.value = serverStats.value + (id to stats)` at three, are lost updates the moment
+two of them run at once — and they could not, while every one of those bodies was serialised onto
+`Main.immediate`. They can now: two hosts' server cards refresh concurrently, and one refreshing while
+another tab closes and removes its entry. Both are `.update { }` now, which is the rule `updateTab` already
+had, written down there for the same reason.
+
+**A teardown by hand.** `deleteHost` closed its channel and session itself rather than through the store,
+which also meant its channel was never marked deliberate — so deleting a host wrote `SSH_MSG_DISCONNECT` from
+the UI thread *and* let the shell's own close listener report the ending as a fault. It goes through
+`sessionStore.close` now.
+
+The maps needed no change: every mutable collection in the view model was already a `ConcurrentHashMap`,
+because MINA's I/O threads have always written some of them.
+
+### 35.4 The safety net, and why it is louder rather than quieter
+
+The threading fix is the fix. But a one-word omission in a `launch` is exactly the mistake that will be made
+again, and last time nothing caught it until a user lost three sessions on a train. So the classifier now
+knows this ending:
+
+```kotlin
+val SessionEnd.isAppFault: Boolean
+    get() = this is SessionEnd.TransportFailed && causeChain(cause).any { it is NetworkOnMainThreadException }
+```
+
+`shouldAutoReconnect` returns false for it — a ladder cannot help, because every rung runs the same defect —
+and `describeSessionEnd` says *"Eclipse used the network on its UI thread — an app bug, not your server or
+your link"* instead of *"Connection lost"*.
+
+Both halves are deliberately the loud choice. The ending stays an `isFault`, so the tab goes to **ERROR** and
+stays there: suppressing the ladder is not the same as suppressing the problem, and the user really is
+without a shell. And the sentence names the app, because the previous wording sent people to look at an
+`sshd_config`, a firewall and a carrier, none of which had done anything wrong.
+
+This is a net, not a patch over the hole. The hole is closed at the four owners above.
+
+### 35.5 What is asserted, and what cannot be
+
+BlockGuard does not exist on a JVM, so no test in this repository can watch the original exception be
+thrown. Pretending otherwise would be the workaround this report exists to avoid. What is observable is
+asserted instead, in two places.
+
+**The dispatcher, not the thread** — `SshIntegrationTest.an sftp lifetime opened for a caller stays off the
+caller's dispatcher`, against the real OpenSSH sandbox. A named single-thread dispatcher stands in for the UI
+thread; `openSftp` is shown handing its client back on it, which is the hand-off behaviour the transfer
+coordinator depends on and the reason a `use` around it is the caller's problem; `withSftp` is then shown
+running its block on `Dispatchers.IO`. The *dispatcher* is what the assertion reads, because `use`'s
+`finally` — the close, the thing that actually threw on the device — is the same coroutine frame as the
+block, so proving where the block ran proves where the close will run. Nothing outside the frame can observe
+that, which is exactly why the lifetime had to be moved inside one.
+
+Robolectric's `Dispatchers.Main` could not be used for it: the main looper *is* the thread blocked in
+`runBlocking`, so a coroutine that hopped to IO could never be resumed back onto it. The rule under test does
+not depend on which dispatcher the caller is, and the production path through `viewModelScope` is covered end
+to end by `SftpAutoLoginRobolectricTest`, which already asserts a tab is CONNECTED after an auto-SFTP login —
+the assertion that was passing on the JVM while the same code was killing sessions on a phone.
+
+**The classifier and the wording** — `MainThreadFaultTest`, nine tests: that a `TransportFailed` caused by a
+`NetworkOnMainThreadException` is the app's fault, including when MINA has wrapped it two deep, which is how
+it arrives; that a cause chain pointing back at itself is answered rather than followed forever; that every
+ordinary ending — a reset, a timeout, a lost network, a closed transport, a shell that exited — is **not**
+the app's fault, because a predicate that over-matches would disable the reconnect ladder for the outages it
+was built for; that the ladder does not answer an app fault and does still answer a genuine drop; that the
+sentence on the tab names the app and carries no exception class name; that an ordinary drop still reads
+`Connection lost: Connection reset`; and that an app fault is still an `isFault`, so the tab shows an error
+rather than looking connected.
+
+The two behaviours that could not be verified here are named rather than assumed: the absence of the
+BlockGuard throw itself, and the disappearance of the ladder on the reporter's device. Both need the APK on a
+phone, which is what the release below is for.
+
+### 35.6 The service's restore pass, checked and deliberately left alone
+
+One loop remains reachable in principle, and it is worth writing down why it is not being changed. The
+foreground service restores any host in `SessionRegistry.activeHostIds` that has no live session, and an
+app-fault ending does not unregister anything — only closing a tab and deleting a host do, both of them the
+user saying so. So a session killed by an app fault is still a session the service will redial.
+
+That is the correct behaviour for the ending it was designed for and it is not a second ladder: the service
+dials on its own IO scope, so nothing in its path runs a socket close on the main thread; it dials only when
+`isLive` says no; and its retries are one growing exponential backoff, reported in the notification, not a
+five-rung sprint. Teaching it to veto a host on an app fault would mean carrying an ending through the
+registry into a different process component to guard against a defect that no longer exists. The hole is
+closed at the four owners; adding speculative plumbing behind it would be a change with no test that could
+fail.

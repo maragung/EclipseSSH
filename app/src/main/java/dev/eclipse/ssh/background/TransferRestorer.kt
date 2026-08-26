@@ -45,7 +45,7 @@ class TransferRestorer @Inject constructor(
         if (pending.isEmpty()) return 0
 
         var resumed = 0
-        sshConnectionManager.openSftp(session).use { sftp ->
+        sshConnectionManager.withSftp(session) { sftp ->
             pending.forEach { item ->
                 val uri = runCatching { item.localUri?.toUri() }.getOrNull() ?: return@forEach
                 val remotePath = item.remotePath ?: return@forEach

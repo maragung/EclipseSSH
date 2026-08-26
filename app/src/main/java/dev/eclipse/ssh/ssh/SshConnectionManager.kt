@@ -484,6 +484,43 @@ class SshConnectionManager @Inject constructor(
         }
     }
 
+    /**
+     * Opens an SFTP channel on [session], hands it to [block], and closes it - all on [Dispatchers.IO].
+     *
+     * The only correct way to run a bounded piece of SFTP work, and it exists because the obvious
+     * spelling of it is wrong in a way that costs the user their session. `openSftp(session).use { }`
+     * looks safe: every call inside it suspends into [Dispatchers.IO] and comes back. But `use`
+     * closes the client in a `finally` on the *caller's* dispatcher, and the callers here are
+     * `viewModelScope` coroutines, which dispatch on `Main.immediate`. Closing an SFTP client tears
+     * down a channel, which writes to the socket - so the close, and only the close, ran on the UI
+     * thread.
+     *
+     * What that produced was not a caught exception. Android's BlockGuard raises
+     * [android.os.NetworkOnMainThreadException] from inside MINA's write path, which marks the
+     * transport broken before the throw ever reaches our `runCatching` - so a session that had just
+     * finished authenticating and opened a shell was reported as `TransportFailed`, the tab said
+     * "Connection lost: NetworkOnMainThreadException", and the reconnect ladder answered an app-side
+     * threading mistake by climbing it, five rungs, waiting half a minute at the top. Every shell
+     * open ran the auto-SFTP login, so every session died about two seconds after it came up.
+     *
+     * One `withContext` around the whole lifetime is the fix: the open, the work and the close all
+     * happen on the same IO thread, and no call site can reintroduce the gap by forgetting a
+     * dispatcher.
+     */
+    suspend fun <T> withSftp(session: ClientSession, block: suspend (SftpClient) -> T): T =
+        withContext(Dispatchers.IO) { openSftp(session).use { sftp -> block(sftp) } }
+
+    /**
+     * Opens an SFTP channel, leaving its lifetime to the caller.
+     *
+     * For the file-transfer paths only, which hand the client to [TransferCoordinator] to be closed
+     * when the transfer ends - a `use { }` here would close the channel before the transfer that was
+     * handed it ever ran. **The caller owns closing it, and must not do so on the main thread**: see
+     * [withSftp] for what that costs. `TransferCoordinator` closes it inside its own
+     * [Dispatchers.IO] scope, which is why those call sites are safe.
+     *
+     * Anything with a bounded scope wants [withSftp] instead.
+     */
     suspend fun openSftp(session: ClientSession): SftpClient = withContext(Dispatchers.IO) {
         SftpClientFactory.instance().createSftpClient(session)
     }

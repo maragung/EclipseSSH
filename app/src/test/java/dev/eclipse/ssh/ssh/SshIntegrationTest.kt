@@ -19,13 +19,18 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyPair
 import java.util.Collections
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.ContinuationInterceptor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.apache.sshd.common.cipher.BuiltinCiphers
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.common.kex.BuiltinDHFactories
@@ -675,7 +680,7 @@ class SshIntegrationTest {
         val directory = SftpDirectoryService()
         try {
             val session = trustedConnect(manager, hostProfile(), PASSWORD)
-            manager.openSftp(session).use { sftp ->
+            manager.withSftp(session) { sftp ->
                 // List
                 val listing = directory.list(sftp, "sftp_test")
                 val names = listing.map { it.name }
@@ -714,6 +719,78 @@ class SshIntegrationTest {
                 assertThat(directory.exists(sftp, "sftp_test/renamed.bin")).isFalse()
             }
         } finally {
+            manager.close()
+        }
+        }
+    }
+
+    /**
+     * Where an SFTP lifetime runs, which on a real device decided whether a session survived it.
+     *
+     * The bug this pins ended three sessions in a row on a phone, 1.6 to 2.0 seconds after each login,
+     * and reported itself as `Connection lost: NetworkOnMainThreadException` with a five-rung reconnect
+     * ladder behind it. The link was fine. The code was `openSftp(session).use { ... }` called from a
+     * `viewModelScope` body: `openSftp` does its work in `withContext(Dispatchers.IO)`, and a
+     * `withContext` **resumes its caller on the caller's dispatcher** - so the client came back on
+     * `Dispatchers.Main.immediate`, and `use`'s `finally` closed it there. Closing an SFTP client tears
+     * down a channel, which is a socket write, which on Android's UI thread is a `BlockGuard` throw
+     * raised *inside* MINA's write path - so the transport was already broken before any `catch` could
+     * see it, and an app-side threading mistake arrived at the state machine as a transport fault.
+     *
+     * Two assertions, and the first is the mechanism the second exists to defeat:
+     *
+     *  - [SshConnectionManager.openSftp] hands its client back on the *caller's* dispatcher. That is not
+     *    a defect - it is a hand-off for a caller that owns the client's lifetime, which is what the
+     *    transfer coordinator does - and it is exactly why closing one in a `use` is the caller's
+     *    problem rather than `openSftp`'s.
+     *  - [SshConnectionManager.withSftp] runs the whole lifetime somewhere else. The block's dispatcher
+     *    is asserted rather than only its thread, because `use`'s `finally` - the close - is the same
+     *    coroutine frame as the block, so its dispatcher cannot be anything other than the one asserted
+     *    here. That is the whole guarantee, and it is not observable from outside the frame.
+     *
+     * A named single-thread dispatcher stands in for the UI thread. Robolectric's `Dispatchers.Main` is
+     * backed by the main looper, and the main looper is this thread, blocked in `runBlocking` - so a
+     * coroutine that hopped to IO could never be resumed back onto it. The rule under test is
+     * dispatcher-independent, and the production path through `viewModelScope` is covered end to end by
+     * `SftpAutoLoginRobolectricTest`.
+     */
+    @Test(timeout = 120_000)
+    fun `an sftp lifetime opened for a caller stays off the caller's dispatcher`() {
+        runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = SshConnectionManager(context, SettingsRepository(context))
+        val uiThreads = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "stand-in-ui") }
+        val ui = uiThreads.asCoroutineDispatcher()
+        try {
+            val session = trustedConnect(manager, hostProfile(), PASSWORD)
+            withContext(ui) {
+                val caller = Thread.currentThread()
+                // `startsWith`, not equality: with assertions enabled - which Gradle's test tasks do
+                // by default - kotlinx.coroutines renames the running thread to `<name> @coroutine#N`
+                // while a coroutine is on it. The prefix is the part that says which dispatcher this is.
+                assertThat(caller.name).startsWith("stand-in-ui")
+
+                // The hand-off: opened on IO, handed back here. This is the line that used to be
+                // followed by `.use { }`, and `use` closes where it stands.
+                val handedBack = manager.openSftp(session)
+                assertThat(Thread.currentThread()).isEqualTo(caller)
+                // Closed the way a hand-off's owner has to: somewhere that may block on a socket.
+                withContext(Dispatchers.IO) { handedBack.close() }
+
+                // The owned lifetime: open, work and close, none of them here.
+                val where = manager.withSftp(session) { sftp ->
+                    // A real round trip on the wire from inside the block, so this is not merely a
+                    // statement about a dispatcher - the channel is open and answering from there.
+                    assertThat(sftp.canonicalPath(".")).isNotEmpty()
+                    Thread.currentThread() to currentCoroutineContext()[ContinuationInterceptor]
+                }
+                assertThat(where.first).isNotEqualTo(caller)
+                assertThat(where.second).isEqualTo(Dispatchers.IO)
+            }
+            session.close(false)
+        } finally {
+            ui.close()
+            uiThreads.shutdownNow()
             manager.close()
         }
         }
@@ -778,7 +855,7 @@ class SshIntegrationTest {
                 val deep = (1..70).fold(root.resolve("deep")) { path, level -> path.resolve("l$level") }
                 Files.createDirectories(deep)
 
-                manager.openSftp(session).use { sftp ->
+                manager.withSftp(session) { sftp ->
                     val error = runCatching { directory.listTree(sftp, "deep") }.exceptionOrNull()
 
                     assertThat(error).isInstanceOf(java.io.IOException::class.java)
@@ -788,7 +865,7 @@ class SshIntegrationTest {
 
                 // And a tree inside the ceiling still lists normally — the guard bounds the walk, it
                 // does not disable it.
-                manager.openSftp(session).use { sftp ->
+                manager.withSftp(session) { sftp ->
                     assertThat(directory.listTree(sftp, "sftp_test").keys).contains("subdir/nested.txt")
                 }
             } finally {
@@ -826,7 +903,7 @@ class SshIntegrationTest {
                 val alreadySent = 150 * 1024
                 val remote = "sftp_test/resumed-upload.bin"
 
-                manager.openSftp(session).use { sftp ->
+                manager.withSftp(session) { sftp ->
                     // The state an interrupted upload leaves behind: a partial remote file.
                     sftp.write(remote).use { it.write(content, 0, alreadySent) }
                     assertThat(sftp.stat(remote).size).isEqualTo(alreadySent.toLong())
@@ -865,7 +942,7 @@ class SshIntegrationTest {
             try {
                 val session = trustedConnect(manager, hostProfile(), PASSWORD)
                 val remote = "sftp_test/short-source.bin"
-                manager.openSftp(session).use { sftp ->
+                manager.withSftp(session) { sftp ->
                     sftp.write(remote).use { it.write(ByteArray(64 * 1024)) }
 
                     val error = runCatching {
@@ -910,7 +987,7 @@ class SshIntegrationTest {
                 val local = Files.createTempFile("resume-download", ".bin")
                 Files.write(local, content.copyOfRange(0, alreadyHave))
 
-                manager.openSftp(session).use { sftp ->
+                manager.withSftp(session) { sftp ->
                     java.io.FileOutputStream(local.toFile(), /* append = */ true).use { out ->
                         transfers.resumeDownload(
                             sftp = sftp,

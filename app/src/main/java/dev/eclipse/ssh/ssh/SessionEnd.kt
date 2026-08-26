@@ -1,5 +1,6 @@
 package dev.eclipse.ssh.ssh
 
+import android.os.NetworkOnMainThreadException
 import org.apache.sshd.common.SshConstants
 
 /**
@@ -110,7 +111,12 @@ fun describeSessionEnd(end: SessionEnd): String = when (end) {
         end.status == 0 -> "Session ended"
         else -> "Session ended (exit ${end.status})"
     }
-    is SessionEnd.TransportFailed -> "Connection lost: ${transportMessage(end.cause)}"
+    is SessionEnd.TransportFailed ->
+        // Named rather than dressed up as an outage. See [isAppFault] for why this one ending gets its
+        // own sentence: "Connection lost" would send the user to look at a server and a link that are
+        // both fine, and it is the app that has to be fixed.
+        if (end.isAppFault) "App bug: Eclipse SSH used the network on its UI thread — not your server or your link"
+        else "Connection lost: ${transportMessage(end.cause)}"
     is SessionEnd.Disconnected -> {
         val reason = end.message?.trim()?.takeIf { it.isNotEmpty() }
             ?: SshConstants.getDisconnectReasonName(end.reason).takeIf { it.isNotBlank() }
@@ -130,12 +136,51 @@ fun describeSessionEnd(end: SessionEnd): String = when (end) {
  * class name because an exception with no message at all still has to be reportable as *something*.
  */
 private fun transportMessage(cause: Throwable): String {
-    val chain = generateSequence(cause) { previous -> previous.cause?.takeIf { it !== previous } }
-        .take(MAX_TRANSPORT_CAUSE_DEPTH)
-        .toList()
+    val chain = causeChain(cause)
     return chain.asReversed().firstNotNullOfOrNull { it.message?.trim()?.takeIf(String::isNotEmpty) }
         ?: cause::class.java.simpleName
 }
+
+/**
+ * [cause] and its causes, nearest first, bounded and safe against a chain that points back at itself.
+ *
+ * Shared by [transportMessage] and [isAppFault] because both have to look past MINA's wrapping - the
+ * throwable the collector is handed is routinely an `SshException` around an `IOException` around the
+ * one that says what actually happened - and a second copy of that walk is a second place for the bound
+ * and the self-reference guard to be got wrong.
+ */
+private fun causeChain(cause: Throwable): List<Throwable> =
+    generateSequence(cause) { previous -> previous.cause?.takeIf { it !== previous } }
+        .take(MAX_TRANSPORT_CAUSE_DEPTH)
+        .toList()
+
+/**
+ * Whether this ending is the app's own bug rather than anything that happened to the connection.
+ *
+ * Exactly one ending qualifies today: a transport failure whose cause is a
+ * [NetworkOnMainThreadException]. Android's BlockGuard raises that when a socket is read or written on
+ * the UI thread, and because it is raised *inside* the write it is the transport that is marked broken -
+ * so an app-side threading mistake arrives here indistinguishable from a cable being pulled, and the
+ * reconnect ladder answers it. It cannot help. The next session opens on the same code path and dies the
+ * same way, 1.6 seconds later, which is precisely the loop this predicate exists to stop: five rungs, a
+ * 29-second wait, and a message naming the exception class with no text, on a link that never failed.
+ *
+ * Two deliberate choices about how this is handled, both of which make the defect *louder*:
+ *
+ *  - It is still an [isFault], so the tab goes to `ERROR` and stays there. Suppressing the ladder is
+ *    not the same as suppressing the problem - the session really did die and the user really is
+ *    without a shell.
+ *  - [describeSessionEnd] says whose fault it is. A user cannot fix this and must not spend an evening
+ *    on their `sshd_config` or their carrier because the app blamed the network for its own bug.
+ *
+ * This is a safety net, not the fix. The fix is that every call that touches a socket runs off the main
+ * thread - see `MainViewModel.transportScope`, `SshConnectionManager.withSftp` and
+ * `SshSessionStore.release`, which is where the reported occurrences came from. The net stays because
+ * the class of mistake is a one-word omission in a `launch` that nothing else would catch until a user
+ * on a real device lost their session over it.
+ */
+val SessionEnd.isAppFault: Boolean
+    get() = this is SessionEnd.TransportFailed && causeChain(cause).any { it is NetworkOnMainThreadException }
 
 private const val MAX_TRANSPORT_CAUSE_DEPTH = 8
 
