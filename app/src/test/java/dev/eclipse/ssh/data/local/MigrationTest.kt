@@ -6,6 +6,7 @@ import androidx.room.testing.MigrationTestHelper
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.TransferEntity
 import java.io.File
+import org.json.JSONObject
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.After
@@ -16,10 +17,14 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
- * The database has grown from version 2 to 12 through hand-written `ALTER TABLE` migrations.
+ * The database has grown from version 2 to 13 through hand-written `ALTER TABLE` migrations.
  * Room validates the migrated schema against the entities when it opens, so a single missing
- * or mistyped column turns an app update into a crash on launch. The schema is not exported,
- * so these tests build the old database by hand rather than using [MigrationTestHelper].
+ * or mistyped column turns an app update into a crash on launch.
+ *
+ * The oldest database is built by hand, because version 2 predates the exported schemas. Every
+ * version since is reconstructed from its own committed file in `schemas/`, so a test for one step
+ * of the ladder starts from the schema that shipped rather than from a copy of it that could drift -
+ * and a missing or edited schema file fails a test here instead of at the next release.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -35,7 +40,7 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 2 database migrates all the way to 12 with its rows intact`() = runTest {
+    fun `a version 2 database migrates all the way to 13 with its rows intact`() = runTest {
         seedVersion2()
 
         val db = openWithMigrations()
@@ -107,6 +112,20 @@ class MigrationTest {
         assertThat(host.keyboardInteractiveAuth).isTrue()
         assertThat(host.legacyAlgorithms).isNull()
         assertThat(host.hostKeyPolicy).isEqualTo("ASK")
+        // Version 13's four algorithm preferences are null for the same reason legacyAlgorithms is:
+        // null means "no opinion, negotiate normally", which is the only behaviour that existed. An
+        // empty string would be a different instruction entirely - propose nothing at all - and would
+        // make an upgraded host unable to connect to anything.
+        assertThat(host.ciphers).isNull()
+        assertThat(host.kexAlgorithms).isNull()
+        assertThat(host.macs).isNull()
+        assertThat(host.hostKeyAlgorithms).isNull()
+        // The other three are NOT NULL and empty, because "" is genuinely the absence of them: no
+        // command to run at login, no environment to request, no forwarding rules to bind. Nullable
+        // would have bought a second way to say the same thing at every read site.
+        assertThat(host.startupCommand).isEmpty()
+        assertThat(host.environment).isEmpty()
+        assertThat(host.savedForwards).isEmpty()
 
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.hostId).isNull()
@@ -151,6 +170,90 @@ class MigrationTest {
     }
 
     @Test
+    fun `a version 12 host keeps every configured value across the step to 13`() = runTest {
+        // The step this release adds, on its own. The other tests here start at version 2, so every
+        // value they can check is a default - which cannot catch the failure this one is for: an
+        // `ALTER TABLE` that rebuilds the table instead of extending it, or a column list that drifts
+        // out of order, loses settings the user chose and would look exactly like the app resetting
+        // itself. Seeded from the committed version-12 schema rather than a copy of it, so this stays
+        // honest as the ladder grows.
+        seedVersion12()
+
+        val host = openWithMigrations().hostDao().observeAll().first().single()
+
+        // Every version-12 column, read back after the migration, none of them at its default.
+        assertThat(host.id).isEqualTo("tuned-host")
+        assertThat(host.name).isEqualTo("Tuned edge")
+        assertThat(host.host).isEqualTo("edge.example.com")
+        assertThat(host.username).isEqualTo("ops")
+        assertThat(host.port).isEqualTo(2222)
+        assertThat(host.authMethod).isEqualTo("KEY")
+        assertThat(host.groupName).isEqualTo("Production")
+        assertThat(host.toDomain().tags).containsExactly("eu", "edge")
+        assertThat(host.isFavorite).isFalse()
+        assertThat(host.lastConnectedAt).isEqualTo(1_750_000_000_000L)
+        assertThat(host.fingerprint).isEqualTo("SHA256:tuned")
+        assertThat(host.proxyType).isEqualTo("SOCKS5")
+        assertThat(host.proxyJump).isEqualTo("bastion.example.com")
+        assertThat(host.socksHost).isEqualTo("10.0.0.1")
+        assertThat(host.socksPort).isEqualTo(9050)
+        assertThat(host.socksUsername).isEqualTo("ops")
+        assertThat(host.accentColor).isEqualTo(0xFF2196F3)
+        assertThat(host.connectTimeoutSeconds).isEqualTo(25)
+        assertThat(host.keepAliveSeconds).isEqualTo(45)
+        assertThat(host.autoLoginSftp).isFalse()
+        assertThat(host.compression).isTrue()
+        assertThat(host.keepAliveEnabled).isFalse()
+        assertThat(host.serverAliveCountMax).isEqualTo(6)
+        assertThat(host.authTimeoutSeconds).isEqualTo(90)
+        assertThat(host.autoReconnect).isFalse()
+        assertThat(host.maxReconnectAttempts).isEqualTo(9)
+        assertThat(host.reconnectBackoffSeconds).isEqualTo(12)
+        assertThat(host.usePty).isFalse()
+        assertThat(host.terminalType).isEqualTo("screen-256color")
+        assertThat(host.terminalColumns).isEqualTo(132)
+        assertThat(host.terminalRows).isEqualTo(50)
+        assertThat(host.keyboardInteractiveAuth).isFalse()
+        assertThat(host.legacyAlgorithms).isTrue()
+        assertThat(host.hostKeyPolicy).isEqualTo("STRICT")
+
+        // And the new ones arrive absent, so a host configured before this release connects the way
+        // it did yesterday: negotiate normally, run nothing at login, bind nothing.
+        assertThat(host.ciphers).isNull()
+        assertThat(host.kexAlgorithms).isNull()
+        assertThat(host.macs).isNull()
+        assertThat(host.hostKeyAlgorithms).isNull()
+        assertThat(host.startupCommand).isEmpty()
+        assertThat(host.environment).isEmpty()
+        assertThat(host.savedForwards).isEmpty()
+    }
+
+    @Test
+    fun `the version 13 columns accept and return what the form can put in them`() = runTest {
+        // The other half of the migration: a column Room can validate is not necessarily a column the
+        // DAO round trips. An `ALTER TABLE` naming the right column with the wrong affinity passes the
+        // schema check and then loses data, so the widest realistic value for each new column is
+        // written through the DAO and read back.
+        seedVersion2()
+        val db = openWithMigrations()
+        val migrated = db.hostDao().observeAll().first().single()
+
+        val configured = migrated.copy(
+            ciphers = "aes256-gcm@openssh.com,aes128-ctr",
+            kexAlgorithms = "curve25519-sha256,diffie-hellman-group14-sha256",
+            macs = "hmac-sha2-256-etm@openssh.com",
+            hostKeyAlgorithms = "ssh-ed25519,rsa-sha2-512",
+            startupCommand = "tmux attach || tmux new",
+            // Newline separated, which is the shape most likely to be mangled by a text column.
+            environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
+            savedForwards = "L:8080:intranet.example:80\nD:1080",
+        )
+        db.hostDao().upsert(configured)
+
+        assertThat(db.hostDao().observeAll().first().single()).isEqualTo(configured)
+    }
+
+    @Test
     fun `a database older than the first migration is rebuilt instead of crashing`() = runTest {
         // Production adds fallbackToDestructiveMigration for exactly this: a version with no
         // migration path must cost the user their queue, never a crash loop on launch.
@@ -162,7 +265,7 @@ class MigrationTest {
                 Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
-                Migrations.MIGRATION_11_12,
+                Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
             )
             .fallbackToDestructiveMigration(dropAllTables = true)
             .allowMainThreadQueries()
@@ -180,7 +283,7 @@ class MigrationTest {
                 Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
-                Migrations.MIGRATION_11_12,
+                Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()
@@ -217,6 +320,64 @@ class MigrationTest {
         )
         db.execSQL("PRAGMA user_version = $userVersion")
         db.close()
+    }
+
+    /**
+     * Writes the version-12 schema from its committed file, with one fully configured host in it.
+     *
+     * Reconstructed from `schemas/12.json` rather than from SQL pasted into this test, because a
+     * hand-copied `CREATE TABLE` is a second definition of the same thing: it would keep passing
+     * after the real version 12 was found to differ from it, which is the one failure a migration
+     * test exists to catch. Room writes that file on every build and it is committed, so it is the
+     * same text the shipped release validated against.
+     */
+    private fun seedVersion12() {
+        val schema = JSONObject(schemaFile(12).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            // Room writes the table name as a placeholder so one schema can be reused for a temp
+            // table during a destructive migration; substituting it is the documented way to run it.
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
+            "INSERT INTO host_profiles (id, name, host, username, port, authMethod, groupName, tags, " +
+                "isFavorite, lastConnectedAt, fingerprint, proxyType, proxyJump, socksHost, socksPort, " +
+                "socksUsername, socksPassword, accentColor, connectTimeoutSeconds, keepAliveSeconds, " +
+                "autoLoginSftp, compression, keepAliveEnabled, serverAliveCountMax, authTimeoutSeconds, " +
+                "autoReconnect, maxReconnectAttempts, reconnectBackoffSeconds, usePty, terminalType, " +
+                "terminalColumns, terminalRows, keyboardInteractiveAuth, legacyAlgorithms, hostKeyPolicy) " +
+                "VALUES ('tuned-host','Tuned edge','edge.example.com','ops',2222,'KEY','Production'," +
+                "'eu' || char(31) || 'edge',0,1750000000000,'SHA256:tuned','SOCKS5'," +
+                "'bastion.example.com','10.0.0.1',9050,'ops'," +
+                // socksPassword stays NULL on purpose: no fixture in this repo carries anything
+                // shaped like a credential, and the column's survival is covered by the ones beside it.
+                "NULL,4280391411,25,45,0,1,0,6,90,0,9,12,0,'screen-256color',132,50,0,1,'STRICT')",
+        )
+        db.execSQL("PRAGMA user_version = 12")
+        db.close()
+    }
+
+    /**
+     * The committed schema for [version].
+     *
+     * Found by walking up from the working directory, because a unit test's is the Gradle project
+     * and a run from the repository root is one directory above it - and a test that silently
+     * skipped when it could not find the file would be a test that stopped running the day the
+     * layout changed. Missing is a failure with the path in it, not a pass.
+     */
+    private fun schemaFile(version: Int): File {
+        val relative = "schemas/dev.eclipse.ssh.data.local.EclipseDatabase/$version.json"
+        var directory: File? = File("").absoluteFile
+        while (directory != null) {
+            val candidate = File(directory, relative)
+            if (candidate.isFile) return candidate
+            directory = directory.parentFile
+        }
+        throw AssertionError("No committed Room schema for version $version: looked for $relative above ${File("").absolutePath}")
     }
 
     private companion object {

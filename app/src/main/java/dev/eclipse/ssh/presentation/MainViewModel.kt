@@ -24,6 +24,9 @@ import dev.eclipse.ssh.data.model.AppSettings
 import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
 import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardType
+import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.data.model.describe
+import dev.eclipse.ssh.data.model.savedForwardIdPrefix
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.matchesQuery
@@ -79,6 +82,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.security.KeyPair
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelAndJoin
@@ -225,11 +229,46 @@ class MainViewModel @Inject constructor(
     private val terminalJobs = ConcurrentHashMap<String, Job>()
     /** In-flight connect attempts, so double-tapping a host cannot open two sessions. */
     private val connectJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * Which dial each host is on, so an attempt that has been replaced cannot report over its
+     * replacement.
+     *
+     * [connectJobs] cancels the previous attempt, and cancellation is not enough on its own: it is
+     * cooperative, and the path from a caught failure to the tab write that reports it contains no
+     * suspension point at all, so a `cancel()` arriving anywhere along it is only noticed after the
+     * report has already been made. The window is not theoretical - it is the one every new host goes
+     * through. An unknown host key fails the attempt and raises the trust question, the user answers it,
+     * [acceptHostKey] dials again, and the answered attempt then finishes unwinding and puts
+     * `Server key did not validate` on a tab that is, by then, connecting for real. The user sees a red
+     * failure appear *after* saying yes, on a connection that is about to succeed - which is the shape
+     * of the complaint this release is about, arriving from the one direction nobody was looking.
+     *
+     * A number rather than a job identity, because the identity is not available in time: `viewModelScope`
+     * dispatches on `Main.immediate`, so a body launched from the main thread starts running before
+     * `connectJobs[host.id] = job` has executed, and an attempt that failed before its own job was
+     * recorded would mistake itself for the stale one and report nothing at all. This is incremented
+     * synchronously by [connect] before anything else happens, so every attempt knows its own number
+     * from the moment it exists.
+     *
+     * Read *inside* the `updateTab` transform, never before it, for the reason spelled out on
+     * [isDisplaying]: a check on one side of a suspension and a write on the other is two steps with a
+     * whole replacement able to fit between them.
+     */
+    private val dialGenerations = ConcurrentHashMap<String, AtomicLong>()
     /**
      * In-flight SFTP logins, one per host, so a reconnect cannot leave the previous attempt writing
      * a stale listing (or a stale failure) into the tab it no longer belongs to.
      */
     private val sftpJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * In-flight starts of a host's saved forwarding rules, one per host, for the same reason as
+     * [sftpJobs] and one more: binding a listening socket is the one thing here that can block on a
+     * port another app is holding, so a reconnect arriving mid-bind must be able to abandon the
+     * previous attempt rather than let it report against the transport that replaced it.
+     */
+    private val forwardJobs = ConcurrentHashMap<String, Job>()
     /** Remote home directory resolved from the server, keyed by host id. */
     private val homePaths = ConcurrentHashMap<String, String>()
 
@@ -507,6 +546,9 @@ class MainViewModel @Inject constructor(
         keyPassphrase: String? = null,
         resuming: Boolean = false,
     ) {
+        // First, and synchronously: from here on this is the dial that speaks for this host, and every
+        // attempt still unwinding somewhere behind it is one whose report the user must not be shown.
+        val dial = dialGenerations.computeIfAbsent(host.id) { AtomicLong() }.incrementAndGet()
         selectedHostId.value = host.id
         pendingConnection = PendingConnection(host, password, keyPair, keyBytes, keyPassphrase, resuming)
         // Asking for this session by hand is a fresh start, whatever the last one did: the allowance
@@ -621,6 +663,10 @@ class MainViewModel @Inject constructor(
                             // See [retryNotice] for why one message for all of them was actively
                             // misleading, and [retryPhase] for why this is no longer RECONNECTING.
                             updateTab(host.id) { tab ->
+                                // Not this host's dial any more: a countdown belonging to an attempt the
+                                // user has already replaced would sit on top of the one they are waiting
+                                // for, counting attempts that are no longer being made.
+                                if (!isCurrentDial(host.id, dial)) return@updateTab tab
                                 tab?.copy(
                                     state = retryPhase(tab.state),
                                     lastError = retryNotice(
@@ -641,12 +687,23 @@ class MainViewModel @Inject constructor(
                 // the credentials, the host, the network - has to change before trying again is worth
                 // anything, and the tab says so in red rather than in the amber of a finished session.
                 val reason = describeConnectFailure(lastError)
-                updateTab(host.id) { it?.copy(state = SessionConnectionState.ERROR, lastError = reason) }
+                updateTab(host.id) { tab ->
+                    // See [dialGenerations]. This attempt did fail, and the trace below says so - but a
+                    // failure is only news about the session the user is watching if it is still that
+                    // session's failure.
+                    if (isCurrentDial(host.id, dial)) {
+                        tab?.copy(state = SessionConnectionState.ERROR, lastError = reason)
+                    } else {
+                        tab
+                    }
+                }
                 diagnostics.record(
                     host.id,
                     SessionEvent.CONNECT_FAILED,
                     state = SessionConnectionState.ERROR,
-                    detail = reason,
+                    // Marked in the trace rather than hidden from it: a CONNECT_FAILED followed by a
+                    // session that came up is otherwise a contradiction a reader has to guess at.
+                    detail = if (isCurrentDial(host.id, dial)) reason else "$reason (superseded)",
                     network = networkMonitor.describe(),
                 )
             }
@@ -824,6 +881,111 @@ class MainViewModel @Inject constructor(
         } else {
             updateTab(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
         }
+        // Last, and after the tab is already CONNECTED: the shell is the session, and the tunnels are a
+        // convenience attached to it. See [startSavedForwards] for why a tunnel that cannot bind is not
+        // allowed to change what this function just published.
+        startSavedForwards(host)
+    }
+
+    /**
+     * Brings up [host]'s saved forwarding rules on the session that has just come up.
+     *
+     * Called from [attachTerminal], so it runs for a fresh login, for every rung of the reconnect
+     * ladder, and for a live session adopted instead of dialled - the three ways a host acquires a
+     * transport, and all three need the rules rebound, because a `PortForwardingTracker` belongs to the
+     * `ClientSession` that created it.
+     *
+     * **A forward that fails may not cost the user their shell.** This is the whole rule the feature
+     * turns on. Every ordinary reason a tunnel does not come up - the local port is already taken,
+     * usually by the last run of this app or by another one; the server refuses a remote bind because
+     * its `AllowTcpForwarding` says no - is a fact about one listening socket and says nothing about the
+     * session. So nothing here touches [SessionTab.state], nothing arms a reconnect, and the failure is
+     * reported on [SessionTab.forwardError] beside the `forwardsOpen`/`forwardsTotal` pair. Answering a
+     * taken port with a reconnect is exactly the loop this release exists to stop, and it would be a
+     * loop nothing could break: the port would still be taken on the next attempt.
+     *
+     * Launched rather than awaited, like [loginSftp], because binding a listening socket can block long
+     * enough to be noticed and the shell is on screen and typeable already.
+     */
+    private fun startSavedForwards(host: HostProfile) {
+        forwardJobs.remove(host.id)?.cancel()
+        // Unconditional, including for a host with no rules: this also clears the previous transport's
+        // trackers, and a host whose last rule was just deleted has to end up with nothing bound and
+        // nothing claimed on its tab.
+        stopSavedForwards(host.id)
+        val rules = decodeForwardRules(host.savedForwards, host.id)
+        updateTab(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size, forwardError = null) }
+        if (rules.isEmpty()) return
+        val job = viewModelScope.launch {
+            val session = sessions[host.id]
+            if (session == null) {
+                // Not an error worth a message: the only way to get here is a session that ended between
+                // the shell opening and this line, and whatever ended it is already on the tab.
+                updateTab(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size) }
+                return@launch
+            }
+            var open = 0
+            val failures = mutableListOf<String>()
+            rules.forEach { entry ->
+                try {
+                    forwardHandles[entry.id] = openForward(session, entry)
+                    forwardings.value = forwardings.value + entry
+                    open++
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    // Recorded per rule and continued, not aborted: three rules where the first port is
+                    // taken must still give the user the other two, and "8080 is busy" is a different
+                    // problem from "this server does not allow forwarding at all".
+                    failures += "${entry.describe()}: ${error.message ?: error::class.java.simpleName}"
+                }
+                // Written as each one lands rather than once at the end, so a rule that takes a while to
+                // bind does not hide the ones that already worked.
+                updateTab(host.id) { it?.copy(forwardsOpen = open, forwardsTotal = rules.size) }
+            }
+            if (failures.isEmpty()) return@launch
+            val reason = failures.joinToString(" · ")
+            updateTab(host.id) { it?.copy(forwardError = reason) }
+            // One message for the whole set, and it names the host: this fires on a reconnect the user
+            // may not have asked for, so a snackbar per failed rule on a flaky link would be a queue of
+            // notifications about the same two ports.
+            report("Port forwarding on ${host.name}: $reason")
+        }
+        forwardJobs[host.id] = job
+        job.invokeOnCompletion { forwardJobs.remove(host.id, job) }
+    }
+
+    /** One saved rule, on the manager, bound to loopback on whichever side it lands. */
+    private suspend fun openForward(session: ClientSession, entry: ForwardEntry): ForwardingHandle = when (entry.type) {
+        ForwardType.LOCAL -> portForwardingManager.startLocal(
+            session,
+            "127.0.0.1",
+            entry.localPort,
+            entry.remoteHost.orEmpty(),
+            entry.remotePort ?: 0,
+        )
+        // Server loopback, for the reason spelled out in [startRemoteForward]: a rule written as two
+        // port numbers has not asked for the phone's port to be published to the server's network.
+        ForwardType.REMOTE -> portForwardingManager.startRemote(session, "127.0.0.1", entry.remotePort ?: 0, "127.0.0.1", entry.localPort)
+        ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, "127.0.0.1", entry.localPort)
+    }
+
+    /**
+     * Closes the forwards that came from [hostId]'s saved column, leaving the user's own alone.
+     *
+     * The distinction is [savedForwardIdPrefix]: a saved rule's id is derived from its text, a forward
+     * opened by hand in the sheet gets a `UUID`. Only the derived ones are rebound by
+     * [startSavedForwards], so only those may be closed here - a SOCKS proxy the user started
+     * themselves is not this function's to take away.
+     */
+    private fun stopSavedForwards(hostId: String) {
+        val prefix = savedForwardIdPrefix(hostId)
+        forwardings.value.filter { it.id.startsWith(prefix) }.forEach { entry ->
+            // Guarded for the same reason as [stopForwarding]: closing a tracker asks the server to
+            // cancel the forward, and the usual reason this runs is that the server is no longer there.
+            forwardHandles.remove(entry.id)?.let { handle -> runCatching { handle.close() } }
+        }
+        forwardings.value = forwardings.value.filterNot { it.id.startsWith(prefix) }
     }
 
     /**
@@ -1455,6 +1617,16 @@ class MainViewModel @Inject constructor(
      */
     private fun isDisplaying(hostId: String, buffer: AnsiTerminalBuffer): Boolean =
         terminalBuffers[hostId] === buffer
+
+    /**
+     * Whether [generation] is still the dial [hostId] is on. See [dialGenerations].
+     *
+     * Absent means yes, deliberately: nothing removes a host's counter, so the only way to read null
+     * here is for the counter to have gone with the whole map, and refusing to report at all would be
+     * the worse of the two failures.
+     */
+    private fun isCurrentDial(hostId: String, generation: Long): Boolean =
+        (dialGenerations[hostId]?.get() ?: generation) == generation
 
     fun acceptHostKey() {
         val challenge = hostKeyChallenge.value ?: return
@@ -2567,6 +2739,7 @@ class MainViewModel @Inject constructor(
         terminalJobs.remove(tab.hostId)?.cancel()
         connectJobs.remove(tab.hostId)?.cancel()
         sftpJobs.remove(tab.hostId)?.cancel()
+        forwardJobs.remove(tab.hostId)?.cancel()
         // Closing a tab is the clearest possible statement that this session is not wanted, so it also
         // ends any reconnect waiting to bring it back.
         reconnectJobs.remove(tab.hostId)?.let { waiting ->
@@ -2655,6 +2828,7 @@ class MainViewModel @Inject constructor(
             terminalJobs.remove(host.id)?.cancel()
             connectJobs.remove(host.id)?.cancel()
             sftpJobs.remove(host.id)?.cancel()
+            forwardJobs.remove(host.id)?.cancel()
             channels.remove(host.id)?.close()
             sessions.remove(host.id)?.close(false)
             tabs.value = tabs.value.filterNot { it.hostId == host.id }
@@ -2872,6 +3046,8 @@ class MainViewModel @Inject constructor(
         connectJobs.clear()
         reconnectJobs.values.forEach { it.cancel() }
         reconnectJobs.clear()
+        forwardJobs.values.forEach { it.cancel() }
+        forwardJobs.clear()
         forwardHandles.values.forEach { runCatching { it.close() } }
         forwardHandles.clear()
         reconnectWake.close()
@@ -3051,7 +3227,16 @@ class MainViewModel @Inject constructor(
         else -> "$bytes B"
     }
 
-    private companion object {
+    /**
+     * Module-visible for one reason: [MAX_CONNECT_ATTEMPTS] is a number a test has to agree with.
+     *
+     * `RealOpenSshInteropRobolectricTest` counts the logins a real `sshd` records while the connect
+     * ladder climbs, and "three" written out in the test would turn a deliberate change to the ladder
+     * into a failing interop test about OpenSSH. Nothing else here is public API; `internal` is the
+     * whole module and no wider, the same seam [dev.eclipse.ssh.ssh.SessionDiagnostics] uses for its
+     * bounds.
+     */
+    internal companion object {
         const val MAX_TERMINAL_CHARS = 100_000
         /**
          * Ceiling on how often the terminal repaints, in milliseconds — about 30 frames a second.

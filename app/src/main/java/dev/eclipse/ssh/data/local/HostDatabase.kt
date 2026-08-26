@@ -69,6 +69,21 @@ data class HostEntity(
     val keyboardInteractiveAuth: Boolean = true,
     val legacyAlgorithms: Boolean? = null,
     val hostKeyPolicy: String = "ASK",
+    /*
+     * The rest of the advanced per-host settings, added in [Migrations.MIGRATION_12_13].
+     *
+     * The four algorithm lists are nullable for the same reason [legacyAlgorithms] is: null means
+     * "whatever the library negotiates", which is not a list and is what every existing row means.
+     * The three text columns are NOT NULL DEFAULT '' because empty already means "nothing to do" in
+     * each of them, so an upgraded row needs no special case anywhere downstream.
+     */
+    val ciphers: String? = null,
+    val kexAlgorithms: String? = null,
+    val macs: String? = null,
+    val hostKeyAlgorithms: String? = null,
+    val startupCommand: String = "",
+    val environment: String = "",
+    val savedForwards: String = "",
 )
 
 class HostConverters {
@@ -96,10 +111,10 @@ interface HostDao {
     suspend fun count(): Int
 }
 
-// exportSchema is on so `app/schemas` records what version 12 actually looks like: every
+// exportSchema is on so `app/schemas` records what version 13 actually looks like: every
 // migration from here has to be written against a known starting point, and Room's migration
 // test helper reads those files. See the ksp `room.schemaLocation` argument in build.gradle.kts.
-@Database(entities = [HostEntity::class, TransferEntity::class], version = 12, exportSchema = true)
+@Database(entities = [HostEntity::class, TransferEntity::class], version = 13, exportSchema = true)
 @TypeConverters(HostConverters::class)
 abstract class EclipseDatabase : RoomDatabase() {
     abstract fun hostDao(): HostDao
@@ -141,6 +156,13 @@ fun HostEntity.toDomain() = HostProfile(
     terminalRows = terminalRows,
     keyboardInteractiveAuth = keyboardInteractiveAuth,
     legacyAlgorithms = legacyAlgorithms,
+    ciphers = ciphers,
+    kexAlgorithms = kexAlgorithms,
+    macs = macs,
+    hostKeyAlgorithms = hostKeyAlgorithms,
+    startupCommand = startupCommand,
+    environment = environment,
+    savedForwards = savedForwards,
     // An unrecognised name falls back to asking, the same way [authMethod] and [proxyType] fall back
     // to their safest value: a row written by a newer build, or edited by hand, must not silently
     // become the policy that trusts whatever key turns up.
@@ -182,6 +204,13 @@ fun HostProfile.toEntity() = HostEntity(
     terminalRows = terminalRows,
     keyboardInteractiveAuth = keyboardInteractiveAuth,
     legacyAlgorithms = legacyAlgorithms,
+    ciphers = ciphers,
+    kexAlgorithms = kexAlgorithms,
+    macs = macs,
+    hostKeyAlgorithms = hostKeyAlgorithms,
+    startupCommand = startupCommand,
+    environment = environment,
+    savedForwards = savedForwards,
     hostKeyPolicy = hostKeyPolicy.name,
 )
 

@@ -3395,3 +3395,199 @@ identical. The same five are served from port 19001, where the arm64 file fetche
 Signing passwords went to `apksigner` through mode-600 files in a mode-700 directory, shredded by an `EXIT`
 trap; `/proc/<pid>/cmdline` is world-readable on this host, so they were never arguments. No `sign.*`
 directory survived the run.
+
+## 33. Three asks, one root cause, and a cipher that should never have been offered
+
+The 1.1.3 round answers three requests: the server's files should fill the screen on their own tab, the
+terminal login should stop saying "Reconnecting" the moment it logs in, and every host should carry a full
+set of its own options — compression among them.
+
+The middle one turned out to be a reporting bug with a one-line root cause, and finding it changed what the
+other two are worth: an app that cannot say why a session failed produces bug reports nobody can act on, and
+three releases of "it keeps reconnecting" were exactly that.
+
+### 33.1 The line that deleted the app's own explanation
+
+`statusLine` had this branch:
+
+```kotlin
+SessionConnectionState.RECONNECTING -> lastError?.takeIf { !compact } ?: "Reconnecting…"
+```
+
+`compact = true` has exactly one caller: the terminal screen's status row — the screen a user is looking at
+while a session drops. `DISCONNECTED` and `ERROR` both keep `lastError` when compact. `RECONNECTING` was the
+only state that threw it away.
+
+So the whole chain worked and the last step discarded the result. The engine classified the ending, the
+ladder wrote `attempt 2 of 5 · The server disconnected: Timeout, your session not responding` onto the tab
+and deliberately kept it there for the entire recovery, and the `maxLines = 2` immediately below the call
+site exists *specifically* to give that sentence room — and then `takeIf { !compact }` deleted it, on the one
+screen where it mattered. Every other surface in the app showed the reason. The terminal showed the bare
+word.
+
+That is the root cause of the reports. Not a transport fault: the reason was computed correctly, stored
+correctly, and never rendered. `RECONNECTING` now keeps its reason in compact rows exactly as the other ended
+states do — shortening the prefix, never the explanation — and a regression test asserts a reconnecting tab's
+reason survives `compact = true`.
+
+### 33.2 The second half: a retry that was never a reconnect
+
+`connect()`'s attempt loop wrote `RECONNECTING` for a failed attempt. Because `openTerminal` runs *after*
+authentication, a server that accepts the key and then refuses a pty — no ptys left, a `MaxSessions`
+ceiling, a `ForceCommand` that exits — produced the word "Reconnecting" on a first login, seconds after
+Connect was tapped, about a session that had never once existed. The user's own words for this were
+"penyakitnya masih sama langsung reconnecting", and they were describing the app accurately.
+
+A connect-time retry now stays in the phase it is retrying (`retryPhase`) and says which half failed and
+which attempt is next (`retryNotice`): *Logged in · the shell did not open · attempt 2 of 3*. After this the
+word RECONNECTING appears only when a session that was genuinely up has dropped, which makes the next report
+unambiguous whichever way it goes.
+
+One policy fix rides with it: a session that comes up and dies immediately having never carried a byte is a
+server closing the connection, not an outage to wait out, so it ends at ERROR with the server's own words
+instead of starting a ladder. Auto-reconnect for genuine transport faults is untouched.
+
+### 33.3 A server that refuses a shell, in the harness
+
+None of the above could be tested end to end, and that is worth stating plainly: on the sandbox's ordinary
+port every failure happens before the login or not at all, and a unit test cannot reach the case either,
+because the premise is that authentication *succeeded* first. `tools/local-sshd.sh` therefore gained a third
+port — `MaxSessions 0` plus `PermitTTY no`, OpenSSH's own documented switch for "prevent all shell, login and
+subsystem sessions while still permitting forwarding" — and the interop suite gained a test that logs in
+there and asserts, against a real `sshd`:
+
+* the trace reaches `CHANNEL_PTY_INITIALIZING`, so the login really did work first;
+* RECONNECTING appears nowhere in it, on a host with auto-reconnect deliberately left **on**;
+* each wait says which half failed and which attempt is next, and none of them blames the connection;
+* the server logged one accepted key per attempt — the only witness that the credential was taken every
+  time rather than this being an authentication retry in disguise;
+* the tab ends at ERROR with a reason, and that reason survives the compact status row;
+* and the keyboard that is still on screen is inert — the IME host stays composed for as long as the terminal
+  screen does, deliberately, because an `InputConnection` cannot be established for a view that is not in the
+  tree, so what the test requires is that a keystroke aimed at a session which never had a pty reaches
+  nothing: no echo, no fourth login in the server's log, and no change to what the tab says.
+
+Both CI jobs assert the port file exists, because a skipped interop test and a passing one look identical in
+a summary.
+
+### 33.4 Files: the server's listing had nowhere to be full height
+
+Every non-terminal screen renders inside a `Column(...).verticalScroll(...)`, which hands children an
+unbounded height — so `fillMaxHeight()` and `weight(1f)` cannot work there, and the server listing got
+roughly half a phone screen with local files below it. `Destination.TERMINAL` already escapes that scroll
+with its own branch for the same reason; `Destination.FILES` now does too. Under 700 dp the two listings are
+a `PrimaryTabRow` — **Server** and **Local**, only the selected one composed, filling the remaining height,
+selection kept in `rememberSaveable` so rotation does not move it. At 700 dp and above they stay side by
+side. Both listings became `LazyColumn`s now that they own a bounded height. The session switcher stays
+above the tabs and the selection action bar stays below both, because switching session and switching pane
+are different choices, and `N selected` counts both sides.
+
+### 33.5 Per-host options, and what is deliberately not there
+
+Room 12 → 13 adds seven columns to `host_profiles`: four nullable algorithm lists (`ciphers`,
+`kexAlgorithms`, `macs`, `hostKeyAlgorithms` — null means "no opinion", so nothing changes for an existing
+host) and three `NOT NULL DEFAULT ''` (`startupCommand`, `environment`, `savedForwards`). Compression was
+already per host and already correct; what it lacked was discoverability, so the Advanced section now opens
+expanded and keeps "Reset to defaults".
+
+Saved port forwarding is per host and starts with the session, through the `PortForwardingManager` that
+already existed. The rule the feature turns on: a tunnel that cannot bind reports on its own field and
+**never** touches `SessionConnectionState`. A busy port must not cost the user their shell, and must not
+hand the reconnect ladder a failure redialling cannot fix.
+
+Three deviations from the approved plan, called out rather than shipped quietly:
+
+1. **`host_forwards` is a text column, not a table.** The plan specified a table keyed by `hostId` with a
+   foreign key. What shipped is `savedForwards` on `host_profiles`, holding rules in ssh's own syntax
+   (`L:8080:intranet:80`, `R:2222:22`, `D:1080`). One column, one migration, no join, and the stored form is
+   the form a user already knows from `ssh -L`; the editor decodes to `ForwardEntry` and back, and an
+   unparseable rule is dropped on the way in rather than travelling with the host.
+2. **`x11Forwarding` is not shippable.** MINA SSHD 2.14.0 has no client-side X11 channel, so the switch
+   would have been a control that does nothing — the same reason agent forwarding was already excluded. Not
+   built, and now documented beside it.
+3. **No promoted Compression switch on the main Add/Edit form.** The plan put one there for
+   discoverability; the Advanced section opening expanded achieves that without giving one setting two
+   controls that can disagree.
+
+### 33.6 A cipher the UI should never have been able to choose
+
+Validating algorithm lists against what the library actually offers turned up something worse than an
+unsupported name. `BuiltinCiphers` contains `none` — verified with `javap`, not assumed — and MINA will
+honour it: a host with `ciphers = none` would negotiate an **unencrypted** session while every status line
+in the app still said "Connected · encrypted".
+
+Nothing in the UI had asked for that, but nothing stopped it either: the field took a name, the name was
+supported, and the factory list was built from it. `AlgorithmCatalog` now refuses `none` in the form (with a
+message that says it would leave the session unencrypted), keeps it out of the suggestions, and — because a
+backup file is hand-editable — strips it in all four factory builders, so an imported host that names it
+gets encryption anyway. A test asserts a hand-edited backup cannot switch a host's encryption off.
+
+### 33.7 The failure that arrived after the user said yes
+
+The interop suite found one more, and it found it the way these are supposed to be found: an assertion that
+had been passing for weeks started failing on a run where nothing about it had changed.
+`realServerOutputWrapsWithoutSplittingATokenApart` ends with `assertNothingLookedLikeADrop`, which is the
+claim that a session's tab only ever moved forwards. Its trace came back
+`[ERROR, CONNECTING, AUTHENTICATING, CHANNEL_PTY_INITIALIZING, CONNECTED]` — an ERROR *before* the connection
+that succeeded, on a login that worked.
+
+The sequence behind it is the one every new host goes through:
+
+1. Connect is tapped. The dial reaches the server, whose key has never been seen, and the verifier raises the
+   trust question and fails the attempt.
+2. The question reaches the screen. The user taps Trust. `acceptHostKey` dials again — a new attempt, which
+   writes `CONNECTING` to the tab synchronously.
+3. The *answered* attempt, still unwinding, reaches its own report and writes
+   `ERROR · Server key did not validate` — onto the tab of the dial that replaced it.
+
+So the user answers a question and is shown a red failure for their trouble, on a connection that is at that
+moment succeeding. Three of the four things the reports complained about are the same shape as this: a state
+on the tab that belongs to something that is no longer happening.
+
+`connectJobs` was supposed to prevent exactly this and cannot: `cancel()` is cooperative, and the path from a
+caught failure to the tab write that reports it has no suspension point in it, so a cancellation arriving
+anywhere along that path is noticed only after the report has been made. The fix is `dialGenerations` — one
+counter per host, incremented **synchronously** by `connect` before anything else happens, captured by the
+attempt it belongs to, and read *inside* the `updateTab` transform rather than before it, the same
+compare-and-set discipline `isDisplaying` already uses for the terminal buffers. Two writes are guarded: the
+retry countdown and the final `ERROR`. Nothing else changes — a superseded attempt that *succeeds* still
+installs its session, because the gate serialises the two dials and the replacement adopts what it finds.
+
+A number, not a job identity, and that is not a style choice: `viewModelScope` dispatches on
+`Main.immediate`, so an attempt launched from the main thread starts running before `connectJobs[id] = job`
+has executed, and an attempt that failed inside that window would mistake itself for the stale one and report
+nothing at all — a genuine failure with an empty tab, which is worse than the bug being fixed.
+
+The trace still records the failure, marked `(superseded)`, because a `CONNECT_FAILED` followed by a session
+that came up is otherwise a contradiction the reader has to guess at.
+
+**What tests this.** `assertNothingLookedLikeADrop`, in every interop test that logs in — which is how it was
+caught. That coverage is honest but not deterministic: reproducing step 3 means cancelling an attempt during
+the handful of instructions between its `catch` and its tab write, and the only way to hit that on demand is a
+seam in production code whose sole purpose is to let a test pause there. Not added. The one deterministic
+consequence is asserted instead — `aServerThatRefusesTheShellNeverCallsTheFailureAReconnect` waits for the
+login to reach the shell phase *before* it waits for `ERROR`, so the ERROR it asserts on cannot be the
+answered question's.
+
+### 33.8 What was measured
+
+`:app:testDebugUnitTest` and `:app:testReleaseUnitTest`, one invocation, on the two cores this host is allowed:
+
+```
+testDebugUnitTest:   classes=73 tests=978 failures=0 errors=0 skipped=7
+testReleaseUnitTest: classes=73 tests=978 failures=0 errors=0 skipped=7
+BUILD SUCCESSFUL in 22m 48s
+```
+
+The seven skips are the `ECLIPSE_STRESS` idle matrix, which is minutes of deliberate silence per case and belongs
+to the hand-triggered `stress` job rather than to a gate that runs on every push. The other ten interop tests
+ran for real, against OpenSSH_10.0p2 on this machine, in 201 seconds — including the two that only exist
+because a real server can be asked to refuse a shell, and the two that take the server's own key-exchange log
+as the witness for whether compression was negotiated.
+
+Worth being precise about one number, because the honest version is better than the flattering one: the
+previous full run in this session reported 973 tests with 12 skipped, and those twelve were the *entire*
+interop class skipping — the sandbox was not running, so `assumeTrue` retired every test that needs a server,
+including the five new ones. The five tests added since then account for the difference in the total; the
+difference in the skips is a live server, and it is the reason two genuine defects turned up between one green
+run and the next.

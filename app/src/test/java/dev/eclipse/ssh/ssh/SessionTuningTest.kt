@@ -240,6 +240,125 @@ class SessionTuningTest {
         assertThat(request.rows).isEqualTo(30)
     }
 
+    @Test
+    fun `an environment column becomes the variables it names, in the order it names them`() {
+        val environment = parseEnvironment("LANG=en_US.UTF-8\nTZ=Europe/Amsterdam\nEDITOR=vim")
+
+        assertThat(environment).containsExactly(
+            "LANG", "en_US.UTF-8",
+            "TZ", "Europe/Amsterdam",
+            "EDITOR", "vim",
+        ).inOrder()
+    }
+
+    @Test
+    fun `a host that was never given an environment sends no channel requests at all`() {
+        // Not an empty variable, and not a request with nothing in it: a channel request per variable is
+        // what MINA sends, so "no environment" has to mean no requests or every session pays for a
+        // feature nobody configured.
+        listOf(null, "", "   ", "\n\n", "# just a comment").forEach { text ->
+            assertThat(parseEnvironment(text)).isEmpty()
+        }
+    }
+
+    @Test
+    fun `a value keeps the characters that make it a value`() {
+        // The three shapes that a naive split on '=' or on whitespace would destroy, and all three are
+        // ordinary: a locale with a dot, a PATH with colons, a value that simply contains an equals sign.
+        val environment = parseEnvironment("PATH=/usr/local/bin:/usr/bin\nOPTS=-Dkey=value\nGREETING=hello world")
+
+        assertThat(environment["PATH"]).isEqualTo("/usr/local/bin:/usr/bin")
+        assertThat(environment["OPTS"]).isEqualTo("-Dkey=value")
+        assertThat(environment["GREETING"]).isEqualTo("hello world")
+    }
+
+    @Test
+    fun `one layer of matching quotes is a convenience, not a shell`() {
+        // Quotes let a value with spaces be written the way it would be in a file. Only one layer and only
+        // when both ends match, because there is no shell in a channel request - pretending otherwise
+        // would make a value mean something different here than it does anywhere else.
+        assertThat(parseEnvironment("TZ=\"Europe/London\"")["TZ"]).isEqualTo("Europe/London")
+        assertThat(parseEnvironment("TZ='Europe/London'")["TZ"]).isEqualTo("Europe/London")
+        // Unbalanced stays verbatim: dropping the one quote would be this app editing the value.
+        assertThat(parseEnvironment("TZ=\"Europe/London")["TZ"]).isEqualTo("\"Europe/London")
+        assertThat(parseEnvironment("PS1='\\u@\\h '")["PS1"]).isEqualTo("\\u@\\h ")
+    }
+
+    @Test
+    fun `a name that is not a name is dropped, and the rest of the column still sends`() {
+        // A name is a protocol field, not a shell word: a channel request carrying a space or a newline in
+        // its name is a malformed request and MINA would send it. And one bad line must not cost the login
+        // - a host whose environment has a typo in the third line should still get the other two.
+        val environment = parseEnvironment(
+            listOf(
+                "LANG=en_US.UTF-8",   // fine
+                "has space=1",        // a space in a name
+                "1STARTS_WITH_DIGIT=1",
+                "LÄNG=1",             // non-ASCII
+                "WITH-DASH=1",
+                "NO_EQUALS_AT_ALL",   // nothing it could mean
+                "=orphan",            // a value with no name
+                "  ",
+                "# a comment=1",
+                "TZ=Europe/Amsterdam", // fine
+            ).joinToString("\n"),
+        )
+
+        assertThat(environment.keys).containsExactly("LANG", "TZ").inOrder()
+    }
+
+    @Test
+    fun `an over long name is refused rather than truncated`() {
+        // Truncating would send a *different* variable, which is worse than sending none: `LONG…` cut to
+        // 64 characters is a name the server has never heard of and the user cannot see.
+        assertThat(parseEnvironment("${"A".repeat(64)}=1")).hasSize(1)
+        assertThat(parseEnvironment("${"A".repeat(65)}=1")).isEmpty()
+    }
+
+    @Test
+    fun `a name assigned twice keeps the last line`() {
+        // What a shell script doing the same thing would do, and the only answer that makes editing the
+        // field predictable: a line added at the bottom wins.
+        assertThat(parseEnvironment("TZ=UTC\nTZ=Europe/Amsterdam")["TZ"]).isEqualTo("Europe/Amsterdam")
+    }
+
+    @Test
+    fun `a startup command is typed into the shell, ending in a Return`() {
+        // A pty, so Return is what a keypress sends and the line discipline turns it into the newline the
+        // shell reads. LF works on Linux and is subtly wrong on the systems that do not map it.
+        val bytes = startupCommandBytes("tmux attach")
+
+        assertThat(bytes).isNotNull()
+        assertThat(String(bytes!!, Charsets.UTF_8)).isEqualTo("tmux attach\r")
+    }
+
+    @Test
+    fun `no startup command means nothing is written into the shell`() {
+        // Null rather than an empty array, so the call site cannot write "nothing" into the pty and print
+        // a second prompt above the user's first one.
+        listOf(null, "", "   ", "\n", "  \n  ").forEach { command ->
+            assertThat(startupCommandBytes(command)).isNull()
+        }
+    }
+
+    @Test
+    fun `a multi line startup command is a multi line paste with exactly one Return at the end`() {
+        // Two Returns at the end would run an empty line and print a second prompt, which reads as the
+        // command having gone wrong.
+        assertThat(startupCommandBytes("cd /srv\nls -la")?.toString(Charsets.UTF_8)).isEqualTo("cd /srv\rls -la\r")
+        assertThat(startupCommandBytes("cd /srv\n\n")?.toString(Charsets.UTF_8)).isEqualTo("cd /srv\r")
+        assertThat(startupCommandBytes("cd /srv\r\nls\r\n")?.toString(Charsets.UTF_8)).isEqualTo("cd /srv\rls\r")
+    }
+
+    @Test
+    fun `a command with characters outside ASCII survives as the bytes a shell reads`() {
+        // The pty is a byte stream and the shell's charset is UTF-8 on anything current, so a path with an
+        // accent in it has to arrive as UTF-8 and not as a mangled single byte per character.
+        val bytes = startupCommandBytes("cd /srv/données")
+
+        assertThat(bytes).isEqualTo("cd /srv/données\r".toByteArray(Charsets.UTF_8))
+    }
+
     private fun profile() = HostProfile(
         id = "tuning-host",
         name = "Tuning",

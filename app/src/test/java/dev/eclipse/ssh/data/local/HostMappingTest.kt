@@ -113,7 +113,7 @@ class HostMappingTest {
     /**
      * Every advanced column survives the mapping, set to something other than its default.
      *
-     * One profile with all fourteen changed at once, rather than fourteen assertions on one field: a
+     * One profile with all twenty-one changed at once, rather than twenty-one assertions on one field: a
      * mapper written by hand fails by *dropping* a field, and a field that is dropped reads back as its
      * default. A test that only ever compares defaults to defaults cannot see that happen.
      */
@@ -137,6 +137,16 @@ class HostMappingTest {
             terminalRows = 43,
             keyboardInteractiveAuth = false,
             legacyAlgorithms = true,
+            ciphers = "aes256-gcm@openssh.com,aes128-ctr",
+            kexAlgorithms = "curve25519-sha256,diffie-hellman-group14-sha256",
+            macs = "hmac-sha2-256-etm@openssh.com",
+            hostKeyAlgorithms = "ssh-ed25519,rsa-sha2-512",
+            startupCommand = "tmux attach || tmux new",
+            // The three text columns are the ones a mapper can mangle rather than drop: a newline in a
+            // column joined with anything but a newline comes back as one line, and both of these are
+            // parsed line by line at connect time.
+            environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
+            savedForwards = "L:8080:intranet.example:80\nD:1080",
             hostKeyPolicy = HostKeyPolicy.STRICT,
         )
 
@@ -146,9 +156,9 @@ class HostMappingTest {
     /**
      * The defaults reproduce what the engine did before any of this was configurable.
      *
-     * This is the half that matters for an install upgrading into version 12: `MIGRATION_11_12` fills
-     * these columns with literals, and the literals have to agree with the values here or an existing
-     * host changes behaviour on upgrade without anybody asking it to.
+     * This is the half that matters for an install upgrading into version 12 or 13: `MIGRATION_11_12`
+     * and `MIGRATION_12_13` fill these columns with literals, and the literals have to agree with the
+     * values here or an existing host changes behaviour on upgrade without anybody asking it to.
      */
     @Test
     fun `advanced options default to the behaviour that used to be hard-coded`() {
@@ -170,10 +180,24 @@ class HostMappingTest {
         assertThat(fresh.keyboardInteractiveAuth).isTrue()
         assertThat(fresh.legacyAlgorithms).isNull()
         assertThat(fresh.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
+        // Null, not empty. An empty algorithm list is a real instruction - propose nothing - and a
+        // host that had never been asked about ciphers must keep negotiating the way it always did.
+        assertThat(fresh.ciphers).isNull()
+        assertThat(fresh.kexAlgorithms).isNull()
+        assertThat(fresh.macs).isNull()
+        assertThat(fresh.hostKeyAlgorithms).isNull()
+        // Empty, not null: for these three "nothing" and "absent" are the same thing, so a second way
+        // to say it would only give the read sites a null to forget about.
+        assertThat(fresh.startupCommand).isEmpty()
+        assertThat(fresh.environment).isEmpty()
+        assertThat(fresh.savedForwards).isEmpty()
 
         val entity = fresh.toEntity()
         assertThat(entity.hostKeyPolicy).isEqualTo("ASK")
         assertThat(entity.legacyAlgorithms).isNull()
+        assertThat(entity.ciphers).isNull()
+        assertThat(entity.startupCommand).isEmpty()
+        assertThat(entity.savedForwards).isEmpty()
         assertThat(entity.toDomain()).isEqualTo(fresh)
     }
 
@@ -204,6 +228,11 @@ class HostMappingTest {
             socksPassword = "socks-secret",
             compression = true,
             terminalType = "screen-256color",
+            // Both of these are free text the user typed, and both have an obvious way to end up
+            // holding a credential: a startup command that logs into something else, an environment
+            // carrying an API token. So neither may be printed, however useful it would be.
+            startupCommand = "vault login token=startup-secret",
+            environment = "API_TOKEN=environment-secret",
             hostKeyPolicy = HostKeyPolicy.ACCEPT_NEW,
         )
 
@@ -211,8 +240,30 @@ class HostMappingTest {
 
         assertThat(rendered).doesNotContain("socks-secret")
         assertThat(rendered).contains("socksPassword=***")
+        assertThat(rendered).doesNotContain("startup-secret")
+        assertThat(rendered).doesNotContain("environment-secret")
+        // Presence still reported, because "the startup command did not run" is a real bug report and
+        // whether there was one at all is the first thing that narrows it.
+        assertThat(rendered).contains("startupCommand=***")
+        assertThat(rendered).contains("environment=***")
         assertThat(rendered).contains("compression=true")
         assertThat(rendered).contains("terminalType=screen-256color")
         assertThat(rendered).contains("hostKeyPolicy=ACCEPT_NEW")
+    }
+
+    /**
+     * A host with nothing in those two fields says so, rather than claiming to be hiding something.
+     *
+     * The other half of the redaction: `***` for every state would make the trace useless for the one
+     * question it is read for. A blank field is not a secret, and printing it as one would mean a user
+     * reporting "my startup command never runs" could not be told that the host has none.
+     */
+    @Test
+    fun `the redacting toString distinguishes an empty field from a hidden one`() {
+        val rendered = HostProfile(id = "h9", name = "P", host = "p.example.com", username = "root").toString()
+
+        assertThat(rendered).contains("startupCommand=\"\"")
+        assertThat(rendered).contains("environment=\"\"")
+        assertThat(rendered).contains("socksPassword=null")
     }
 }

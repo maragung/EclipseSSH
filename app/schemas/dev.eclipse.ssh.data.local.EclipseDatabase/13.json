@@ -1,0 +1,360 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 13,
+    "identityHash": "61fd14e017869c6b272130640ea5a69c",
+    "entities": [
+      {
+        "tableName": "host_profiles",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `host` TEXT NOT NULL, `username` TEXT NOT NULL, `port` INTEGER NOT NULL, `authMethod` TEXT NOT NULL, `groupName` TEXT NOT NULL, `tags` TEXT NOT NULL, `isFavorite` INTEGER NOT NULL, `lastConnectedAt` INTEGER, `fingerprint` TEXT, `proxyType` TEXT NOT NULL, `proxyJump` TEXT, `socksHost` TEXT, `socksPort` INTEGER NOT NULL, `socksUsername` TEXT, `socksPassword` TEXT, `accentColor` INTEGER, `connectTimeoutSeconds` INTEGER NOT NULL, `keepAliveSeconds` INTEGER, `autoLoginSftp` INTEGER NOT NULL, `compression` INTEGER NOT NULL, `keepAliveEnabled` INTEGER NOT NULL, `serverAliveCountMax` INTEGER NOT NULL, `authTimeoutSeconds` INTEGER NOT NULL, `autoReconnect` INTEGER NOT NULL, `maxReconnectAttempts` INTEGER NOT NULL, `reconnectBackoffSeconds` INTEGER NOT NULL, `usePty` INTEGER NOT NULL, `terminalType` TEXT NOT NULL, `terminalColumns` INTEGER NOT NULL, `terminalRows` INTEGER NOT NULL, `keyboardInteractiveAuth` INTEGER NOT NULL, `legacyAlgorithms` INTEGER, `hostKeyPolicy` TEXT NOT NULL, `ciphers` TEXT, `kexAlgorithms` TEXT, `macs` TEXT, `hostKeyAlgorithms` TEXT, `startupCommand` TEXT NOT NULL, `environment` TEXT NOT NULL, `savedForwards` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "host",
+            "columnName": "host",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "username",
+            "columnName": "username",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "port",
+            "columnName": "port",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "authMethod",
+            "columnName": "authMethod",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "groupName",
+            "columnName": "groupName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "tags",
+            "columnName": "tags",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isFavorite",
+            "columnName": "isFavorite",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastConnectedAt",
+            "columnName": "lastConnectedAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "fingerprint",
+            "columnName": "fingerprint",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "proxyType",
+            "columnName": "proxyType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "proxyJump",
+            "columnName": "proxyJump",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "socksHost",
+            "columnName": "socksHost",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "socksPort",
+            "columnName": "socksPort",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "socksUsername",
+            "columnName": "socksUsername",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "socksPassword",
+            "columnName": "socksPassword",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "accentColor",
+            "columnName": "accentColor",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "connectTimeoutSeconds",
+            "columnName": "connectTimeoutSeconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "keepAliveSeconds",
+            "columnName": "keepAliveSeconds",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "autoLoginSftp",
+            "columnName": "autoLoginSftp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "compression",
+            "columnName": "compression",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "keepAliveEnabled",
+            "columnName": "keepAliveEnabled",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "serverAliveCountMax",
+            "columnName": "serverAliveCountMax",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "authTimeoutSeconds",
+            "columnName": "authTimeoutSeconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "autoReconnect",
+            "columnName": "autoReconnect",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "maxReconnectAttempts",
+            "columnName": "maxReconnectAttempts",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reconnectBackoffSeconds",
+            "columnName": "reconnectBackoffSeconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "usePty",
+            "columnName": "usePty",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "terminalType",
+            "columnName": "terminalType",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "terminalColumns",
+            "columnName": "terminalColumns",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "terminalRows",
+            "columnName": "terminalRows",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "keyboardInteractiveAuth",
+            "columnName": "keyboardInteractiveAuth",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "legacyAlgorithms",
+            "columnName": "legacyAlgorithms",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "hostKeyPolicy",
+            "columnName": "hostKeyPolicy",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ciphers",
+            "columnName": "ciphers",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "kexAlgorithms",
+            "columnName": "kexAlgorithms",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "macs",
+            "columnName": "macs",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "hostKeyAlgorithms",
+            "columnName": "hostKeyAlgorithms",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "startupCommand",
+            "columnName": "startupCommand",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "environment",
+            "columnName": "environment",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "savedForwards",
+            "columnName": "savedForwards",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "transfer_queue",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `direction` TEXT NOT NULL, `hostName` TEXT NOT NULL, `progress` REAL NOT NULL, `status` TEXT NOT NULL, `sizeLabel` TEXT NOT NULL, `hostId` TEXT, `remotePath` TEXT, `localUri` TEXT, `transferredBytes` INTEGER NOT NULL, `totalBytes` INTEGER, `retryCount` INTEGER NOT NULL, `scheduledAt` INTEGER, `repeatMinutes` INTEGER, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "direction",
+            "columnName": "direction",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostName",
+            "columnName": "hostName",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "progress",
+            "columnName": "progress",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sizeLabel",
+            "columnName": "sizeLabel",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "remotePath",
+            "columnName": "remotePath",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "localUri",
+            "columnName": "localUri",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "transferredBytes",
+            "columnName": "transferredBytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalBytes",
+            "columnName": "totalBytes",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "retryCount",
+            "columnName": "retryCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scheduledAt",
+            "columnName": "scheduledAt",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "repeatMinutes",
+            "columnName": "repeatMinutes",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '61fd14e017869c6b272130640ea5a69c')"
+    ]
+  }
+}

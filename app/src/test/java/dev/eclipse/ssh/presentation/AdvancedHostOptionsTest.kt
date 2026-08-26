@@ -1,16 +1,24 @@
 package dev.eclipse.ssh.presentation
 
 import com.google.common.truth.Truth.assertThat
+import dev.eclipse.ssh.data.model.ALGORITHM_LIST_MAX_LENGTH
 import dev.eclipse.ssh.data.model.AUTH_TIMEOUT_RANGE
 import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
+import dev.eclipse.ssh.data.model.ENVIRONMENT_MAX_LENGTH
+import dev.eclipse.ssh.data.model.ForwardEntry
+import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
 import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
+import dev.eclipse.ssh.data.model.MAX_SAVED_FORWARDS
 import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
 import dev.eclipse.ssh.data.model.SERVER_ALIVE_COUNT_RANGE
+import dev.eclipse.ssh.data.model.STARTUP_COMMAND_MAX_LENGTH
 import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
 import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
+import dev.eclipse.ssh.ssh.AlgorithmKind
+import dev.eclipse.ssh.ssh.supportedAlgorithmNames
 import org.junit.Test
 
 /**
@@ -38,6 +46,15 @@ class AdvancedHostOptionsTest {
         assertThat(defaults.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
         // Null, not false: a host follows the app-wide legacy-algorithm switch until it says otherwise.
         assertThat(defaults.legacyAlgorithms).isNull()
+        // Blank, not a rendering of this build's default lists: showing MINA's twelve ciphers in the box
+        // would turn a host with no opinion into a host that has pinned this release's list forever.
+        assertThat(defaults.ciphers).isEmpty()
+        assertThat(defaults.kexAlgorithms).isEmpty()
+        assertThat(defaults.macs).isEmpty()
+        assertThat(defaults.hostKeyAlgorithms).isEmpty()
+        assertThat(defaults.startupCommand).isEmpty()
+        assertThat(defaults.environment).isEmpty()
+        assertThat(defaults.forwards).isEmpty()
     }
 
     @Test
@@ -70,6 +87,13 @@ class AdvancedHostOptionsTest {
             keyboardInteractiveAuth = false,
             legacyAlgorithms = true,
             hostKeyPolicy = HostKeyPolicy.ACCEPT_NEW,
+            ciphers = "aes256-gcm@openssh.com,aes128-ctr",
+            kexAlgorithms = "curve25519-sha256",
+            macs = "hmac-sha2-256-etm@openssh.com",
+            hostKeyAlgorithms = "ssh-ed25519,rsa-sha2-512",
+            startupCommand = "tmux attach || tmux new",
+            environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
+            savedForwards = "L:8080:intranet.example:80\nD:1080",
         )
 
         val edited = AdvancedHostOptions.from(tuned)
@@ -233,8 +257,8 @@ class AdvancedHostOptionsTest {
 
     @Test
     fun `switching one option off does not disturb the others`() {
-        // The section edits fourteen columns with one value object, so a copy that dropped a field would
-        // silently reset it - the failure mode of every form that maps widgets to columns by hand.
+        // The section edits twenty-one columns with one value object, so a copy that dropped a field
+        // would silently reset it - the failure mode of every form that maps widgets to columns by hand.
         val tuned = AdvancedHostOptions.from(
             profile().copy(compression = true, terminalColumns = 132, hostKeyPolicy = HostKeyPolicy.STRICT),
         )
@@ -250,7 +274,7 @@ class AdvancedHostOptionsTest {
     @Test
     fun `the section leaves the rest of the host alone`() {
         // applyTo is handed a profile the main form has already filled in, so anything it touched
-        // outside its own fourteen columns would be an edit the user never made.
+        // outside its own twenty-one columns would be an edit the user never made.
         val host = profile().copy(
             name = "Prod",
             host = "prod.example.com",
@@ -263,6 +287,186 @@ class AdvancedHostOptionsTest {
         val applied = AdvancedHostOptions.from(host).copy(compression = true).applyTo(host)
 
         assertThat(applied).isEqualTo(host.copy(compression = true))
+    }
+
+    @Test
+    fun `a blank algorithm list is saved as no opinion rather than as an empty list`() {
+        // The distinction the column depends on. Null means "negotiate normally"; "" would be a real
+        // instruction to propose nothing at all, which no server can answer - so a host whose boxes are
+        // empty has to reach the database as four nulls and not as four empty strings.
+        val applied = AdvancedHostOptions.DEFAULTS.copy(ciphers = "   ", macs = "").applyTo(profile())
+
+        assertThat(applied.ciphers).isNull()
+        assertThat(applied.kexAlgorithms).isNull()
+        assertThat(applied.macs).isNull()
+        assertThat(applied.hostKeyAlgorithms).isNull()
+        assertThat(AdvancedHostOptions.DEFAULTS.isValid).isTrue()
+    }
+
+    @Test
+    fun `an algorithm this device cannot do is refused in the form rather than at connect time`() {
+        // The whole reason the review is computed here: a name MINA cannot honour would otherwise be
+        // saved, and the failure would arrive as a key-exchange error on a host that used to work.
+        val options = AdvancedHostOptions.DEFAULTS.copy(ciphers = "aes256-unicorn")
+
+        assertThat(options.cipherReview.isAcceptable).isFalse()
+        assertThat(options.cipherReview.unsupported).contains("aes256-unicorn")
+        assertThat(options.isValid).isFalse()
+    }
+
+    @Test
+    fun `the none cipher cannot be saved on a host`() {
+        // MINA implements the protocol's null cipher and reports it as available, so nothing but an
+        // explicit refusal stops a host being saved with encryption switched off. The form is the last
+        // place that refusal can still be explained to the user.
+        val options = AdvancedHostOptions.DEFAULTS.copy(ciphers = "none")
+
+        assertThat(options.cipherReview.refused).containsExactly("none")
+        assertThat(options.cipherReview.problem).contains("unencrypted")
+        assertThat(options.isValid).isFalse()
+    }
+
+    @Test
+    fun `a list of real algorithms can still be too long to save`() {
+        // The case the reviews cannot catch, and the realistic one: the chip rows append rather than
+        // replace, and a paste is a paste. Built out of a name this device really does support, so the
+        // only thing wrong with the list is its length.
+        val supported = supportedAlgorithmNames(AlgorithmKind.CIPHERS).first()
+        val pasted = List(ALGORITHM_LIST_MAX_LENGTH / supported.length + 2) { supported }.joinToString(",")
+        assertThat(pasted.length).isGreaterThan(ALGORITHM_LIST_MAX_LENGTH)
+
+        val options = AdvancedHostOptions.DEFAULTS.copy(ciphers = pasted)
+
+        assertThat(options.cipherReview.isAcceptable).isTrue()
+        assertThat(options.algorithmListsValid).isFalse()
+        assertThat(options.isValid).isFalse()
+    }
+
+    @Test
+    fun `a startup command longer than the column blocks the save rather than being cut in half`() {
+        // Truncation is the dangerous answer here: half a command line is still a command, and
+        // `cd /srv && rm -rf build` cut at the wrong character is a different instruction entirely.
+        val options = AdvancedHostOptions.DEFAULTS.copy(startupCommand = "x".repeat(STARTUP_COMMAND_MAX_LENGTH + 1))
+
+        assertThat(options.startupCommandValid).isFalse()
+        assertThat(options.isValid).isFalse()
+        assertThat(AdvancedHostOptions.DEFAULTS.copy(startupCommand = "x".repeat(STARTUP_COMMAND_MAX_LENGTH)).isValid)
+            .isTrue()
+    }
+
+    @Test
+    fun `an environment line the protocol cannot carry blocks the save`() {
+        // Asked of the parser rather than re-implemented, so the red field and the variables that
+        // actually get sent cannot drift apart.
+        val options = AdvancedHostOptions.DEFAULTS.copy(environment = "LANG=en_US.UTF-8\nnot an assignment")
+
+        assertThat(options.environmentValid).isFalse()
+        assertThat(options.isValid).isFalse()
+    }
+
+    @Test
+    fun `comments and blank lines are not mistakes in the environment box`() {
+        val options = AdvancedHostOptions.DEFAULTS.copy(
+            environment = "# the shell needs these\n\nLANG=en_US.UTF-8\n\nTZ=Europe/Amsterdam\n",
+        )
+
+        assertThat(options.environmentValid).isTrue()
+        assertThat(options.isValid).isTrue()
+    }
+
+    @Test
+    fun `an environment longer than the column blocks the save`() {
+        // Every line is a real assignment with a name of its own, so the only thing wrong with this box
+        // is its size - which is the case the per-line check cannot see.
+        val options = AdvancedHostOptions.DEFAULTS.copy(
+            environment = List(ENVIRONMENT_MAX_LENGTH / 6 + 2) { "V" + it.toString().padStart(3, '0') + "=x" }
+                .joinToString("\n"),
+        )
+
+        assertThat(options.environment.length).isGreaterThan(ENVIRONMENT_MAX_LENGTH)
+        assertThat(options.environmentValid).isFalse()
+        assertThat(options.isValid).isFalse()
+    }
+
+    @Test
+    fun `the startup command and the environment lose the whitespace around them on save`() {
+        val applied = AdvancedHostOptions.DEFAULTS
+            .copy(startupCommand = "  tmux attach  ", environment = "\n LANG=en_US.UTF-8 \n")
+            .applyTo(profile())
+
+        assertThat(applied.startupCommand).isEqualTo("tmux attach")
+        assertThat(applied.environment).isEqualTo("LANG=en_US.UTF-8")
+    }
+
+    @Test
+    fun `a saved forward reaches the editor as a rule and the column as a line`() {
+        val host = profile().copy(savedForwards = "L:8080:intranet.example:80\nD:1080")
+
+        val edited = AdvancedHostOptions.from(host)
+
+        assertThat(edited.forwards).hasSize(2)
+        assertThat(edited.forwards.map { it.type })
+            .containsExactly(ForwardType.LOCAL, ForwardType.DYNAMIC).inOrder()
+        // Tagged with the host that owns them, because a running forward is stopped by host id.
+        assertThat(edited.forwards.map { it.hostId }).containsExactly(host.id, host.id)
+        assertThat(edited.applyTo(profile())).isEqualTo(host)
+    }
+
+    @Test
+    fun `a rule the app could not act on does not travel with the host`() {
+        // The column can arrive from a hand-edited backup. A line that is not a rule is dropped on the
+        // way in, and Save then writes back only what the editor could actually show.
+        val host = profile().copy(savedForwards = "D:1080\nL:8080\nX:99")
+
+        val edited = AdvancedHostOptions.from(host)
+
+        assertThat(edited.forwards).hasSize(1)
+        assertThat(edited.forwardsValid).isTrue()
+        assertThat(edited.applyTo(host).savedForwards).isEqualTo("D:1080")
+    }
+
+    @Test
+    fun `more forwards than a host may carry blocks the save`() {
+        val tooMany = List(MAX_SAVED_FORWARDS + 1) { index ->
+            ForwardEntry(type = ForwardType.DYNAMIC, localPort = 1080 + index, hostId = "advanced-host")
+        }
+
+        val options = AdvancedHostOptions.DEFAULTS.copy(forwards = tooMany)
+
+        assertThat(options.forwardsValid).isFalse()
+        assertThat(options.isValid).isFalse()
+        assertThat(AdvancedHostOptions.DEFAULTS.copy(forwards = tooMany.dropLast(1)).isValid).isTrue()
+    }
+
+    @Test
+    fun `configuring any of the new options enables Reset`() {
+        // isDefault decides whether the button is offered at all, so a field it did not know about would
+        // be a setting the user could turn on and never get back.
+        listOf(
+            AdvancedHostOptions.DEFAULTS.copy(ciphers = "aes128-ctr"),
+            AdvancedHostOptions.DEFAULTS.copy(kexAlgorithms = "curve25519-sha256"),
+            AdvancedHostOptions.DEFAULTS.copy(macs = "hmac-sha2-256"),
+            AdvancedHostOptions.DEFAULTS.copy(hostKeyAlgorithms = "ssh-ed25519"),
+            AdvancedHostOptions.DEFAULTS.copy(startupCommand = "tmux attach"),
+            AdvancedHostOptions.DEFAULTS.copy(environment = "LANG=C"),
+            AdvancedHostOptions.DEFAULTS.copy(
+                forwards = listOf(ForwardEntry(type = ForwardType.DYNAMIC, localPort = 1080)),
+            ),
+        ).forEach { assertThat(it.isDefault).isFalse() }
+    }
+
+    @Test
+    fun `reset clears the new options too`() {
+        val configured = AdvancedHostOptions.from(
+            profile().copy(
+                ciphers = "aes128-ctr",
+                startupCommand = "tmux attach",
+                environment = "LANG=C",
+                savedForwards = "D:1080",
+            ),
+        )
+
+        assertThat(AdvancedHostOptions.DEFAULTS.applyTo(configured.applyTo(profile()))).isEqualTo(profile())
     }
 
     private fun profile() = HostProfile(

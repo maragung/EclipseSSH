@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import org.apache.sshd.client.channel.ChannelSession
 import org.apache.sshd.client.channel.ClientChannel
 import org.apache.sshd.client.channel.PtyCapableChannelSession
 import org.apache.sshd.common.session.Session
@@ -368,12 +369,19 @@ class TerminalChannel(
      * `xterm-256color` tells the server this app understands everything an xterm does, and a host whose
      * emulator or curses build predates that is better served by being told `vt100` than by being sent
      * sequences it will print as text.
+     *
+     * [environment] is sent as one `env` channel request per entry, and has to be sent *here* because
+     * the protocol allows it only between creating a channel and opening it - after the open there is no
+     * request the server will honour, and MINA's own `setEnv` documents the same window. Best-effort by
+     * design: OpenSSH refuses anything its `AcceptEnv` does not list, and refuses it silently, so a
+     * variable that does not arrive is not something this side can detect or report.
      */
     suspend fun open(
         columns: Int = this.columns,
         rows: Int = this.rows,
         usePty: Boolean = true,
         terminalType: String = DEFAULT_TERMINAL_TYPE,
+        environment: Map<String, String> = emptyMap(),
     ) {
         // Clamped once and then used everywhere. Sending the *parameter* to the pty while storing the
         // clamped value in the field put the two sides permanently out of step: the remote came up at
@@ -389,6 +397,13 @@ class TerminalChannel(
             setPtyType(terminalType)
             setPtyColumns(safeColumns)
             setPtyLines(safeRows)
+        }
+        // Before the open, for the reason on the parameter. Guarded by a cast rather than assumed,
+        // because `channel` is typed as the general channel interface and only a session channel carries
+        // an environment - a host configured with variables but somehow opened on another channel kind
+        // should lose the variables, not the shell.
+        (channel as? ChannelSession)?.let { session ->
+            environment.forEach { (name, value) -> session.setEnv(name, value) }
         }
         channel.setIn(input)
         channel.setOut(EmittingOutputStream())

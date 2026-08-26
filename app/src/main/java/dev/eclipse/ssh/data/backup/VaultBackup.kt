@@ -1,15 +1,33 @@
 package dev.eclipse.ssh.data.backup
 
+import dev.eclipse.ssh.data.model.ALGORITHM_LIST_MAX_LENGTH
 import dev.eclipse.ssh.data.model.AppSettings
+import dev.eclipse.ssh.data.model.AUTH_TIMEOUT_RANGE
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.DEFAULT_AUTH_TIMEOUT_SECONDS
 import dev.eclipse.ssh.data.model.DEFAULT_CONNECT_TIMEOUT_SECONDS
+import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
+import dev.eclipse.ssh.data.model.DEFAULT_SERVER_ALIVE_COUNT_MAX
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
+import dev.eclipse.ssh.data.model.ENVIRONMENT_MAX_LENGTH
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
 import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
+import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
 import dev.eclipse.ssh.data.model.PORT_RANGE
+import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
+import dev.eclipse.ssh.data.model.SERVER_ALIVE_COUNT_RANGE
+import dev.eclipse.ssh.data.model.STARTUP_COMMAND_MAX_LENGTH
+import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_TYPE_CHOICES
 import dev.eclipse.ssh.data.model.HOST_KEY_FINGERPRINT_PATTERN
+import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.TerminalTheme
+import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.data.model.encodeForwardRules
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.security.SecureRandom
 import java.util.Base64
@@ -30,11 +48,21 @@ import org.json.JSONObject
  * them cannot be exported. Every other host and settings field round-trips losslessly, so
  * restoring a vault reproduces the workspace apart from those secrets.
  *
- * Version 1 payloads (which omitted the extra settings and host fields) still import; the
- * missing keys fall back to [AppSettings] defaults.
+ * Older payloads still import, and this is the property the format is built around rather than a
+ * concession: every key is read with an `opt…(key, default)` whose default is the field's own shipped
+ * default, so a backup written before a field existed restores a host that behaves exactly as it did on
+ * the build that wrote it. Version 1 omitted the extra settings and host fields; version 2 omitted the
+ * twenty-one advanced per-host columns, which is what version 3 adds.
+ *
+ * **Every imported value is range- or shape-checked**, without exception, for a reason that is easy to
+ * lose sight of: a backup is a file the user can hand-edit, mail to themselves, or restore from a
+ * truncated copy, so it is untrusted input that goes straight into the engine. An unchecked import is a
+ * way to install a 0-second timeout, a 0-column pty, a `TERM` no terminfo database has, or a forwarding
+ * rule the form would have refused. Anything that fails its check falls back to the default rather than
+ * failing the import - one bad field must not cost the user their hosts.
  */
 object VaultBackup {
-    const val VERSION = 2
+    const val VERSION = 3
 
     fun toJson(hosts: List<HostProfile>, settings: AppSettings, knownHosts: Map<String, String>): String {
         val root = JSONObject()
@@ -74,6 +102,37 @@ object VaultBackup {
                 put("connectTimeoutSeconds", host.connectTimeoutSeconds)
                 host.keepAliveSeconds?.let { put("keepAliveSeconds", it) }
                 put("autoLoginSftp", host.autoLoginSftp)
+                // The advanced per-host columns. Absent from version 2 backups, which is why every one
+                // of them is read back against its own default rather than against zero or false.
+                put("compression", host.compression)
+                put("keepAliveEnabled", host.keepAliveEnabled)
+                put("serverAliveCountMax", host.serverAliveCountMax)
+                put("authTimeoutSeconds", host.authTimeoutSeconds)
+                put("autoReconnect", host.autoReconnect)
+                put("maxReconnectAttempts", host.maxReconnectAttempts)
+                put("reconnectBackoffSeconds", host.reconnectBackoffSeconds)
+                put("usePty", host.usePty)
+                put("terminalType", host.terminalType)
+                put("terminalColumns", host.terminalColumns)
+                put("terminalRows", host.terminalRows)
+                put("keyboardInteractiveAuth", host.keyboardInteractiveAuth)
+                // Tri-state: null means "follow the app-wide switch", and writing it as a boolean would
+                // turn every host with no opinion into one that has pinned this device's setting.
+                host.legacyAlgorithms?.let { put("legacyAlgorithms", it) }
+                host.ciphers?.let { put("ciphers", it) }
+                host.kexAlgorithms?.let { put("kexAlgorithms", it) }
+                host.macs?.let { put("macs", it) }
+                host.hostKeyAlgorithms?.let { put("hostKeyAlgorithms", it) }
+                // Written unconditionally, blank included, so a host whose startup command was cleared
+                // restores cleared. Neither is a credential, and both say so in the form that edits
+                // them - but a backup is the one place they leave the device, so they are also the two
+                // fields [HostProfile.toString] redacts, in case one is used as one anyway.
+                put("startupCommand", host.startupCommand)
+                put("environment", host.environment)
+                // Re-encoded from the decoded rules rather than copied, so a column that arrived from a
+                // hand-edited file is normalised on its way out instead of being passed on.
+                put("savedForwards", encodeForwardRules(decodeForwardRules(host.savedForwards, host.id)))
+                put("hostKeyPolicy", host.hostKeyPolicy.name)
             }) }
         })
         root.put("knownHosts", JSONObject().apply { knownHosts.forEach { (key, value) -> put(key, value) } })
@@ -148,6 +207,55 @@ object VaultBackup {
                 // default is what keeps those importing as they used to behave rather than as
                 // false-by-accident.
                 autoLoginSftp = h.optBoolean("autoLoginSftp", HostProfile.DEFAULT_AUTO_LOGIN_SFTP),
+                compression = h.optBoolean("compression", false),
+                keepAliveEnabled = h.optBoolean("keepAliveEnabled", true),
+                serverAliveCountMax = h.optInt("serverAliveCountMax", DEFAULT_SERVER_ALIVE_COUNT_MAX)
+                    .takeIf { it in SERVER_ALIVE_COUNT_RANGE } ?: DEFAULT_SERVER_ALIVE_COUNT_MAX,
+                authTimeoutSeconds = h.optInt("authTimeoutSeconds", DEFAULT_AUTH_TIMEOUT_SECONDS)
+                    .takeIf { it in AUTH_TIMEOUT_RANGE } ?: DEFAULT_AUTH_TIMEOUT_SECONDS,
+                autoReconnect = h.optBoolean("autoReconnect", true),
+                maxReconnectAttempts = h.optInt("maxReconnectAttempts", DEFAULT_MAX_RECONNECT_ATTEMPTS)
+                    .takeIf { it in MAX_RECONNECT_ATTEMPTS_RANGE } ?: DEFAULT_MAX_RECONNECT_ATTEMPTS,
+                // The sentinel is outside the range on purpose - 0 means "inherit the app-wide delay" -
+                // so it has to be admitted here as well, or restoring a host that inherits would give it
+                // a fixed delay it never had.
+                reconnectBackoffSeconds = h.optInt("reconnectBackoffSeconds", INHERIT_RECONNECT_BACKOFF)
+                    .takeIf { it == INHERIT_RECONNECT_BACKOFF || it in RECONNECT_BACKOFF_RANGE }
+                    ?: INHERIT_RECONNECT_BACKOFF,
+                usePty = h.optBoolean("usePty", true),
+                // Checked against the offered list rather than merely non-blank: `TERM` is looked up in
+                // the server's terminfo database, and a name that is not in it fails as a broken `vim`
+                // rather than as a setting - the exact reason the form is a set of choices and not a
+                // text field. See [TERMINAL_TYPE_CHOICES].
+                terminalType = h.optString("terminalType", DEFAULT_TERMINAL_TYPE)
+                    .takeIf { it in TERMINAL_TYPE_CHOICES } ?: DEFAULT_TERMINAL_TYPE,
+                // 0 is the "match the screen" sentinel and is admitted alongside the range, like the
+                // backoff above. A pty may not be 0 columns wide, so an out-of-range number becomes the
+                // sentinel rather than being clamped to 20 - "automatic" is what the user had.
+                terminalColumns = h.optInt("terminalColumns", 0)
+                    .takeIf { it == 0 || it in TERMINAL_COLUMNS_RANGE } ?: 0,
+                terminalRows = h.optInt("terminalRows", 0)
+                    .takeIf { it == 0 || it in TERMINAL_ROWS_RANGE } ?: 0,
+                keyboardInteractiveAuth = h.optBoolean("keyboardInteractiveAuth", true),
+                // Tri-state, and `isNull` is what preserves it: an absent key and an explicit `null` both
+                // have to come back as "follow the app-wide switch" rather than as false.
+                legacyAlgorithms = if (h.isNull("legacyAlgorithms")) null else h.optBoolean("legacyAlgorithms"),
+                // Length only. What the names mean is the engine's business, and it already refuses to
+                // propose an empty list - a preference whose names this build cannot honour falls back to
+                // the library's own list rather than failing key exchange - so dropping an unrecognised
+                // name here would throw away a preference that is valid on the device it came from.
+                ciphers = h.algorithmList("ciphers"),
+                kexAlgorithms = h.algorithmList("kexAlgorithms"),
+                macs = h.algorithmList("macs"),
+                hostKeyAlgorithms = h.algorithmList("hostKeyAlgorithms"),
+                startupCommand = h.optString("startupCommand").take(STARTUP_COMMAND_MAX_LENGTH),
+                environment = h.optString("environment").take(ENVIRONMENT_MAX_LENGTH),
+                // Re-encoded from what decoding accepted, so an imported column contains exactly the
+                // rules the engine will act on: a line the app would not have let the user save does not
+                // survive the round trip, and the [MAX_SAVED_FORWARDS] cap is applied by the decoder.
+                savedForwards = encodeForwardRules(decodeForwardRules(h.optString("savedForwards"))),
+                hostKeyPolicy = HostKeyPolicy.entries.firstOrNull { it.name == h.optString("hostKeyPolicy") }
+                    ?: HostKeyPolicy.ASK,
             )
         }
         // Known-host entries are validated before they are handed back, because importing a vault
@@ -170,6 +278,16 @@ object VaultBackup {
         }
         return Triple(hosts, settings, knownHosts)
     }
+
+    /**
+     * One algorithm preference column as imported: bounded, trimmed, and null when there is nothing.
+     *
+     * Null rather than blank, because the column's two states are not the same thing to the engine -
+     * null is "no opinion, negotiate normally" and an empty list would be an instruction to propose
+     * nothing at all. See [HostProfile.ciphers].
+     */
+    private fun JSONObject.algorithmList(key: String): String? =
+        if (isNull(key)) null else optString(key).trim().take(ALGORITHM_LIST_MAX_LENGTH).takeIf(String::isNotBlank)
 
     /** Exports one connection profile using the same passphrase-encrypted format as a vault. */
     fun toAccountJson(host: HostProfile): String = toJson(listOf(host), AppSettings(), emptyMap())

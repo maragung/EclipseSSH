@@ -283,7 +283,7 @@ class SshConnectionManager @Inject constructor(
             compression = profile.compression,
             preferredAuths = preferredAuths(profile),
             hostKeyPolicy = profile.hostKeyPolicy,
-            algorithms = algorithmsOverrideFor(profile.legacyAlgorithms, globalLegacy),
+            algorithms = algorithmsOverrideFor(profile, globalLegacy),
         )
         // Separate from the connect budget on purpose: a server can answer its socket in a millisecond
         // and then spend a minute in a PAM stack or waiting for a hardware token. See
@@ -406,6 +406,14 @@ class SshConnectionManager @Inject constructor(
      * The caller normally does know it: a session being reconnected is replacing a pty whose geometry
      * the user's screen already decided. Passing it here rather than resizing afterwards is what makes
      * a reconnected `htop` come back at the size it left.
+     *
+     * Also where [HostProfile.environment] and [HostProfile.startupCommand] are applied, and
+     * deliberately the *only* place. Both mean "on a shell this app just created", and this function is
+     * called from exactly the three sites that create one - a first dial, a reconnect, and adopting a
+     * live session that has no shell yet - so "fresh shells only" is a property of where the code is
+     * rather than a flag a caller could forget to pass. A session the app adopts *with* a running shell
+     * never reaches here, which is correct: its environment was fixed when it was created and its
+     * startup command has already run.
      */
     suspend fun openTerminal(
         session: ClientSession,
@@ -420,7 +428,13 @@ class SshConnectionManager @Inject constructor(
             rows = pty.rows ?: channel.ptyRows,
             usePty = pty.enabled,
             terminalType = pty.terminalType,
+            environment = parseEnvironment(profile?.environment),
         )
+        // After the channel is open, because there is nowhere to write before it. A startup command is
+        // typed into the shell exactly as if the user had typed it - see [startupCommandBytes] for why
+        // that, and not an SSH `exec` - so it goes down the same path as a keystroke and its output
+        // appears in the transcript above the first prompt, which is what makes a failing one visible.
+        startupCommandBytes(profile?.startupCommand)?.let { channel.writeBytes(it) }
         channel
     }
 
@@ -548,14 +562,54 @@ class SshConnectionManager @Inject constructor(
     /**
      * The four algorithm lists to install on one session, or null to leave it on the client's.
      *
-     * A host only gets its own lists when it disagrees with the global switch, which keeps the common
-     * case - every host following one setting - on exactly the path it was on before, lists included.
-     * A disagreeing host gets *session*-level lists rather than a second write to the client's,
-     * because the client is a singleton shared by every connection: two hosts dialled at once with
-     * different answers would otherwise each get whichever set was installed last, and neither would
-     * be reproducible.
+     * Two independent per-host settings land here, in that order: the legacy-compatibility switch,
+     * which is a whole-proposal answer, and then the four explicit lists, each of which replaces one
+     * role outright. So a host can say "allow the old CBC ciphers" and *also* "but propose exactly
+     * these two key exchanges", and the second is not undone by the first.
+     *
+     * Null when the host has nothing to say - the legacy switch agreeing with the global one, or
+     * inheriting it, and no explicit list - which keeps the common case on exactly the path it was on
+     * before, lists included.
+     *
+     * A host with something to say gets *session*-level lists rather than a second write to the
+     * client's, because the client is a singleton shared by every connection: two hosts dialled at once
+     * with different answers would otherwise each get whichever set was installed last, and neither
+     * would be reproducible.
      */
-    private fun algorithmsOverrideFor(hostPreference: Boolean?, global: Boolean): SessionAlgorithms? {
+    private fun algorithmsOverrideFor(profile: HostProfile, global: Boolean): SessionAlgorithms? {
+        val baseline = baselineAlgorithms(profile.legacyAlgorithms, global)
+        val ciphers = cipherFactoriesFor(profile.ciphers)
+        val macs = macFactoriesFor(profile.macs)
+        val signatures = signatureFactoriesFor(profile.hostKeyAlgorithms)
+        val keyExchange = keyExchangeFactoriesFor(profile.kexAlgorithms)
+        if (baseline == null && ciphers == null && macs == null && signatures == null && keyExchange == null) {
+            return null
+        }
+        // Read from the client, not from `modern*`: those were captured from the library's defaults at
+        // construction, whereas the client's current lists are what this session would otherwise
+        // propose - which is what an explicit list has to be laid over when the legacy switch is
+        // inherited rather than overridden.
+        val base = baseline ?: SessionAlgorithms(
+            ciphers = client.cipherFactories.toList(),
+            macs = client.macFactories.toList(),
+            signatures = client.signatureFactories.toList(),
+            keyExchange = client.keyExchangeFactories.toList(),
+        )
+        return SessionAlgorithms(
+            ciphers = ciphers ?: base.ciphers,
+            macs = macs ?: base.macs,
+            signatures = signatures ?: base.signatures,
+            keyExchange = keyExchange ?: base.keyExchange,
+        )
+    }
+
+    /**
+     * The whole proposal the legacy switch asks for, or null when this host has no opinion on it.
+     *
+     * Split out from [algorithmsOverrideFor] so that "does the legacy switch differ from the global
+     * one" stays one readable question, and so the explicit lists have something to be layered over.
+     */
+    private fun baselineAlgorithms(hostPreference: Boolean?, global: Boolean): SessionAlgorithms? {
         if (hostPreference == null || hostPreference == global) return null
         return if (hostPreference) {
             SessionAlgorithms(
@@ -1024,6 +1078,86 @@ internal fun ptyRequestFor(profile: HostProfile?, measuredColumns: Int?, measure
         columns = forcedColumns ?: measuredColumns,
         rows = forcedRows ?: measuredRows,
     )
+}
+
+/**
+ * [text] as the environment variables to send with a channel, in the order they were written.
+ *
+ * One `NAME=VALUE` per line, `#` comments and blank lines ignored, and a line without an `=` dropped -
+ * there is nothing else it could mean, and failing the whole login over one stray line would be a worse
+ * answer than sending the rest.
+ *
+ * Names are restricted to the POSIX shape (letters, digits and underscore, not starting with a digit)
+ * because a name is a *protocol field*, not a shell word: a channel request carrying a name with a
+ * space or a newline in it is a malformed request, and MINA would send it. Values are taken verbatim
+ * apart from surrounding whitespace and one optional layer of quotes, since a value legitimately
+ * contains spaces, colons and equals signs - `LC_ALL=en_GB.UTF-8` and `PATH=/a:/b` both have to survive.
+ *
+ * A duplicate name keeps the *last* line, the way a shell script assigning twice would.
+ *
+ * Best-effort by design, and that has to be said in the UI rather than only here: OpenSSH sends
+ * `AcceptEnv` and refuses everything not listed in it, which by default is nothing but `LANG` and
+ * `LC_*`. A refused variable is not an error the protocol reports - the request simply has no effect -
+ * so this cannot be verified from the client at all.
+ */
+internal fun parseEnvironment(text: String?): Map<String, String> {
+    if (text.isNullOrBlank()) return emptyMap()
+    val out = LinkedHashMap<String, String>()
+    text.lineSequence().forEach { line ->
+        val trimmed = line.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith('#')) return@forEach
+        val name = trimmed.substringBefore('=', missingDelimiterValue = "").trim()
+        if (!name.isEnvironmentName()) return@forEach
+        val value = trimmed.substringAfter('=', missingDelimiterValue = "").trim().unquoted()
+        out[name] = value
+    }
+    return out
+}
+
+/** The POSIX shape for an environment variable name, which is also the shape the protocol field allows. */
+private fun String.isEnvironmentName(): Boolean = isNotEmpty() &&
+    length <= MAX_ENVIRONMENT_NAME_LENGTH &&
+    first().let { it.isLetter() || it == '_' } &&
+    all { it.isLetterOrDigit() || it == '_' } &&
+    all { it.code < 128 }
+
+/**
+ * One layer of matching quotes removed, so `TZ="Europe/London"` sends what it looks like it sends.
+ *
+ * Only one layer, and only when both ends match, because the quotes are a convenience for a value with
+ * spaces in it and not a shell grammar - there is no shell involved in a channel request, and pretending
+ * otherwise would make `PS1='\u@\h '` mean something different here than it does in a file.
+ */
+private fun String.unquoted(): String = when {
+    length >= 2 && startsWith('"') && endsWith('"') -> substring(1, length - 1)
+    length >= 2 && startsWith('\'') && endsWith('\'') -> substring(1, length - 1)
+    else -> this
+}
+
+private const val MAX_ENVIRONMENT_NAME_LENGTH = 64
+
+/**
+ * [command] as the bytes to write into a freshly opened shell, or null when there is nothing to send.
+ *
+ * Typed into the pty rather than run as an SSH `exec`, which is the whole design decision here. An
+ * `exec` channel gets no interactive shell at all, so a host with a startup command would lose the
+ * terminal it exists to provide; and a `ForceCommand`-style server would refuse it outright. Writing it
+ * to the shell means it runs *in* the session the user is about to use, sees that session's environment,
+ * and can be a `cd`, a `tmux attach` or a `sudo -i` - all of which are the actual reasons to want this
+ * and none of which work as an `exec`.
+ *
+ * The consequence is that it is echoed and its output is in the transcript, which is a feature: a
+ * startup command that failed is visible above the first prompt instead of silently not having happened.
+ *
+ * Newlines in [command] are preserved, so a multi-line command is a multi-line paste - but a trailing
+ * newline is normalised to exactly one, because two would run an empty line and print a second prompt.
+ * CR is used rather than LF: this is a pty, where Return is what a keypress sends, and the line
+ * discipline turns it into the newline the shell reads. Sending LF instead works on Linux and is subtly
+ * wrong on the systems that do not map it.
+ */
+internal fun startupCommandBytes(command: String?): ByteArray? {
+    val text = command?.trimEnd()?.takeIf(String::isNotBlank) ?: return null
+    return (text.replace("\r\n", "\n").replace('\n', '\r') + '\r').toByteArray(Charsets.UTF_8)
 }
 
 /**

@@ -161,6 +161,81 @@ data class HostProfile(
      */
     val legacyAlgorithms: Boolean? = null,
     /**
+     * The ciphers to propose for this host, comma-separated, or null for the app's own list.
+     *
+     * A narrower control than [legacyAlgorithms], and needed for the cases that switch cannot express:
+     * an appliance that negotiates a cipher it then cannot actually do, a policy that requires
+     * `aes256-gcm@openssh.com` and nothing else, a server whose key exchange succeeds only when the
+     * proposal is short enough to fit its buffer. Null - which is every existing host - means the list
+     * the app builds from [legacyAlgorithms], so nothing changes for anyone who does not set one.
+     *
+     * Validated against what Apache MINA can actually instantiate *on this device* before it is saved,
+     * because the failure mode otherwise is silent: an unknown name is dropped from the proposal, and a
+     * list of only unknown names leaves an empty proposal and a key exchange that fails with "no
+     * matching cipher" naming nothing the user typed. See `reviewAlgorithmList`.
+     */
+    val ciphers: String? = null,
+    /** The key exchange algorithms to propose, comma-separated, or null for the app's own list. */
+    val kexAlgorithms: String? = null,
+    /** The MACs to propose, comma-separated, or null for the app's own list. */
+    val macs: String? = null,
+    /**
+     * The host key algorithms to accept, comma-separated, or null for the app's own list.
+     *
+     * MINA expresses this as the session's *signature* factory list, which is the same set seen from
+     * the other side: a host key algorithm is the signature algorithm the server signs the exchange
+     * hash with. Narrowing it is how a host pinned to an Ed25519 key refuses to be offered an RSA one.
+     */
+    val hostKeyAlgorithms: String? = null,
+    /**
+     * A command sent to the shell the moment it opens, or blank for none.
+     *
+     * Typed into the shell rather than run as an SSH `exec`, and that is the point: `exec` replaces the
+     * login shell, so a `cd` or a `tmux attach` done that way would end the session as soon as it
+     * finished. Written to the pty as if the user had typed it, it leaves an ordinary interactive shell
+     * sitting where they wanted to start - which is what makes this worth having for a host whose work
+     * always begins in one directory, or inside one multiplexer.
+     *
+     * Sent on every *fresh* shell, including the one a reconnect opens, because a recovered shell is a
+     * new shell that starts in the home directory again. It is not sent to a session the app adopted:
+     * that shell is already where the user left it.
+     *
+     * Not a place for a password. It is stored beside the rest of the profile, unencrypted like
+     * [terminalType], travels in a vault backup, and is redacted from [toString] only so an accidental
+     * interpolation cannot publish it - which is a guard against a leak, not storage fit for a secret.
+     * The form says so under the field.
+     */
+    val startupCommand: String = "",
+    /**
+     * Environment variables to request for the shell, one `NAME=value` per line, or blank for none.
+     *
+     * Sent with the channel before it is opened, which is the only moment the protocol allows, and
+     * best-effort by design: OpenSSH accepts only what its `AcceptEnv` allows and silently ignores the
+     * rest, so a variable that does not arrive is the server's policy rather than a failure here. That
+     * asymmetry is why nothing is reported when one is dropped - there is nothing to report, the
+     * server does not say.
+     *
+     * Redacted from [toString] and kept out of the diagnostics for the same reason as
+     * [startupCommand], and with the same caveat: `NAME=value` is a natural place to put a token, and
+     * this column is not a vault.
+     */
+    val environment: String = "",
+    /**
+     * Port forwards to open automatically once this host's shell is up, in `ssh`'s own syntax.
+     *
+     * One rule per line - `L:8080:intranet:80`, `R:2222:22`, `D:1080` - encoded by
+     * [encodeForwardRules] and read back by [decodeForwardRules], which is also what validates them:
+     * this column can arrive from an imported backup that no form ever checked.
+     *
+     * Stored on the profile rather than in a table of its own so that the rules are part of the host in
+     * every place a host travels: one Save writes them with everything else or writes nothing, deleting
+     * the host takes them with it, and a vault backup carries them without a second serialiser to keep
+     * in step. It is the same shape [tags] already uses in this table.
+     *
+     * A rule that cannot bind never costs the session its shell. See `MainViewModel.startSavedForwards`.
+     */
+    val savedForwards: String = "",
+    /**
      * What to do when this host presents a key that is not in known-hosts.
      *
      * A *changed* key is refused under every policy, which is the whole point of pinning: only the
@@ -190,7 +265,13 @@ data class HostProfile(
         "reconnectBackoffSeconds=$reconnectBackoffSeconds, usePty=$usePty, terminalType=$terminalType, " +
         "terminalColumns=$terminalColumns, terminalRows=$terminalRows, " +
         "keyboardInteractiveAuth=$keyboardInteractiveAuth, legacyAlgorithms=$legacyAlgorithms, " +
-        "hostKeyPolicy=$hostKeyPolicy)"
+        "ciphers=$ciphers, kexAlgorithms=$kexAlgorithms, macs=$macs, " +
+        "hostKeyAlgorithms=$hostKeyAlgorithms, " +
+        // Both can hold a token or a password the user typed into a command line, so neither is
+        // printed. Their *presence* is, because "the startup command did not run" is a real report and
+        // an answer of `null` versus `***` is the first thing that narrows it.
+        "startupCommand=${redacted(startupCommand)}, environment=${redacted(environment)}, " +
+        "savedForwards=$savedForwards, hostKeyPolicy=$hostKeyPolicy)"
 
     companion object {
         /**
@@ -200,6 +281,18 @@ data class HostProfile(
          */
         const val DEFAULT_AUTO_LOGIN_SFTP = true
     }
+}
+
+/**
+ * A field's *presence* without its contents, for a redacting `toString`.
+ *
+ * `null` and `""` are printed as themselves because neither can leak anything and both answer a real
+ * question - "was this host ever given a startup command?" - that `***` for every state would hide.
+ */
+private fun redacted(value: String?): String = when {
+    value == null -> "null"
+    value.isEmpty() -> "\"\""
+    else -> "***"
 }
 
 /** Bounds shared by the UI validation and the engine, so neither can accept what the other rejects. */
@@ -262,6 +355,30 @@ val TERMINAL_ROWS_RANGE = 5..200
 
 /** True when a forced pty size is meaningful, i.e. anything but the "match the screen" sentinel. */
 fun Int.isForcedTerminalSize(): Boolean = this != 0
+
+/**
+ * Bounds on the two free-text per-host fields.
+ *
+ * Not arbitrary tidiness: [HostProfile.startupCommand] is written into a pty, where a very long line
+ * is echoed back character by character through the terminal emulator, and
+ * [HostProfile.environment] becomes one `env` request per line inside the channel-open handshake,
+ * which a server may refuse outright if there are hundreds. Both are far above any real use and
+ * below the point where either turns into a performance question.
+ */
+const val STARTUP_COMMAND_MAX_LENGTH = 512
+const val ENVIRONMENT_MAX_LENGTH = 2048
+
+/**
+ * Bound on each of the four algorithm preference columns.
+ *
+ * MINA's own complete list for the longest of the four is a little over 300 characters, so this holds
+ * every name the library knows with room to spare while keeping a hand-edited backup from putting a
+ * document into a column the connect path splits and looks up name by name.
+ */
+const val ALGORITHM_LIST_MAX_LENGTH = 512
+
+/** The most saved forwards one host may carry, so an imported backup cannot ask for thousands. */
+const val MAX_SAVED_FORWARDS = 32
 
 /** Default TCP ports, named so the form, the importer and the entity cannot drift apart. */
 const val DEFAULT_SSH_PORT = 22
@@ -383,6 +500,25 @@ data class SessionTab(
      * looks like an empty home directory.
      */
     val sftpError: String? = null,
+    /**
+     * How many of this host's saved forwards are open, and how many it has.
+     *
+     * A pair rather than a count because the interesting state is the ratio: `2/3` says one rule failed,
+     * `0/0` says the host has none, and `3/3` says every tunnel this host describes is up. Zero of zero
+     * is the default and renders as nothing at all.
+     */
+    val forwardsOpen: Int = 0,
+    val forwardsTotal: Int = 0,
+    /**
+     * Why a saved forward is not open, in a sentence fit to show the user, or null.
+     *
+     * Separate from [lastError] on purpose, and this is the rule the whole feature turns on: a tunnel
+     * that cannot bind is not a session failure. The port is already in use, or the server refuses to
+     * listen, and the shell beside it is perfectly good - so the report goes here, [state] is not
+     * touched, and nothing arms a reconnect. Writing it to [lastError] would put a bind failure on the
+     * status line of a working session, which is the class of mistake this release exists to remove.
+     */
+    val forwardError: String? = null,
 )
 
 /**

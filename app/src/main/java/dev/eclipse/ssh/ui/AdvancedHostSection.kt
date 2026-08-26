@@ -33,26 +33,45 @@ import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import dev.eclipse.ssh.data.model.AUTH_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.ENVIRONMENT_MAX_LENGTH
+import dev.eclipse.ssh.data.model.ForwardEntry
+import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
+import dev.eclipse.ssh.data.model.MAX_SAVED_FORWARDS
+import dev.eclipse.ssh.data.model.PORT_RANGE
 import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
 import dev.eclipse.ssh.data.model.SERVER_ALIVE_COUNT_RANGE
+import dev.eclipse.ssh.data.model.STARTUP_COMMAND_MAX_LENGTH
 import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
 import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.TERMINAL_TYPE_CHOICES
+import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.data.model.describe
+import dev.eclipse.ssh.data.model.toPortOrNull
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
+import dev.eclipse.ssh.ssh.AlgorithmKind
+import dev.eclipse.ssh.ssh.AlgorithmListReview
+import dev.eclipse.ssh.ssh.supportedAlgorithmNames
 
 /**
  * The Advanced section of the Add / Edit Host form.
  *
- * Collapsed by default, and that is the point of it being a section at all: fourteen switches between
- * "Username" and "Save" would bury the four fields that decide whether a host connects at all. Opened,
- * every control carries one line saying what it does to this connection, because a setting whose effect
- * has to be guessed is one a user changes once and then cannot un-change with any confidence.
+ * Open by default, which is a deliberate reversal. It was collapsed so that a wall of switches would not
+ * bury the four fields that decide whether a host connects at all - sound reasoning that turned out to
+ * have the more expensive failure mode: a per-host setting nobody can see is a per-host setting nobody
+ * knows exists, and every one of these was asked for again after it had already shipped. A section that
+ * is open still keeps its heading, still collapses, and still remembers which way the user left it; a
+ * section that is hidden teaches the user it is not there.
+ *
+ * Still a section, and still ordered, because the list is now long: Connection, Keep-alive, Reconnect,
+ * Terminal, Authentication, Algorithms, Session start, Port forwarding. Every control carries one line
+ * saying what it does to this connection, because a setting whose effect has to be guessed is one a user
+ * changes once and then cannot un-change with any confidence.
  *
  * Holds no rules - [AdvancedHostOptions] owns validation, defaults and the mapping onto the profile, so
- * that all of it stays testable on the JVM. See its KDoc for the four requested settings MINA cannot
- * apply per host, and why they are not here.
+ * that all of it stays testable on the JVM. See its KDoc for the requested settings MINA cannot apply
+ * per host, and why they are not here.
  */
 @Composable
 internal fun AdvancedHostSection(
@@ -60,9 +79,9 @@ internal fun AdvancedHostSection(
     onChange: (AdvancedHostOptions) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    // Survives rotation, so an option changed on the far side of a config change is not re-hidden with
-    // the section that was open when it was typed.
-    var expanded by rememberSaveable { mutableStateOf(false) }
+    // Survives rotation, so a section closed - or left open - before a config change is in the same
+    // state after it, and an option changed on the far side of one is not re-hidden with it.
+    var expanded by rememberSaveable { mutableStateOf(true) }
     Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
             Modifier
@@ -290,12 +309,247 @@ internal fun AdvancedHostSection(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        SectionLabel("Algorithms")
+        Text(
+            "Leave these empty unless a server needs otherwise - empty means the library negotiates, " +
+                "which is right for almost every host. Order matters: the first name both ends know wins.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        AlgorithmField(
+            kind = AlgorithmKind.CIPHERS,
+            value = options.ciphers,
+            review = options.cipherReview,
+            onValueChange = { onChange(options.copy(ciphers = it)) },
+        )
+        AlgorithmField(
+            kind = AlgorithmKind.KEX,
+            value = options.kexAlgorithms,
+            review = options.kexReview,
+            onValueChange = { onChange(options.copy(kexAlgorithms = it)) },
+        )
+        AlgorithmField(
+            kind = AlgorithmKind.MACS,
+            value = options.macs,
+            review = options.macReview,
+            onValueChange = { onChange(options.copy(macs = it)) },
+        )
+        AlgorithmField(
+            kind = AlgorithmKind.HOST_KEYS,
+            value = options.hostKeyAlgorithms,
+            review = options.hostKeyAlgorithmReview,
+            onValueChange = { onChange(options.copy(hostKeyAlgorithms = it)) },
+        )
+
+        SectionLabel("Session start")
+        OutlinedTextField(
+            options.startupCommand,
+            { onChange(options.copy(startupCommand = it.take(STARTUP_COMMAND_MAX_LENGTH))) },
+            label = { Text("Startup command") },
+            isError = !options.startupCommandValid,
+            minLines = 2,
+            supportingText = supportText(
+                "Typed into the shell once it opens, on every new connection including a reconnect - " +
+                    "a `cd`, a `tmux attach`. It is echoed and its output is in the terminal, so this is " +
+                    "not a place for a password.",
+            ),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            options.environment,
+            { onChange(options.copy(environment = it.take(ENVIRONMENT_MAX_LENGTH))) },
+            label = { Text("Environment") },
+            isError = !options.environmentValid,
+            minLines = 2,
+            supportingText = supportText(
+                if (options.environmentValid) {
+                    "One NAME=VALUE per line. Most servers accept only what their AcceptEnv lists - " +
+                        "usually just LANG and LC_* - and refuse the rest silently. Not a place for a secret."
+                } else {
+                    "Each line must be NAME=VALUE, where NAME is letters, digits and underscore."
+                },
+            ),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        SectionLabel("Port forwarding")
+        Text(
+            "Opened after the shell comes up, on every connection. A rule that cannot bind is reported " +
+                "on the session and never costs it the shell.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        options.forwards.forEach { rule ->
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(rule.describe(), style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        rule.type.label,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = { onChange(options.copy(forwards = options.forwards - rule)) }) {
+                    Text("Remove")
+                }
+            }
+        }
+        ForwardRuleEditor(
+            enabled = options.forwards.size < MAX_SAVED_FORWARDS,
+            onAdd = { rule -> onChange(options.copy(forwards = options.forwards + rule)) },
+        )
+
         TextButton(
             onClick = { onChange(AdvancedHostOptions.DEFAULTS) },
             enabled = !options.isDefault,
         ) { Text("Reset to defaults") }
     }
 }
+
+/**
+ * One algorithm preference list: a field to type into, and every name this device supports as a chip.
+ *
+ * The chips are the point. These four lists are the only settings in this form whose values are opaque
+ * strings from a specification - nobody remembers whether it is `hmac-sha2-256` or `hmac-sha256`, and a
+ * typo here is a host that stops connecting for a reason the error message will not name. Tapping the
+ * name that the device actually offers cannot be misspelt, and the field stays editable for a paste out
+ * of an `ssh_config`.
+ *
+ * A chip toggles rather than only appends, so a list is built and unbuilt the same way, and an appended
+ * name goes on the *end* because the end is the least-preferred position - adding a name must not
+ * silently promote it past the ones already chosen.
+ */
+@Composable
+private fun AlgorithmField(
+    kind: AlgorithmKind,
+    value: String,
+    review: AlgorithmListReview,
+    onValueChange: (String) -> Unit,
+) {
+    // Computed from the JCE providers, so once per composition of this field rather than once per frame.
+    val available = remember(kind) { supportedAlgorithmNames(kind) }
+    val chosen = remember(value) { value.split(',', '\n', ' ').map(String::trim).filter(String::isNotEmpty) }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        OutlinedTextField(
+            value,
+            onValueChange,
+            label = { Text(kind.label) },
+            singleLine = true,
+            isError = !review.isAcceptable,
+            supportingText = supportText(review.problem ?: kind.help),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            available.forEach { name ->
+                val selected = name in chosen
+                FilterChip(
+                    selected = selected,
+                    onClick = {
+                        val next = if (selected) chosen - name else chosen + name
+                        onValueChange(next.joinToString(", "))
+                    },
+                    label = { Text(name) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The add-a-rule row of the port forwarding editor.
+ *
+ * Validation is [decodeForwardRules] rather than a second set of checks: the row builds the same line
+ * the column stores and asks the codec to read it back, so a rule the editor accepts is exactly a rule a
+ * restored backup would accept, and the two can never drift. The fields are [rememberSaveable] because a
+ * half-typed rule must survive a rotation - losing three fields to turning the phone is the kind of
+ * thing that makes a user give up on a feature.
+ */
+@Composable
+private fun ForwardRuleEditor(enabled: Boolean, onAdd: (ForwardEntry) -> Unit) {
+    var type by rememberSaveable { mutableStateOf(ForwardType.LOCAL) }
+    var localPort by rememberSaveable { mutableStateOf("") }
+    var remoteHost by rememberSaveable { mutableStateOf("") }
+    var remotePort by rememberSaveable { mutableStateOf("") }
+
+    val rule = when (type) {
+        ForwardType.LOCAL -> "L:$localPort:${remoteHost.trim()}:$remotePort"
+        ForwardType.REMOTE -> "R:$remotePort:$localPort"
+        ForwardType.DYNAMIC -> "D:$localPort"
+    }
+    val parsed = decodeForwardRules(rule).singleOrNull()
+
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ForwardType.entries.forEach { choice ->
+                FilterChip(
+                    selected = type == choice,
+                    onClick = { type = choice },
+                    label = { Text(choice.label) },
+                    enabled = enabled,
+                )
+            }
+        }
+        Text(
+            when (type) {
+                ForwardType.LOCAL -> "A port on this device reaches a host the server can see."
+                ForwardType.REMOTE -> "A port on the server reaches this device. Bound to the " +
+                    "server's loopback, so it is not published to the server's network."
+                ForwardType.DYNAMIC -> "A SOCKS5 proxy on this device, routed through the server."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            NumberField(
+                value = localPort,
+                onValueChange = { localPort = it },
+                label = if (type == ForwardType.REMOTE) "Port on this device" else "Local port",
+                valid = localPort.isEmpty() || localPort.toPortOrNull() != null,
+                range = PORT_RANGE,
+                help = null,
+                modifier = Modifier.weight(1f),
+                enabled = enabled,
+                maxDigits = PORT_DIGITS,
+            )
+            if (type != ForwardType.DYNAMIC) {
+                NumberField(
+                    value = remotePort,
+                    onValueChange = { remotePort = it },
+                    label = if (type == ForwardType.REMOTE) "Port on the server" else "Remote port",
+                    valid = remotePort.isEmpty() || remotePort.toPortOrNull() != null,
+                    range = PORT_RANGE,
+                    help = null,
+                    modifier = Modifier.weight(1f),
+                    enabled = enabled,
+                    maxDigits = PORT_DIGITS,
+                )
+            }
+        }
+        if (type == ForwardType.LOCAL) {
+            OutlinedTextField(
+                remoteHost,
+                { remoteHost = it },
+                label = { Text("Remote host") },
+                singleLine = true,
+                enabled = enabled,
+                supportingText = supportText("As the server would resolve it - a name on its network, or an address."),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        TextButton(
+            onClick = {
+                parsed?.let(onAdd)
+                localPort = ""
+                remoteHost = ""
+                remotePort = ""
+            },
+            enabled = enabled && parsed != null,
+        ) { Text(if (enabled) "Add forward" else "At most $MAX_SAVED_FORWARDS forwards") }
+    }
+}
+
+/** Digits in the highest TCP port, so a port field can hold 65535 and not 6553. */
+private const val PORT_DIGITS = 5
 
 /** The three states of a per-host override of a global switch: inherit, force on, force off. */
 private val LEGACY_CHOICES: List<Pair<String, Boolean?>> =
@@ -340,6 +594,10 @@ private fun OptionSwitch(
  *
  * [help] is the line under it while the value is fine; the range replaces it while the value is not, so
  * an error never costs the user the explanation of what the field is for.
+ *
+ * [maxDigits] is what the field will hold at all, and it is a parameter because a port needs five and
+ * every other number here needs four. Truncating at four silently made 65535 into 6553, which is a valid
+ * port - so the mistake would not have been reported by anything, it would just have bound the wrong one.
  */
 @Composable
 private fun NumberField(
@@ -351,9 +609,10 @@ private fun NumberField(
     help: String?,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
+    maxDigits: Int = 4,
 ) = OutlinedTextField(
     value,
-    { onValueChange(it.filter(Char::isDigit).take(4)) },
+    { onValueChange(it.filter(Char::isDigit).take(maxDigits)) },
     label = { Text(label) },
     singleLine = true,
     enabled = enabled,

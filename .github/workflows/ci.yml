@@ -104,6 +104,10 @@ jobs:
           # not come up is a broken harness, and a skipped interop test looks identical to
           # a passing one in the summary.
           test -f .tmp-build/sshd-test/port
+          # `MaxSessions 0`, for the login case that cannot be built any other way: a server
+          # that accepts the key and then refuses the shell. Its absence would silently skip
+          # the one test standing between this release and the reconnect mislabel returning.
+          test -f .tmp-build/sshd-test/port-no-shell
 
       # The project's integration tests live in src/test: they drive the real
       # SshConnectionManager, TerminalChannel and SFTP client against a local MINA
@@ -237,6 +241,10 @@ jobs:
           # The silent port is what this job needs: `ClientAliveInterval 0`, so the app's
           # own heartbeat is the only traffic and the only thing keeping the session up.
           test -f .tmp-build/sshd-test/port-silent
+          # This job runs the whole class, so it needs the no-shell port too - and with
+          # ECLIPSE_STRESS set it may not skip, so a missing port would fail the job here
+          # rather than confusingly, later, on an assumption.
+          test -f .tmp-build/sshd-test/port-no-shell
 
       # The whole interop class, not one test: with ECLIPSE_STRESS set, the idle matrix
       # (30s / 1 / 5 / 10 / 30 minutes, keep-alive on and off, compression on and off) runs

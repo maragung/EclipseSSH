@@ -126,4 +126,37 @@ object Migrations {
             db.execSQL("ALTER TABLE host_profiles ADD COLUMN hostKeyPolicy TEXT NOT NULL DEFAULT 'ASK'")
         }
     }
+
+    /**
+     * The rest of the per-host settings: four algorithm lists, a startup command, an environment and
+     * the saved port-forwarding rules.
+     *
+     * Same rule as [MIGRATION_11_12] - every default is what the engine did *before* the column
+     * existed, so an upgraded row connects identically:
+     *
+     *  - `ciphers`, `kexAlgorithms`, `macs`, `hostKeyAlgorithms` NULL, meaning "whatever MINA
+     *    negotiates". Nullable rather than an empty string because an empty *list* would be a real
+     *    instruction - offer nothing, which no session can be built from - and NULL is the only value
+     *    that can mean "this host has no opinion". Existing rows have none.
+     *  - `startupCommand` and `environment` '', which is nothing to send: the app opened every shell
+     *    with no typed command and no `env` requests.
+     *  - `savedForwards` '', because forwards existed only for the life of a session and were never
+     *    stored, so no host can have had one.
+     *
+     * No new table. The rules live in a text column in `ssh`'s own syntax, one per line, the way
+     * `tags` already lives in this table - so a host and its tunnels are one row that one Save writes
+     * atomically, one delete removes entirely, and one backup carries without a second serialiser.
+     * See `encodeForwardRules`.
+     */
+    val MIGRATION_12_13 = object : Migration(12, 13) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN ciphers TEXT")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN kexAlgorithms TEXT")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN macs TEXT")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN hostKeyAlgorithms TEXT")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN startupCommand TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN environment TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN savedForwards TEXT NOT NULL DEFAULT ''")
+        }
+    }
 }

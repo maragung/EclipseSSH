@@ -13,7 +13,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * The same version-2-to-11 upgrade the unit tests cover, run against the device's own SQLite.
+ * The same version-2-to-13 upgrade the unit tests cover, run against the device's own SQLite.
  * Robolectric substitutes a host build of SQLite, so a migration can pass there and still fail
  * on a real Android version — and this one runs on every user's first launch after an update.
  */
@@ -53,6 +53,17 @@ class MigrationInstrumentedTest {
         assertThat(host.accentColor).isNull()
         // Version 11: on by default, so an upgraded profile still opens its file browser on connect.
         assertThat(host.autoLoginSftp).isTrue()
+        // Version 12 and 13: an upgrade must not change how an existing host connects, and on a real
+        // device that is the claim worth checking - `ALTER TABLE ... ADD COLUMN` with a NOT NULL
+        // default is the statement whose behaviour varies most between SQLite builds.
+        assertThat(host.compression).isFalse()
+        assertThat(host.terminalType).isEqualTo("xterm-256color")
+        assertThat(host.hostKeyPolicy).isEqualTo("ASK")
+        assertThat(host.ciphers).isNull()
+        assertThat(host.hostKeyAlgorithms).isNull()
+        assertThat(host.startupCommand).isEmpty()
+        assertThat(host.environment).isEmpty()
+        assertThat(host.savedForwards).isEmpty()
 
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.name).isEqualTo("old.log")
@@ -77,7 +88,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
-                Migrations.MIGRATION_11_12,
+                Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
             )
             // Deliberately no destructive fallback: a broken migration must fail, not wipe data.
             .build()

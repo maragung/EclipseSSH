@@ -21,6 +21,8 @@ PORT="${ECLIPSE_TEST_SSHD_PORT:-22022}"
 # A second port on the same server whose only difference is that it never probes the client. See the
 # Match block below for what it is for.
 SILENT_PORT="${ECLIPSE_TEST_SSHD_SILENT_PORT:-$((PORT + 1))}"
+# A third port that logs the user in and then refuses to give them a shell. Also below.
+NO_SHELL_PORT="${ECLIPSE_TEST_SSHD_NO_SHELL_PORT:-$((PORT + 2))}"
 SFTP_SERVER="${ECLIPSE_SFTP_SERVER:-}"
 
 find_sftp_server() {
@@ -83,11 +85,26 @@ start() {
     # login with nothing wrong at either end - which is what "connects, prints the motd, then keeps
     # reconnecting" looks like from the outside. Five seconds with two strikes puts that failure inside
     # a test's patience instead of three minutes away, and MINA's own server never sends the request at
-    # all. Note that this heredoc is unquoted (it interpolates \$DIR and \$PORT), so nothing inside it
-    # may contain backticks.
+    # all.
+    #
+    # The second Match block is the third port, and it exists because of a bug that shipped three
+    # times: a server that accepts the credential and *then* refuses the shell used to make the app say
+    # "Reconnecting" - the word for an outage - about a session that had never once been up. Nothing on
+    # \$PORT can reproduce that, because there every failure happens before the login or not at all,
+    # and no unit test can either: the whole point is that authentication genuinely succeeded first.
+    # `MaxSessions 0` is OpenSSH's own switch for it, documented as preventing "all shell, login and
+    # subsystem sessions while still permitting forwarding" - so the transport comes up, the key is
+    # accepted, and the session channel is then refused, which is exactly the shape of a host with no
+    # ptys left, a MaxSessions ceiling already reached, or a ForceCommand that exits. `PermitTTY no` is
+    # belt and braces: it refuses the pty request on its own, so this port cannot accidentally start
+    # handing out working shells if a later OpenSSH reads MaxSessions 0 as "no limit".
+    #
+    # Note that this heredoc is unquoted (it interpolates \$DIR and \$PORT), so nothing inside it may
+    # contain backticks.
     cat > "$DIR/sshd_config" <<EOF
 Port $PORT
 Port $SILENT_PORT
+Port $NO_SHELL_PORT
 ListenAddress 127.0.0.1
 HostKey $DIR/host_ed25519
 AuthorizedKeysFile $DIR/authorized_keys
@@ -108,17 +125,21 @@ ClientAliveCountMax 2
 TCPKeepAlive yes
 Match LocalPort $SILENT_PORT
 ClientAliveInterval 0
+Match LocalPort $NO_SHELL_PORT
+MaxSessions 0
+PermitTTY no
 EOF
     "$sshd" -t -f "$DIR/sshd_config"
     nohup nice -n 10 "$sshd" -D -e -f "$DIR/sshd_config" > "$DIR/sshd.log" 2>&1 &
     printf '%s\n' "$PORT" > "$DIR/port"
     printf '%s\n' "$SILENT_PORT" > "$DIR/port-silent"
+    printf '%s\n' "$NO_SHELL_PORT" > "$DIR/port-no-shell"
     id -un > "$DIR/user"
     for _ in $(seq 1 50); do
         if ssh -i "$DIR/client_ed25519" -p "$PORT" -o StrictHostKeyChecking=no \
                -o UserKnownHostsFile="$DIR/known_hosts" -o BatchMode=yes \
                -o ConnectTimeout=2 "$(id -un)@127.0.0.1" true 2>/dev/null; then
-            echo "local sshd ready on 127.0.0.1:$PORT (silent on $SILENT_PORT) as $(id -un)"
+            echo "local sshd ready on 127.0.0.1:$PORT (silent on $SILENT_PORT, no shell on $NO_SHELL_PORT) as $(id -un)"
             return 0
         fi
         sleep 0.2

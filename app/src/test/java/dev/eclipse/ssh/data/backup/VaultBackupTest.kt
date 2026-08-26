@@ -1,16 +1,34 @@
 package dev.eclipse.ssh.data.backup
 
 import com.google.common.truth.Truth.assertThat
+import dev.eclipse.ssh.data.model.ALGORITHM_LIST_MAX_LENGTH
+import dev.eclipse.ssh.data.model.AUTH_TIMEOUT_RANGE
 import dev.eclipse.ssh.data.model.AppSettings
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
+import dev.eclipse.ssh.data.model.DEFAULT_AUTH_TIMEOUT_SECONDS
 import dev.eclipse.ssh.data.model.DEFAULT_CONNECT_TIMEOUT_SECONDS
+import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
+import dev.eclipse.ssh.data.model.DEFAULT_SERVER_ALIVE_COUNT_MAX
+import dev.eclipse.ssh.data.model.DEFAULT_TERMINAL_TYPE
+import dev.eclipse.ssh.data.model.ENVIRONMENT_MAX_LENGTH
 import dev.eclipse.ssh.data.model.HOST_KEY_FINGERPRINT_PATTERN
+import dev.eclipse.ssh.data.model.HostKeyPolicy
 import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.data.model.INHERIT_RECONNECT_BACKOFF
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
+import dev.eclipse.ssh.data.model.MAX_RECONNECT_ATTEMPTS_RANGE
+import dev.eclipse.ssh.data.model.MAX_SAVED_FORWARDS
 import dev.eclipse.ssh.data.model.ProxyType
+import dev.eclipse.ssh.data.model.RECONNECT_BACKOFF_RANGE
+import dev.eclipse.ssh.data.model.SERVER_ALIVE_COUNT_RANGE
+import dev.eclipse.ssh.data.model.STARTUP_COMMAND_MAX_LENGTH
+import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
+import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.TerminalTheme
+import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.ssh.cipherFactoriesFor
 import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -477,6 +495,255 @@ class VaultBackupTest {
             assertThat(HostFormDraft(host = "h", username = "u", fingerprint = fingerprint).fingerprintValid)
                 .isTrue()
         }
+    }
+
+    // --- The advanced per-host columns, which arrived after the format did ---
+
+    @Test
+    fun `every advanced per-host option survives the round trip`() {
+        // Each of the twenty-one set away from its default, so the whole-object comparison at the end
+        // fails for a dropped field instead of matching it by coincidence. This is the test that says a
+        // restored host connects the way the host that was backed up connected.
+        val tuned = HostProfile(
+            id = "tuned-host",
+            name = "Tuned edge",
+            host = "edge.example.com",
+            username = "ops",
+            compression = true,
+            keepAliveEnabled = false,
+            serverAliveCountMax = 6,
+            authTimeoutSeconds = 90,
+            autoReconnect = false,
+            maxReconnectAttempts = 9,
+            reconnectBackoffSeconds = 12,
+            usePty = false,
+            terminalType = "screen-256color",
+            terminalColumns = 132,
+            terminalRows = 50,
+            keyboardInteractiveAuth = false,
+            legacyAlgorithms = true,
+            hostKeyPolicy = HostKeyPolicy.STRICT,
+            ciphers = "aes256-gcm@openssh.com,aes128-ctr",
+            kexAlgorithms = "curve25519-sha256,diffie-hellman-group14-sha256",
+            macs = "hmac-sha2-256-etm@openssh.com",
+            hostKeyAlgorithms = "ssh-ed25519,rsa-sha2-512",
+            startupCommand = "tmux attach || tmux new",
+            environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
+            savedForwards = "L:8080:intranet.example:80\nR:2222:22\nD:1080",
+        )
+
+        val restored = VaultBackup.fromJson(VaultBackup.toJson(listOf(tuned), AppSettings(), emptyMap())).first
+
+        assertThat(restored).containsExactly(tuned)
+    }
+
+    @Test
+    fun `a version 2 backup imports the advanced options as the behaviour it described`() {
+        // Written before any of these columns existed. Every one of them has to arrive as the behaviour
+        // the app had when the backup was taken - not as false, not as zero, and not as an empty
+        // algorithm list, which is an instruction to propose nothing rather than an absence of opinion.
+        val v2 = """
+            {"version":2,
+             "settings":{},
+             "hosts":[{"id":"plain-1","name":"Plain","host":"plain.example.com","username":"admin"}]}
+        """.trimIndent()
+
+        val host = VaultBackup.fromJson(v2).first.single()
+
+        assertThat(host.compression).isFalse()
+        assertThat(host.keepAliveEnabled).isTrue()
+        assertThat(host.serverAliveCountMax).isEqualTo(DEFAULT_SERVER_ALIVE_COUNT_MAX)
+        assertThat(host.authTimeoutSeconds).isEqualTo(DEFAULT_AUTH_TIMEOUT_SECONDS)
+        assertThat(host.autoReconnect).isTrue()
+        assertThat(host.maxReconnectAttempts).isEqualTo(DEFAULT_MAX_RECONNECT_ATTEMPTS)
+        assertThat(host.reconnectBackoffSeconds).isEqualTo(INHERIT_RECONNECT_BACKOFF)
+        assertThat(host.usePty).isTrue()
+        assertThat(host.terminalType).isEqualTo(DEFAULT_TERMINAL_TYPE)
+        assertThat(host.terminalColumns).isEqualTo(0)
+        assertThat(host.terminalRows).isEqualTo(0)
+        assertThat(host.keyboardInteractiveAuth).isTrue()
+        assertThat(host.legacyAlgorithms).isNull()
+        assertThat(host.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
+        assertThat(host.ciphers).isNull()
+        assertThat(host.kexAlgorithms).isNull()
+        assertThat(host.macs).isNull()
+        assertThat(host.hostKeyAlgorithms).isNull()
+        assertThat(host.startupCommand).isEmpty()
+        assertThat(host.environment).isEmpty()
+        assertThat(host.savedForwards).isEmpty()
+    }
+
+    @Test
+    fun `hostile advanced values are coerced instead of installing themselves`() {
+        // The importer is the app's only untrusted-input boundary for these columns: the form validates
+        // what a user types, and a hand-edited or truncated backup goes around the form entirely.
+        val hostile = """
+            {"version":3,
+             "hosts":[{"name":"Bad","host":"h","username":"u",
+                       "serverAliveCountMax":0,"authTimeoutSeconds":99999,
+                       "maxReconnectAttempts":0,"reconnectBackoffSeconds":9999,
+                       "terminalType":"vt520","terminalColumns":5000,"terminalRows":-3,
+                       "hostKeyPolicy":"TRUST_EVERYTHING",
+                       "ciphers":"${"a".repeat(ALGORITHM_LIST_MAX_LENGTH + 200)}",
+                       "macs":"   ",
+                       "startupCommand":"${"x".repeat(STARTUP_COMMAND_MAX_LENGTH + 200)}",
+                       "environment":"${"E".repeat(ENVIRONMENT_MAX_LENGTH + 200)}",
+                       "savedForwards":"L:8080\nX:1\nD:1080"}]}
+        """.trimIndent()
+
+        val host = VaultBackup.fromJson(hostile).first.single()
+
+        // Out of range falls back to the shipped default rather than being clamped to the nearest bound:
+        // a host that asked for something impossible had no working setting to preserve.
+        assertThat(host.serverAliveCountMax).isEqualTo(DEFAULT_SERVER_ALIVE_COUNT_MAX)
+        assertThat(host.authTimeoutSeconds).isEqualTo(DEFAULT_AUTH_TIMEOUT_SECONDS)
+        assertThat(host.maxReconnectAttempts).isEqualTo(DEFAULT_MAX_RECONNECT_ATTEMPTS)
+        assertThat(host.reconnectBackoffSeconds).isEqualTo(INHERIT_RECONNECT_BACKOFF)
+        // A TERM the emulator does not implement fails as a broken editor rather than as a setting.
+        assertThat(host.terminalType).isEqualTo(DEFAULT_TERMINAL_TYPE)
+        // 0 is "match the screen", which is the honest answer for a size that cannot be asked for.
+        assertThat(host.terminalColumns).isEqualTo(0)
+        assertThat(host.terminalRows).isEqualTo(0)
+        // The one field where a wrong answer weakens a defence: an unknown policy name must never read
+        // as "accept whatever key turns up".
+        assertThat(host.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
+        assertThat(host.ciphers).hasLength(ALGORITHM_LIST_MAX_LENGTH)
+        // Whitespace is not a preference. Blank has to become null, or the engine would be told to
+        // propose an empty MAC list and the key exchange would fail on a host that used to work.
+        assertThat(host.macs).isNull()
+        assertThat(host.startupCommand).hasLength(STARTUP_COMMAND_MAX_LENGTH)
+        assertThat(host.environment).hasLength(ENVIRONMENT_MAX_LENGTH)
+        // Only the rules the engine can act on survive: `L:8080` names no target and `X:1` no kind.
+        assertThat(host.savedForwards).isEqualTo("D:1080")
+    }
+
+    @Test
+    fun `a backup cannot carry more forwards than a host may hold`() {
+        val many = List(MAX_SAVED_FORWARDS + 8) { "D:${1080 + it}" }.joinToString("\\n")
+        val json = """
+            {"version":3,"hosts":[{"name":"Many","host":"h","username":"u","savedForwards":"$many"}]}
+        """.trimIndent()
+
+        val host = VaultBackup.fromJson(json).first.single()
+
+        assertThat(decodeForwardRules(host.savedForwards)).hasSize(MAX_SAVED_FORWARDS)
+    }
+
+    @Test
+    fun `a hand edited backup cannot switch a host's encryption off`() {
+        // The third layer of the same refusal. The form will not let `none` be typed and the chip rows do
+        // not offer it, but a backup file is neither - so the importer keeps the text and the connect
+        // path is what refuses to install it, falling back to the library's own ciphers. Asserted here
+        // because this is the path that goes around the form.
+        val json = """
+            {"version":3,"hosts":[{"name":"Plain","host":"h","username":"u","ciphers":"none"}]}
+        """.trimIndent()
+
+        val host = VaultBackup.fromJson(json).first.single()
+
+        assertThat(cipherFactoriesFor(host.ciphers)).isNull()
+        assertThat(cipherFactoriesFor("none,aes128-ctr")?.map { it.name }).doesNotContain("none")
+    }
+
+    @Test
+    fun `the advanced sentinels and range bounds import unchanged`() {
+        val hosts = listOf(
+            HostProfile(
+                id = "low",
+                name = "Low",
+                host = "low.example.com",
+                username = "u",
+                serverAliveCountMax = SERVER_ALIVE_COUNT_RANGE.first,
+                authTimeoutSeconds = AUTH_TIMEOUT_RANGE.first,
+                maxReconnectAttempts = MAX_RECONNECT_ATTEMPTS_RANGE.first,
+                reconnectBackoffSeconds = RECONNECT_BACKOFF_RANGE.first,
+                terminalColumns = TERMINAL_COLUMNS_RANGE.first,
+                terminalRows = TERMINAL_ROWS_RANGE.first,
+            ),
+            HostProfile(
+                id = "high",
+                name = "High",
+                host = "high.example.com",
+                username = "u",
+                serverAliveCountMax = SERVER_ALIVE_COUNT_RANGE.last,
+                authTimeoutSeconds = AUTH_TIMEOUT_RANGE.last,
+                maxReconnectAttempts = MAX_RECONNECT_ATTEMPTS_RANGE.last,
+                reconnectBackoffSeconds = RECONNECT_BACKOFF_RANGE.last,
+                terminalColumns = TERMINAL_COLUMNS_RANGE.last,
+                terminalRows = TERMINAL_ROWS_RANGE.last,
+            ),
+            // The sentinels, which sit outside their ranges on purpose and have to be admitted anyway.
+            HostProfile(
+                id = "automatic",
+                name = "Automatic",
+                host = "auto.example.com",
+                username = "u",
+                reconnectBackoffSeconds = INHERIT_RECONNECT_BACKOFF,
+                terminalColumns = 0,
+                terminalRows = 0,
+            ),
+        )
+
+        val restored = VaultBackup.fromJson(VaultBackup.toJson(hosts, AppSettings(), emptyMap())).first
+
+        assertThat(restored).isEqualTo(hosts)
+    }
+
+    @Test
+    fun `a host that follows the app-wide legacy switch keeps following it`() {
+        val hosts = listOf(
+            HostProfile(id = "follows", name = "Follows", host = "a.example.com", username = "u"),
+            HostProfile(id = "on", name = "On", host = "b.example.com", username = "u", legacyAlgorithms = true),
+            HostProfile(id = "off", name = "Off", host = "c.example.com", username = "u", legacyAlgorithms = false),
+        )
+
+        val json = VaultBackup.toJson(hosts, AppSettings(), emptyMap())
+
+        // Absent rather than written as false, which is what keeps the third state a state.
+        assertThat(VaultBackup.fromJson(json).first.map { it.legacyAlgorithms })
+            .containsExactly(null, true, false).inOrder()
+    }
+
+    @Test
+    fun `an exported backup normalises a forward column it was handed`() {
+        // The column can already be malformed before the export: it is written by an importer, and older
+        // builds of this app never validated it. Exporting re-encodes what decoding accepted, so a
+        // backup file never propagates a line the engine would refuse.
+        val host = HostProfile(
+            id = "edited",
+            name = "Edited",
+            host = "h.example.com",
+            username = "u",
+            savedForwards = "D:1080\nnot-a-rule",
+        )
+
+        val json = VaultBackup.toJson(listOf(host), AppSettings(), emptyMap())
+
+        assertThat(json).doesNotContain("not-a-rule")
+        assertThat(VaultBackup.fromJson(json).first.single().savedForwards).isEqualTo("D:1080")
+    }
+
+    @Test
+    fun `a cleared startup command restores cleared`() {
+        // The reason both fields are written unconditionally. A host whose startup command was removed
+        // and then backed up must not come back running the command again, which is what reading an
+        // absent key as "unchanged" would do.
+        val configured = HostProfile(
+            id = "startup",
+            name = "Startup",
+            host = "h.example.com",
+            username = "u",
+            startupCommand = "tmux attach",
+            environment = "LANG=C",
+        )
+        val cleared = configured.copy(startupCommand = "", environment = "")
+
+        val restored = VaultBackup.fromJson(
+            VaultBackup.toJson(listOf(configured, cleared), AppSettings(), emptyMap()),
+        ).first
+
+        assertThat(restored.map { it.startupCommand }).containsExactly("tmux attach", "").inOrder()
+        assertThat(restored.map { it.environment }).containsExactly("LANG=C", "").inOrder()
     }
 
     private companion object {

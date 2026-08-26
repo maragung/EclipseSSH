@@ -19,8 +19,10 @@ import dev.eclipse.ssh.terminal.TerminalVisualRow
 import dev.eclipse.ssh.terminal.terminalLayout
 import java.io.File
 import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.net.Socket
 import java.time.Duration
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
@@ -669,6 +671,346 @@ class RealOpenSshInteropRobolectricTest {
     }
 
     /**
+     * A server that takes the key and then refuses the shell: the reported login fault, as a config.
+     *
+     * This is the one failure the rest of this suite structurally cannot produce and the one the reports
+     * describe. On the sandbox's ordinary port every failure happens before the login or not at all, and
+     * no unit test can reach it either, because the whole premise is that authentication *succeeded* first - three times
+     * over - and that what then failed was the pty. `MaxSessions 0` on the sandbox's third port is
+     * OpenSSH's own switch for exactly this (see `tools/local-sshd.sh`): the transport comes up, the key
+     * is accepted, and the session channel is refused, without needing a host that is genuinely out of
+     * ptys or a `ForceCommand` that exits.
+     *
+     * What it asserts is the whole of the login fix, measured on a real socket:
+     *
+     *  - the trace reaches CHANNEL_PTY_INITIALIZING, so the login really did work before this failed -
+     *    without which the rest of the test would be about a connection that never got that far;
+     *  - RECONNECTING appears nowhere in it, on a host with auto-reconnect deliberately left **on**. A
+     *    session that has never once been up cannot be reconnecting, and that word - on this exact
+     *    sequence - is what three releases of "it connects and then just keeps reconnecting" were
+     *    actually reporting;
+     *  - each wait between attempts says which half of the login failed and which attempt is next,
+     *    rather than borrowing the ladder's sentence about the connection;
+     *  - the server logged one accepted key per attempt, which is the only witness that the credential
+     *    was taken every single time rather than this being an authentication retry in disguise;
+     *  - the tab ends at ERROR carrying a reason, and that reason survives the *compact* status row -
+     *    the row the user is looking at while this happens, and the one place the reason used to be
+     *    deleted on its way to the screen;
+     *  - and the keyboard still on that screen reaches nothing, which is the honest form of "no typing
+     *    into a dead session" for a design that keeps its IME host composed on purpose.
+     */
+    @Test
+    fun aServerThatRefusesTheShellNeverCallsTheFailureAReconnect() {
+        val sandbox = sandbox()
+        assumeTrue("no local sshd sandbox: run tools/local-sshd.sh start", sandbox != null)
+        val noShellPort = File(sandbox, "port-no-shell")
+        assumeTrue(
+            "this sandbox predates the no-shell port: run tools/local-sshd.sh clean && tools/local-sshd.sh start",
+            noShellPort.isFile,
+        )
+        val port = noShellPort.readText().trim().toInt()
+        assumeTrue("local sshd sandbox is not listening on $port", listening(port))
+
+        val log = File(sandbox, "sshd.log")
+        val logOffset = if (log.isFile) log.length() else 0L
+
+        val viewModel = viewModel()
+        val profile = HostProfile(
+            id = "real-openssh-no-shell",
+            name = "real-openssh-no-shell",
+            host = LOOPBACK,
+            username = File(sandbox, "user").readText().trim(),
+            port = port,
+            authMethod = AuthMethod.SSH_KEY,
+            connectTimeoutSeconds = 60,
+            // Left on deliberately. A host with the ladder switched off would pass this test by having
+            // no ladder to mislabel; what has to be true is that a connect-time failure is not answered
+            // with the word for an outage even when the user has asked for outages to be answered.
+            autoReconnect = true,
+            autoLoginSftp = false,
+        )
+        compose.runOnUiThread { viewModel.saveHost(profile) }
+        pumpUntil(describe = { "the host was never saved" }) {
+            viewModel.uiState.value.hosts.any { it.id == profile.id }
+        }
+        val saved = viewModel.uiState.value.hosts.first { it.id == profile.id }
+        val key = File(sandbox, "client_ed25519").readBytes()
+        compose.runOnUiThread { viewModel.connect(saved, keyBytes = key) }
+
+        // Waited for on its own rather than inside the wait below, because known hosts are keyed by host
+        // *and* port: this port has never been connected to whatever ran before, so the first attempt
+        // always stops at the trust question - and that attempt's own ERROR would otherwise satisfy the
+        // wait for the failure actually under test.
+        pumpUntil(describe = { "the sandbox key was never offered for trust. " + diagnose(saved.id) }) {
+            viewModel.uiState.value.hostKeyChallenge != null
+        }
+        compose.runOnUiThread { viewModel.acceptHostKey() }
+        restartStateTrace(saved.id)
+
+        // Collected inside the wait for the same reason [statesSeen] is: the notices are what the user
+        // reads *during* the ladder, and by the time it has given up the tab is showing the final
+        // failure instead. Deduplicated against the previous one so a sentence that stayed on screen for
+        // two hundred frames appears once.
+        val notices = mutableListOf<String>()
+        val collectNotice: () -> Unit = {
+            tabFor(saved.id)?.lastError?.let { if (notices.lastOrNull() != it) notices += it }
+        }
+
+        // Two waits, and which comes first is the whole reliability of this test. The trust question is
+        // raised from inside the dial and the failure that raised it is written to the tab afterwards, so
+        // the answer can be given - and the trace restarted - while that ERROR is still on its way. A
+        // single wait for ERROR would then be satisfied by the failure the user has just dismissed,
+        // before the sandbox had been asked for a shell at all, and this test would pass without
+        // exercising one line of what it is about. Waiting for the login to reach the shell phase first
+        // makes the ERROR that follows necessarily the shell's.
+        pumpUntil(describe = { "the trusted login never reached the shell phase. " + diagnose(saved.id) }) {
+            collectNotice()
+            statesSeen[saved.id].orEmpty().contains(SessionConnectionState.CHANNEL_PTY_INITIALIZING)
+        }
+        pumpUntil(describe = { "the shell-less login never gave up. " + diagnose(saved.id) }) {
+            collectNotice()
+            tabFor(saved.id)?.state == SessionConnectionState.ERROR
+        }
+
+        val seen = statesSeen[saved.id].orEmpty()
+        val evidence = "states=$seen notices=$notices"
+        assertWithMessage("the login never reached the shell phase, so this proves nothing: $evidence")
+            .that(seen)
+            .contains(SessionConnectionState.CHANNEL_PTY_INITIALIZING)
+        assertWithMessage("a first login that failed was reported as a reconnect: $evidence")
+            .that(seen)
+            .doesNotContain(SessionConnectionState.RECONNECTING)
+        assertWithMessage("the tab did not end at ERROR: $evidence").that(seen.last())
+            .isEqualTo(SessionConnectionState.ERROR)
+
+        assertWithMessage("no retry said what had failed: $evidence")
+            .that(notices.filter { it.contains("the shell did not open") })
+            .isNotEmpty()
+        assertWithMessage("a retry blamed the connection that had just worked: $evidence")
+            .that(notices.filter { it.contains("Retrying connection") })
+            .isEmpty()
+        assertWithMessage("the retries did not count themselves: $evidence")
+            .that(notices.filter { it.endsWith("attempt 2 of ${MainViewModel.MAX_CONNECT_ATTEMPTS}") })
+            .isNotEmpty()
+
+        // The server's own account of the ladder. Every rung authenticated, so every rung failed after
+        // the credential was accepted - which is the premise the wording fix rests on, and the one thing
+        // the app could be wrong about without any of its own state showing it.
+        assertWithMessage("the ladder did not spend its attempts on a server that kept letting it in")
+            .that(logins(log, logOffset))
+            .isEqualTo(MainViewModel.MAX_CONNECT_ATTEMPTS)
+
+        val reason = tabFor(saved.id)?.lastError
+        assertWithMessage("a failed login left the tab with nothing to show for it").that(reason)
+            .isNotEmpty()
+        assertWithMessage("the failure called itself a reconnect: $reason")
+            .that(reason?.lowercase())
+            .doesNotContain("reconnect")
+        // B1 on a real failure: the compact row is the terminal screen's, and it is the row that used to
+        // drop everything the app knew about why.
+        assertThat(statusLine(SessionConnectionState.ERROR, startedAt = null, lastError = reason, compact = true))
+            .isEqualTo(reason)
+        // And the keyboard. The IME host is deliberately in the tree for as long as the terminal screen
+        // is - an `InputConnection` cannot be established for a view that is not composed, so a field
+        // created only when the keyboard was wanted would arrive after the request to open it - so what
+        // has to be true here is not that it is absent but that it is *inert*. Asserted in that order,
+        // because the first half is the app's documented design and a test that quietly required the
+        // opposite would be an argument for breaking it.
+        assertWithMessage("the IME host went missing, and it cannot be created on demand")
+            .that(compose.onAllNodesWithContentDescription("Terminal input").fetchSemanticsNodes())
+            .isNotEmpty()
+        compose.runOnUiThread { viewModel.sendText(saved.id, "echo $MARKER") }
+        compose.runOnUiThread { viewModel.sendKey(saved.id, TerminalKey.ENTER) }
+        pumpFor(DEAD_TYPING_MS)
+        assertWithMessage("a session that never had a pty echoed something back")
+            .that(drawn(saved.id))
+            .doesNotContain(MARKER)
+        assertWithMessage("typing at a failed tab dialled the server again")
+            .that(logins(log, logOffset))
+            .isEqualTo(MainViewModel.MAX_CONNECT_ATTEMPTS)
+        assertWithMessage("typing at a failed tab changed what it says").that(tabFor(saved.id)?.lastError)
+            .isEqualTo(reason)
+        assertWithMessage("typing at a failed tab moved it out of ERROR").that(tabFor(saved.id)?.state)
+            .isEqualTo(SessionConnectionState.ERROR)
+    }
+
+    /**
+     * Compression on, with the server's own key exchange log as the witness that it is on.
+     *
+     * A per-host switch that silently does nothing is worse than no switch, and "the session came up" is
+     * not evidence either way - `none` is in the app's own preference list, so a client that failed to
+     * offer zlib at all would connect exactly like this one. The only honest witness is the far end, and
+     * sshd names the compression it negotiated in each direction at debug level, which is why the
+     * sandbox runs at `LogLevel DEBUG`.
+     */
+    @Test
+    fun aCompressedLoginReachesAShellAndTheServerAgreesItIsCompressed() {
+        aLoginNegotiatesCompression(id = "real-openssh-zlib-on", compression = true)
+    }
+
+    /** And off, which is the shipped default and has to reach the wire just as literally. */
+    @Test
+    fun anUncompressedLoginReachesAShellAndTheServerAgreesItIsNot() {
+        aLoginNegotiatesCompression(id = "real-openssh-zlib-off", compression = false)
+    }
+
+    /**
+     * A host's saved tunnel comes up with its session, and carries real bytes.
+     *
+     * `forwardsOpen == forwardsTotal` is the app's own claim about itself, and a tracker that bound a
+     * socket and forwarded nothing would satisfy it. So the rule points back at the sandbox's own ssh
+     * port and the test reads what comes out: an OpenSSH identification string arriving through a local
+     * socket, having crossed the session as a channel, is proof the tunnel carried traffic that only the
+     * far end could have produced.
+     */
+    @Test
+    fun aSavedLocalForwardComesUpWithTheSessionAndCarriesTheServersOwnTraffic() {
+        val sandbox = sandbox()
+        assumeTrue("no local sshd sandbox: run tools/local-sshd.sh start", sandbox != null)
+        val port = File(sandbox, "port").readText().trim().toInt()
+        assumeTrue("local sshd sandbox is not listening on $port", listening(port))
+
+        val local = freePort()
+        val saved = logInWithAShell(
+            id = "real-openssh-forward",
+            sandbox = sandbox!!,
+            port = port,
+            // Straight back to the server that is carrying it, so the only thing that can answer on the
+            // local port is the far end of the tunnel.
+            savedForwards = "L:$local:$LOOPBACK:$port",
+        )
+        pumpUntil(describe = { "the saved forward never came up. " + diagnose(saved.id) }) {
+            tabFor(saved.id)?.forwardsOpen == 1
+        }
+        val tab = tabFor(saved.id)
+        assertThat(tab?.forwardsTotal).isEqualTo(1)
+        assertThat(tab?.forwardError).isNull()
+        assertThat(tab?.state).isEqualTo(SessionConnectionState.CONNECTED)
+
+        // On its own thread, because the read has to happen while this test keeps pumping: the socket is
+        // answered by MINA's own I/O threads, but a blocking read on this one would stop the looper that
+        // the session's state - and any failure this test would rather report than hang on - travels on.
+        val throughTheTunnel = AtomicReference<String?>(null)
+        val tunnelFailure = AtomicReference<Throwable?>(null)
+        val reader = Thread {
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(LOOPBACK, local), TUNNEL_TIMEOUT_MS.toInt())
+                    socket.soTimeout = TUNNEL_TIMEOUT_MS.toInt()
+                    throughTheTunnel.set(socket.getInputStream().bufferedReader().readLine())
+                }
+            }.onFailure(tunnelFailure::set)
+        }
+        reader.start()
+        pumpUntil(describe = { "nothing came back through the tunnel. " + diagnose(saved.id) }) {
+            throughTheTunnel.get() != null || tunnelFailure.get() != null
+        }
+        reader.join(TUNNEL_TIMEOUT_MS)
+        assertWithMessage("the tunnel failed instead of carrying bytes").that(tunnelFailure.get()).isNull()
+        assertWithMessage("what came through the tunnel was not the server on the other end of it")
+            .that(throughTheTunnel.get())
+            .startsWith("SSH-2.0-")
+        assertNothingLookedLikeADrop(saved.id)
+    }
+
+    /**
+     * A tunnel that cannot bind costs the user the tunnel and nothing else.
+     *
+     * The rule the whole feature turns on. A port already in use is the ordinary case - a SOCKS proxy
+     * left over from another app, two hosts saving the same 8080 - and answering it by ending the
+     * session, or by writing it onto the status line, would make a working shell look broken and hand
+     * the reconnect ladder a failure it cannot fix by redialling. The port is taken by this test rather
+     * than assumed to be, so the failure is the one under test and not a coincidence.
+     */
+    @Test
+    fun aSavedForwardThatCannotBindCostsTheTunnelAndNotTheShell() {
+        val sandbox = sandbox()
+        assumeTrue("no local sshd sandbox: run tools/local-sshd.sh start", sandbox != null)
+        val port = File(sandbox, "port").readText().trim().toInt()
+        assumeTrue("local sshd sandbox is not listening on $port", listening(port))
+
+        ServerSocket().use { taken ->
+            taken.bind(InetSocketAddress(LOOPBACK, 0))
+            val saved = logInWithAShell(
+                id = "real-openssh-forward-busy",
+                sandbox = sandbox!!,
+                port = port,
+                savedForwards = "L:${taken.localPort}:$LOOPBACK:$port",
+            )
+            pumpUntil(describe = { "a forward that could not bind never said so. " + diagnose(saved.id) }) {
+                tabFor(saved.id)?.forwardError != null
+            }
+            val tab = tabFor(saved.id)
+            assertWithMessage("a tunnel that could not bind took the session down with it")
+                .that(tab?.state)
+                .isEqualTo(SessionConnectionState.CONNECTED)
+            assertThat(tab?.forwardsOpen).isEqualTo(0)
+            assertThat(tab?.forwardsTotal).isEqualTo(1)
+            assertWithMessage("a bind failure was written onto the session's own status line")
+                .that(tab?.lastError)
+                .isNull()
+            assertWithMessage("the report did not say which rule failed").that(tab?.forwardError)
+                .contains("localhost:${taken.localPort}")
+
+            // And the shell is not merely labelled connected.
+            val marker = "$FORWARD_MARKER-busy"
+            compose.runOnUiThread { viewModel().sendText(saved.id, "echo $marker") }
+            compose.runOnUiThread { viewModel().sendKey(saved.id, TerminalKey.ENTER) }
+            pumpUntil(describe = { "the shell stopped answering after a forward failed. " + diagnose(saved.id) }) {
+                drawn(saved.id).contains(marker)
+            }
+            assertNothingLookedLikeADrop(saved.id)
+        }
+    }
+
+    /**
+     * Logs in with [compression] set, echoes through the shell, and reads the server's kex log back.
+     *
+     * The two directions are asserted separately from each other only in the failure message: what
+     * matters is that no direction disagrees with the setting, and naming the offenders is what makes a
+     * failure here diagnosable rather than a bare `false`.
+     */
+    private fun aLoginNegotiatesCompression(id: String, compression: Boolean) {
+        val sandbox = sandbox()
+        assumeTrue("no local sshd sandbox: run tools/local-sshd.sh start", sandbox != null)
+        val port = File(sandbox, "port").readText().trim().toInt()
+        assumeTrue("local sshd sandbox is not listening on $port", listening(port))
+
+        val log = File(sandbox, "sshd.log")
+        val logOffset = if (log.isFile) log.length() else 0L
+
+        val saved = logInWithAShell(id = id, sandbox = sandbox!!, port = port, compression = compression)
+        val marker = "$COMPRESSION_MARKER-$id"
+        compose.runOnUiThread { viewModel().sendText(saved.id, "echo $marker") }
+        compose.runOnUiThread { viewModel().sendKey(saved.id, TerminalKey.ENTER) }
+        pumpUntil(describe = { "a compression=$compression shell never answered. " + diagnose(saved.id) }) {
+            drawn(saved.id).contains(marker)
+        }
+
+        // `debug1: kex: client->server cipher: … MAC: <implicit> compression: none [preauth]` - one line
+        // per direction, and the trailing `[preauth]` is why this takes the first token rather than the
+        // rest of the line.
+        val negotiated = appendedLog(log, logOffset).lineSequence()
+            .filter { it.contains("kex:") && it.contains("compression: ") }
+            .map { it.substringAfter("compression: ").trim().substringBefore(' ') }
+            .toList()
+        assertWithMessage("the server logged no negotiated compression for this session")
+            .that(negotiated.size)
+            .isAtLeast(2)
+        if (compression) {
+            assertWithMessage("compression was on for this host and the server compressed nothing")
+                .that(negotiated.filterNot { it.startsWith("zlib") })
+                .isEmpty()
+        } else {
+            assertWithMessage("compression was off for this host and the server compressed anyway")
+                .that(negotiated.filterNot { it == "none" })
+                .isEmpty()
+        }
+        assertThat(tabFor(saved.id)?.lastError).isNull()
+        assertNothingLookedLikeADrop(saved.id)
+    }
+
+    /**
      * Logs in, says nothing for [holdMs], and then checks the shell still answers.
      *
      * Sampling every [IDLE_STEP_MS] rather than only at the end, because the three ways this fails are
@@ -854,11 +1196,22 @@ class RealOpenSshInteropRobolectricTest {
     /**
      * Saves a host, trusts the sandbox's key, connects, and waits for a shell with output in it.
      *
-     * The two terminal tests need the same four things and neither is about how they happen - the tests
-     * above cover that in detail, including what the first, untrusted attempt reports. Returns the saved
-     * profile because the id the app stored is what addresses the session.
+     * The terminal, compression and forwarding tests need the same four things and none of them is
+     * about how they happen - the tests above cover that in detail, including what the first, untrusted
+     * attempt reports. Returns the saved profile because the id the app stored is what addresses the
+     * session.
+     *
+     * [compression] and [savedForwards] are the two per-host settings whose effects are only observable
+     * against a real server: one is a negotiated algorithm the far end has to agree to, the other binds
+     * real sockets and moves real bytes. Both default to what a host has before anybody opens Advanced.
      */
-    private fun logInWithAShell(id: String, sandbox: File, port: Int): HostProfile {
+    private fun logInWithAShell(
+        id: String,
+        sandbox: File,
+        port: Int,
+        compression: Boolean = false,
+        savedForwards: String = "",
+    ): HostProfile {
         val viewModel = viewModel()
         val profile = HostProfile(
             id = id,
@@ -869,6 +1222,8 @@ class RealOpenSshInteropRobolectricTest {
             authMethod = AuthMethod.SSH_KEY,
             connectTimeoutSeconds = 60,
             keepAliveSeconds = KEEP_ALIVE_SECONDS,
+            compression = compression,
+            savedForwards = savedForwards,
             // Off, so the only channel on this session is the one the terminal is on: an SFTP channel
             // opening underneath a full-screen program is a second thing to explain in a failure.
             autoLoginSftp = false,
@@ -1144,14 +1499,19 @@ class RealOpenSshInteropRobolectricTest {
      * app stops and asks. That attempt correctly reports ERROR - and correctly does *not* report
      * RECONNECTING, which is the fault this suite is about - but it is a failed attempt all the same,
      * and it belongs to a question the user has now answered rather than to the session under audit.
-     * Only the first test in the class sees it (the trust survives into the rest of the run), so
-     * leaving it in the trace would make the assertion depend on test order.
+     * Every test here meets it: known hosts live under the app's data directory, and Robolectric hands
+     * each test method its own, so the trust one test establishes is not there for the next.
      */
     private fun restartStateTrace(hostId: String) {
         statesSeen.remove(hostId)
         // `acceptHostKey` dials again from the calling thread but the dial itself is a coroutine, so the
         // tab still reports the failed attempt's state for now. Remember it, and ignore it until it
         // changes, or the next sample would put back exactly what this call just removed.
+        //
+        // That covers the answer arriving after the failure was written. The other order - the question
+        // published, answered, and the failure written afterwards, onto the dial the answer started - is
+        // not a harness problem and is not papered over here: the app refuses the write, because an
+        // attempt the user has replaced does not get to report. See `MainViewModel.dialGenerations`.
         tabFor(hostId)?.let { traceHoldover[it.hostId] = it.state }
     }
 
@@ -1245,6 +1605,29 @@ class RealOpenSshInteropRobolectricTest {
         const val CLOSE_SETTLE_MS = 500L
 
         /**
+         * Long enough for a keystroke aimed at a dead session to have reached a server if it could.
+         *
+         * A round trip on loopback is under a millisecond, so this is generous by three orders of
+         * magnitude - which is the point: the assertion is that nothing arrives, and a wait too short to
+         * have carried anything would prove nothing at all.
+         */
+        const val DEAD_TYPING_MS = 1_000L
+
+        /** Each compression case echoes its own marker, so a stale frame cannot satisfy it. */
+        const val COMPRESSION_MARKER = "eclipse-compressed"
+
+        /** Likewise for the forwarding cases. */
+        const val FORWARD_MARKER = "eclipse-forwarded"
+
+        /**
+         * How long a read through the tunnel may take before the tunnel is the failure.
+         *
+         * Generous for a loopback socket on purpose: it crosses the app's acceptor, a channel on a real
+         * session, and the server's own connector, on a runner sharing two cores with the build.
+         */
+        const val TUNNEL_TIMEOUT_MS = 15_000L
+
+        /**
          * Longer than the idle timeout the app gives itself at [KEEP_ALIVE_SECONDS].
          *
          * `SshConnectionManager.configureIdleTimeout` asks MINA for `keepAlive * 3 + 60` seconds, so at
@@ -1294,5 +1677,18 @@ class RealOpenSshInteropRobolectricTest {
         fun listening(port: Int): Boolean = runCatching {
             Socket().use { it.connect(InetSocketAddress(LOOPBACK, port), 2_000) }
         }.isSuccess
+
+        /**
+         * A loopback port nothing is listening on, for a saved forward to claim.
+         *
+         * Asked of the kernel and then released, rather than picked out of the air: a hard-coded port
+         * is a test that fails on whichever machine already runs something there, and the window
+         * between releasing this one and the app binding it is a fraction of a second on a loopback
+         * interface nothing else in this sandbox is competing for.
+         */
+        fun freePort(): Int = ServerSocket().use { socket ->
+            socket.bind(InetSocketAddress(LOOPBACK, 0))
+            socket.localPort
+        }
     }
 }
