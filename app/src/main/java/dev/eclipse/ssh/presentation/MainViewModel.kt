@@ -2844,7 +2844,18 @@ class MainViewModel @Inject constructor(
         ptySizes.remove(tab.hostId)
         connectedAt.remove(tab.hostId)
         stopForwardingsFor(tab.hostId)
-        viewModelScope.launch { runCatching { sessionRegistry.unregister(tab.hostId) } }
+        // [releaseScope], not [viewModelScope], and for the reason [release] gives: this is teardown, and
+        // teardown launched on a scope that dies with the screen is dropped exactly when it matters. The
+        // write is a DataStore round trip, so it always outlives the frame that asked for it; every other
+        // line of this function has already run synchronously by then. Close the last tab and leave - task
+        // swiped, activity finished, `Stop` from the notification - and [viewModelScope] is cancelled
+        // while that round trip is in flight, with two consequences that both survive the process. The
+        // host is still listed active, so [EclipseSessionService]'s restore pass dials it again on its
+        // next start or the next time the network returns: a session the user explicitly closed comes
+        // back, reconnecting, which is the complaint this app has spent four releases chasing. And
+        // [SessionRegistry.unregister] is also what forgets that host's stored credential, so the
+        // password of a session the user has finished with stays at rest instead of being dropped.
+        releaseScope.launch { runCatching { sessionRegistry.unregister(tab.hostId) } }
     }
 
     fun disconnectAll() {

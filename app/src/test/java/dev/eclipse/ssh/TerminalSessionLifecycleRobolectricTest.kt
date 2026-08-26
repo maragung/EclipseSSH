@@ -16,12 +16,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import dev.eclipse.ssh.background.SessionRegistry
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MAX_AUTO_RECONNECT_ATTEMPTS
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.security.SecureVault
 import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.ssh.SessionEvent
 import dev.eclipse.ssh.terminal.TerminalFrame
@@ -34,6 +36,7 @@ import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
@@ -411,6 +414,53 @@ class TerminalSessionLifecycleRobolectricTest {
         pumpUntil(describe = { "the terminal did not fall back to its empty state" }) {
             compose.onAllNodesWithText("No active sessions").fetchSemanticsNodes().isNotEmpty()
         }
+    }
+
+    /**
+     * A tab closed as the screen goes away is still taken off the registry, so nothing dials it back.
+     *
+     * [SessionRegistry] is how [dev.eclipse.ssh.background.EclipseSessionService] knows which hosts are
+     * meant to be up: it restores every one it lists, on its own start and whenever the network comes
+     * back. So the write that takes a closed host off it is not tidying - it is the only thing standing
+     * between "the user closed this session" and the service dialling it again, minutes later, with the
+     * tab announcing a reconnect for a session nobody asked for. It is also what forgets that host's
+     * stored credential.
+     *
+     * Every other line of `closeTab` has finished by the time this one has anything to wait for: the
+     * write is a DataStore round trip, so it outlives the frame that asked for it by design. Launched on
+     * the view model's own scope it was therefore droppable precisely when it mattered - close the last
+     * tab and leave, and the scope is cancelled mid-write. Clearing the store here is that race made
+     * deterministic: it cancels `viewModelScope` and runs `onCleared` exactly as finishing the activity
+     * does, without depending on which of the two wins.
+     */
+    @Test
+    fun closingATabAsTheScreenGoesAwayStillTakesTheHostOffTheRegistry() {
+        // A second instance, deliberately: DataStore hands out one per process, so this reads exactly
+        // what the view model wrote and what the service would later read.
+        val registry = SessionRegistry(RuntimeEnvironment.getApplication(), SecureVault())
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        val viewModel = viewModel()
+        // Without this the assertion below would pass on a host that was never registered at all.
+        pumpUntil(describe = { "the live session was never registered as active" }) {
+            hostId in runBlocking { registry.activeHostIds.first() }
+        }
+        val tab = viewModel.uiState.value.tabs.first { it.hostId == hostId }
+
+        compose.runOnUiThread { compose.activity.viewModelStore.clear() }
+        compose.runOnUiThread { viewModel.closeTab(tab) }
+
+        pumpUntil(
+            describe = {
+                "a session the user closed is still listed as active, so the service will dial it " +
+                    "again: active=${runBlocking { registry.activeHostIds.first() }}"
+            },
+        ) {
+            hostId !in runBlocking { registry.activeHostIds.first() }
+        }
+        assertWithMessage("the closed session's credential was left at rest in the registry")
+            .that(runBlocking { registry.credential(hostId) })
+            .isNull()
     }
 
     /**

@@ -796,8 +796,16 @@ class RealOpenSshInteropRobolectricTest {
         // The server's own account of the ladder. Every rung authenticated, so every rung failed after
         // the credential was accepted - which is the premise the wording fix rests on, and the one thing
         // the app could be wrong about without any of its own state showing it.
-        assertWithMessage("the ladder did not spend its attempts on a server that kept letting it in")
-            .that(logins(log, logOffset))
+        // Every port's count in the message, not just this one's. The sandbox log is shared, so the
+        // interesting failure is "three here and three somewhere else" - and a bare count cannot tell
+        // that from "six here", which is the difference between a shared log and a ladder gone twice
+        // round. That distinction cost two CI round trips to make.
+        assertWithMessage(
+            "the ladder did not spend its attempts on the server that kept letting it in " +
+                "(port $port; logins by port ${loginsByPort(log, logOffset)}): $evidence " +
+                diagnose(saved.id),
+        )
+            .that(logins(log, logOffset, port))
             .isEqualTo(MainViewModel.MAX_CONNECT_ATTEMPTS)
 
         val reason = tabFor(saved.id)?.lastError
@@ -825,8 +833,11 @@ class RealOpenSshInteropRobolectricTest {
         assertWithMessage("a session that never had a pty echoed something back")
             .that(drawn(saved.id))
             .doesNotContain(MARKER)
-        assertWithMessage("typing at a failed tab dialled the server again")
-            .that(logins(log, logOffset))
+        assertWithMessage(
+            "typing at a failed tab dialled the server again " +
+                "(port $port; logins by port ${loginsByPort(log, logOffset)})",
+        )
+            .that(logins(log, logOffset, port))
             .isEqualTo(MainViewModel.MAX_CONNECT_ATTEMPTS)
         assertWithMessage("typing at a failed tab changed what it says").that(tabFor(saved.id)?.lastError)
             .isEqualTo(reason)
@@ -1095,12 +1106,13 @@ class RealOpenSshInteropRobolectricTest {
                     "(keepAlive=$keepAliveEnabled@${keepAliveSeconds ?: "default"}s compression=$compression): " +
                     "state=${tab?.state} error=${tab?.lastError}. " +
                     "Heartbeats the server logged: ${clientProbes(log, logOffset)}, " +
-                    "logins: ${logins(log, logOffset)}. " + diagnose(saved.id)
+                    "logins: ${logins(log, logOffset, port)}. " + diagnose(saved.id)
             }
-            check(logins(log, logOffset) <= 1) {
+            check(logins(log, logOffset, port) <= 1) {
                 "the session was redialled after ${heldMs}ms of idling - the server has authenticated " +
-                    "this host ${logins(log, logOffset)} times for one connect, so a session died and " +
-                    "came back between two samples. " + diagnose(saved.id)
+                    "this host ${logins(log, logOffset, port)} times for one connect, so a session " +
+                    "died and came back between two samples. " +
+                    "Logins by port: ${loginsByPort(log, logOffset)}. " + diagnose(saved.id)
             }
         }
 
@@ -1129,7 +1141,7 @@ class RealOpenSshInteropRobolectricTest {
             // quietly still beating, which is the opposite of what the setting promises.
             assertThat(probes).isEqualTo(0)
         }
-        assertThat(logins(log, logOffset)).isEqualTo(1)
+        assertThat(logins(log, logOffset, port)).isEqualTo(1)
 
         val marker = "$IDLE_MARKER_PREFIX-$id"
         compose.runOnUiThread { viewModel.sendText(saved.id, "echo $marker") }
@@ -1150,8 +1162,49 @@ class RealOpenSshInteropRobolectricTest {
      * inside a sampling gap presents as CONNECTED at every sample the test takes, but the server has
      * authenticated twice and says so.
      */
-    private fun logins(log: File, offset: Long): Int =
-        appendedLog(log, offset).lineSequence().count { it.contains("Accepted publickey") }
+    /**
+     * How many times the server on [port] accepted a key from this client since [offset].
+     *
+     * Filtered by the port the connection arrived on, and that filter is the whole reliability of every
+     * assertion below that counts logins. `tools/local-sshd.sh` runs *one* sshd serving all three
+     * sandbox ports and writing *one* log, so an unfiltered count is the three servers' logins added
+     * together - and this class shares a JVM, a session store and a database with every other test in
+     * the suite, so it is also every login that any host left behind by an earlier test contributes
+     * while this one is running. "The ladder spent its attempts on *this* server" cannot be read off
+     * that total. It was read off it, and CI found the difference: `expected 3 but was 6` on a run whose
+     * own timings were unchanged to within 70ms, so the three extra logins were never this test's to
+     * count and no ladder here had climbed twice.
+     *
+     * The listening port is recoverable because sshd names both ends when the connection arrives
+     * (`Connection from <ip> port <src> on <ip> port <dst>`, at the `LogLevel DEBUG` this sandbox
+     * already runs for the compression assertions) and names the same client port again on its
+     * `Accepted publickey ... from <ip> port <src>` line. The client port is the join key, and it is
+     * unique for as long as the connection exists - which is longer than the two lines are apart.
+     */
+    private fun logins(log: File, offset: Long, port: Int): Int = loginsByPort(log, offset)[port] ?: 0
+
+    /**
+     * Every login since [offset], counted per listening port, as the evidence for [logins].
+     *
+     * Key 0 collects the logins whose own arrival predates [offset] - a connection this window did not
+     * see opened, so a port cannot be put to it. Counted rather than dropped, because a number nobody
+     * can account for is exactly what sent the last such failure round CI twice.
+     */
+    private fun loginsByPort(log: File, offset: Long): Map<Int, Int> {
+        val arrivedOn = mutableMapOf<String, Int>()
+        val counts = mutableMapOf<Int, Int>()
+        appendedLog(log, offset).lineSequence().forEach { line ->
+            ARRIVED.find(line)?.let { match ->
+                arrivedOn[match.groupValues[1]] = match.groupValues[2].toInt()
+                return@forEach
+            }
+            ACCEPTED.find(line)?.let { match ->
+                val listening = arrivedOn[match.groupValues[1]] ?: 0
+                counts[listening] = (counts[listening] ?: 0) + 1
+            }
+        }
+        return counts
+    }
 
     /**
      * How many `keepalive@openssh.com` requests the server has logged receiving since [offset].
@@ -1671,6 +1724,12 @@ class RealOpenSshInteropRobolectricTest {
 
         /** The request MINA sends for a heartbeat, as sshd names it in its log. */
         const val KEEPALIVE_REQUEST_NAME = "keepalive@openssh.com"
+
+        /** sshd's own record of which of the sandbox's three servers a connection arrived at. */
+        val ARRIVED = Regex("""Connection from \S+ port (\d+) on \S+ port (\d+)""")
+
+        /** The accepted login, naming the client port [ARRIVED] attributed to a server. */
+        val ACCEPTED = Regex("""Accepted publickey for \S+ from \S+ port (\d+)""")
 
         const val SILENT_SERVER_MARKER = "eclipse-outlived-the-silence"
 
