@@ -3897,3 +3897,42 @@ session is up, which is a stale redial in the unlikely case and, in every case, 
 passphrase left reachable for the life of the view model when the entire point of the clear is that they are
 needed only until the session exists. The sweep found nothing else: `pendingConnection` is the view model's
 only mutable field, and its only two non-concurrent collections are locals in sequential loops.
+
+### 35.8 The second thing the dispatcher move invalidated: a harness that read two flows as one
+
+CI run `32963114545`, on the commit that added §35.7's gate, went the other way round: `testDebugUnitTest`
+green at 992 tests, `testReleaseUnitTest` failing exactly one —
+`SftpAutoLoginRobolectricTest.refreshingFilesByHandOnAServerWithoutSftpReportsItAndDoesNotCrash`, on
+`assertThat(uiState.value.remotePath).isNotNull()`. The forward test from run 32949856660 passed on both
+variants, so the gate held; this was a different assumption breaking for the same underlying reason.
+
+The app is right and the harness was reading it wrongly, which is worth spelling out because the opposite
+conclusion is the easy one to reach under release pressure. `refreshFiles`'s failure path strands the
+directory *before* it reports, deliberately — "keeping the path means the header still names the directory the
+error is about instead of teleporting the user home". But the two writes leave the view model by different
+routes: `report` is a bare assignment, `_statusMessage.value = …`, visible the instant the coroutine runs it,
+while `remotePath` only exists once the `uiState` combine — collected on `viewModelScope`, so on the main
+dispatcher — is given a turn. While `refreshFiles` ran on `viewModelScope` itself both writes and the
+recomputation shared one thread and the ordering was effectively stable. Since it runs on `transportScope`,
+a harness that pumps until the status message appears can exit in the gap between the report and the
+recomputation, and `pumpUntil` by construction stops the moment its condition holds without pumping again.
+
+Nothing a user can see turns on it. `MainActivity`'s Files header already reads
+`state.remotePath ?: fallbackHome(host.username)`, so there is no frame in which the browser has nothing to
+draw, and a real frame reads both flows in one snapshot pass. Forcing the ordering to be observable would mean
+routing every status message through the whole `uiState` combine — putting a snackbar behind the transfer
+list, the diagnostics ring and both file listings to fix an interleaving no one can perceive. Declined.
+
+So the wait now covers the flow the assertions actually read, both clauses, with the reason written at the
+site. And since the test had to be touched, the assertion it failed on got stronger rather than merely
+un-flaked: `isNotNull` is satisfied by the app teleporting the user anywhere at all, and this server never
+answered a `realpath`, so the one honest stranded path is `fallbackHome(USER)` — asserted by value.
+Confirmed by running the class twice per variant here, four passes out of four, which is what proves the
+expected value rather than just the compile.
+
+A sweep for the same shape found no other instance: line 195 was the suite's only wait that pumped on one
+view-model flow and then asserted on another. The two remaining `statusMessage` waits assert on
+`statusMessage`, every `frames` wait asserts on `frames`, and `SessionDiagnosticsTest` holds the diagnostics
+object directly. The rule the sweep leaves behind is short enough to keep: **wait on the flow you are about to
+assert on.** Two flows off one coroutine are only ordered if they publish by the same route, and since the
+transport work moved, most of them do not.

@@ -12,6 +12,7 @@ import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ssh.fallbackHome
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -191,12 +192,23 @@ class SftpAutoLoginRobolectricTest {
 
         compose.runOnUiThread { viewModel.refreshFiles(host) }
 
+        // Both clauses, and the second one is the point. `statusMessage` is assigned straight from the
+        // coroutine that failed - which since the transport work moved off the UI thread is a background
+        // one - while `uiState` is a combine collected on the main dispatcher, so the report becomes
+        // readable a main-looper turn before the listing it is about. `refreshFiles` strands the path
+        // *before* it reports, so waiting on the message alone can land in the gap between the two and
+        // read a browser state that has not been recomputed yet. Waiting for both is what the user
+        // experiences anyway: one frame renders the message and the listing together.
         pumpUntil(describe = { "the failed listing was never reported: " + diagnose(hostId) }) {
-            viewModel.statusMessage.value?.contains("Could not list directory") == true
+            viewModel.statusMessage.value?.contains("Could not list directory") == true &&
+                viewModel.uiState.value.remotePath != null
         }
         assertThat(viewModel.uiState.value.remoteFiles).isEmpty()
-        // A directory to show rather than a null: the browser has to render something.
-        assertThat(viewModel.uiState.value.remotePath).isNotNull()
+        // A directory to show rather than a null: the browser has to render something. Named exactly,
+        // because "not null" would be satisfied by the app teleporting the user somewhere - and this
+        // server never answered a `realpath`, so the only honest answer is the fallback for the
+        // username, which is also what the Files header substitutes when there is no listing at all.
+        assertThat(viewModel.uiState.value.remotePath).isEqualTo(fallbackHome(USER))
         // Not promoted by a refresh that threw.
         assertThat(tabFor(hostId)?.sftpState).isNotEqualTo(SftpSessionState.READY)
         assertThat(tabFor(hostId)?.state).isEqualTo(SessionConnectionState.CONNECTED)
