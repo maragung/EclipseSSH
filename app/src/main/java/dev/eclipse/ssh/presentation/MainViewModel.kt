@@ -365,7 +365,15 @@ class MainViewModel @Inject constructor(
     }
 
     private val terminalState = combine(terminalOutput, commandHistory, diagnostics.events) { output, history, events ->
-        TerminalState(output = output, history = history, diagnostics = events)
+        // The labels are read here, off the back of an events emission, and that ordering is what makes
+        // a non-flow safe to read from inside a flow: a label is created by the same `record` call that
+        // pushes the event, so every session with a line in [events] already has its label in the map.
+        TerminalState(
+            output = output,
+            history = history,
+            diagnostics = events,
+            diagnosticsLabels = diagnostics.sessionLabels,
+        )
     }
 
     private val localState = combine(localFiles, localDirUri) { files, dir ->
@@ -383,6 +391,7 @@ class MainViewModel @Inject constructor(
             terminalOutput = terminal.output,
             commandHistory = terminal.history,
             diagnostics = terminal.diagnostics,
+            diagnosticsLabels = terminal.diagnosticsLabels,
             remoteFiles = browsing?.files.orEmpty(),
             remotePath = browsing?.path,
             localFiles = local.files,
@@ -610,11 +619,18 @@ class MainViewModel @Inject constructor(
                         if (attempt < MAX_CONNECT_ATTEMPTS - 1) {
                             // Named by the phase it failed in, read off the tab before it is overwritten.
                             // See [retryNotice] for why one message for all of them was actively
-                            // misleading.
+                            // misleading, and [retryPhase] for why this is no longer RECONNECTING.
                             updateTab(host.id) { tab ->
                                 tab?.copy(
-                                    state = SessionConnectionState.RECONNECTING,
-                                    lastError = retryNotice(tab.state),
+                                    state = retryPhase(tab.state),
+                                    lastError = retryNotice(
+                                        tab.state,
+                                        // 1-based, and it is the attempt this wait leads to rather than
+                                        // the one that just failed: a user reading "attempt 2 of 3" is
+                                        // being told what is about to happen.
+                                        nextAttempt = attempt + 2,
+                                        maxAttempts = MAX_CONNECT_ATTEMPTS,
+                                    ),
                                 )
                             }
                             delay(RECONNECT_DELAY_MS * (attempt + 1))
@@ -747,6 +763,28 @@ class MainViewModel @Inject constructor(
             }
         }
         val buffer = terminalBuffers.getOrPut(host.id) { AnsiTerminalBuffer() }
+        /*
+         * The local half of the size the pty was just opened at.
+         *
+         * [resizeTerminal] could not apply it when it was measured, and that is structural rather than a
+         * race: the first viewport report of a connection arrives while the screen still says
+         * CONNECTING, and no buffer exists to resize until this line has run. The composable reports
+         * only when the size it measures *changes*, so it never mentioned that size again - which left
+         * the grid on its 120x40 default for the whole session while the remote pty was correctly sized
+         * to the phone, undoing the half of "both are required" that had arrived too early.
+         *
+         * Alternate-screen programs are what paid for it. `vim` and `top` draw for the rows the server
+         * told them about, so a grid holding ten rows more than the pty kept ten rows of whatever was
+         * on screen before, with a cursor row that agreed with neither. Both halves are coerced into
+         * [TERMINAL_COLUMN_RANGE]/[TERMINAL_ROW_RANGE] by [AnsiTerminalBuffer.resize] and
+         * [TerminalChannel.open] respectively, so they land on the same numbers even at a size no
+         * terminal may actually be.
+         *
+         * No [SessionEvent.PTY_RESIZED] here: nothing is being asked of the far end. This is the local
+         * grid catching up with what the far end was already told, and recording it as a resize would
+         * put a window-change in the trace that never went out on the wire.
+         */
+        ptySizes[host.id]?.let { (columns, rows) -> buffer.resize(columns, rows) }
         terminalJobs[host.id] = launchTerminalCollector(host.id, terminal, buffer)
         // An adopted session may be sitting at a prompt with nothing to say, and the collector only
         // publishes when output arrives - so without this the scrollback the user already had would
@@ -1022,7 +1060,7 @@ class MainViewModel @Inject constructor(
                 // Which of the two endings this was decides the colour as well as the wording: a shell
                 // that ran and exited is finished, a transport that died under it failed. See
                 // [SessionEnd.isFault].
-                val reason = describeSessionEnd(end)
+                val endReason = describeSessionEnd(end)
                 // The corpse comes out of the registry here, at the one moment the app is entitled to
                 // remove it: the ending has been published, so nothing can be reported over it, and this
                 // is the only path a dead session is guaranteed to reach - a redial replaces the entry
@@ -1040,7 +1078,11 @@ class MainViewModel @Inject constructor(
                 // say what happened, instead of reconnecting for as long as the app is open. See
                 // [STABLE_SESSION_MS] for why the threshold is minutes rather than seconds.
                 if (upForMs != null && upForMs >= STABLE_SESSION_MS) reconnectAttempts.remove(hostId)
-                val willReconnect = shouldAutoReconnect(
+                // A shell the far end hung up on before it produced a single byte. Answering that with a
+                // ladder is the loop users report, so it is answered with the server's reason instead.
+                // See [endedBeforeItRan] for how narrow this is.
+                val refused = endedBeforeItRan(end, upForMs = upForMs, idleForMs = terminal.idleForMs())
+                val willReconnect = !refused && shouldAutoReconnect(
                     end,
                     tabIsOpen = tabs.value.any { it.hostId == hostId },
                     endedDeliberately = false,
@@ -1058,12 +1100,22 @@ class MainViewModel @Inject constructor(
                     willReconnect -> SessionConnectionState.RECONNECTING
                     else -> SessionConnectionState.ERROR
                 }
+                // Why there is no recovery running gets said in the same breath as what happened,
+                // because a tab that stops after one ending, with no explanation of why it did not try
+                // again, is the same unanswerable report in a different costume.
+                val reason = if (refused) {
+                    "$endReason · closed before the shell produced any output, so it was not retried"
+                } else {
+                    endReason
+                }
                 updateTab(hostId) { it?.copy(state = ended, lastError = reason) }
                 diagnostics.record(
                     hostId,
                     SessionEvent.ENDED,
                     state = ended,
-                    detail = "${end::class.java.simpleName}: $reason" + if (reaped) " · session reaped" else "",
+                    detail = "${end::class.java.simpleName}: $endReason" +
+                        (if (refused) " · refused before first output" else "") +
+                        (if (reaped) " · session reaped" else ""),
                     network = networkMonitor.describe(),
                     pty = terminal.ptyLabel,
                     channel = terminal.channelLabel,
@@ -2973,6 +3025,7 @@ class MainViewModel @Inject constructor(
         val output: Map<String, String>,
         val history: Map<String, List<String>>,
         val diagnostics: List<SessionDiagnosticEvent>,
+        val diagnosticsLabels: Map<String, String>,
     )
 
     private data class SecurityState(
@@ -3071,7 +3124,44 @@ data class MainUiState(
      * [dev.eclipse.ssh.ssh.SessionDiagnostics].
      */
     val diagnostics: List<SessionDiagnosticEvent> = emptyList(),
+    /**
+     * Host id to the opaque label its [diagnostics] lines are filed under, so one session's trace can
+     * be shown on that session's own tab. See [dev.eclipse.ssh.ssh.SessionDiagnostics.sessionLabels]
+     * and [sessionDiagnostics].
+     */
+    val diagnosticsLabels: Map<String, String> = emptyMap(),
 )
+
+/**
+ * One host's slice of the trace, newest first, at most [limit] lines.
+ *
+ * Newest first because the question this answers - *why did this session end?* - is answered by the
+ * last few lines, and a user who has opened it from a failed tab should not have to scroll a 500-entry
+ * ring to reach them.
+ *
+ * A host with no label yet has never had a line recorded, and returning nothing for it is the honest
+ * answer: the alternative, falling back to the unfiltered ring, would show one session another
+ * session's trace, which is the one thing this must not do.
+ *
+ * Pure, so both of those properties are asserted directly rather than through a screen.
+ */
+internal fun sessionDiagnostics(
+    events: List<SessionDiagnosticEvent>,
+    label: String?,
+    limit: Int = MAX_SESSION_DIAGNOSTIC_LINES,
+): List<SessionDiagnosticEvent> {
+    if (label == null) return emptyList()
+    return events.asReversed().asSequence().filter { it.session == label }.take(limit).toList()
+}
+
+/**
+ * How many of a session's trace lines the "Why?" sheet shows.
+ *
+ * Enough to hold a whole failed recovery - a connect, an ending, and a five-rung ladder with its
+ * attempts and its exhaustion - so the shape of the failure is visible without scrolling to find the
+ * start of it. The full ring is still one tap away under Settings.
+ */
+internal const val MAX_SESSION_DIAGNOSTIC_LINES = 24
 
 /**
  * Consecutive automatic reconnects allowed per host before the app stops and says so.
@@ -3145,14 +3235,46 @@ internal const val STABLE_SESSION_MS = 300_000L
  *
  * [phase] is the state the tab was in when the attempt failed, which is where that information already
  * lives. See [SessionConnectionState.CHANNEL_PTY_INITIALIZING].
+ *
+ * [nextAttempt] and [maxAttempts] are said out loud because "retrying" on its own cannot distinguish a
+ * first retry from the last one, and those are different situations for the person watching: the first
+ * is worth waiting through, the last is about to become a failure they will have to act on.
  */
-internal fun retryNotice(phase: SessionConnectionState): String = when (phase) {
-    // Authenticated, so the credentials and the route are proven and neither is what to look at. A
-    // server at its MaxSessions limit, out of ptys, or running a ForceCommand that refuses one lands
-    // here, and all three are fixed on the server rather than in this app.
-    SessionConnectionState.CHANNEL_PTY_INITIALIZING -> "Logged in · the shell did not open · retrying"
-    else -> "Retrying connection…"
+internal fun retryNotice(phase: SessionConnectionState, nextAttempt: Int, maxAttempts: Int): String {
+    val what = when (phase) {
+        // Authenticated, so the credentials and the route are proven and neither is what to look at. A
+        // server at its MaxSessions limit, out of ptys, or running a ForceCommand that refuses one lands
+        // here, and all three are fixed on the server rather than in this app.
+        SessionConnectionState.CHANNEL_PTY_INITIALIZING -> "Logged in · the shell did not open"
+        else -> "Retrying connection…"
+    }
+    return "$what · attempt $nextAttempt of $maxAttempts"
 }
+
+/**
+ * The state a tab should wait in between two attempts of the *same* connection.
+ *
+ * It used to be RECONNECTING, and that is the single line of code behind the app's longest-running
+ * complaint. RECONNECTING has one meaning everywhere else in this app - *a session that was up has
+ * dropped and is being recovered* - and a first login that failed once has no session, has never had
+ * one, and is not being recovered. So a server that accepted the password and then refused a pty
+ * announced itself with the word for an outage, on a connection whose transport had just proved it
+ * worked, seconds after the user tapped Connect. "Log in, then straight to Reconnecting" is that
+ * sentence, and it was the app describing its own retry.
+ *
+ * Staying in the phase that failed keeps the report honest and keeps one word meaning one thing: after
+ * this, RECONNECTING on screen always means a session existed and was lost. [retryNotice] carries the
+ * detail, and [dev.eclipse.ssh.data.model.isPastAuthentication] is what stops the next attempt's
+ * handshake callback walking the shell phase back to CONNECTING.
+ */
+internal fun retryPhase(phase: SessionConnectionState): SessionConnectionState =
+    if (phase.isPastAuthentication) {
+        SessionConnectionState.CHANNEL_PTY_INITIALIZING
+    } else {
+        // Not AUTHENTICATING even when that is where it failed: the next attempt starts by dialling, so
+        // the honest phase for the wait is the one it is about to be in.
+        SessionConnectionState.CONNECTING
+    }
 
 /**
  * [autoReconnectEnabled] is the host's own switch, and it is checked here rather than at the top of
@@ -3181,6 +3303,67 @@ internal fun shouldAutoReconnect(
         SessionEnd.TransportClosed, SessionEnd.Released -> true
     }
 }
+
+/**
+ * Whether a session was hung up on before it ever ran, in which case dialling it again immediately is
+ * the loop rather than the cure.
+ *
+ * The shape this catches is specific, and it is the one shape a backoff ladder cannot help with: the
+ * shell opened, the far end never sent a single byte through it - no banner, no prompt, nothing - and
+ * the connection was over in under [NEVER_RAN_MS]. That is a server declining the session, not a link
+ * that faltered: `MaxStartups` shedding load, `MaxSessions` reached, a `ForceCommand` that exits, a
+ * `DenyUsers`/`AllowUsers` rule applied after the login, a firewall or middlebox killing the flow, a
+ * container whose entrypoint is already gone. Every one of those answers a redial the same way, five
+ * times, one backoff apart - which is the connect / disconnect / reconnecting cycle in the reports, and
+ * during it the tab shows the *app's* recovery instead of the server's reason for refusing.
+ *
+ * Narrow on purpose, in three independent ways, because getting this wrong in the other direction would
+ * cost a user the recovery they actually need:
+ *
+ *  - **[idleForMs] must be null**, which [dev.eclipse.ssh.ssh.TerminalChannel.idleForMs] returns only
+ *    when the far end has sent nothing at all. A session that printed even a prompt and then dropped was
+ *    a working session, and working sessions that drop are exactly what auto-reconnect is for.
+ *  - **[upForMs] must be under the floor.** A session that lasted longer than a couple of seconds was
+ *    not refused; it was interrupted.
+ *  - **the ending must be a hang-up**, not an I/O failure. `Disconnected` is the server saying so in
+ *    words and `TransportClosed` is a bare FIN, both decisions taken at the far end.
+ *    [SessionEnd.TransportFailed] (a reset, a timeout) and [SessionEnd.NetworkLost] stay reconnect-worthy
+ *    however young the session was, because a phone that changes network one second after a login is the
+ *    ordinary case and it must ride that out. [SessionEnd.Released] cannot honestly reach here anyway -
+ *    the liveness probe will not conclude anything about a session this young - and is left out for the
+ *    same reason.
+ *
+ * The user is not left worse off: the tab lands in ERROR carrying the server's own words, and the
+ * manual Reconnect button is offered on every ended state. What they lose is four automatic redials
+ * that were always going to fail, and what they gain is the reason.
+ *
+ * Pure, so the whole matrix is testable without a server that can be talked into refusing a shell.
+ */
+internal fun endedBeforeItRan(end: SessionEnd, upForMs: Long?, idleForMs: Long?): Boolean {
+    if (idleForMs != null) return false
+    if (upForMs == null || upForMs >= NEVER_RAN_MS) return false
+    return when (end) {
+        is SessionEnd.Disconnected -> true
+        SessionEnd.TransportClosed -> true
+        is SessionEnd.ShellEnded,
+        is SessionEnd.TransportFailed,
+        SessionEnd.NetworkLost,
+        SessionEnd.Released,
+        -> false
+    }
+}
+
+/**
+ * How long a session has to last before a hang-up counts as an interruption rather than a refusal.
+ *
+ * Three seconds, and it is a generous reading of "immediately": a shell that opens sends its banner or
+ * its prompt in one round trip, so on any link this app can be used over, output has either arrived by
+ * now or is never going to. Long enough that a slow server which is genuinely getting there is not
+ * accused of refusing; short enough that it cannot be confused with a session that was in use.
+ *
+ * See [endedBeforeItRan].
+ */
+internal const val NEVER_RAN_MS = 3_000L
 
 /**
  * Whichever of the two frames was built from the later state of the buffer.

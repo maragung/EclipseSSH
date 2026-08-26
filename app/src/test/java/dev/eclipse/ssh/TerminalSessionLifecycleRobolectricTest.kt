@@ -23,6 +23,7 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MAX_AUTO_RECONNECT_ATTEMPTS
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.security.StandInAndroidKeyStore
+import dev.eclipse.ssh.ssh.SessionEvent
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import java.io.InputStream
@@ -589,6 +590,36 @@ class TerminalSessionLifecycleRobolectricTest {
     }
 
     /**
+     * The local grid is the same size as the pty the shell was given, on the very first connection.
+     *
+     * Both halves are required and only one of them was reachable at the moment the size was known.
+     * The viewport is measured as soon as the terminal is laid out, which is while the screen still says
+     * CONNECTING - before any shell, and so before the buffer that shell's output will be parsed into
+     * exists. `resizeTerminal` remembered the size for the pty and had no buffer to apply it to, and the
+     * composable reports only when the size it measures *changes*, so it never offered it again: the
+     * grid kept its 120x40 construction default for the life of the session while the pty was correctly
+     * sized to the screen.
+     *
+     * The symptom is not wrapped text - the shell wraps first, at the width it was told - it is every
+     * program that addresses the screen directly. `vim` and `top` draw the rows the server knows about,
+     * and a grid holding more rows than that keeps whatever was under them, with a cursor row that
+     * agrees with neither half. Asserted against the size the *server* was asked for, because that is
+     * the number the far end will actually draw for.
+     */
+    @Test
+    fun theGridIsSizedToThePtyTheShellWasGiven() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+
+        val opened = ptyRequests.single()
+        assertWithMessage("a shell must be opened at some size, or this test proves nothing")
+            .that(opened.first).isGreaterThan(0)
+        assertWithMessage("the grid kept its default while the pty was sized to the screen")
+            .that(frameFor(hostId).let { it.columns to it.rows })
+            .isEqualTo(opened)
+    }
+
+    /**
      * A reconnect brings the pty back at the size the user was working at, not at the default.
      *
      * The size lives in the view model rather than in the channel, because the channel that knew it is
@@ -628,6 +659,57 @@ class TerminalSessionLifecycleRobolectricTest {
         val frame = frameFor(hostId)
         assertThat(frame.columns).isEqualTo(47)
         assertThat(frame.rows).isEqualTo(15)
+    }
+
+    /**
+     * A session ending must not resize the terminal, because the reason it ended is drawn above it.
+     *
+     * The test above says the reconnected pty comes back at the user's size; this one says why that was
+     * ever in doubt. The status row over the grid carries the ending's own words on a second line and a
+     * Why? button that only exists while there is something to explain, so for one release it was one
+     * height while a shell was healthy and two rows taller while it was not - and the terminal below it
+     * takes what is left. The composable reported the smaller viewport in good faith,
+     * [dev.eclipse.ssh.presentation.MainViewModel.resizeTerminal] filed it as the size the user was
+     * working at, and the recovered shell opened at a geometry that had only ever existed while the
+     * banner was up, then resized again the moment it cleared: two window-changes per outage, and a
+     * reconnected `top` drawn for a window that had stopped existing.
+     *
+     * Asserted as a count of resizes rather than by reading the layout, because the count is the thing
+     * with consequences - each one is a `window-change` on the wire and a redraw at the far end - and
+     * because it holds the whole way through the outage rather than at one instant of it. An undisturbed
+     * session reports its viewport once, when it is first laid out. Nothing after that is the user.
+     */
+    @Test
+    fun aSessionEndingDoesNotResizeTheTerminal() {
+        val hostId = connectAndOpenTerminal()
+        waitForFrameText(hostId, PROMPT)
+        val settled = ptyResizes()
+        // The size the user's own viewport produced, taken from what the server was asked for rather
+        // than from the layout: it is the number with consequences, and it is the one a second shell
+        // has to reproduce.
+        val opened = ptyRequests.single()
+        assertWithMessage("the grid and the pty disagreed before anything had gone wrong")
+            .that(frameFor(hostId).let { it.columns to it.rows })
+            .isEqualTo(opened)
+
+        checkNotNull(liveTransport.get()) { "the server never recorded its session" }.close(true)
+        pumpUntil(describe = { "the session never noticed the drop. " + diagnose(hostId) }) {
+            tabFor(hostId)?.state != SessionConnectionState.CONNECTED
+        }
+        // Held across the whole first backoff window, so the frames the reason and the Why? button are
+        // on screen for are all measured, not just whichever one the loop above happened to stop on.
+        holdWhileTheLadderWouldHaveFired(
+            describe = { "the terminal was resized by the session ending, not by the user. " + diagnose(hostId) },
+            invariant = { ptyResizes() == settled },
+        )
+
+        pumpUntil(describe = { "the session never came back. " + diagnose(hostId) }) {
+            tabFor(hostId)?.state == SessionConnectionState.CONNECTED && ptyRequests.size >= 2
+        }
+        assertWithMessage("the recovered shell was opened at a size the user never chose")
+            .that(ptyRequests.last()).isEqualTo(opened)
+        assertWithMessage("the grid moved back after the banner cleared, so the outage cost two resizes")
+            .that(ptyResizes()).isEqualTo(settled)
     }
 
     /**
@@ -1308,6 +1390,16 @@ class TerminalSessionLifecycleRobolectricTest {
     )
 
     /** Everything worth knowing when the terminal is not showing what it should. */
+    /**
+     * How many times the app has told the engine the terminal changed size, read from its own trace.
+     *
+     * The trace rather than a spy, because [dev.eclipse.ssh.ssh.SessionEvent.PTY_RESIZED] is recorded
+     * only when the size actually differs from the one already remembered - which is the definition the
+     * assertion wants, and one a counter wrapped around the call would get wrong.
+     */
+    private fun ptyResizes(): Int =
+        viewModel().uiState.value.diagnostics.count { it.event == SessionEvent.PTY_RESIZED }
+
     private fun diagnose(hostId: String): String {
         val viewModel = viewModel()
         val frame = viewModel.frames.value[hostId]

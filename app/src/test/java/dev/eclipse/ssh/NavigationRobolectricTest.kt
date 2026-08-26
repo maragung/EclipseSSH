@@ -228,9 +228,10 @@ class NavigationRobolectricTest {
         // MainViewModel's `selectedHostId = selected ?: hosts.firstOrNull()` mean one is always
         // selected. The browser composes disconnected instead, so the remote listing shows its
         // parent-directory row over a body that says so — "Not connected", not "Empty directory",
-        // which would be a claim about the server rather than about the session. assertExists rather
-        // than assertIsDisplayed: the narrow branch stacks the remote and local listings in a Column,
-        // so rows further down are legitimately below the fold on a phone-sized viewport.
+        // which would be a claim about the server rather than about the session. Both are on the
+        // Server tab, which is the one a phone opens on; [FilesTabsRobolectricTest] covers the tabs
+        // themselves. assertExists rather than assertIsDisplayed because a listing longer than the
+        // pane legitimately keeps its later rows below the fold.
         waitForText("Parent directory")
         compose.onNodeWithText("Parent directory").assertExists()
         compose.onNodeWithText("Not connected").assertExists()

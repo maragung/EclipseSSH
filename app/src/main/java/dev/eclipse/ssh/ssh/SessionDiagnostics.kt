@@ -143,6 +143,21 @@ class SessionDiagnostics @Inject constructor() {
         Log.i(TAG, entry.line())
     }
 
+    /**
+     * Every host id's opaque label, as a snapshot.
+     *
+     * The one way a caller holding a host id can find that host's lines in [events], which is what the
+     * per-session "Why?" sheet needs: the trace deliberately records [label] rather than the id, so
+     * without this the entries for one session could not be picked out of the ring at all. Only the
+     * mapping crosses the boundary - the ids stay on this side and the labels remain the opaque
+     * ordinals they were designed to be, so nothing that is exported or pasted gains an identifier.
+     *
+     * A snapshot rather than the live map, because the caller is a UI reading it during composition and
+     * [labels] is written from MINA's I/O threads. Grows by one entry per host per process, so copying
+     * it is cheaper than the events list it is read alongside.
+     */
+    val sessionLabels: Map<String, String> get() = labels.toMap()
+
     /** The whole ring as text, for Save logs and for a bug report. */
     fun export(): String = synchronized(entries) { entries.joinToString("\n") { it.line() } }
 

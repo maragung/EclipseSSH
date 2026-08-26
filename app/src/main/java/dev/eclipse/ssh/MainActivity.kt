@@ -109,12 +109,14 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -200,6 +202,7 @@ import dev.eclipse.ssh.background.EclipseSessionService
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
+import dev.eclipse.ssh.presentation.sessionDiagnostics
 import dev.eclipse.ssh.presentation.transfersForDisplay
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
@@ -222,6 +225,7 @@ import dev.eclipse.ssh.data.saf.PickedKeyFile
 import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
 import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
+import dev.eclipse.ssh.ssh.scrub
 import dev.eclipse.ssh.ssh.fallbackHome
 import dev.eclipse.ssh.data.saf.LocalFile
 import androidx.compose.ui.focus.FocusRequester
@@ -926,6 +930,7 @@ private fun EclipseWorkspace(
                         if (text.isNotEmpty()) viewModel.copyToClipboard(text)
                     },
                     onCopyTerminalText = viewModel::copyToClipboard,
+                    onCopyTrace = viewModel::copyToClipboard,
                     onPasteTerminal = viewModel::pasteFromClipboard,
                     onSaveSnippet = viewModel::saveSnippet,
                     onDeleteSnippet = viewModel::deleteSnippet,
@@ -1080,6 +1085,7 @@ private fun EclipseWorkspace(
                         if (text.isNotEmpty()) viewModel.copyToClipboard(text)
                     },
                     onCopyTerminalText = viewModel::copyToClipboard,
+                    onCopyTrace = viewModel::copyToClipboard,
                     onPasteTerminal = viewModel::pasteFromClipboard,
                     onSaveSnippet = viewModel::saveSnippet,
                     onDeleteSnippet = viewModel::deleteSnippet,
@@ -1455,6 +1461,8 @@ private fun WorkspaceScaffold(
     onScrollTerminalTo: (String, Int) -> Unit = { _, _ -> },
     onCopySelection: (String, TerminalSelection) -> Unit = { _, _ -> },
     onCopyTerminalText: (String) -> Unit = {},
+    /** Puts one session's own diagnostic trace on the clipboard - see [SessionWhySheet]. */
+    onCopyTrace: (String) -> Unit = {},
     onPasteTerminal: (String) -> Unit = {},
     onSaveSnippet: (String, String) -> Unit = { _, _ -> },
     onDeleteSnippet: (String) -> Unit = {},
@@ -1537,6 +1545,7 @@ private fun WorkspaceScaffold(
             onScrollTo = onScrollTerminalTo,
             onCopySelection = onCopySelection,
             onCopyText = onCopyTerminalText,
+            onCopyTrace = onCopyTrace,
             onPaste = onPasteTerminal,
             onSaveSnippet = onSaveSnippet,
             onDeleteSnippet = onDeleteSnippet,
@@ -1600,17 +1609,32 @@ private fun WorkspaceScaffold(
                     // The same authentication sheet the Hosts list opens, deliberately: a reconnect is
                     // a connection, and it should ask for whatever a connection asks for.
                     onReconnect = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onConnect) },
+                    onCopyTrace = onCopyTrace,
                     onGoToHosts = { onDestination(Destination.HOSTS) },
                 )
+            }
+            return@Scaffold
+        }
+        // Files is measured rather than scrolled, for the same reason the terminal is.
+        //
+        // Two directory listings that scroll themselves cannot live inside a scrolling Column: there they
+        // are measured with an infinite maximum height, so `weight(1f)` and `fillMaxHeight()` collapse to
+        // "as tall as your contents" and a `LazyColumn` throws out of `checkScrollableContainerConstraints`
+        // outright. That is the whole reason the server's files came out squeezed - the pane could not be
+        // told to fill the window, because nothing it sat in had a height to fill, so both listings drew
+        // themselves at full length and the *page* scrolled past the server's to reach the phone's.
+        // Branching here gives Files a bounded window, which is what lets one tab own the whole of it.
+        if (destination == Destination.FILES) {
+            Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).padding(horizontal = 20.dp)) {
+                FilesScreen(state, onSelectHost, onRefreshFiles, onUpload, onDownloadFile, onNavigateRemote, onCreateFolder, onDeleteFile, onDeleteFiles, onRenameFile, onChmodFile, onCopyFile, onCopyFiles, onMoveFile, onMoveFiles, onPickLocalFolder, onNavigateLocal, onNavigateLocalUp, onUploadLocal, onScheduleDownload, onScheduleUpload, onSync, onSendToHost)
             }
             return@Scaffold
         }
         Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
             when (destination) {
                 Destination.HOSTS -> HostsScreen(state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost)
-                // Handled above, outside the scrolling column.
-                Destination.TERMINAL -> Unit
-                Destination.FILES -> FilesScreen(state, onSelectHost, onRefreshFiles, onUpload, onDownloadFile, onNavigateRemote, onCreateFolder, onDeleteFile, onDeleteFiles, onRenameFile, onChmodFile, onCopyFile, onCopyFiles, onMoveFile, onMoveFiles, onPickLocalFolder, onNavigateLocal, onNavigateLocalUp, onUploadLocal, onScheduleDownload, onScheduleUpload, onSync, onSendToHost)
+                // Both handled above, outside the scrolling column, because both are measured.
+                Destination.TERMINAL, Destination.FILES -> Unit
                 Destination.TRANSFERS -> TransfersScreen(state.transfers, onClearCompleted, onPauseTransfer, onResumeTransfer, onCancelTransfer)
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
@@ -1794,6 +1818,7 @@ private fun TerminalScreen(
     onScrollTo: (String, Int) -> Unit,
     onCopySelection: (String, TerminalSelection) -> Unit,
     onCopyText: (String) -> Unit,
+    onCopyTrace: (String) -> Unit,
     onPaste: (String) -> Unit,
     onSaveSnippet: (String, String) -> Unit,
     onDeleteSnippet: (String) -> Unit,
@@ -2013,6 +2038,10 @@ private fun TerminalScreen(
             showCommandBar = showCommandBar,
             showHistory = showHistory,
             terminalText = terminalText,
+            // Filtered to this session before it reaches the strip, so nothing on this screen can show
+            // one host another host's trace. See [sessionDiagnostics].
+            trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[activeTab.hostId]),
+            onCopyTrace = onCopyTrace,
         )
         // The terminal takes every pixel that is left, and it is the only thing in this Column that
         // does. That is what makes it a screen rather than a card: the weight is why a full-screen
@@ -2230,6 +2259,7 @@ private fun TerminalSessionsScreen(
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
     onReconnect: (String) -> Unit,
+    onCopyTrace: (String) -> Unit,
     onGoToHosts: () -> Unit,
 ) {
     if (state.tabs.isEmpty()) {
@@ -2276,8 +2306,13 @@ private fun TerminalSessionsScreen(
                         timeFormat.format(java.util.Date(tab.startedAt))
                     },
                     lastOutput = state.terminalOutput[tab.hostId],
+                    // This session's own lines only - see [sessionDiagnostics]. Computed per row and
+                    // not remembered: the ring changes while a ladder runs, which is exactly when the
+                    // sheet is open and reading it.
+                    trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[tab.hostId]),
                     onOpen = { onOpenSession(tab) },
                     onReconnect = { onReconnect(tab.hostId) },
+                    onCopyTrace = onCopyTrace,
                     onClose = { onCloseTab(tab) },
                 )
             }
@@ -2297,8 +2332,14 @@ private fun TerminalSessionsScreen(
  * Every state says something specific. Before this there were four states and one of them, "Connecting…",
  * covered both dialling and a PAM stack taking fifteen seconds to answer - which is indistinguishable
  * from a hang unless the app says which one it is waiting for.
+ *
+ * Module-visible rather than private because the bug that made this function famous was invisible from
+ * outside: the compact form silently dropped the reason, which reads as a UI detail and was in fact the
+ * app throwing away every diagnosis it had. A pure function that decides what the user is told about a
+ * failure is worth asserting directly rather than through a rendered screen. See
+ * [dev.eclipse.ssh.presentation.retryNotice].
  */
-private fun statusLine(
+internal fun statusLine(
     state: SessionConnectionState,
     startedAt: String?,
     lastError: String?,
@@ -2313,18 +2354,31 @@ private fun statusLine(
 } else {
     when (state) {
         SessionConnectionState.IDLE -> "Not connected"
-        SessionConnectionState.CONNECTING -> "Connecting…"
-        SessionConnectionState.AUTHENTICATING -> "Authenticating…"
+        // A working phase with something already written against it is the connect ladder retrying, and
+        // its own sentence is better than the phase word: [dev.eclipse.ssh.presentation.retryNotice]
+        // says which half of the login failed and which attempt this is, where "Connecting…" says only
+        // that the app is busy. Nothing else puts a message on a working state - a fresh connect clears
+        // it, and a reconnect stays RECONNECTING - so there is no stale text to leak in here.
+        SessionConnectionState.CONNECTING -> lastError ?: "Connecting…"
+        SessionConnectionState.AUTHENTICATING -> lastError ?: "Authenticating…"
         // Not "Connecting…": the login is done by this point, and a user watching a slow server open a
         // pty is entitled to know the difference between a host that will not let them in and one that
         // has.
-        SessionConnectionState.CHANNEL_PTY_INITIALIZING -> "Opening shell…"
+        SessionConnectionState.CHANNEL_PTY_INITIALIZING -> lastError ?: "Opening shell…"
         SessionConnectionState.CONNECTED ->
             if (compact || startedAt == null) "Connected · encrypted" else "Connected · since $startedAt"
-        // The reason travels with the state where there is room for it: "Reconnecting…" on its own
-        // cannot say which attempt this is, or that the app is parked waiting for a network rather than
-        // dialling.
-        SessionConnectionState.RECONNECTING -> lastError?.takeIf { !compact } ?: "Reconnecting…"
+        // The reason travels with the state, in compact rows as much as roomy ones. `takeIf { !compact }`
+        // used to drop it here, and the terminal screen - the only caller that asks for compact, and the
+        // one screen a user is looking at while this happens - was therefore the single place in the app
+        // that showed the bare word. Every other ended state keeps its reason when compact; this one
+        // deleted the app's entire account of what went wrong, and the two-line row below the call site
+        // exists precisely to carry it. What that cost was not cosmetic: the ladder writes "attempt 2 of
+        // 5 · The server disconnected: Timeout, your session not responding" onto the tab and keeps it
+        // there for the whole recovery, and for several releases none of it reached the screen, so a
+        // session that would not stay up could only ever be described as "it keeps reconnecting" - by
+        // the user, and by anyone trying to fix it from that report.
+        SessionConnectionState.RECONNECTING ->
+            lastError?.let { if (compact) "Reconnecting · $it" else it } ?: "Reconnecting…"
         SessionConnectionState.DISCONNECTED -> lastError ?: "Disconnected"
         SessionConnectionState.ERROR -> lastError ?: "Connection failed"
     }
@@ -2361,10 +2415,13 @@ private fun SessionRow(
     host: HostProfile?,
     startedAt: String,
     lastOutput: String?,
+    trace: List<SessionDiagnosticEvent>,
     onOpen: () -> Unit,
     onReconnect: () -> Unit,
+    onCopyTrace: (String) -> Unit,
     onClose: () -> Unit,
 ) {
+    var showWhy by remember { mutableStateOf(false) }
     val preview = remember(lastOutput) {
         lastOutput?.takeLast(SESSION_PREVIEW_SCAN_CHARS)
             ?.lineSequence()?.lastOrNull { it.isNotBlank() }?.trim()?.take(120)
@@ -2453,10 +2510,30 @@ private fun SessionRow(
                     Text("Reconnect", style = MaterialTheme.typography.labelMedium)
                 }
             }
+            // Here as well as inside the shell, and for the same reason Reconnect is: this list is where
+            // a session that dropped while the app was elsewhere gets discovered.
+            if (tab.state.explainable) {
+                TextButton(
+                    onClick = { showWhy = true },
+                    contentPadding = PaddingValues(horizontal = 8.dp),
+                    // Named by session, because there is one of these per row.
+                    modifier = Modifier.semantics { contentDescription = "Why ${tab.title} is ${tab.state.name}" },
+                ) {
+                    Text("Why?", style = MaterialTheme.typography.labelMedium)
+                }
+            }
             IconButton(onClick = onClose) {
                 Icon(Icons.Default.Close, "Close ${tab.title} session", modifier = Modifier.size(18.dp))
             }
         }
+    }
+    if (showWhy) {
+        SessionWhySheet(
+            tab = tab,
+            trace = trace,
+            onCopy = onCopyTrace,
+            onDismiss = { showWhy = false },
+        )
     }
 }
 
@@ -2568,8 +2645,11 @@ private fun TerminalTabStrip(
     showCommandBar: Boolean,
     showHistory: Boolean,
     terminalText: String,
+    trace: List<SessionDiagnosticEvent>,
+    onCopyTrace: (String) -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+    var showWhy by remember { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().padding(start = 2.dp, end = 4.dp, top = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -2649,8 +2729,24 @@ private fun TerminalTabStrip(
     }
     // The session's own state, on one line. A full-screen terminal has no card header to carry it, and
     // it is the only thing that distinguishes a shell waiting for input from a session that dropped.
+    //
+    // Its height is reserved rather than fitted, and that is not a cosmetic choice: this row sits
+    // directly above the terminal, and the terminal takes what is left, so every dp this row gains is a
+    // row of pty the shell loses. Fitted, it grew the moment a session dropped - a second line for the
+    // reason, a Why? button that exists only while there is something to explain - and the consequences
+    // ran all the way to the far end. The grid shrank by two rows mid-outage, the composable dutifully
+    // reported the smaller viewport, [MainViewModel.resizeTerminal] remembered it as the size the user
+    // was working at, and the reconnected pty was opened at a geometry that had existed only while the
+    // banner was up - then resized again the moment it cleared. A reconnected `top` came back drawn for
+    // a window that had already stopped existing, and every recovery cost two spurious window-changes.
+    //
+    // Reserved for its tallest form, the terminal's geometry changes only when the user's viewport
+    // does: a rotation, the keyboard opening, a zoom. A session ending is not one of those.
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+        // Padding first, so the reserved height belongs to the content and the insets are a constant on
+        // top of it. The other order would let a two-line reason add the padding twice.
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)
+            .heightIn(min = TERMINAL_STATUS_ROW_MIN_HEIGHT),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -2671,7 +2767,11 @@ private fun TerminalTabStrip(
             // the pty size, one line ellipsised every one of those to "The server disconnected: T…".
             // The reason a session ended is the only thing on screen that can tell the user whether
             // to look at their network, their account or their server, so it is worth a row that is
-            // one line taller while it has something to say.
+            // one line taller. Taller *always*, not only while there is something to say: `minLines`
+            // is what makes the second line reserved space rather than growth, and reserving it here -
+            // in the text itself - is what makes the guarantee hold at a 200% font scale, where two
+            // lines are taller than any touch target and no outer minimum could stand in for them.
+            minLines = 2,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
@@ -2685,6 +2785,19 @@ private fun TerminalTabStrip(
                 Icon(Icons.Default.Wifi, null, modifier = Modifier.size(15.dp))
                 Spacer(Modifier.width(4.dp))
                 Text("Reconnect", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+        // Offered while a recovery is still running as well as after one has given up, because a ladder
+        // that is halfway through its five attempts is exactly when a user wants to know what it is
+        // answering - and the two-line status above can only ever show the latest sentence. See
+        // [SessionWhySheet].
+        if (activeTab.state.explainable) {
+            TextButton(
+                onClick = { showWhy = true },
+                contentPadding = PaddingValues(horizontal = 8.dp),
+                modifier = Modifier.semantics { contentDescription = "Why this session is ${activeTab.state.name}" },
+            ) {
+                Text("Why?", style = MaterialTheme.typography.labelMedium)
             }
         }
         if (frame.columns > 0) {
@@ -2717,7 +2830,42 @@ private fun TerminalTabStrip(
             )
         }
     }
+    if (showWhy) {
+        SessionWhySheet(
+            tab = activeTab,
+            trace = trace,
+            onCopy = onCopyTrace,
+            onDismiss = { showWhy = false },
+        )
+    }
 }
+
+/**
+ * The floor under the terminal's status row, which is what keeps the grid a constant size.
+ *
+ * 48dp because that is what Material lays an interactive component out at: a `TextButton` draws 40dp
+ * tall and then reports 48dp, since its touch target is expanded regardless of its visual size - the
+ * same rule that made a 26dp close button cover the tab label above. Reconnect and Why? come and go
+ * with the session's state, so without a floor at least as tall as one of them the row is one height
+ * while a shell is healthy and another while it is not, and the terminal below pays the difference.
+ *
+ * A floor rather than a fixed height: [Text]'s own `minLines` already reserves the second line, so at a
+ * large font scale the two lines outgrow this and the row must be allowed to follow them - clipping the
+ * reason to protect the grid would throw away the sentence the row exists for. Both states grow by the
+ * same amount, so the guarantee survives.
+ */
+private val TERMINAL_STATUS_ROW_MIN_HEIGHT = 48.dp
+
+/**
+ * Whether there is anything worth explaining about this state.
+ *
+ * The three states a user asks *why* about: one that gave up, one that finished without being asked to,
+ * and one that is in the middle of a recovery. The working states are not included - a session that is
+ * still dialling has nothing to account for yet - and CONNECTED is not either, since the answer to "why
+ * is it connected" is on the screen behind the sheet.
+ */
+private val SessionConnectionState.explainable: Boolean
+    get() = isEnded || this == SessionConnectionState.RECONNECTING
 
 /**
  * The optional one-line command box.
@@ -2823,8 +2971,17 @@ private fun SaveSnippetDialog(initialCommand: String, label: String, onLabelChan
     )
 }
 
+/**
+ * The file browser: one server's directory and one of the phone's, and a way from either to the other.
+ *
+ * A `ColumnScope` member rather than a plain composable, because the point of this screen is that the
+ * listing fills the window: the header above it is a fixed height, the selection bar below it appears
+ * only when something is selected, and everything left over belongs to the files. `weight(1f)` is how
+ * that is said, and it can only be said by something that knows it is in a Column.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FilesScreen(
+private fun ColumnScope.FilesScreen(
     state: MainUiState,
     onSelectHost: (HostProfile) -> Unit,
     onRefresh: () -> Unit,
@@ -2887,6 +3044,7 @@ private fun FilesScreen(
     LaunchedEffect(path) { selectedRemote = emptySet() }
     LaunchedEffect(state.localDirUri) { selectedLocal = emptySet() }
 
+    val browsedTab = state.tabs.firstOrNull { it.hostId == host.id }
     if (state.tabs.isNotEmpty()) {
         FilesSessionSwitcher(state, host.id, onSelectHost)
         Spacer(Modifier.height(10.dp))
@@ -2902,10 +3060,15 @@ private fun FilesScreen(
     }
     Spacer(Modifier.height(12.dp))
 
-    BoxWithConstraints(Modifier.fillMaxWidth()) {
+    // The one place the two listings are laid out, and the only thing that differs between a phone and
+    // a tablet: whether there is room to show both at once. `weight(1f)` claims everything the header
+    // above and the selection bar below do not use, so whichever listing is on screen is full height.
+    BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
         val isWide = maxWidth >= 700.dp
         if (isWide) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            // Room for both: side by side, each the full height of the window. A tablet has the width to
+            // show a transfer's two ends at the same time, which is worth more than either pane's width.
+            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 RemoteListing(
                     state,
                     path,
@@ -2914,7 +3077,7 @@ private fun FilesScreen(
                     onOpenActions = { actionFile = it },
                     selected = selectedRemote,
                     onToggleSelect = { file -> selectedRemote = if (file.path in selectedRemote) selectedRemote - file.path else selectedRemote + file.path },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
                 )
                 LocalListing(
                     state,
@@ -2924,32 +3087,89 @@ private fun FilesScreen(
                     onUploadLocal,
                     selected = selectedLocal,
                     onToggleSelect = { file -> selectedLocal = if (file.uri in selectedLocal) selectedLocal - file.uri else selectedLocal + file.uri },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
                 )
             }
         } else {
-            Column(Modifier.fillMaxWidth()) {
-                RemoteListing(
-                    state,
-                    path,
-                    onNavigateRemote,
-                    onDownloadFile,
-                    onOpenActions = { actionFile = it },
-                    selected = selectedRemote,
-                    onToggleSelect = { file -> selectedRemote = if (file.path in selectedRemote) selectedRemote - file.path else selectedRemote + file.path },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(16.dp))
-                LocalListing(
-                    state,
-                    onPickLocalFolder,
-                    onNavigateLocal,
-                    onNavigateLocalUp,
-                    onUploadLocal,
-                    selected = selectedLocal,
-                    onToggleSelect = { file -> selectedLocal = if (file.uri in selectedLocal) selectedLocal - file.uri else selectedLocal + file.uri },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+            // A phone shows one listing, filling the screen, chosen by a tab.
+            //
+            // Stacked they shared a screen that was already too short, and the server's directory - the
+            // reason this screen exists - took the top half of it with the phone's files below the fold,
+            // so browsing a server meant scrolling a page rather than a directory. Tabs rather than a
+            // pager: both panes scroll, and a horizontal drag across a file list is how a user *starts*
+            // a scroll on a phone, so a pager would take the gesture and change panes under them.
+            //
+            // `rememberSaveable`, because a rotation is not a decision: the pane the user chose has to
+            // survive one, and survive the activity being recreated behind a file picker.
+            var pane by rememberSaveable { mutableIntStateOf(SERVER_PANE) }
+            Column(Modifier.fillMaxSize()) {
+                PrimaryTabRow(
+                    selectedTabIndex = pane,
+                    // The screen's own background rather than a raised surface: the tabs divide this
+                    // screen, they are not a bar sitting on top of it.
+                    containerColor = MaterialTheme.colorScheme.background,
+                ) {
+                    Tab(
+                        selected = pane == SERVER_PANE,
+                        onClick = { pane = SERVER_PANE },
+                        text = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                // The same dot as the session switcher and the terminal's tab strip, so
+                                // the tab says whether the directory under it belongs to a live session
+                                // or to one that has since dropped.
+                                Box(
+                                    Modifier.size(7.dp).clip(RoundedCornerShape(50)).background(
+                                        statusColor(
+                                            browsedTab?.state ?: SessionConnectionState.IDLE,
+                                            browsedTab?.networkHeld == true,
+                                        ),
+                                    ),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                // Counted only once there is a listing, for the same reason Local is
+                                // counted only once a folder is chosen, and it matters more here: an
+                                // empty `remoteFiles` means "not connected" and "the directory is
+                                // empty" alike, so "Server · 0" would state the one thing this tab
+                                // cannot know. The body under it says which of the two it is.
+                                Text(listingTabLabel("Server", state.remoteFiles.size.takeIf { it > 0 }))
+                            }
+                        },
+                    )
+                    Tab(
+                        selected = pane == LOCAL_PANE,
+                        onClick = { pane = LOCAL_PANE },
+                        // Counted only once a folder has been chosen: "Local · 0" would read as an empty
+                        // folder where the truth is that no folder has been picked yet.
+                        text = { Text(listingTabLabel("Local", state.localFiles.size.takeIf { state.localDirUri != null })) },
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+                // Only the chosen pane is composed. Both would defeat the point - the unseen one would
+                // claim half the height again - and keeping the discarded one alive buys nothing: its
+                // contents come from `state`, and its scroll position is worth less than the full screen.
+                if (pane == SERVER_PANE) {
+                    RemoteListing(
+                        state,
+                        path,
+                        onNavigateRemote,
+                        onDownloadFile,
+                        onOpenActions = { actionFile = it },
+                        selected = selectedRemote,
+                        onToggleSelect = { file -> selectedRemote = if (file.path in selectedRemote) selectedRemote - file.path else selectedRemote + file.path },
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                    )
+                } else {
+                    LocalListing(
+                        state,
+                        onPickLocalFolder,
+                        onNavigateLocal,
+                        onNavigateLocalUp,
+                        onUploadLocal,
+                        selected = selectedLocal,
+                        onToggleSelect = { file -> selectedLocal = if (file.uri in selectedLocal) selectedLocal - file.uri else selectedLocal + file.uri },
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                    )
+                }
             }
         }
     }
@@ -3211,22 +3431,31 @@ private fun RemoteListing(
     modifier: Modifier = Modifier,
 ) {
     Card(modifier, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(vertical = 8.dp)) {
-            FileRow("..", "Parent directory", "—", true) { onNavigateRemote(parentOf(path)) }
+        // Lazy, now that the pane is given a height instead of taking one. Eagerly composing a directory
+        // was only affordable while the page above scrolled and nobody could see how many rows were being
+        // built; a pane that fills the screen has to build the screenful and no more.
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
+            item(key = "..") {
+                FileRow("..", "Parent directory", "—", true) { onNavigateRemote(parentOf(path)) }
+            }
             if (state.remoteFiles.isEmpty()) {
                 // "Empty directory" is only true when there was a session to list one with. Without
                 // one the contents are simply unknown, and calling them empty describes the server
                 // instead of the connection — which on a clean install, where nothing is connected
                 // yet, is the first thing this pane ever says and is wrong.
-                val connected = state.tabs.any { it.hostId == state.selectedHostId && it.state.isLive }
-                Text(
-                    if (connected) "Empty directory" else "Not connected",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(16.dp),
-                )
+                item(key = "state") {
+                    val connected = state.tabs.any { it.hostId == state.selectedHostId && it.state.isLive }
+                    Text(
+                        if (connected) "Empty directory" else "Not connected",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
             } else {
-                // See [MAX_LISTED_ENTRIES] for why this is bounded and why the remainder is named.
-                state.remoteFiles.take(MAX_LISTED_ENTRIES).forEach { file ->
+                // See [MAX_LISTED_ENTRIES] for why this is bounded and why the remainder is named. The
+                // cap protects the SFTP listing and the batch actions, not the composition, so it stays
+                // exactly as it was now that the composition no longer needs protecting.
+                items(state.remoteFiles.take(MAX_LISTED_ENTRIES), key = { it.path }) { file ->
                     FileRow(
                         file.name,
                         if (file.isDirectory) "Directory" else "${file.size} bytes",
@@ -3240,11 +3469,13 @@ private fun RemoteListing(
                         },
                     )
                 }
-                TruncatedListingNotice(
-                    state.remoteFiles.size,
-                    "entries in this directory",
-                    "Open a subfolder to narrow it down, or use Sync to transfer the whole folder.",
-                )
+                item(key = "truncated") {
+                    TruncatedListingNotice(
+                        state.remoteFiles.size,
+                        "entries in this directory",
+                        "Open a subfolder to narrow it down, or use Sync to transfer the whole folder.",
+                    )
+                }
             }
         }
     }
@@ -3269,17 +3500,26 @@ private fun LocalListing(
             IconButton(onClick = onPickFolder) { Icon(Icons.Default.Add, "Choose local folder") }
         }
         Spacer(Modifier.height(12.dp))
-        Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-            Column(Modifier.padding(vertical = 8.dp)) {
-                if (state.localDirUri == null) {
+        // Takes the rest of this pane's height, so the header above stays put while the files scroll -
+        // and so the card ends at the bottom of the screen rather than at the end of the folder.
+        Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+            if (state.localDirUri == null) {
+                // Nothing to scroll and one thing to do: not a list, so not a LazyColumn.
+                Column(Modifier.padding(vertical = 8.dp)) {
                     Text("Choose a local folder to browse and transfer files.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
                     TextButton(onClick = onPickFolder, modifier = Modifier.padding(horizontal = 12.dp)) { Text("Pick local folder") }
-                } else {
-                    FileRow("..", "Parent folder", "—", true) { onNavigateUp() }
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
+                    item(key = "..") {
+                        FileRow("..", "Parent folder", "—", true) { onNavigateUp() }
+                    }
                     if (state.localFiles.isEmpty()) {
-                        Text("Empty folder", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
+                        item(key = "state") {
+                            Text("Empty folder", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
+                        }
                     } else {
-                        state.localFiles.take(MAX_LISTED_ENTRIES).forEach { file ->
+                        items(state.localFiles.take(MAX_LISTED_ENTRIES), key = { it.uri.toString() }) { file ->
                             FileRow(
                                 file.name,
                                 if (file.isDirectory) "Directory" else "${file.size} bytes",
@@ -3290,11 +3530,13 @@ private fun LocalListing(
                                 onToggleSelect = if (file.isDirectory) null else fun() { onToggleSelect(file) },
                             )
                         }
-                        TruncatedListingNotice(
-                            state.localFiles.size,
-                            "files in this folder",
-                            "Open a subfolder, or pick a narrower folder, to reach the rest.",
-                        )
+                        item(key = "truncated") {
+                            TruncatedListingNotice(
+                                state.localFiles.size,
+                                "files in this folder",
+                                "Open a subfolder, or pick a narrower folder, to reach the rest.",
+                            )
+                        }
                     }
                 }
             }
@@ -3316,6 +3558,27 @@ private fun TruncatedListingNotice(total: Int, what: String, advice: String) {
         modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
     )
 }
+
+/**
+ * Which of the file browser's two panes a phone is showing.
+ *
+ * Indices rather than an enum because that is what `PrimaryTabRow` is given, and named rather than
+ * written as 0 and 1 because `pane == 1` at the call site says nothing about which listing that is.
+ */
+private const val SERVER_PANE = 0
+private const val LOCAL_PANE = 1
+
+/**
+ * A tab's label: what the pane is, and how much is in it.
+ *
+ * The count is the whole directory, not the drawn part of it, so a folder that is showing the first 500
+ * of 4,000 entries still says 4,000 - the number the user needs is how much is there, and the notice at
+ * the end of the list is what explains the difference. [count] is null when there is nothing to count
+ * yet, which is not the same as a count of zero: "Local · 0" describes an empty folder, where the truth
+ * before one is chosen is that there is no folder.
+ */
+private fun listingTabLabel(what: String, count: Int?): String =
+    if (count == null) what else "$what · $count"
 
 private fun parentOf(path: String): String = path.trimEnd('/').substringBeforeLast('/', "").ifBlank { "/" }
 
@@ -3927,6 +4190,109 @@ private fun SettingsScreen(
             onForget = onForgetKnownHost,
             onClearAll = { onClearKnownHosts(); showKnownHosts = false },
         )
+    }
+}
+
+/**
+ * Why *this* session is in the state it is in: its own reason, and its own slice of the trace.
+ *
+ * The app has recorded all of this since the diagnostics work landed, and every word of it was two
+ * screens and four taps away - Settings, Background processing, Connection diagnostics, View - in a
+ * five-hundred-line ring shared by every host, at the moment when the user is looking at a tab that
+ * will not stay connected. So the single most-reported problem with this app arrived as "it keeps
+ * reconnecting", not because the app did not know why, but because nothing put the answer where the
+ * question is asked.
+ *
+ * [trace] is already filtered to this session and ordered newest first by [sessionDiagnostics], and
+ * every line is already scrubbed and carries an opaque `s1`/`s2` label rather than a host name - so
+ * what Copy puts on the clipboard is safe to paste into a bug report as it stands. The reason line goes
+ * through [scrub] as well: it is passed through from the transport library, which is the one string
+ * here this app did not compose itself.
+ */
+@Composable
+private fun SessionWhySheet(
+    tab: SessionTab,
+    trace: List<SessionDiagnosticEvent>,
+    onCopy: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val clock = remember {
+        DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
+    }
+    val reason = remember(tab.lastError) { tab.lastError?.let(::scrub) }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                when {
+                    tab.state == SessionConnectionState.RECONNECTING -> "Why it is reconnecting"
+                    tab.state.isBusy -> "What it is waiting for"
+                    else -> "Why it ended"
+                },
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Text(
+                reason ?: "No reason was recorded for this session.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = statusColor(tab.state, tab.networkHeld),
+            )
+            if (trace.isEmpty()) {
+                Text(
+                    "Nothing has been recorded for this session yet.",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                Text(
+                    "This session's last ${trace.size} event(s), newest first. No password, key or host " +
+                        "name is recorded, so this is safe to attach to a bug report.",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                LazyColumn(
+                    Modifier.heightIn(max = 320.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(trace, key = { it.sequence }) { entry ->
+                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text(
+                                    clock.format(Instant.ofEpochMilli(entry.atMs)),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    // The epoch millis at the front of `line()` is for the exported
+                                    // file; the clock above says the same thing to a reader.
+                                    entry.line().substringAfter(' '),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(
+                    onClick = {
+                        // Oldest first in the copy, the opposite of the display: on screen the answer
+                        // wanted is the last thing that happened, and in a pasted report the reader
+                        // needs to follow the session forwards.
+                        onCopy(
+                            buildString {
+                                append(tab.state.name)
+                                reason?.let { append(" · ").append(it) }
+                                trace.asReversed().forEach { append('\n').append(it.line()) }
+                            },
+                        )
+                    },
+                ) { Text("Copy") }
+                TextButton(onClick = onDismiss) { Text("Close") }
+            }
+        }
     }
 }
 

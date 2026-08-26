@@ -443,4 +443,68 @@ class SessionDiagnosticsTest {
         assertThat(bare).doesNotContain("chan=")
         assertThat(bare).doesNotContain("idle=")
     }
+
+    @Test
+    fun `a caller holding a host id can find that host's lines`() {
+        // The one thing the labels made impossible, and it was needed the moment a session had to explain
+        // itself on its own tab: the ring records the label, so without this mapping the entries for one
+        // host cannot be picked out of it at all.
+        val diagnostics = diagnostics()
+        val other = "0f9e8d7c-6b5a-4938-8271-6f5e4d3c2b1a"
+        diagnostics.record(hostId, SessionEvent.CONNECT_REQUESTED)
+        diagnostics.record(other, SessionEvent.CONNECT_REQUESTED)
+
+        val labels = diagnostics.sessionLabels
+        assertThat(labels.keys).containsExactly(hostId, other)
+        // Distinct, or a sheet would show one host another host's ending as its own cause.
+        assertThat(labels.values.toSet()).hasSize(2)
+        // And the label really is the one the lines are filed under.
+        val ownLines = diagnostics.events.value.filter { it.session == labels.getValue(hostId) }
+        assertThat(ownLines).hasSize(1)
+    }
+
+    @Test
+    fun `the labels a caller reads say nothing about the host`() {
+        // Same promise as the trace itself, checked at the new boundary: the mapping crosses it, the ids
+        // do not travel any further, and the values stay the opaque ordinals they were designed to be.
+        val diagnostics = diagnostics()
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+
+        val label = diagnostics.sessionLabels.getValue(hostId)
+        assertThat(label).doesNotContain(hostId)
+        assertThat(label).matches("s\\d+")
+    }
+
+    @Test
+    fun `a host keeps one label for the life of the process`() {
+        // A sheet reading the mapping during composition and the ring recording from a MINA I/O thread
+        // must agree about which label is this host's, however many transports it has been given - and
+        // clearing the log does not renumber, for the same reason the connection counter does not.
+        val diagnostics = diagnostics()
+        diagnostics.record(hostId, SessionEvent.CONNECT_REQUESTED)
+        val first = diagnostics.sessionLabels.getValue(hostId)
+
+        diagnostics.record(hostId, SessionEvent.HANDSHAKE)
+        diagnostics.record(hostId, SessionEvent.ENDED)
+        diagnostics.clear()
+        diagnostics.record(hostId, SessionEvent.RECONNECT_ATTEMPT)
+
+        assertThat(diagnostics.sessionLabels.getValue(hostId)).isEqualTo(first)
+        assertThat(diagnostics.events.value.single().session).isEqualTo(first)
+    }
+
+    @Test
+    fun `the mapping a caller holds cannot be changed underneath it`() {
+        // A snapshot, not the live map: the caller is a UI reading this during composition while MINA's
+        // I/O threads add hosts to it, and handing out the backing map would be a concurrent modification
+        // in the middle of a frame.
+        val diagnostics = diagnostics()
+        diagnostics.record(hostId, SessionEvent.CONNECT_REQUESTED)
+        val snapshot = diagnostics.sessionLabels
+
+        diagnostics.record("2c3d4e5f-6a7b-8c9d-0e1f-2a3b4c5d6e7f", SessionEvent.CONNECT_REQUESTED)
+
+        assertThat(snapshot).hasSize(1)
+        assertThat(diagnostics.sessionLabels).hasSize(2)
+    }
 }

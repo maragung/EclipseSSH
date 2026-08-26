@@ -136,6 +136,93 @@ class AutoReconnectDecisionTest {
     )
 
     @Test
+    fun `a connection closed before it said anything is not an outage to wait out`() {
+        // The loop the user kept reporting, in its remaining form. A server that accepts the transport
+        // and then closes it - MaxStartups, DenyUsers, a wrapper that hangs up, a firewall that resets
+        // the moment a shell is asked for - produces an ending the ladder cannot tell from a drop, so
+        // the app redialled it, got the same refusal, and spent the whole ladder announcing
+        // "Reconnecting" over a session that had never once carried a byte.
+        assertThat(
+            endedBeforeItRan(
+                SessionEnd.TransportClosed,
+                upForMs = 400,
+                idleForMs = null,
+            ),
+        ).isTrue()
+        assertThat(
+            endedBeforeItRan(
+                SessionEnd.Disconnected(reason = SshConstants.SSH2_DISCONNECT_BY_APPLICATION, message = "bye", byPeer = true),
+                upForMs = 900,
+                idleForMs = null,
+            ),
+        ).isTrue()
+    }
+
+    @Test
+    fun `output arriving even once makes an ending a real drop`() {
+        // The veto, and the reason this needs no tolerance on the clock: `idleForMs` is null until the
+        // far end has sent something, so a non-null value - any value, including zero - is proof the
+        // session ran. A shell that printed its prompt and then lost its socket in the same second is
+        // exactly what auto-reconnect is for, and must not be caught by the rule above.
+        assertThat(endedBeforeItRan(SessionEnd.TransportClosed, upForMs = 400, idleForMs = 0)).isFalse()
+        assertThat(endedBeforeItRan(SessionEnd.TransportClosed, upForMs = 400, idleForMs = 120)).isFalse()
+    }
+
+    @Test
+    fun `a session that stayed up long enough is a real drop however it ended`() {
+        // Past the floor there is nothing to distinguish this from an outage, and guessing would cost a
+        // user their reconnect. A silent session is ordinary: an ssh window left open at a prompt sends
+        // nothing and receives nothing for hours.
+        endings().forEach { end ->
+            assertThat(endedBeforeItRan(end, upForMs = NEVER_RAN_MS, idleForMs = null)).isFalse()
+            assertThat(endedBeforeItRan(end, upForMs = 3_600_000, idleForMs = null)).isFalse()
+        }
+    }
+
+    @Test
+    fun `an ending with no uptime recorded is left to the ladder`() {
+        // A connect that failed before a session existed reports no uptime, and it has its own path -
+        // `connect()`'s attempt loop - which must keep it. Absent evidence is not evidence.
+        endings().forEach { end ->
+            assertThat(endedBeforeItRan(end, upForMs = null, idleForMs = null)).isFalse()
+        }
+    }
+
+    @Test
+    fun `only an ending that could be a refusal is treated as one`() {
+        // Narrow on purpose. A transport that *failed* names a fault - a reset, a timeout, a parse
+        // error - and a network that went away names an outage; both are worth retrying however fast
+        // they arrived, and a phone that connects as it loses Wi-Fi produces the second inside a
+        // second. A shell that ended reported an exit, which is already handled. So the rule covers
+        // only the two endings that carry no fault at all: a bare close, and a server saying goodbye.
+        assertThat(endedBeforeItRan(SessionEnd.TransportFailed(IOException("Connection reset")), 200, null)).isFalse()
+        assertThat(endedBeforeItRan(SessionEnd.NetworkLost, 200, null)).isFalse()
+        assertThat(endedBeforeItRan(SessionEnd.Released, 200, null)).isFalse()
+        assertThat(endedBeforeItRan(SessionEnd.ShellEnded(status = null, signal = null), 200, null)).isFalse()
+        assertThat(endedBeforeItRan(SessionEnd.ShellEnded(status = 0, signal = null), 200, null)).isFalse()
+    }
+
+    @Test
+    fun `a refusal and a reconnectable drop are not the same answer`() {
+        // The two predicates run on the same ending, and the whole point is that they disagree about
+        // this one: `shouldAutoReconnect` says yes to a bare close - correctly, it cannot see the
+        // uptime - and this says the ladder is pointless here. If they ever agreed, the fix would be
+        // doing nothing.
+        val refused = SessionEnd.TransportClosed
+        assertThat(shouldAutoReconnect(refused, tabIsOpen = true, endedDeliberately = false)).isTrue()
+        assertThat(endedBeforeItRan(refused, upForMs = 250, idleForMs = null)).isTrue()
+    }
+
+    @Test
+    fun `the floor is short enough to mean immediately`() {
+        // It has to be too short for a person to have used the session and long enough to cover a
+        // handshake, an authentication and a channel open on a slow link. Seconds, not tens of seconds:
+        // a genuine drop three seconds into a working session must still get its ladder.
+        assertThat(NEVER_RAN_MS).isAtLeast(1_000)
+        assertThat(NEVER_RAN_MS).isAtMost(5_000)
+    }
+
+    @Test
     fun `the ladder grows and stays inside the ceiling for every allowed attempt`() {
         val base = SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS
         val windows = (1..MAX_AUTO_RECONNECT_ATTEMPTS).map { backoffWindowMs(base, it) }
