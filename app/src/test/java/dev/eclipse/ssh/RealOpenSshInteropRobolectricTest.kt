@@ -1190,7 +1190,27 @@ class RealOpenSshInteropRobolectricTest {
         append("tabs=").append(viewModel.uiState.value.tabs)
         append(" status=").append(viewModel.statusMessage.value)
         append(" challenge=").append(viewModel.uiState.value.hostKeyChallenge)
+        append("\ntrace:\n").append(trace(hostId))
         append("\nframe:\n").append(drawn(hostId))
+    }
+
+    /**
+     * This host's own lines from the app's diagnostic ring.
+     *
+     * The trace is the only witness to what a failed attempt actually was - which of the endings, whose
+     * dial, how many attempts in - and a harness that reports a state sequence without it leaves the
+     * reader guessing at exactly the point the app has already written the answer down. Filtered to one
+     * host by its session label, because these tests run several sessions at once and a sandbox port
+     * appears in nobody's line: [SessionDiagnostics] records an opaque ordinal per host on purpose.
+     */
+    private fun trace(hostId: String): String {
+        val viewModel = viewModel()
+        val label = viewModel.uiState.value.diagnosticsLabels[hostId] ?: return "(no session label yet)"
+        return viewModel.exportDiagnostics()
+            .lineSequence()
+            .filter { line -> " $label." in line }
+            .joinToString("\n")
+            .ifEmpty { "(nothing recorded for $label)" }
     }
 
     /**
@@ -1537,14 +1557,17 @@ class RealOpenSshInteropRobolectricTest {
      */
     private fun assertNothingLookedLikeADrop(hostId: String) {
         val seen = statesSeen[hostId].orEmpty()
-        assertThat(seen).isNotEmpty()
-        assertThat(seen).containsNoneOf(
+        // Every one of these carries the trace, because the sequence alone says a step was taken
+        // backwards and nothing about which attempt took it. That cost a CI round trip once.
+        val why = { "states=$seen " + diagnose(hostId) }
+        assertWithMessage(why()).that(seen).isNotEmpty()
+        assertWithMessage(why()).that(seen).containsNoneOf(
             SessionConnectionState.RECONNECTING,
             SessionConnectionState.DISCONNECTED,
             SessionConnectionState.ERROR,
         )
-        assertThat(seen.map { it.ordinal }).isInStrictOrder()
-        assertThat(seen.last()).isEqualTo(SessionConnectionState.CONNECTED)
+        assertWithMessage(why()).that(seen.map { it.ordinal }).isInStrictOrder()
+        assertWithMessage(why()).that(seen.last()).isEqualTo(SessionConnectionState.CONNECTED)
     }
 
     private companion object {

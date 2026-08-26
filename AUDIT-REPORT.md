@@ -3838,3 +3838,62 @@ five-rung sprint. Teaching it to veto a host on an app fault would mean carrying
 registry into a different process component to guard against a defect that no longer exists. The hole is
 closed at the four owners; adding speculative plumbing behind it would be a change with no test that could
 fail.
+
+### 35.7 The one write in `connect` that never asked whose dial it was
+
+Moving the transport work off the UI thread turned a latent reporting race into a reproducible one, and CI
+caught it on the very commit that fixed the socket bug: run 32949856660 failed one test out of 988,
+`RealOpenSshInteropRobolectricTest.aSavedLocalForwardComesUpWithTheSessionAndCarriesTheServersOwnTraffic`,
+with the state sequence `[2, 1, 2, 3, 4]` — AUTHENTICATING, then **CONNECTING**, then AUTHENTICATING,
+CHANNEL_PTY_INITIALIZING, CONNECTED. A step backwards through the state machine, which is the shape of the
+bug this whole report is about, on a session that connected perfectly well.
+
+The mechanism is in `SshConnectionManager.awaitHandshake`, and it is deliberate there:
+
+> `ClientSessionEvent.CLOSED` is waited for but deliberately not thrown on. A handshake that fails for a real
+> reason — no key exchange in common, no cipher in common, a host key the verifier refused — closes the
+> session carrying that reason, and the `auth()` call that follows reports it verbatim.
+
+So a dial whose host key the user has *not* yet trusted does not fail at the key exchange. It returns from
+the handshake, reports `AUTHENTICATE` — writing AUTHENTICATING onto the tab — and only then has
+`session.auth()` hand back `Server key did not validate`, which `connectFailure` recognises as final. That is
+the right design: the server's own words beat an invented message. But it means the rejected dial reports a
+phase *after* the point where the user answers the host-key question.
+
+The first connection to an unknown host therefore has two dials alive for a few milliseconds. Dial 1 raises
+the challenge and is waiting to be told it failed; the user taps Trust; `acceptHostKey` starts dial 2, whose
+prologue writes CONNECTING. On this host that ordering is stable and the test passed every time. On a loaded
+CI runner it is not: dial 1's `AUTHENTICATE` callback landed *after* dial 2's prologue, so the tab the user
+was waiting on went AUTHENTICATING (dial 1, already dead) → CONNECTING (dial 2, real) → AUTHENTICATING
+(dial 2) — a session flickering backwards through a phase it had never reached, narrated by a dial that no
+longer spoke for the host.
+
+Every other write in `connect` already refuses this. The dial generation exists precisely for it: the retry
+countdown checks it, the final failure checks it and marks its diagnostic `(superseded)`. The phase callback
+was the one write that did not — it had only `isPastAuthentication`, which asks *when* a report arrived
+within one dial and cannot answer *whose* it is. Here the tab was at CONNECTING, not past authentication, so
+that guard had nothing to say.
+
+The gate is now one named rule, `phaseReportIsWritable(phase, isCurrentDial)`, extracted for the same reason
+`retryPhase` and `retryNotice` were: a decision inside a coroutine inside a view model is otherwise only
+testable by standing up a server. `onConnectPhase` and `markOpeningShell` both take it, with `dial` threaded
+through `adoptStoredSession` so the adopted-session path is gated too. Four tests in
+`ConnectPhaseReportingTest` pin it: a replaced dial writes nothing for **any** of the eight states; a current
+dial reports every phase it has not already passed; a session with a pty is never told it is still logging
+in; and an ended tab can still be dialled again.
+
+The superseded phase is still recorded in the trace, marked `detail="superseded"`, matching what the final
+failure already does. A diagnostic that hid the attempts actually being made would be the harder bug to
+read — and the trace is the only witness to which dial did what, which is the second thing this failure
+exposed: `assertNothingLookedLikeADrop` reported a list of ordinals and nothing else, so the first CI failure
+could say a step had been taken backwards and not which attempt took it. It now prints the app's own
+diagnostic ring for that host, filtered by session label, on all four of its assertions.
+
+**One more field, found by sweeping for what else the dispatcher move exposed.** `pendingConnection` holds
+the credentials a host-key question is waiting on. It is set and read on the main thread — `connect`'s
+prologue, `acceptHostKey`, `rejectHostKey` — but cleared in `attachTerminal`, which now runs on
+`transportScope`. It is `@Volatile` now. Without it the main thread may keep seeing the object after the
+session is up, which is a stale redial in the unlikely case and, in every case, a password and a decrypted
+passphrase left reachable for the life of the view model when the entire point of the clear is that they are
+needed only until the session exists. The sweep found nothing else: `pendingConnection` is the view model's
+only mutable field, and its only two non-concurrent collections are locals in sequential loops.

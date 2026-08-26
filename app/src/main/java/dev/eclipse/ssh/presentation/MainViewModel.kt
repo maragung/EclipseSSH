@@ -367,7 +367,21 @@ class MainViewModel @Inject constructor(
      * immediately. Same channel shape as the foreground service uses; see [awaitReconnectWindow].
      */
     private val reconnectWake = Channel<Unit>(Channel.CONFLATED)
-    private var pendingConnection: PendingConnection? = null
+
+    /**
+     * The credentials a host-key question is holding, or null once nothing is waiting on one.
+     *
+     * `@Volatile` because the clear and the reads sit on different threads. It is set and read on the
+     * main thread - [connect]'s prologue, [acceptHostKey], [rejectHostKey] - but cleared in
+     * [attachTerminal], which since the transport work moved off the UI thread runs on
+     * [transportScope]. Without it the main thread may go on seeing the object after the session it
+     * belongs to is up, which is two problems: a host-key question answered later would redial from a
+     * stale record, and - the reason this is not merely tidiness - a password and a decrypted
+     * passphrase would stay reachable for the life of the view model when the whole point of the clear
+     * is that they are needed only until the session exists. A reference write is already atomic, so
+     * visibility is the only thing missing and `@Volatile` is the whole fix.
+     */
+    @Volatile private var pendingConnection: PendingConnection? = null
 
     private val _statusMessage = MutableStateFlow<String?>(null)
 
@@ -649,9 +663,9 @@ class MainViewModel @Inject constructor(
                         // waited for it is one to use, not one to duplicate - and asked on every attempt,
                         // because a restore pass can install one between two of them. See
                         // [adoptStoredSession] for the two shapes that count.
-                        if (adoptStoredSession(host, resolved, resuming)) return@dialing
+                        if (adoptStoredSession(host, dial, resolved, resuming)) return@dialing
                         val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair) { phase ->
-                            onConnectPhase(host.id, phase, resuming, attempt)
+                            onConnectPhase(host.id, dial, phase, resuming, attempt)
                         }
                         // The tab may have been closed (or the host deleted) while the handshake
                         // was in flight. Honour that instead of resurrecting the tab — and tear
@@ -665,7 +679,7 @@ class MainViewModel @Inject constructor(
                         // Authenticated. Everything from here is the channel and the pty, and it is worth
                         // saying so: a server that accepts the password and then cannot give out a pty
                         // used to spend that whole time claiming to be connecting.
-                        markOpeningShell(host.id, resuming)
+                        markOpeningShell(host.id, dial, resuming)
                         val terminal =
                             sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
                         // Never replaces a live session with this one: if another dialler installed one
@@ -681,7 +695,7 @@ class MainViewModel @Inject constructor(
                             // The incumbent may have no shell on it - a restore pass installs
                             // transport-only sessions - so adopting has to be able to open one. Going
                             // round the loop instead would only lose the same race again, forever.
-                            if (adoptStoredSession(host, resolved, resuming)) return@dialing
+                            if (adoptStoredSession(host, dial, resolved, resuming)) return@dialing
                             continue
                         }
                         attachTerminal(host, terminal, resolved)
@@ -781,6 +795,7 @@ class MainViewModel @Inject constructor(
      */
     private suspend fun adoptStoredSession(
         host: HostProfile,
+        dial: Long,
         resolved: ResolvedCredentials,
         resuming: Boolean,
     ): Boolean {
@@ -794,7 +809,7 @@ class MainViewModel @Inject constructor(
         // session it was asked of rather than looking like a fresh handshake that stalled.
         diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
         val size = ptySizes[host.id]
-        markOpeningShell(host.id, resuming)
+        markOpeningShell(host.id, dial, resuming)
         val terminal = try {
             sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
         } catch (cancelled: CancellationException) {
@@ -3167,6 +3182,27 @@ class MainViewModel @Inject constructor(
     }
 
     /**
+     * Says that the login is done and the shell is being opened.
+     *
+     * Silent during a reconnect, for the same reason [onConnectPhase] is: a tab that is counting
+     * attempts should keep counting them rather than narrate the phases of each one. Silent, too, on a
+     * tab that is already live, which is what an adopted session's tab already is - there is no shell to
+     * wait for when the shell is the one already on screen. And silent on behalf of a [dial] that has
+     * been replaced, for the reason [onConnectPhase] gives.
+     */
+    private fun markOpeningShell(hostId: String, dial: Long, resuming: Boolean) {
+        if (resuming) return
+        val current = isCurrentDial(hostId, dial)
+        updateTab(hostId) { tab ->
+            if (tab != null && phaseReportIsWritable(tab.state, current)) {
+                tab.copy(state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
+            } else {
+                tab
+            }
+        }
+    }
+
+    /**
      * Moves a tab through the two phases of one dial.
      *
      * The point of separating them is that they fail for entirely different reasons and take entirely
@@ -3182,34 +3218,25 @@ class MainViewModel @Inject constructor(
      * authentication that finishes instantly can have its AUTHENTICATING land behind the
      * CHANNEL_PTY_INITIALIZING or CONNECTED that followed it, and a session with a pty must not be told
      * it is still logging in. See [isPastAuthentication].
-     */
-    /**
-     * Says that the login is done and the shell is being opened.
      *
-     * Silent during a reconnect, for the same reason [onConnectPhase] is: a tab that is counting
-     * attempts should keep counting them rather than narrate the phases of each one. Silent, too, on a
-     * tab that is already live, which is what an adopted session's tab already is - there is no shell to
-     * wait for when the shell is the one already on screen.
+     * Nor does it let a superseded [dial] narrate. Every other write in `connect` already takes this
+     * gate - the retry countdown and the final failure both check it - and the phase callback was the
+     * one that did not, so an attempt the user had already replaced could still walk the tab they *are*
+     * waiting on backwards from AUTHENTICATING to CONNECTING as its own handshake came up. The
+     * [isPastAuthentication] guard cannot catch that: it is there to order two reports of one dial, and
+     * this is a report belonging to a dial that no longer speaks for the host. Recorded in the trace
+     * either way, marked as superseded - a diagnostic that hid the attempts actually being made would
+     * be the harder bug to read. See [dialGenerations].
      */
-    private fun markOpeningShell(hostId: String, resuming: Boolean) {
-        if (resuming) return
-        updateTab(hostId) { tab ->
-            if (tab == null || tab.state.isPastAuthentication) {
-                tab
-            } else {
-                tab.copy(state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
-            }
-        }
-    }
-
-    private fun onConnectPhase(hostId: String, phase: SshConnectPhase, resuming: Boolean, attempt: Int) {
+    private fun onConnectPhase(hostId: String, dial: Long, phase: SshConnectPhase, resuming: Boolean, attempt: Int) {
         val state = when {
             resuming -> SessionConnectionState.RECONNECTING
             phase == SshConnectPhase.HANDSHAKE -> SessionConnectionState.CONNECTING
             else -> SessionConnectionState.AUTHENTICATING
         }
+        val current = isCurrentDial(hostId, dial)
         updateTab(hostId) { tab ->
-            if (tab == null || tab.state.isPastAuthentication) tab else tab.copy(state = state)
+            if (tab != null && phaseReportIsWritable(tab.state, current)) tab.copy(state = state) else tab
         }
         diagnostics.record(
             hostId,
@@ -3218,6 +3245,7 @@ class MainViewModel @Inject constructor(
                 SshConnectPhase.AUTHENTICATE -> SessionEvent.AUTHENTICATE
             },
             state = state,
+            detail = if (current) null else "superseded",
             network = networkMonitor.describe(),
             attempt = attempt + 1,
         )
@@ -3503,6 +3531,25 @@ internal fun retryNotice(phase: SessionConnectionState, nextAttempt: Int, maxAtt
     }
     return "$what · attempt $nextAttempt of $maxAttempts"
 }
+
+/**
+ * Whether a phase report may be written onto a tab that is currently showing [phase].
+ *
+ * Two independent reasons to refuse, and they answer different questions. [isCurrentDial] asks *whose*
+ * report this is: `connect` gates its retry countdown and its final failure on the dial generation
+ * already, and until this existed the phase callback was the one write that did not, so an attempt the
+ * user had replaced - a double tap, a host key answered while the rejected attempt was still unwinding -
+ * could walk the tab they were actually waiting on backwards from AUTHENTICATING to CONNECTING as its
+ * own handshake came up. [SessionConnectionState.isPastAuthentication] asks *when*: within one dial the
+ * callback crosses threads, so an instant authentication can have its AUTHENTICATING land behind the
+ * shell phase that followed it, and a session with a pty must never be told it is still logging in.
+ *
+ * Extracted rather than left as a two-clause `if` for the same reason [retryPhase] and [retryNotice]
+ * were: the interesting part of this app's connect reporting is a handful of decisions, and a decision
+ * inside a coroutine inside a view model can only be tested by standing up a server.
+ */
+internal fun phaseReportIsWritable(phase: SessionConnectionState, isCurrentDial: Boolean): Boolean =
+    isCurrentDial && !phase.isPastAuthentication
 
 /**
  * The state a tab should wait in between two attempts of the *same* connection.

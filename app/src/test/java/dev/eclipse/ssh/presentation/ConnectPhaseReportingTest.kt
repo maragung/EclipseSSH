@@ -12,9 +12,13 @@ import org.junit.Test
 /**
  * What the app says about a session between "the password was accepted" and "here is your shell".
  *
- * That gap had no name, and the two consequences of it not having one are the two things this pins: a
- * failure in it borrowed the reconnect ladder's words, and a phase callback arriving late could walk the
- * state machine backwards over it.
+ * That gap had no name, and the two consequences of it not having one are the first two things this
+ * pins: a failure in it borrowed the reconnect ladder's words, and a phase callback arriving late could
+ * walk the state machine backwards over it.
+ *
+ * The third is *whose* phase is being reported. Two dials to one host can be alive at once - a host key
+ * answered while the attempt it rejected is still unwinding, a second tap on Connect - and the one the
+ * user has replaced must not narrate onto the tab they are waiting on.
  */
 class ConnectPhaseReportingTest {
 
@@ -123,6 +127,46 @@ class ConnectPhaseReportingTest {
         assertThat(SessionConnectionState.RECONNECTING.isPastAuthentication).isFalse()
         assertThat(SessionConnectionState.DISCONNECTED.isPastAuthentication).isFalse()
         assertThat(SessionConnectionState.ERROR.isPastAuthentication).isFalse()
+    }
+
+    @Test
+    fun `a phase report from a replaced dial is not written at all`() {
+        // The second half of the reconnect-loop report, and the one the state machine's own ordering
+        // guard cannot catch. A host key answered while the rejected attempt is still unwinding, or a
+        // second tap on Connect, leaves two dials alive; only one of them speaks for the host, and the
+        // other one's handshake would otherwise walk the tab the user *is* waiting on back from
+        // "Authenticating…" to "Connecting…".
+        SessionConnectionState.entries.forEach { phase ->
+            assertThat(phaseReportIsWritable(phase, isCurrentDial = false)).isFalse()
+        }
+    }
+
+    @Test
+    fun `the current dial reports every phase it has not already passed`() {
+        // And the other direction, or the phases stop being reported at all - which is the state the
+        // app was in before they were separated, with one "Connecting…" covering a PAM stack, a
+        // two-factor push and an unreachable address alike.
+        assertThat(phaseReportIsWritable(SessionConnectionState.IDLE, isCurrentDial = true)).isTrue()
+        assertThat(phaseReportIsWritable(SessionConnectionState.CONNECTING, isCurrentDial = true)).isTrue()
+        assertThat(phaseReportIsWritable(SessionConnectionState.AUTHENTICATING, isCurrentDial = true)).isTrue()
+    }
+
+    @Test
+    fun `a session with a pty is never told it is still logging in`() {
+        // The within-one-dial half: the callback crosses threads, so an authentication that finishes in
+        // milliseconds can have its AUTHENTICATING delivered behind the shell phase it led to.
+        assertThat(phaseReportIsWritable(SessionConnectionState.CHANNEL_PTY_INITIALIZING, isCurrentDial = true))
+            .isFalse()
+        assertThat(phaseReportIsWritable(SessionConnectionState.CONNECTED, isCurrentDial = true)).isFalse()
+    }
+
+    @Test
+    fun `an ended tab can be dialled again`() {
+        // A tab that failed, dropped or was disconnected is the ordinary starting point for the next
+        // connect, so refusing to report onto it would leave Connect looking like it did nothing.
+        assertThat(phaseReportIsWritable(SessionConnectionState.ERROR, isCurrentDial = true)).isTrue()
+        assertThat(phaseReportIsWritable(SessionConnectionState.DISCONNECTED, isCurrentDial = true)).isTrue()
+        assertThat(phaseReportIsWritable(SessionConnectionState.RECONNECTING, isCurrentDial = true)).isTrue()
     }
 
     @Test
