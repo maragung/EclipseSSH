@@ -3936,3 +3936,100 @@ view-model flow and then asserted on another. The two remaining `statusMessage` 
 object directly. The rule the sweep leaves behind is short enough to keep: **wait on the flow you are about to
 assert on.** Two flows off one coroutine are only ordered if they publish by the same route, and since the
 transport work moved, most of them do not.
+
+## 36. Releasing 1.1.4
+
+Same process as §20, §22, §25, §27, §30, §32 and §34: GitHub Actions assembles from the commit on `main`,
+this host does nothing but re-sign. Workflow run `32976013395` built commit `9b82ce1` — §35's
+`NetworkOnMainThreadException` fix, plus the two repairs below that its own CI runs turned up.
+
+| | |
+| --- | --- |
+| `lintRelease` | **0 errors, 51 warnings** — 44 `GradleDependency`, 4 `ConfigurationScreenWidthHeight`, 2 `AndroidGradlePluginVersion`, 1 `OldTargetApi`: the same 51 as 1.1.0 through 1.1.3, so a fifth round of work has added none |
+| Unit and integration tests | **993 per variant across 74 classes, 0 failures, 0 errors**, on debug *and* release — 15 more tests than 1.1.3 |
+| Skipped | **7, and exactly the 7 intended** — the long idle matrix behind `ECLIPSE_STRESS=1`. So 986 ran |
+| Interop | **10 of those talk to a real OpenSSH**, on the runner as well as here |
+| Instrumentation sources | compiled |
+| APKs | **five**, the five-output count asserted in CI |
+
+CI and this host agree exactly — `classes=74 tests=993 failures=0 errors=0 skipped=7` on both variants in
+both places. **Local `--offline` lint reported 4 warnings and CI reported 51, both right**, for §32's
+unchanged reason: the 46 `GradleDependency`/`AndroidGradlePluginVersion` advisories ask whether newer
+versions exist, which needs the network. CI is the number to quote.
+
+### 36.1 Two failures on the way here, and neither was in the release commit
+
+Worth recording because both were found *by* CI on code that passed locally, and only one was a product bug.
+
+**A tab closed as the screen goes away stayed on the registry.** `closeTab` took the host off
+`SessionRegistry` with `viewModelScope.launch`. That write is a DataStore round trip, so it always outlives
+the frame that asked for it, while every other line of `closeTab` — cancelling the connect and reconnect
+jobs, dropping the buffers, stopping the forwards — has already run synchronously by then. So it was the one
+piece of the teardown that could be dropped, and dropped in the case that matters: close the last tab and
+leave, and the scope is cancelled mid-write. Two consequences, both surviving the process. The host stays
+listed active, so `EclipseSessionService`'s restore pass dials it again on its next start or the next time
+the network returns — **a session the user explicitly closed comes back, reconnecting**, which is the shape
+of the complaint this app has spent five releases chasing. And `unregister` is also what forgets that host's
+stored credential, so the password of a finished session stayed at rest instead of being dropped. Fixed by
+launching on `releaseScope`, which exists for exactly this and whose KDoc already said a teardown coroutine
+on `viewModelScope` "would never run at all". `closingATabAsTheScreenGoesAwayStillTakesTheHostOffTheRegistry`
+pins it, and was run against the unfixed line first: it times out with
+`active=[lifecycle-0]`, so it fails for the reason it exists.
+
+**And a harness that was counting other tests' logins.** CI failed
+`aServerThatRefusesTheShellNeverCallsTheFailureAReconnect` with `expected: 3 but was: 6` on app code that had
+passed the run before. It was not a sixth dial: the test's own duration was unchanged to within 70ms, so
+whatever produced the extras ran *beside* it. `logins()` grepped the whole sandbox log for
+`Accepted publickey` — but `tools/local-sshd.sh` runs one sshd serving all three sandbox ports into one log,
+and this class shares a JVM, a session store and a database with every other test in the suite, so that total
+was three servers' logins plus anything another test left dialling. Logins are now attributed to the
+listening port, joined through the client source port sshd names on both its `Connection from … on … port`
+and `Accepted publickey … from … port` lines, and the two assertions carry the per-port breakdown as
+evidence. The count is *stricter* than before, not looser: a login to another sandbox server no longer
+counts toward the three this one must show. Logins whose connection line predates the window are counted
+under port 0 rather than dropped, because an unexplained number is what sent this round CI twice.
+
+### 36.2 The five files
+
+| file | bytes | SHA-256 |
+| --- | --- | --- |
+| `EclipseSSH-1.1.4-universal-release.apk` | 5,875,133 | `8700024fafcab1ac0bb8da35fbba06a78b94d6d1cfba9d05bc5c68b996ccd73e` |
+| `EclipseSSH-1.1.4-arm64-v8a-release.apk` | 5,776,309 | `e5815350d91c0d12ec92de37111616809c634ee5b87630f7edbcef94ca3be03a` |
+| `EclipseSSH-1.1.4-armeabi-v7a-release.apk` | 5,772,217 | `0a8a29c93b43f380627998f02ac313affe438f8a3b53b93bdf0ddfcc086de176` |
+| `EclipseSSH-1.1.4-x86-release.apk` | 5,776,297 | `404eb24a3d45b7c18baad28a8a2d348ed9798443b0755a47b6f7321c72897ee2` |
+| `EclipseSSH-1.1.4-x86_64-release.apk` | 5,776,303 | `1bc480aff9a632cb9b630a0a2dddae90918c4ae7247b71523af4e54550bb4218` |
+
+versionCode 12 for all five, signer certificate SHA-256
+`a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e` — the same key as every release since
+1.0.0, so any of these installs straight over 1.1.3. `apksigner verify` reports v3 alone at minSdk 28 and
+v2 as well once asked with `--min-sdk-version 24`, which is §12.8's finding, not a missing signature;
+`zipalign -c 4` clean on all five. Each file is 16,384 bytes longer than its 1.1.3 counterpart — one
+alignment page, for a release whose only shipping change is two lines of `MainViewModel`.
+
+### 36.3 What CI verified and what it could not
+
+Unchanged from §32.2 and §34.2: CI asserts the five-output count unconditionally, but its dual-scheme
+signature check is guarded on `steps.signing.outputs.signed`, and no signing secrets are set on the
+repository — deliberately, per §20. The runner therefore signs with the debug key, that guard is false, and
+the v2+v3 assertion ran here instead, on all five, after re-signing with the real key. The runner's five
+APKs are build-shape evidence, not artifacts anybody installs.
+
+What CI still cannot do is run the instrumentation suite or the long idle matrix: no emulator on this host
+(no KVM) and none provisioned on the runner, so `connectedAndroidTest` is compiled and never executed, and
+the 7 `ECLIPSE_STRESS` tests stay skipped in both places. The registry fix above is covered by a Robolectric
+test against a real in-JVM OpenSSH, which is the strongest evidence available without a device.
+
+### 36.4 Published and verified
+
+Tag `v1.1.4` (annotated object `e6033d2`) on `9b82ce1`, release
+`https://github.com/maragung/EclipseSSH/releases/tag/v1.1.4`, five assets uploaded. Each was then
+**downloaded back** from `https://api.github.com/repos/maragung/EclipseSSH/releases/assets/<id>` with
+`Accept: application/octet-stream` and its SHA-256 compared against the local signed file: **all five
+identical**, byte for byte. The unauthenticated `releases/download/…` URL is *not* a verification path on a
+private repository — it returns a 12-byte `Not Found` page, which hashes identically for all five files and
+would look like five mismatches rather than five missing downloads. The same five are served from port 19001,
+where `README.txt` now leads with 1.1.4 as entry 1 of eleven.
+
+Signing passwords went to `apksigner` through mode-600 files in a mode-700 directory, shredded by an `EXIT`
+trap; `/proc/<pid>/cmdline` is world-readable on this host, so they were never arguments. No `sign.*`
+directory survived the run.
