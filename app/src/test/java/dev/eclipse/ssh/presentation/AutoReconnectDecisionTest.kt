@@ -214,48 +214,50 @@ class AutoReconnectDecisionTest {
     }
 
     @Test
-    fun `a server that hangs up on a brand new session is a refusal not a drop`() {
+    fun `a server that disconnects a brand new session is a refusal not a drop`() {
         // The gap that left "it logs in and then goes straight to Reconnecting" unfixed: a server that
-        // prints a banner and closes the channel within the first seconds did not drop - it refused.
-        // `endedBeforeItRan` misses this because output arrived, so this predicate catches it, and the
-        // tab must land in ERROR with the server's words rather than looping.
-        val closedChannel = SessionEnd.TransportClosed
+        // accepts the login and then sends SSH_MSG_DISCONNECT did not drop - it refused. `endedBeforeItRan`
+        // cannot see this because a disconnect is not a zero-output refusal, so this predicate catches
+        // it, and the tab must land in ERROR with the server's words rather than looping.
         val byServer = SessionEnd.Disconnected(
             reason = SshConstants.SSH2_DISCONNECT_BY_APPLICATION,
             message = "your session is not responding",
             byPeer = true,
         )
-        assertThat(serverRefusedYoungSession(closedChannel, upForMs = 400)).isTrue()
         assertThat(serverRefusedYoungSession(byServer, upForMs = 900)).isTrue()
-        // The combined decision the collector actually uses must now refuse it too.
-        assertThat(endedBeforeItRan(closedChannel, upForMs = 400, idleForMs = 120) || serverRefusedYoungSession(closedChannel, upForMs = 400)).isTrue()
+        // The combined decision the collector actually uses refuses it too.
+        assertThat(endedBeforeItRan(byServer, upForMs = 900, idleForMs = 120) || serverRefusedYoungSession(byServer, upForMs = 900)).isTrue()
     }
 
     @Test
-    fun `output does not rescue a server refusal that arrived while the session was young`() {
-        // The veto [endedBeforeItRan] applies to a bare close once any output has arrived must not let
-        // a genuine server refusal reconnect forever. A banner followed by a channel close in the same
-        // second is a refusal; a reset in the same second is a drop. They must be answered differently.
+    fun `a young bare close is still a reconnectable drop, not a refusal`() {
+        // A bare channel close (TransportClosed) - what a phone leaving Wi-Fi, or a ForceCommand that
+        // returns, looks like - is deliberately left reconnect-worthy no matter how young or how much
+        // output arrived: `aDroppedTransportIsNeverSilent` and `aFlappingSessionStopsReconnectingAndSaysWhy`
+        // depend on that. Only an explicit SSH_MSG_DISCONNECT (byPeer) from the server is a refusal.
+        assertThat(serverRefusedYoungSession(SessionEnd.TransportClosed, upForMs = 500)).isFalse()
+        assertThat(serverRefusedYoungSession(SessionEnd.TransportFailed(IOException("Connection reset")), upForMs = 500)).isFalse()
+        // The combined decision must still reconnect a young bare close, even with output present.
         val bannerThenClose = SessionEnd.TransportClosed
-        val bannerThenReset = SessionEnd.TransportFailed(IOException("Connection reset"))
-        assertThat(serverRefusedYoungSession(bannerThenClose, upForMs = 500)).isTrue()
-        assertThat(serverRefusedYoungSession(bannerThenReset, upForMs = 500)).isFalse()
+        assertThat(endedBeforeItRan(bannerThenClose, upForMs = 400, idleForMs = 120) || serverRefusedYoungSession(bannerThenClose, upForMs = 400)).isFalse()
     }
 
     @Test
-    fun `a young session the server refused is still reconnectable once it has been up a while`() {
+    fun `a young session the server disconnected is still reconnectable once it has been up a while`() {
         // Past the floor the same ending is an interruption, not a refusal: an idle timeout or an admin
         // hang-up on a session that was in use is exactly what auto-reconnect is for.
-        assertThat(serverRefusedYoungSession(SessionEnd.TransportClosed, upForMs = NEVER_RAN_MS)).isFalse()
-        assertThat(serverRefusedYoungSession(SessionEnd.TransportClosed, upForMs = 3_600_000)).isFalse()
+        assertThat(serverRefusedYoungSession(SessionEnd.Disconnected(SshConstants.SSH2_DISCONNECT_BY_APPLICATION, "bye", byPeer = true), upForMs = NEVER_RAN_MS)).isFalse()
         assertThat(serverRefusedYoungSession(SessionEnd.Disconnected(SshConstants.SSH2_DISCONNECT_BY_APPLICATION, "bye", byPeer = true), upForMs = 3_600_000)).isFalse()
     }
 
     @Test
-    fun `only a server side hang up counts as a young refusal`() {
-        // A protocol/MAC error MINA raised itself (byPeer false) is a fault worth retrying, as are a
-        // transport failure, a network loss, a shell that reported an end, and an app release.
+    fun `only a peer sent disconnect counts as a young refusal`() {
+        // A protocol/MAC error MINA raised itself (byPeer false) is a fault worth retrying; a bare close,
+        // a transport failure, a network loss, a shell that reported an end, and an app release are
+        // likewise not refusals here.
+        assertThat(serverRefusedYoungSession(SessionEnd.Disconnected(SshConstants.SSH2_DISCONNECT_BY_APPLICATION, "bye", byPeer = true), 200)).isTrue()
         assertThat(serverRefusedYoungSession(SessionEnd.Disconnected(SshConstants.SSH2_DISCONNECT_MAC_ERROR, null, byPeer = false), 200)).isFalse()
+        assertThat(serverRefusedYoungSession(SessionEnd.TransportClosed, 200)).isFalse()
         assertThat(serverRefusedYoungSession(SessionEnd.TransportFailed(IOException("Connection reset")), 200)).isFalse()
         assertThat(serverRefusedYoungSession(SessionEnd.NetworkLost, 200)).isFalse()
         assertThat(serverRefusedYoungSession(SessionEnd.Released, 200)).isFalse()
@@ -267,7 +269,7 @@ class AutoReconnectDecisionTest {
     fun `a young refusal with no uptime recorded is left to the ladder`() {
         // Absent evidence is not evidence: a connect that failed before a session existed reports no
         // uptime and keeps its own path.
-        assertThat(serverRefusedYoungSession(SessionEnd.TransportClosed, upForMs = null)).isFalse()
+        assertThat(serverRefusedYoungSession(SessionEnd.Disconnected(SshConstants.SSH2_DISCONNECT_BY_APPLICATION, "bye", byPeer = true), upForMs = null)).isFalse()
     }
 
     @Test
