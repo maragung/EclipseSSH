@@ -1324,7 +1324,13 @@ class MainViewModel @Inject constructor(
                 // A shell the far end hung up on before it produced a single byte. Answering that with a
                 // ladder is the loop users report, so it is answered with the server's reason instead.
                 // See [endedBeforeItRan] for how narrow this is.
-                val refused = endedBeforeItRan(end, upForMs = upForMs, idleForMs = terminal.idleForMs())
+                val refusedBeforeOutput = endedBeforeItRan(end, upForMs = upForMs, idleForMs = terminal.idleForMs())
+                // A server that prints a banner and then closes the channel within the first moments of a
+                // login did not suffer a transient drop - it refused the session. Reconnecting answers a
+                // deliberate server decision and loops on every login, so it is answered with the server's
+                // reason instead. See [serverRefusedYoungSession].
+                val refusedByServer = serverRefusedYoungSession(end, upForMs = upForMs)
+                val refused = refusedBeforeOutput || refusedByServer
                 val willReconnect = !refused && shouldAutoReconnect(
                     end,
                     tabIsOpen = tabs.value.any { it.hostId == hostId },
@@ -1346,10 +1352,10 @@ class MainViewModel @Inject constructor(
                 // Why there is no recovery running gets said in the same breath as what happened,
                 // because a tab that stops after one ending, with no explanation of why it did not try
                 // again, is the same unanswerable report in a different costume.
-                val reason = if (refused) {
-                    "$endReason · closed before the shell produced any output, so it was not retried"
-                } else {
-                    endReason
+                val reason = when {
+                    refusedByServer -> "$endReason · the server closed the session right after login, so it was not retried"
+                    refusedBeforeOutput -> "$endReason · closed before the shell produced any output, so it was not retried"
+                    else -> endReason
                 }
                 updateTab(hostId) { it?.copy(state = ended, lastError = reason) }
                 diagnostics.record(
@@ -1357,7 +1363,8 @@ class MainViewModel @Inject constructor(
                     SessionEvent.ENDED,
                     state = ended,
                     detail = "${end::class.java.simpleName}: $endReason" +
-                        (if (refused) " · refused before first output" else "") +
+                        (if (refusedByServer) " · refused by server right after login" else "") +
+                        (if (refusedBeforeOutput) " · refused before first output" else "") +
                         (if (reaped) " · session reaped" else ""),
                     network = networkMonitor.describe(),
                     pty = terminal.ptyLabel,
@@ -3661,6 +3668,54 @@ internal fun endedBeforeItRan(end: SessionEnd, upForMs: Long?, idleForMs: Long?)
     return when (end) {
         is SessionEnd.Disconnected -> true
         SessionEnd.TransportClosed -> true
+        is SessionEnd.ShellEnded,
+        is SessionEnd.TransportFailed,
+        SessionEnd.NetworkLost,
+        SessionEnd.Released,
+        -> false
+    }
+}
+
+/**
+ * Whether the far end closed a session that had only just come up, in which case the ladder is the
+ * loop rather than the cure - the server's decision, not a link that faltered.
+ *
+ * This is the companion to [endedBeforeItRan] for the case that one misses. [endedBeforeItRan] only
+ * fires when the server sent nothing at all; a server that prints a banner or a prompt and *then*
+ * closes the channel slips past it, because output arriving once is normally proof the session ran.
+ * But a hang-up within [NEVER_RAN_MS] of authentication that carries output is almost never a
+ * transient drop - it is a [SessionEnd.TransportClosed] (the server gracefully closing the pty
+ * channel, as `nologin`, a `ForceCommand` that returns, a `~/.profile` that exits, or a
+ * `MaxSessions`/`MaxStartups` rule all do) or a [SessionEnd.Disconnected] the peer sent itself. Every
+ * one of those answers a redial the same way, and because it is deterministic the tab shows
+ * *Reconnecting…* on every login instead of the server's reason.
+ *
+ * The set is deliberately narrow, for the same reason [endedBeforeItRan] is:
+ *
+ *  - **[upForMs] must be under the floor.** A session that lasted longer than a couple of seconds was
+ *    interrupted, not refused; an idle timeout or an admin hang-up on a session that was in use is
+ *    exactly what auto-reconnect is for.
+ *  - **the ending must be the far end giving up**, not an I/O failure. [SessionEnd.TransportClosed] is
+ *    the server closing the channel and [SessionEnd.Disconnected] with [SessionEnd.Disconnected.byPeer]
+ *    is the server sending `SSH_MSG_DISCONNECT`; both are decisions taken at the far end. A
+ *    [SessionEnd.TransportFailed] (a reset, a timeout, a parse error) and [SessionEnd.NetworkLost] stay
+ *    reconnect-worthy however young the session was, because a phone that changes network one second
+ *    after a login is the ordinary case and it must ride that out. A [SessionEnd.Disconnected] MINA
+ *    raised itself ([SessionEnd.Disconnected.byPeer] false - a protocol or MAC error) is likewise a
+ *    fault worth retrying. [SessionEnd.ShellEnded] and [SessionEnd.Released] are already handled
+ *    elsewhere and are left out.
+ *
+ * The user is not left worse off: the tab lands in ERROR carrying the server's own words, and the
+ * manual Reconnect button is offered on every ended state. What they lose is an automatic redial that
+ * was always going to fail, and what they gain is the reason.
+ *
+ * Pure, so the whole matrix is testable without a server that can be talked into refusing a shell.
+ */
+internal fun serverRefusedYoungSession(end: SessionEnd, upForMs: Long?): Boolean {
+    if (upForMs == null || upForMs >= NEVER_RAN_MS) return false
+    return when (end) {
+        is SessionEnd.TransportClosed -> true
+        is SessionEnd.Disconnected -> end.byPeer
         is SessionEnd.ShellEnded,
         is SessionEnd.TransportFailed,
         SessionEnd.NetworkLost,
