@@ -1,5 +1,19 @@
 # Continuous integration
 
+Three workflows, by purpose:
+
+| Workflow | Trigger | Job |
+| --- | --- | --- |
+| `ci.yml` | Every push to `main`, every pull request, `workflow_dispatch` | Lint, both unit-test variants, instrumentation compile, both APKs, signature check, artifacts |
+| `release.yml` | Push to `main`, `workflow_dispatch` | `assembleRelease` + signature check, uploads the APKs as a downloadable artifact |
+| `tagged-release.yml` | A `vX.Y.Z` (or `vX.Y.Z-…`) tag | The same as `release.yml`, then creates a GitHub release, attaches every APK and the checksums file, and writes release notes drawn from `AUDIT-REPORT.md` |
+
+The CI gate (`ci.yml`) is the one that has to stay fast. The other two exist so a release can be
+rebuilt at any time without rerunning lint and the full test suite, and so a `git tag` is the only
+path that creates a published release.
+
+## ci.yml
+
 `.github/workflows/ci.yml` runs on every push to `main`, on every pull request, and on demand
 (`workflow_dispatch`). One job, `verify`, does the whole chain in order, so a failure stops at the
 first thing that is actually broken:
@@ -12,6 +26,35 @@ first thing that is actually broken:
 | Build | `./gradlew assembleDebug assembleRelease` | Both APKs, R8/resource shrinking included. |
 | Signature | `apksigner verify --verbose` | That the release APK is signed. See the note below on reading its output. |
 | Artifacts | `actions/upload-artifact` | `eclipse-ssh-debug-apk`, `eclipse-ssh-release-apk`, and `reports` (lint + test HTML, kept 14 days, uploaded even on failure). |
+
+## release.yml
+
+`.github/workflows/release.yml` runs on every push to `main` and on demand. It does
+`assembleRelease`, verifies the APKs, computes a `SHA256SUMS.txt`, and uploads everything as the
+`eclipse-ssh-release-apk` artifact. There is no test run and no OpenSSH sandbox - the CI gate
+already covers that, and a release rebuild should not pay for it twice.
+
+## tagged-release.yml
+
+`.github/workflows/tagged-release.yml` is what the brief calls the "tagged release" path. It runs
+on any `v*` tag pushed to the repository (matching `v[0-9]+.[0-9]+.[0-9]+`, optionally with a
+`-…` pre-release suffix). It does `clean assembleRelease` from the tag exactly
+(`git describe --exact-match` is asserted), verifies the signature, computes checksums, and uses
+`softprops/action-gh-release` to create a GitHub release. The release title and the
+`versionName`/`versionCode` it reports are read out of the built APK with `aapt2 dump badging` so
+the published metadata cannot drift from the artifact.
+
+The release is created as a **draft** when the tag carries a pre-release suffix (e.g. `v1.2.0-rc.1`),
+and as a normal release otherwise. Release notes are composed from the latest section heading of
+`AUDIT-REPORT.md`; if that file is missing or the section cannot be found the step fails rather
+than producing a blank release.
+
+Cutting a release:
+
+```sh
+git tag v1.2.3
+git push origin v1.2.3
+```
 
 ## Reading the signature check
 

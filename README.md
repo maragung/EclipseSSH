@@ -85,15 +85,24 @@ data, they authorise nothing anywhere, and they must never be reused as real cre
 
 ## Continuous integration
 
-Every push and pull request runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml): release lint,
-both unit-test variants, a compile of the instrumentation sources, both APKs, and a signature check.
-The debug and release APKs are uploaded as build artifacts, and the test and lint reports are uploaded
-even when a step fails, because that is what a red run is diagnosed from.
+Three GitHub Actions workflows, by purpose:
+
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — the gate that runs on every push to
+  `main` and every pull request. Lint, both unit-test variants, a compile of the instrumentation
+  sources, both APKs, and a signature check. The debug and release APKs are uploaded as build
+  artifacts, and the test and lint reports are uploaded even when a step fails.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) — the release build, run on
+  demand or on every push to `main`. `assembleRelease` + signature check, with the APKs and their
+  SHA-256 sums uploaded as a single artifact.
+- [`.github/workflows/tagged-release.yml`](.github/workflows/tagged-release.yml) — the
+  publication path. A `git tag vX.Y.Z && git push --tags` triggers a clean `assembleRelease`
+  from the tag, asserts the source matches the tag (`git describe --exact-match`), verifies the
+  signature, computes checksums, and creates a GitHub release with every APK attached.
 
 Signing in CI is optional. Set the repository secrets `RELEASE_KEYSTORE_BASE64` and
-`RELEASE_KEYSTORE_PROPERTIES` to sign for real; without them the release APK is built with the debug
-key and says so. [`docs/ci.md`](docs/ci.md) covers the workflow step by step, including why the
-emulator suite is compiled but not executed and how to read the signature output.
+`RELEASE_KEYSTORE_PROPERTIES` to sign for real; without them the release APK is built with the
+debug key and says so. [`docs/ci.md`](docs/ci.md) covers the workflows step by step, including
+why the emulator suite is compiled but not executed and how to read the signature output.
 
 ## Report
 

@@ -1,0 +1,114 @@
+name: Release build
+
+# A release build of every artifact, run on demand from main. A separate workflow from `ci.yml`
+# so the push/PR gate stays fast and a release can be rebuilt at any time without rerunning lint
+# and the full test suite. A tag push triggers the heavier `tagged-release.yml` workflow, which
+# builds, signs, and publishes a GitHub release - this workflow is the "build the artifacts and
+# put them somewhere I can download" path.
+#
+# Required secrets (a fork without them still builds, but signs with the debug key):
+#   RELEASE_KEYSTORE_BASE64    base64 of keystore/eclipse-release.jks (no newlines)
+#   RELEASE_KEYSTORE_PROPERTIES the keystore.properties file contents, with a trailing newline
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # The runner that started first wins; a second push to main cancels the first.
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+
+jobs:
+  release:
+    name: Build signed release artifacts
+    runs-on: ubuntu-latest
+    # assembleRelease on a cold cache pulls, compiles and shrinks; allow for that.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Cache Robolectric runtime jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
+          restore-keys: robolectric-${{ runner.os }}-
+
+      - name: Restore release signing material
+        id: signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PROPERTIES" ]; then
+            mkdir -p keystore
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > keystore/eclipse-release.jks
+            printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > keystore.properties
+            chmod 600 keystore/eclipse-release.jks keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets set: the release APK will carry the debug key." >&2
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble the release APK
+        run: ./gradlew --stacktrace assembleRelease
+
+      - name: Verify the release APK signatures
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -1)"
+          mapfile -t APKS < <(find app/build/outputs/apk/release -name '*.apk' | sort)
+          test "${#APKS[@]}" -eq 5 || { echo "expected 5 release APKs, found ${#APKS[@]}: ${APKS[*]}"; exit 1; }
+          for APK in "${APKS[@]}"; do
+            echo "== Verifying $APK"
+            "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
+            if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+              "$APKSIGNER" verify --verbose --min-sdk-version 24 "$APK" | tee /tmp/sigs.txt
+              grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sigs.txt
+              grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
+            fi
+          done
+
+      - name: Compute APK checksums
+        run: |
+          set -euo pipefail
+          cd app/build/outputs/apk/release
+          for APK in *.apk; do
+            sha256sum "$APK" | tee -a SHA256SUMS.txt
+          done
+
+      - name: Upload release APKs and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: eclipse-ssh-release-apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Shred signing material
+        if: always()
+        run: |
+          rm -f keystore.properties
+          rm -rf keystore
