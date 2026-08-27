@@ -131,15 +131,17 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          : > app/build/outputs/SHA256SUMS.txt
-          for f in app/build/outputs/apk/release/*.apk; do
-            echo "# APK"
-            sha256sum "$f"
-          done >> app/build/outputs/SHA256SUMS.txt
-          for f in app/build/outputs/bundle/release/*.aab; do
-            echo "# AAB"
-            sha256sum "$f"
-          done >> app/build/outputs/SHA256SUMS.txt
+          {
+            echo "# APKs (sha256)"
+            for f in app/build/outputs/apk/release/*.apk; do
+              sha256sum "$f" | awk '{sub(/^.*\//,"",$2); print $1"  "$2}'
+            done
+            echo
+            echo "# AAB (sha256)"
+            for f in app/build/outputs/bundle/release/*.aab; do
+              sha256sum "$f" | awk '{sub(/^.*\//,"",$2); print $1"  "$2}'
+            done
+          } > app/build/outputs/SHA256SUMS.txt
           cat app/build/outputs/SHA256SUMS.txt
 
       - name: Upload release APKs, AAB and checksums
