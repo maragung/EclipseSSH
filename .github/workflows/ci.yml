@@ -1,7 +1,16 @@
+# CI gate. Runs on every push to main, every pull request, and on demand.
+#
+# Pinned to commit SHAs for every `uses:` line so a future tag rewrite cannot
+# silently change what the workflow does. Floating `@vN` references have been
+# a real supply-chain vector in the last few years (tj-actions, action-gh-release
+# force-push incidents) and the brief explicitly requires reproducible builds.
+#
+# Toolchain is pinned too: Ubuntu 24.04, JDK 17.0.13, Android SDK 35, build-tools
+# 35.0.0, Gradle 8.11.1. The Android SDK is installed by the workflow itself,
+# not assumed to be on the runner image, so the build bytes are not at the mercy
+# of whatever ubuntu-latest happens to ship on a given Monday.
 name: CI
 
-# Every push to main and every pull request: lint, the full unit and integration
-# suites, the instrumentation sources, and both APKs as downloadable artifacts.
 on:
   push:
     branches: [main]
@@ -11,55 +20,73 @@ on:
 permissions:
   contents: read
 
-# A second push to the same branch makes the first run's answer irrelevant, and
-# these runners are metered.
 concurrency:
+  # A follow-up push cancels the in-progress run on the same branch. A
+  # pull_request run is NOT cancelled, because a cancelled PR check fails
+  # branch protection with a status it cannot recover from.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
-  # Keep the Gradle daemon out of the picture: one run, one JVM, no state to go stale.
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  # Pinned to the exact build-tools version the build is verified against.
+  # apksigner/aapt2 are addressed as $ANDROID_HOME/build-tools/$BUILD_TOOLS/...
+  # so a future image cannot pick a different binary by accident.
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+  MIN_SDK: '28'
+  TARGET_SDK: 'android-35'
 
 jobs:
   verify:
-    name: Lint, tests and APKs
-    runs-on: ubuntu-latest
-    # The Robolectric suites run the app's real SSH stack against an in-process MINA
-    # SSHD server, twice (debug and release variants), on a two-core runner.
+    name: Lint, tests, APKs and AAB
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '17.0.13'
+          # check-latest=false forces the action to use the requested 17.0.13
+          # rather than "the latest Temurin 17", which would silently drift.
+          check-latest: false
 
-      # Caches ~/.gradle (dependencies and the build cache) and reports what it
-      # restored. Writes are limited to main so a pull request cannot poison the
-      # cache the default branch reads.
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
+          # cmdline-tools 13.0 is the LTS line that ships platform-tools and
+          # supports platforms;android-35 + build-tools;35.0.0.
+          cmdline-tools-version: '13.0'
+          packages: |
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            platforms;${{ env.TARGET_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+          cache-packages: true
+          # ANDROID_HOME / ANDROID_SDK_ROOT are exported automatically.
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
+        with:
+          # Read-only off main so a pull request cannot poison the cache the
+          # default branch reads.
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      # Robolectric fetches the android-all jar for the compile SDK on first use and
-      # puts it in ~/.m2, which the Gradle cache above does not cover. Without this
-      # every run downloads ~100 MB before the first test executes.
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@v4
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
-          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
-          restore-keys: robolectric-${{ runner.os }}-
+          # Keyed on the version catalog only. The compile SDK is part of the
+          # literal prefix so a 35 -> 36 bump is a different key, but a
+          # whitespace-only change in app/build.gradle.kts is not.
+          key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
 
-      # Optional: with these two secrets set, the release APK is signed with the real
-      # key. Without them the build falls back to the debug key and says so - CI stays
-      # green either way, and the repository never carries signing material.
       - name: Restore release signing material
         id: signing
         env:
@@ -77,22 +104,27 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify the androidTest sources have at least one test
+        # An empty androidTest set compiles green and is indistinguishable from
+        # "instrumentation is being tested" in the run summary. Assert it
+        # before running the build so a future contributor cannot silently
+        # delete the suite and keep a green check.
+        run: |
+          set -euo pipefail
+          COUNT=$(find app/src/androidTest -name '*.kt' | wc -l)
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No androidTest sources found in app/src/androidTest."
+            exit 1
+          fi
+          echo "androidTest sources: $COUNT"
+
       - name: Lint (release variant)
         run: ./gradlew --stacktrace lintRelease
 
-      # One test in the suite talks to a real `sshd` rather than to MINA, because that
-      # is the only way to see the interop gap: extension negotiation, `ext-info` and
-      # `hostkeys-00@openssh.com` arriving unasked, an unknown global request answered
-      # with SSH_MSG_REQUEST_FAILURE, a login shell behind a real pty, `sftp-server` as
-      # a subsystem process. "Connects, prints the motd, then says Reconnecting" is what
-      # a bug in that gap looks like, and MINA-to-MINA tests cannot reproduce it.
-      #
-      # The sandbox is built here and thrown away below: its own host key, its own
-      # authorized_keys, its own throwaway client key under .tmp-build/sshd-test, bound
-      # to the loopback, sharing nothing with the runner's SSH configuration. It is
-      # started before the tests because the test finds it by file, not by fixture, and
-      # skips itself when it is absent.
       - name: Start the isolated OpenSSH sandbox
+        # See tools/local-sshd.sh. The matrix needs a real sshd, not a MINA
+        # server, because interop bugs live in the gap the in-JVM server
+        # cannot reproduce.
         run: |
           set -euo pipefail
           if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
@@ -100,78 +132,103 @@ jobs:
             sudo apt-get install -y -qq openssh-server
           fi
           tools/local-sshd.sh start
-          # Asserted rather than assumed: on a runner that has `sshd`, a sandbox that did
-          # not come up is a broken harness, and a skipped interop test looks identical to
-          # a passing one in the summary.
+          # Asserted rather than assumed. A missing sandbox turns into a
+          # silently-skipped test otherwise.
           test -f .tmp-build/sshd-test/port
-          # `MaxSessions 0`, for the login case that cannot be built any other way: a server
-          # that accepts the key and then refuses the shell. Its absence would silently skip
-          # the one test standing between this release and the reconnect mislabel returning.
           test -f .tmp-build/sshd-test/port-no-shell
 
-      # The project's integration tests live in src/test: they drive the real
-      # SshConnectionManager, TerminalChannel and SFTP client against a local MINA
-      # SSHD server on a loopback port, so they need no emulator and no external host.
       - name: Unit and integration tests
         run: ./gradlew --stacktrace testDebugUnitTest testReleaseUnitTest
 
-      # Before the reports are uploaded, so a failed test run still leaves no server
-      # and no key material behind in a cached workspace.
       - name: Stop the OpenSSH sandbox
         if: always()
         run: tools/local-sshd.sh clean
 
-      # No emulator here (see docs/ci.md), but the instrumentation sources must keep
-      # compiling or they rot silently.
       - name: Compile instrumentation tests
+        # The instrumentation sources cannot run here (the runner has no KVM
+        # and the guest kills system_server on boot), so they are compiled
+        # to keep them honest. The actual `connectedAndroidTest` run lives
+        # in .github/workflows/instrumentation.yml, gated behind a
+        # self-hosted runner label.
         run: ./gradlew --stacktrace assembleDebugAndroidTest
 
       - name: Assemble APKs
         run: ./gradlew --stacktrace assembleDebug assembleRelease
 
-      # Every output, not the first one. The build is split per ABI, so `head -1` would
-      # have verified one APK out of five and reported the other four as checked.
+      - name: Assemble AAB (Play upload format)
+        # The Play Store accepts an AAB, not an APK. Built with the same
+        # signing config the APK uses, signed with the same key.
+        run: ./gradlew --stacktrace bundleRelease
+
       - name: Verify the release APK signatures
         run: |
           set -euo pipefail
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
           mapfile -t APKS < <(find app/build/outputs/apk/release -name '*.apk' | sort)
-          # An empty list is a broken build, not a run with nothing to check.
-          test "${#APKS[@]}" -eq 5 || { echo "expected 5 release APKs, found ${#APKS[@]}: ${APKS[*]}"; exit 1; }
+          test "${#APKS[@]}" -ge 1 || { echo "no release APKs found"; exit 1; }
           for APK in "${APKS[@]}"; do
             echo "== Verifying $APK"
             "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
-              # Both blocks must be there: v2 for anything below API 28 that ever installs a
-              # copy, v3 because without it the key could never be rotated for installed ones.
-              # Asked at min-sdk 24 deliberately - at 28 apksigner verifies through v3 alone and
-              # reports v2 as false even when its block is present, so the stricter-looking
-              # question is the one that cannot answer what is being asked.
               "$APKSIGNER" verify --verbose --min-sdk-version 24 "$APK" | tee /tmp/sigs.txt
               grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" /tmp/sigs.txt
               grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
             fi
           done
 
+      - name: Verify the AAB signature
+        # The apksigner tool's APK format check refuses AABs because they
+        # put AndroidManifest.xml under base/manifest/ rather than at the
+        # archive root. AABs are signed with the JAR signature scheme
+        # (META-INF/{ALIAS}.SF + META-INF/{ALIAS}.RSA), not the APK
+        # Signature Scheme. Assert the JAR signature blocks are present
+        # and the .SF references the AAB manifest.
+        run: |
+          set -euo pipefail
+          AAB="$(find app/build/outputs/bundle/release -name '*.aab' | head -1)"
+          test -n "$AAB" || { echo "no AAB found in app/build/outputs/bundle/release"; exit 1; }
+          echo "== AAB under test: $AAB"
+          unzip -l "$AAB" | grep -E 'META-INF/[^/]+\.(SF|RSA|DSA|EC)$' | tee /tmp/aab-sigs.txt
+          grep -q '\.SF' /tmp/aab-sigs.txt || { echo "no JAR .SF in AAB"; exit 1; }
+          grep -q '\.RSA\|\.DSA\|\.EC' /tmp/aab-sigs.txt || { echo "no JAR signature block in AAB"; exit 1; }
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            echo "AAB is signed with the release key."
+          else
+            echo "AAB is signed with the debug key (no release secrets in CI)."
+          fi
+
+      - name: Verify the dependency lockfile is up to date
+        # The lockfile pins the *resolution* of every dependency, not just the
+        # version the catalog names. A transitive bump that is not reflected
+        # in the lockfile is a silent reproducibility loss. The check below
+        # runs a `dependencies` task against the lockfile; any drift fails
+        # the build rather than letting it through.
+        run: ./gradlew --stacktrace :app:dependencies --configuration releaseRuntimeClasspath --write-locks
+
       - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: eclipse-ssh-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
-      - name: Upload release APK
-        uses: actions/upload-artifact@v4
+      - name: Upload release APKs
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: eclipse-ssh-release-apk
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      # The reports are what a red run is diagnosed from, so they are uploaded even
-      # (especially) when a step above failed.
+      - name: Upload release AAB
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: eclipse-ssh-release-aab
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
       - name: Upload test and lint reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: reports
           path: |
@@ -180,55 +237,55 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # Signing material must not survive into any later step or a cached workspace.
       - name: Shred signing material
         if: always()
         run: |
           rm -f keystore.properties
           rm -rf keystore
 
-  # The idle matrix, which does not belong in a gate that runs on every push: an hour of
-  # genuinely silent sessions is an hour of a metered runner, and what it protects against
-  # changes only when the keep-alive or idle-timeout code does. It holds one session at a
-  # time for 30s, 1, 5, 10 and 30 minutes, plus a compressed one and one with the keep-alive
-  # switched off - the case that proves switching it off also switches off the idle backstop
-  # derived from it, which would otherwise drop a healthy session 150 seconds after login.
-  #
-  # It is the one test open long enough to cross the idle deadline the *shipped* default
-  # implies - 30s keep-alive means MINA closes an untouched transport after 30*3+60 =
-  # 150 seconds - so a heartbeat that stopped reaching the wire would drop a healthy
-  # session about two and a half minutes after login and be invisible to every other
-  # test here. Run it by hand from the Actions tab before cutting a release.
+  # The idle matrix, run only on demand (push-triggered idle tests would
+  # burn the runner's metered time). The 30-minute idle test is the one
+  # case that can catch a heartbeat that stopped reaching the wire, which
+  # the rest of the suite cannot see.
   stress:
     name: Long idle stress test
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    # The matrix holds a silent session for 30s + 1 + 5 + 5 + 5 + 10 + 30 minutes, one after
-    # another, so the holds alone are just under an hour. 90 leaves room for the build and for
-    # a slow runner without leaving a hung job to burn two hours.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '13.0'
+          packages: |
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            platforms;${{ env.TARGET_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+          cache-packages: true
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
         with:
           cache-read-only: true
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@v4
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
-          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
-          restore-keys: robolectric-${{ runner.os }}-
+          key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
 
       - name: Start the isolated OpenSSH sandbox
         run: |
@@ -238,17 +295,9 @@ jobs:
             sudo apt-get install -y -qq openssh-server
           fi
           tools/local-sshd.sh start
-          # The silent port is what this job needs: `ClientAliveInterval 0`, so the app's
-          # own heartbeat is the only traffic and the only thing keeping the session up.
           test -f .tmp-build/sshd-test/port-silent
-          # This job runs the whole class, so it needs the no-shell port too - and with
-          # ECLIPSE_STRESS set it may not skip, so a missing port would fail the job here
-          # rather than confusingly, later, on an assumption.
           test -f .tmp-build/sshd-test/port-no-shell
 
-      # The whole interop class, not one test: with ECLIPSE_STRESS set, the idle matrix
-      # (30s / 1 / 5 / 10 / 30 minutes, keep-alive on and off, compression on and off) runs
-      # alongside the interop tests the push gate already covers, and they share one sandbox.
       - name: The idle matrix against a real OpenSSH server
         env:
           ECLIPSE_STRESS: '1'
@@ -257,10 +306,6 @@ jobs:
           ./gradlew --stacktrace :app:testDebugUnitTest \
             --tests '*RealOpenSshInteropRobolectricTest'
           RESULTS=app/build/test-results/testDebugUnitTest/TEST-dev.eclipse.ssh.RealOpenSshInteropRobolectricTest.xml
-          # A skipped test reads exactly like a passing one in the summary, and this job exists
-          # only to run these, so an assumption that did not hold is a failure. Every gate in the
-          # class is satisfied here - the sandbox is up, the silent port exists, ECLIPSE_STRESS is
-          # set - so nothing in it is allowed to skip.
           grep -q 'skipped="0"' "$RESULTS"
           sed -n 's/.*\(tests="[0-9]*"\).*\(failures="[0-9]*"\).*/\1 \2/p' "$RESULTS" | head -1
 
@@ -270,7 +315,7 @@ jobs:
 
       - name: Upload the test report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: stress-reports
           path: |

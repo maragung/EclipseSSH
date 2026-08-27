@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # Keep the workflow actions current. Dependabot will open a PR whenever
+  # a new action version is published, but every bump is reviewed because
+  # the project pins actions to commit SHAs (see README and docs/ci.md).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        # All action updates are reviewed as a group, never auto-merged:
+        # a SHA bump is a security decision.
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # Keep Gradle and the version catalog current. The version catalog
+  # is the single source of truth for dependency versions, so a bump
+  # here is the only way a transitive upgrade gets in.
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      gradle:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+    ignore:
+      # Major-version bumps for AGP and Kotlin are reviewed by hand
+      # because the build files reference deprecated APIs.
+      - dependency-name: "com.android.tools.build:gradle"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "org.jetbrains.kotlin:kotlin-*"
+        update-types: ["version-update:semver-major"]

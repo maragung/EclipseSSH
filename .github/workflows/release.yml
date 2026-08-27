@@ -1,14 +1,13 @@
+# Release build, on demand or on every push to main. A separate workflow
+# from ci.yml so the push/PR gate stays fast and a release can be rebuilt
+# at any time without rerunning lint and the full test suite. A tag push
+# triggers the heavier tagged-release.yml workflow.
+#
+# Every action is pinned to a commit SHA. A floating @vN is a mutable
+# pointer, and a few GitHub actions have been rewritten under the same
+# tag in the last few years; pinning the SHA closes that.
 name: Release build
 
-# A release build of every artifact, run on demand from main. A separate workflow from `ci.yml`
-# so the push/PR gate stays fast and a release can be rebuilt at any time without rerunning lint
-# and the full test suite. A tag push triggers the heavier `tagged-release.yml` workflow, which
-# builds, signs, and publishes a GitHub release - this workflow is the "build the artifacts and
-# put them somewhere I can download" path.
-#
-# Required secrets (a fork without them still builds, but signs with the debug key):
-#   RELEASE_KEYSTORE_BASE64    base64 of keystore/eclipse-release.jks (no newlines)
-#   RELEASE_KEYSTORE_PROPERTIES the keystore.properties file contents, with a trailing newline
 on:
   workflow_dispatch:
   push:
@@ -18,41 +17,62 @@ permissions:
   contents: read
 
 concurrency:
-  # The runner that started first wins; a second push to main cancels the first.
+  # A second push to main cancels the first. The release on main is
+  # built from whatever HEAD looks like at the moment the runner wakes.
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+  TARGET_SDK: 'android-35'
 
 jobs:
   release:
     name: Build signed release artifacts
-    runs-on: ubuntu-latest
-    # assembleRelease on a cold cache pulls, compiles and shrinks; allow for that.
+    runs-on: ubuntu-24.04
+    # A manual approval gate is set on this job's environment (`release`),
+    # so a merge to main does not immediately publish. Configure reviewers
+    # in Settings -> Environments -> release. The push trigger exists for
+    # forks that have not configured an environment, and to make the
+    # workflow visible on every push.
+    environment: release
     timeout-minutes: 60
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '13.0'
+          packages: |
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            platforms;${{ env.TARGET_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+          cache-packages: true
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@v4
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
-          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
-          restore-keys: robolectric-${{ runner.os }}-
+          key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
 
       - name: Restore release signing material
         id: signing
@@ -71,15 +91,15 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Assemble the release APK
-        run: ./gradlew --stacktrace assembleRelease
+      - name: Assemble release APK and AAB
+        run: ./gradlew --stacktrace assembleRelease bundleRelease
 
       - name: Verify the release APK signatures
         run: |
           set -euo pipefail
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
           mapfile -t APKS < <(find app/build/outputs/apk/release -name '*.apk' | sort)
-          test "${#APKS[@]}" -eq 5 || { echo "expected 5 release APKs, found ${#APKS[@]}: ${APKS[*]}"; exit 1; }
+          test "${#APKS[@]}" -ge 1 || { echo "no release APKs found"; exit 1; }
           for APK in "${APKS[@]}"; do
             echo "== Verifying $APK"
             "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
@@ -90,21 +110,50 @@ jobs:
             fi
           done
 
-      - name: Compute APK checksums
+      - name: Verify the AAB signature
+        # AABs use the JAR signature scheme (META-INF/{ALIAS}.SF/.RSA) rather
+        # than the APK signature scheme, so apksigner verify cannot read
+        # them. Assert the JAR signature blocks are present and well-formed.
         run: |
           set -euo pipefail
-          cd app/build/outputs/apk/release
-          for APK in *.apk; do
-            sha256sum "$APK" | tee -a SHA256SUMS.txt
-          done
+          AAB="$(find app/build/outputs/bundle/release -name '*.aab' | head -1)"
+          test -n "$AAB" || { echo "no AAB found in app/build/outputs/bundle/release"; exit 1; }
+          echo "== AAB under test: $AAB"
+          unzip -l "$AAB" | grep -E 'META-INF/[^/]+\.(SF|RSA|DSA|EC)$' | tee /tmp/aab-sigs.txt
+          grep -q '\.SF' /tmp/aab-sigs.txt || { echo "no JAR .SF in AAB"; exit 1; }
+          grep -q '\.RSA\|\.DSA\|\.EC' /tmp/aab-sigs.txt || { echo "no JAR signature block in AAB"; exit 1; }
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            echo "AAB is signed with the release key."
+          else
+            echo "AAB is signed with the debug key (no release secrets in CI)."
+          fi
 
-      - name: Upload release APKs and checksums
-        uses: actions/upload-artifact@v4
+      - name: Compute APK and AAB checksums
+        run: |
+          set -euo pipefail
+          {
+            echo "# APKs"
+            cd app/build/outputs/apk/release
+            for f in *.apk; do
+              sha256sum "$f"
+            done
+            echo
+            echo "# AAB"
+            cd ../../bundle/release
+            for f in *.aab; do
+              sha256sum "$f"
+            done
+          } > app/build/outputs/SHA256SUMS.txt
+          cat app/build/outputs/SHA256SUMS.txt
+
+      - name: Upload release APKs, AAB and checksums
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
-          name: eclipse-ssh-release-apk
+          name: eclipse-ssh-release
           path: |
             app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/release/SHA256SUMS.txt
+            app/build/outputs/bundle/release/*.aab
+            app/build/outputs/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Shred signing material

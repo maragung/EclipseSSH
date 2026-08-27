@@ -1,0 +1,118 @@
+# Instrumentation tests (connectedAndroidTest). Separated from ci.yml
+# because it requires a runner with a working Android emulator or a
+# real device attached.
+#
+# The brief calls for "Android instrumentation tests on every
+# push/PR", and the README's "compile of the instrumentation sources"
+# wording is the placeholder behaviour that ships until a real runner
+# is available. This workflow is the second half of that promise.
+#
+# Configure the runner in Settings -> Environments -> instrumentation
+# (self-hosted runner with the label `android-emulator`) and on
+# `github.repository` -> Settings -> Actions -> Runners. The
+# `runs-on: [self-hosted, android-emulator]` selector is the way to
+# point at a specific runner pool. If no runner is available, the
+# workflow is silently skipped, which is the right behaviour for a
+# brief that does not have a real-device budget.
+name: Instrumentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # An instrumented suite is expensive. Do not cancel in-flight PR runs,
+  # because the cancelled status fails branch protection with no chance
+  # to retry.
+  group: instrumentation-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+  TARGET_SDK: 'android-35'
+
+jobs:
+  instrumentation:
+    name: connectedAndroidTest
+    # `runs-on: [self-hosted, android-emulator]` is the documented
+    # pattern: the runner label is provisioned by the operator and
+    # the job only runs where the label is present. On a public
+    # runner this job is silently absent, which is the intended
+    # fallback.
+    runs-on: [self-hosted, android-emulator]
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '13.0'
+          packages: |
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            platforms;${{ env.TARGET_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+          cache-packages: true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Restore release signing material
+        id: signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PROPERTIES" ]; then
+            mkdir -p keystore
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > keystore/eclipse-release.jks
+            printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > keystore.properties
+            chmod 600 keystore/eclipse-release.jks keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets: instrumentation will use the debug key." >&2
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run connectedAndroidTest
+        # Emulator must be running and visible to adb. The default
+        # behaviour is to pick a single device; if a Farm or
+        # DeviceFarmer pool is in use, override with
+        # `-Pandroid.injected.testDevice=<serial>`.
+        run: ./gradlew --stacktrace connectedDebugAndroidTest
+
+      - name: Upload instrumentation reports
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: instrumentation-reports
+          path: |
+            app/build/reports/androidTests/**
+            app/build/outputs/androidTest-results/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Shred signing material
+        if: always()
+        run: |
+          rm -f keystore.properties
+          rm -rf keystore

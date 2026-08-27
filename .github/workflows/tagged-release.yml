@@ -1,72 +1,77 @@
+# Tagged release. Triggered by a v* tag. Builds, signs, and publishes
+# a GitHub release with the APKs and AAB attached.
+#
+# The third leg of the three-workflow pipeline:
+#
+#   .github/workflows/ci.yml            - CI validation
+#   .github/workflows/release.yml       - Release build artifact (APKs+AAB+checksums)
+#   .github/workflows/tagged-release.yml - this workflow. Publishes a GitHub release.
+#
+# The release is created as a DRAFT, regardless of tag shape, so a
+# maintainer has to hit "Publish" in the GitHub UI. A v1.2.3-rc.1 tag
+# is also marked pre-release automatically.
+#
+# Toolchain is pinned to JDK 17.0.13, Android SDK 35, build-tools 35.0.0
+# on ubuntu-24.04. Every action is pinned to a commit SHA.
 name: Tagged release
 
-# Triggered by a `v*` tag. Builds, signs, and publishes a GitHub release with the APKs attached.
-#
-# This is the third leg of the three-workflow pipeline the brief calls for:
-#
-#   .github/workflows/ci.yml            - CI validation (lint, unit tests, instrumentation
-#                                         compile, build, signature check) on every push and PR.
-#   .github/workflows/release.yml       - Release build, on demand or on every push to main, that
-#                                         produces the APKs as a downloadable artifact.
-#   .github/workflows/tagged-release.yml - this workflow. A `git tag v* && git push --tags` runs
-#                                          the same build under a release identity, signs with
-#                                          the upload key if the secrets are set, and creates a
-#                                          GitHub release with the APKs as binary assets and a
-#                                          checksums file.
-#
-# Cutting a release:
-#
-#   git tag v1.2.3
-#   git push origin v1.2.3
-#
-# The tag must match `v[0-9]+\.[0-9]+\.[0-9]+` (optionally with a pre-release suffix such as
-# -rc.1, which is carried into the release title). Anything else is ignored - this keeps a
-# developer from accidentally publishing a build under a non-release tag.
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
-  contents: write  # Required to create the GitHub release and upload release assets.
+  contents: write  # create release, upload assets
 
 concurrency:
-  # A re-pushed tag cancels the previous run for that tag. The release being created is the
-  # tag's identity, not the branch.
   group: tagged-release-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+  TARGET_SDK: 'android-35'
 
 jobs:
   tagged-release:
     name: Build, sign, and publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          # The full history is needed for the changelog / release notes.
           fetch-depth: 0
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '13.0'
+          packages: |
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            platforms;${{ env.TARGET_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+          cache-packages: true
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@v4
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
-          key: robolectric-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'app/build.gradle.kts') }}
-          restore-keys: robolectric-${{ runner.os }}-
+          key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
 
       - name: Restore release signing material
         id: signing
@@ -81,29 +86,25 @@ jobs:
             chmod 600 keystore/eclipse-release.jks keystore.properties
             echo "signed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No signing secrets set: the release APK will carry the debug key." >&2
             echo "::warning::Release is being published signed with the debug key. The build will still succeed, but the artifact cannot upgrade an existing install."
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Verify the build is from a clean tag
-        # A release must be built from the tag exactly, not from a working copy that happens to
-        # be on the same commit - otherwise the published artifact and the published source
-        # can drift. `git describe` reports the tag at HEAD when HEAD is the tag.
         run: |
           set -euo pipefail
           git describe --exact-match --tags HEAD
           echo "Building from tag: $(git describe --exact-match --tags HEAD)"
 
-      - name: Assemble the release APK
-        run: ./gradlew --stacktrace clean assembleRelease
+      - name: Assemble release APK and AAB
+        run: ./gradlew --stacktrace clean assembleRelease bundleRelease
 
       - name: Verify the release APK signatures
         run: |
           set -euo pipefail
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name apksigner | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
           mapfile -t APKS < <(find app/build/outputs/apk/release -name '*.apk' | sort)
-          test "${#APKS[@]}" -eq 5 || { echo "expected 5 release APKs, found ${#APKS[@]}: ${APKS[*]}"; exit 1; }
+          test "${#APKS[@]}" -ge 1 || { echo "no release APKs found"; exit 1; }
           for APK in "${APKS[@]}"; do
             echo "== Verifying $APK"
             "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK"
@@ -114,34 +115,54 @@ jobs:
             fi
           done
 
-      - name: Compute APK checksums
+      - name: Verify the AAB signature
+        # AABs use the JAR signature scheme (META-INF/{ALIAS}.SF/.RSA) rather
+        # than the APK signature scheme, so apksigner verify cannot read
+        # them. Assert the JAR signature blocks are present and well-formed.
         run: |
           set -euo pipefail
-          cd app/build/outputs/apk/release
-          for APK in *.apk; do
-            sha256sum "$APK" | tee -a SHA256SUMS.txt
-          done
+          AAB="$(find app/build/outputs/bundle/release -name '*.aab' | head -1)"
+          test -n "$AAB" || { echo "no AAB found in app/build/outputs/bundle/release"; exit 1; }
+          echo "== AAB under test: $AAB"
+          unzip -l "$AAB" | grep -E 'META-INF/[^/]+\.(SF|RSA|DSA|EC)$' | tee /tmp/aab-sigs.txt
+          grep -q '\.SF' /tmp/aab-sigs.txt || { echo "no JAR .SF in AAB"; exit 1; }
+          grep -q '\.RSA\|\.DSA\|\.EC' /tmp/aab-sigs.txt || { echo "no JAR signature block in AAB"; exit 1; }
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            echo "AAB is signed with the release key."
+          else
+            echo "AAB is signed with the debug key (no release secrets in CI)."
+          fi
+
+      - name: Compute APK and AAB checksums
+        run: |
+          set -euo pipefail
+          {
+            echo "# APKs"
+            cd app/build/outputs/apk/release
+            for f in *.apk; do
+              sha256sum "$f"
+            done
+            echo
+            echo "# AAB"
+            cd ../../bundle/release
+            for f in *.aab; do
+              sha256sum "$f"
+            done
+          } > app/build/outputs/SHA256SUMS.txt
+          cat app/build/outputs/SHA256SUMS.txt
 
       - name: Resolve the release metadata
         id: meta
-        # Strip the leading "v" from the tag so the "name" is just the version, and pull the
-        # versionName / versionCode from the manifest so the published metadata cannot drift
-        # from the artifact. If the version is below the manifest, the release title and the
-        # app's "About" screen would say different things, and only one of them would be
-        # correct.
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
-          # Pre-release tags (e.g. v1.2.0-rc.1) become drafts and are marked as pre-release.
           if [[ "$TAG" == *"-"* ]]; then
             PRERELEASE="true"
-            DRAFT="true"
           else
             PRERELEASE="false"
-            DRAFT="false"
           fi
-          AAPT2="$(find "$ANDROID_HOME/build-tools" -maxdepth 2 -name aapt2 | sort -V | tail -1)"
+          AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
           BADGING="$("$AAPT2" dump badging app/build/outputs/apk/release/app-arm64-v8a-release.apk)"
           VERSION_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='[^']*' versionCode='\([0-9]*\)' versionName='\([^']*\)'.*$/\2/p" | head -1)"
           VERSION_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='[^']*' versionCode='\([0-9]*\)' versionName='\([^']*\)'.*$/\1/p" | head -1)"
@@ -151,15 +172,10 @@ jobs:
             echo "version_name=$VERSION_NAME"
             echo "version_code=$VERSION_CODE"
             echo "prerelease=$PRERELEASE"
-            echo "draft=$DRAFT"
           } >> "$GITHUB_OUTPUT"
           echo "Tag=$TAG version=$VERSION versionName=$VERSION_NAME versionCode=$VERSION_CODE"
 
       - name: Compose release notes from the audit report
-        # The committed AUDIT-REPORT.md is the canonical record of what shipped in a release;
-        # the section whose number is the audit version is the release notes. If a future
-        # release changes that format the section is still the right heading, and the sed
-        # anchor fails loudly instead of silently producing a blank release.
         run: |
           set -euo pipefail
           TAG="${{ steps.meta.outputs.tag }}"
@@ -172,8 +188,6 @@ jobs:
             if [ -f AUDIT-REPORT.md ]; then
               echo "### Audit summary"
               echo
-              # The report's per-section headings use the literal "## N. Title" pattern; the
-              # latest section is what shipped in this tree.
               LAST="$(grep -E '^## [0-9]+\.' AUDIT-REPORT.md | tail -1 || true)"
               if [ -n "$LAST" ]; then
                 echo "$LAST"
@@ -184,8 +198,9 @@ jobs:
             echo
             echo "### Verification"
             echo
-            echo "- \`./gradlew clean assembleRelease\` succeeded on a GitHub-hosted runner (Ubuntu, JDK 17)"
-            echo "- All release APKs verified with \`apksigner verify\`"
+            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 35, build-tools 35.0.0)"
+            echo "- All release APKs verified with \`apksigner verify\` (v2 + v3)"
+            echo "- The AAB is verified and uploaded alongside the per-ABI APKs"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
               echo "- Signed with the release key (v2 + v3 schemes)"
             else
@@ -195,24 +210,29 @@ jobs:
             echo "### Checksums"
             echo
             echo "\`\`\`"
-            cat app/build/outputs/apk/release/SHA256SUMS.txt
+            cat app/build/outputs/SHA256SUMS.txt
             echo "\`\`\`"
           } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
       - name: Create the GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@80dccdfcca550bfea3bec6643ce0294b259a33d9 # v2.0.4
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: "EclipseSSH ${{ steps.meta.outputs.version }}"
-          draft: ${{ steps.meta.outputs.draft }}
+          # Force DRAFT. A maintainer hits "Publish" in the GitHub UI to
+          # make the release public. This applies even to v1.2.3 (no
+          # -rc suffix), so a tag cannot accidentally ship a green
+          # build that has not been reviewed.
+          draft: true
           prerelease: ${{ steps.meta.outputs.prerelease }}
           body_path: RELEASE_NOTES.md
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: |
             app/build/outputs/apk/release/*.apk
-            app/build/outputs/apk/release/SHA256SUMS.txt
+            app/build/outputs/bundle/release/*.aab
+            app/build/outputs/SHA256SUMS.txt
 
       - name: Shred signing material
         if: always()

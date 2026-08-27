@@ -734,6 +734,28 @@ data class AppSettings(
      * user does with their sessions, so the choice is theirs rather than the app's.
      */
     val blockScreenshots: Boolean = false,
+    /**
+     * Number of scrollback lines the terminal buffer holds. The default
+     * of 2 000 is the Bitvise/PuTTY/iTerm2 standard; the user can
+     * raise it for long-running `tail -f` sessions and lower it for a
+     * battery-conscious device that does not need to scroll back 200
+     * screens. Clamped to 200..50_000 by the settings row.
+     */
+    val terminalScrollback: Int = 2_000,
+    /**
+     * Cursor style for the on-screen caret. SGR 12-style:
+     * "block" (the default), "underline", or "bar". Mapped to the
+     * ANSI cursor shape sequences `ESC [ <n> q` for the local caret
+     * and applied as a SGR-style draw for the Compose paint.
+     */
+    val terminalCursorStyle: String = "block",
+    /**
+     * Bytes per second cap on SFTP transfers, or 0 for "unlimited".
+     * Applied at the [SftpTransferManager] level via a token-bucket
+     * limiter (see [dev.eclipse.ssh.feature.bandwidth.RateLimiter]).
+     * 0 = no limit; the row in Settings is bounded to 0..50 MiB/s.
+     */
+    val transferBytesPerSecond: Long = 0L,
 )
 
 /**

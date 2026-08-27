@@ -19,8 +19,8 @@ android {
         applicationId = "dev.eclipse.ssh"
         minSdk = 28
         targetSdk = 35
-        versionCode = 12
-        versionName = "1.1.4"
+        versionCode = 13
+        versionName = "1.1.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -132,23 +132,36 @@ android {
     }
 
     splits {
-        // One APK per ABI, plus a universal one that carries all four.
-        //
-        // Stated honestly, because the usual reason for splitting does not apply here: this app has
-        // almost no native code. The only .so files in the APK are two AndroidX shims totalling
-        // 60,292 bytes across all four ABIs, against a 5,163,504-byte classes.dex - so a per-ABI APK
-        // saves roughly 45 KB of 5.7 MB, about 0.8 %. The reason to ship them anyway is the install
-        // side rather than the download: a device only ever loads the .so for its own ABI, and an
-        // APK that carries the other three is three chances for a mismatched or corrupt library to be
-        // the one a verifier trips over. The universal APK stays because it is the one a user can
-        // always be told to download without knowing what a phone's ABI is.
+        // Disabled in favour of the AAB's per-ABI splitting at Play
+        // install time. AGP 8.9.1's `PerModuleBundleTask` crashes when
+        // `splits.abi` is enabled alongside the bundle pipeline, so
+        // shipping a single universal APK is the simpler choice. The
+        // universal APK is `isUniversalApk = true` below - it carries
+        // the .so files for all four ABIs. The cost is ~45 KB on a
+        // ~5.7 MB APK, which is the difference documented in the audit
+        // report. Sideloading loses the per-ABI option; the Play Store
+        // path gains per-ABI APKs at install time.
         abi {
-            isEnable = true
-            // reset() drops AGP's default include list, which is "every ABI the NDK knows" - a list
-            // that changes between AGP versions. The four below are the four Android still ships.
+            isEnable = false
             reset()
             include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
             isUniversalApk = true
+        }
+    }
+
+    // Android App Bundle (AAB) configuration. The AAB is the format the
+    // Google Play Store requires for new app submissions. Play generates
+    // per-ABI / per-density / per-language APK splits from the AAB at
+    // install time, so the build does not need to do that work.
+    bundle {
+        language {
+            enableSplit = true
+        }
+        density {
+            enableSplit = true
+        }
+        abi {
+            enableSplit = true
         }
     }
 
@@ -272,6 +285,20 @@ configurations.configureEach {
  */
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+// Dependency locking. Pinned resolution is what makes the build
+// reproducible: the version catalog is the *requested* version, and the
+// lockfile is the *resolved* version, including every transitive
+// coordinate. Without the lockfile, a future run can resolve
+// `androidx.compose.ui` to a different patch release and produce a
+// different APK without the build noticing.
+//
+// Run `./gradlew --write-locks` once to populate `app/gradle.lockfile`,
+// commit the file, and the CI check `./gradlew --write-locks dependencies`
+// (see ci.yml) refuses to merge if a lockfile is out of date.
+dependencyLocking {
+    lockAllConfigurations()
 }
 
 dependencies {

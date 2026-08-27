@@ -64,6 +64,9 @@ class SettingsRepositoryTest {
             repo.setLegacyAlgorithms(false)
             repo.setTerminalTheme(TerminalTheme.DARK.name)
             repo.setBlockScreenshots(false)
+            repo.setTerminalScrollback(2_000)
+            repo.setTerminalCursorStyle("block")
+            repo.setTransferBytesPerSecond(0L)
             repo.clearPin()
         }
     }
@@ -86,6 +89,9 @@ class SettingsRepositoryTest {
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.DARK.name)
         // Off unless asked for: FLAG_SECURE blocks the user's own screenshots too.
         assertThat(settings.blockScreenshots).isFalse()
+        assertThat(settings.terminalScrollback).isEqualTo(2_000)
+        assertThat(settings.terminalCursorStyle).isEqualTo("block")
+        assertThat(settings.transferBytesPerSecond).isEqualTo(0L)
     }
 
     @Test
@@ -101,6 +107,9 @@ class SettingsRepositoryTest {
         repo.setLegacyAlgorithms(true)
         repo.setTerminalTheme(TerminalTheme.entries.last().name)
         repo.setBlockScreenshots(true)
+        repo.setTerminalScrollback(20_000)
+        repo.setTerminalCursorStyle("bar")
+        repo.setTransferBytesPerSecond(5L * 1024 * 1024)
 
         val settings = repo.settings.first()
 
@@ -114,6 +123,9 @@ class SettingsRepositoryTest {
         assertThat(settings.legacyAlgorithms).isTrue()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
         assertThat(settings.blockScreenshots).isTrue()
+        assertThat(settings.terminalScrollback).isEqualTo(20_000)
+        assertThat(settings.terminalCursorStyle).isEqualTo("bar")
+        assertThat(settings.transferBytesPerSecond).isEqualTo(5L * 1024 * 1024)
     }
 
     @Test
@@ -131,6 +143,34 @@ class SettingsRepositoryTest {
         repo.setReconnectBaseSeconds(Int.MAX_VALUE)
         assertThat(repo.settings.first().reconnectBaseSeconds)
             .isEqualTo(SettingsRepository.MAX_RECONNECT_BASE_SECONDS)
+    }
+
+    @Test
+    fun `03b scrollback is clamped to the supported range`() = runTest {
+        val repo = repository
+
+        repo.setTerminalScrollback(0)
+        assertThat(repo.settings.first().terminalScrollback)
+            .isEqualTo(SettingsRepository.MIN_SCROLLBACK)
+
+        repo.setTerminalScrollback(Int.MAX_VALUE)
+        assertThat(repo.settings.first().terminalScrollback)
+            .isEqualTo(SettingsRepository.MAX_SCROLLBACK)
+
+        // A request to disable the cap is preserved as 0.
+        repo.setTransferBytesPerSecond(0L)
+        assertThat(repo.settings.first().transferBytesPerSecond).isEqualTo(0L)
+
+        repo.setTransferBytesPerSecond(Long.MAX_VALUE)
+        assertThat(repo.settings.first().transferBytesPerSecond)
+            .isEqualTo(SettingsRepository.MAX_BANDWIDTH_BYTES_PER_SECOND)
+    }
+
+    @Test
+    fun `03c cursor style rejects unknown values`() = runTest {
+        val repo = repository
+        repo.setTerminalCursorStyle("oblique")
+        assertThat(repo.settings.first().terminalCursorStyle).isEqualTo("block")
     }
 
     @Test

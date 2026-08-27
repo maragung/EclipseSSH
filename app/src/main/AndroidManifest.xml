@@ -56,6 +56,24 @@
                 <data android:scheme="ssh" />
                 <data android:scheme="sftp" />
             </intent-filter>
+
+            <!--
+              Receive shared text (host config snippet, a public key, a
+              hostname to connect to). The activity reads the
+              EXTRA_STREAM / EXTRA_TEXT and routes it to the right
+              surface: a host key into the keys list, a hostname into
+              the Add Host form, a command into the terminal.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
         </activity>
 
         <!--
@@ -106,5 +124,24 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/quick_connect_widget_info" />
         </receiver>
+
+        <!--
+          Quick Settings tile. Tapping the tile opens MainActivity with
+          the EXTRA_QUICK_CONNECT_LAST extra, which the activity turns
+          into a connect-to-most-recently-used-host action.
+
+          android.service.quicksettings.activatable is the API 24+ signal
+          that the tile is enabled for the user to add.
+        -->
+        <service
+            android:name=".feature.qstile.QuickConnectTileService"
+            android:exported="true"
+            android:label="@string/qstile_label"
+            android:icon="@mipmap/ic_launcher"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

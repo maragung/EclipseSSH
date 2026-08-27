@@ -49,4 +49,10 @@
     <string name="lock_biometric_hw_unavailable">The biometric sensor is busy or unavailable</string>
     <string name="lock_biometric_none_enrolled">No fingerprint or face is enrolled on this device</string>
     <string name="lock_biometric_update_required">A security update is required before biometrics can be used</string>
+
+    <!-- Quick Settings tile -->
+    <string name="qstile_label">Eclipse SSH — connect to last host</string>
+
+    <!-- Widget subtitle (with a connected host name) -->
+    <string name="widget_subtitle_with_host">Tap to connect to %1$s</string>
 </resources>

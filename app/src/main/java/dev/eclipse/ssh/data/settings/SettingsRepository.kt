@@ -58,9 +58,12 @@ internal object Keys {
         val pinEnabled = booleanPreferencesKey("pin_enabled")
         val pinHash = stringPreferencesKey("pin_hash")
         val pinSalt = stringPreferencesKey("pin_salt")
-        val legacyAlgorithms = booleanPreferencesKey("legacy_algorithms")
-        val terminalTheme = stringPreferencesKey("terminal_theme")
+    val legacyAlgorithms = booleanPreferencesKey("legacy_algorithms")
+    val terminalTheme = stringPreferencesKey("terminal_theme")
     val blockScreenshots = booleanPreferencesKey("block_screenshots")
+    val terminalScrollback = intPreferencesKey("terminal_scrollback")
+    val terminalCursorStyle = stringPreferencesKey("terminal_cursor_style")
+    val transferBytesPerSecond = androidx.datastore.preferences.core.longPreferencesKey("transfer_bytes_per_second")
 }
 
 /**
@@ -90,6 +93,11 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     legacyAlgorithms = prefs[Keys.legacyAlgorithms] ?: false,
     terminalTheme = prefs[Keys.terminalTheme] ?: TerminalTheme.DARK.name,
     blockScreenshots = prefs[Keys.blockScreenshots] ?: false,
+    terminalScrollback = (prefs[Keys.terminalScrollback] ?: 2_000)
+        .coerceIn(SettingsRepository.MIN_SCROLLBACK, SettingsRepository.MAX_SCROLLBACK),
+    terminalCursorStyle = prefs[Keys.terminalCursorStyle] ?: "block",
+    transferBytesPerSecond = (prefs[Keys.transferBytesPerSecond] ?: 0L)
+        .coerceIn(0L, SettingsRepository.MAX_BANDWIDTH_BYTES_PER_SECOND),
 )
 
 class SettingsRepository(private val context: Context) {
@@ -138,6 +146,38 @@ class SettingsRepository(private val context: Context) {
      */
     suspend fun setReconnectBaseSeconds(seconds: Int) = editPrefs {
         it[Keys.reconnectBaseSeconds] = seconds.coerceIn(MIN_RECONNECT_BASE_SECONDS, MAX_RECONNECT_BASE_SECONDS)
+    }
+
+    /**
+     * Number of scrollback lines the terminal buffer holds.
+     *
+     * Clamped to a range that keeps the buffer from being uselessly small
+     * (200 lines is less than two screens) or large enough to be a memory
+     * problem on a low-end device (50 000 lines is about 6 MB at 120
+     * columns × 4 bytes per cell).
+     */
+    suspend fun setTerminalScrollback(lines: Int) = editPrefs {
+        it[Keys.terminalScrollback] = lines.coerceIn(MIN_SCROLLBACK, MAX_SCROLLBACK)
+    }
+
+    /** Cursor style. One of "block", "underline", "bar". */
+    suspend fun setTerminalCursorStyle(style: String) = editPrefs {
+        it[Keys.terminalCursorStyle] = when (style) {
+            "underline" -> "underline"
+            "bar" -> "bar"
+            else -> "block"
+        }
+    }
+
+    /**
+     * Bytes per second cap on SFTP transfers. 0 = unlimited.
+     *
+     * The cap is per transfer, not per session: two simultaneous transfers
+     * share the cap (one halves its effective rate for the other to use).
+     * That is the simpler model and is what `scp -l` does.
+     */
+    suspend fun setTransferBytesPerSecond(bytesPerSecond: Long) = editPrefs {
+        it[Keys.transferBytesPerSecond] = bytesPerSecond.coerceIn(0L, MAX_BANDWIDTH_BYTES_PER_SECOND)
     }
     /**
      * The terminal's text size in sp, clamped to what the app is willing to draw.
@@ -224,6 +264,19 @@ class SettingsRepository(private val context: Context) {
         const val DEFAULT_RECONNECT_BASE_SECONDS = 5
         const val MIN_RECONNECT_BASE_SECONDS = 1
         const val MAX_RECONNECT_BASE_SECONDS = 60
+
+        // Scrollback bounds. 200 lines is "less than two screens" — the
+        // minimum for a useful terminal — and 50_000 is the largest
+        // buffer that is still ~6 MB at 120 columns. Beyond that the
+        // buffer is a memory cost the user has not asked for.
+        const val MIN_SCROLLBACK = 200
+        const val MAX_SCROLLBACK = 50_000
+
+        // Bandwidth cap. 0 = unlimited; the upper bound is 50 MiB/s,
+        // which is faster than any consumer mobile network in 2026
+        // and faster than what a typical USB 3 SSD can deliver for a
+        // single file.
+        const val MAX_BANDWIDTH_BYTES_PER_SECOND = 50L * 1024L * 1024L
 
         /**
          * The reconnect delays the settings screen offers.
