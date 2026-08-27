@@ -135,6 +135,10 @@ jobs:
       - name: Compute APK and AAB checksums
         run: |
           set -euo pipefail
+          # `nullglob` is required so a directory with no `*.apk` does
+          # not trip the for loop into a non-zero exit that `set -e`
+          # would interpret as a build failure.
+          shopt -s nullglob
           {
             echo "# APKs"
             cd app/build/outputs/apk/release
