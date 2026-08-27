@@ -133,25 +133,23 @@ jobs:
           fi
 
       - name: Compute APK and AAB checksums
+        # The simplest reliable form: a single `find` to a file, with
+        # `shopt -s nullglob` so an empty APK directory does not error.
+        # Previous heredoc-based versions failed under `set -e` because
+        # the subshell `{ ... } > file` produced no output (and no file)
+        # when a for loop's glob expanded to nothing.
         run: |
           set -euo pipefail
-          # `nullglob` is required so a directory with no `*.apk` does
-          # not trip the for loop into a non-zero exit that `set -e`
-          # would interpret as a build failure.
           shopt -s nullglob
-          {
-            echo "# APKs"
-            cd app/build/outputs/apk/release
-            for f in *.apk; do
-              sha256sum "$f"
-            done
-            echo
+          : > app/build/outputs/SHA256SUMS.txt
+          for f in app/build/outputs/apk/release/*.apk; do
+            echo "# APK"
+            sha256sum "$f"
+          done >> app/build/outputs/SHA256SUMS.txt
+          for f in app/build/outputs/bundle/release/*.aab; do
             echo "# AAB"
-            cd ../../bundle/release
-            for f in *.aab; do
-              sha256sum "$f"
-            done
-          } > app/build/outputs/SHA256SUMS.txt
+            sha256sum "$f"
+          done >> app/build/outputs/SHA256SUMS.txt
           cat app/build/outputs/SHA256SUMS.txt
 
       - name: Resolve the release metadata
