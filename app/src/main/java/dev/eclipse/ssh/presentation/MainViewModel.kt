@@ -1353,7 +1353,7 @@ class MainViewModel @Inject constructor(
                 // because a tab that stops after one ending, with no explanation of why it did not try
                 // again, is the same unanswerable report in a different costume.
                 val reason = when {
-                    refusedByServer -> "$endReason · the server closed the session right after login, so it was not retried"
+                    refusedByServer -> "$endReason · the server disconnected right after login, so it was not retried"
                     refusedBeforeOutput -> "$endReason · closed before the shell produced any output, so it was not retried"
                     else -> endReason
                 }
@@ -3677,42 +3677,6 @@ internal fun endedBeforeItRan(end: SessionEnd, upForMs: Long?, idleForMs: Long?)
 }
 
 /**
- * Whether the far end explicitly disconnected a session that had only just come up, in which case the
- * ladder is the loop rather than the cure - the server's decision, not a link that faltered.
- *
- * This is the companion to [endedBeforeItRan] for the one shape it cannot see. [endedBeforeItRan] only
- * fires when the server sent nothing at all, so a server that accepts the login and then sends
- * `SSH_MSG_DISCONNECT` - an idle timeout it applies the instant the pty opens, an administrator, a
- * policy that refuses the session after authentication - slips past it, because [shouldAutoReconnect]
- * answers every [SessionEnd.Disconnected] with a redial. That redial reaches the same refusal, and
- * because it is deterministic the tab shows *Reconnecting…* on every login instead of the server's
- * reason.
- *
- * The ending this catches is the narrowest possible, and on purpose:
- *
- *  - **the far end must have sent `SSH_MSG_DISCONNECT` itself** - [SessionEnd.Disconnected.byPeer] true.
- *    That is the only ending that is unambiguously the server's decision rather than a transport event:
- *    a bare channel close ([SessionEnd.TransportClosed]) is what a phone leaving Wi-Fi looks like to
- *    the client and is left reconnect-worthy on purpose (see `aDroppedTransportIsNeverSilent` and
- *    `aFlappingSessionStopsReconnectingAndSaysWhy`), and a [SessionEnd.Disconnected] MINA raised itself
- *    ([SessionEnd.Disconnected.byPeer] false - a protocol or MAC error) is a fault worth retrying.
- *  - **[upForMs] must be under the floor.** A session that lasted longer than a couple of seconds was
- *    interrupted, not refused; an idle timeout or an admin hang-up on a session that was in use is
- *    exactly what auto-reconnect is for.
- *
- * The user is not left worse off: the tab lands in ERROR carrying the server's own words, and the
- * manual Reconnect button is still offered on every ended state. What they lose is an automatic redial
- * that was always going to fail, and what they gain is the reason.
- *
- * Pure, so the whole matrix is testable without a server that can be talked into refusing a shell.
- */
-internal fun serverRefusedYoungSession(end: SessionEnd, upForMs: Long?): Boolean {
-    if (upForMs == null || upForMs >= NEVER_RAN_MS) return false
-    return end is SessionEnd.Disconnected && end.byPeer
-}
-}
-
-/**
  * How long a session has to last before a hang-up counts as an interruption rather than a refusal.
  *
  * Three seconds, and it is a generous reading of "immediately": a shell that opens sends its banner or
@@ -3754,3 +3718,38 @@ internal const val NEVER_RAN_MS = 3_000L
  */
 internal fun newerTerminalFrame(published: TerminalFrame?, built: TerminalFrame): TerminalFrame =
     if (published != null && published.revision > built.revision) published else built
+
+/**
+ * Whether the far end explicitly disconnected a session that had only just come up, in which case the
+ * ladder is the loop rather than the cure - the server's decision, not a link that faltered.
+ *
+ * This is the companion to [endedBeforeItRan] for the one shape it cannot see. [endedBeforeItRan] only
+ * fires when the server sent nothing at all, so a server that accepts the login and then sends
+ * `SSH_MSG_DISCONNECT` - an idle timeout it applies the instant the pty opens, an administrator, a
+ * policy that refuses the session after authentication - slips past it, because [shouldAutoReconnect]
+ * answers every [SessionEnd.Disconnected] with a redial. That redial reaches the same refusal, and
+ * because it is deterministic the tab shows *Reconnecting…* on every login instead of the server's
+ * reason.
+ *
+ * The ending this catches is the narrowest possible, and on purpose:
+ *
+ *  - **the far end must have sent `SSH_MSG_DISCONNECT` itself** - [SessionEnd.Disconnected.byPeer] true.
+ *    That is the only ending that is unambiguously the server's decision rather than a transport event:
+ *    a bare channel close ([SessionEnd.TransportClosed]) is what a phone leaving Wi-Fi looks like to
+ *    the client and is left reconnect-worthy on purpose (see `aDroppedTransportIsNeverSilent` and
+ *    `aFlappingSessionStopsReconnectingAndSaysWhy`), and a [SessionEnd.Disconnected] MINA raised itself
+ *    ([SessionEnd.Disconnected.byPeer] false - a protocol or MAC error) is a fault worth retrying.
+ *  - **[upForMs] must be under the floor.** A session that lasted longer than a couple of seconds was
+ *    interrupted, not refused; an idle timeout or an admin hang-up on a session that was in use is
+ *    exactly what auto-reconnect is for.
+ *
+ * The user is not left worse off: the tab lands in ERROR carrying the server's own words, and the
+ * manual Reconnect button is still offered on every ended state. What they lose is an automatic redial
+ * that was always going to fail, and what they gain is the reason.
+ *
+ * Pure, so the whole matrix is testable without a server that can be talked into refusing a shell.
+ */
+internal fun serverRefusedYoungSession(end: SessionEnd, upForMs: Long?): Boolean {
+    if (upForMs == null || upForMs >= NEVER_RAN_MS) return false
+    return end is SessionEnd.Disconnected && end.byPeer
+}
