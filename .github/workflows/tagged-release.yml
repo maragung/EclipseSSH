@@ -164,7 +164,13 @@ jobs:
             PRERELEASE="false"
           fi
           AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
-          BADGING="$("$AAPT2" dump badging app/build/outputs/apk/release/app-arm64-v8a-release.apk)"
+          # Pick the first APK in the release directory. The per-ABI
+          # splits were removed in favour of the AAB's per-ABI
+          # splitting at Play install time, so the directory now
+          # contains a single app-release.apk.
+          APK="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -1)"
+          test -n "$APK" || { echo "no APK found in app/build/outputs/apk/release"; exit 1; }
+          BADGING="$("$AAPT2" dump badging "$APK")"
           VERSION_NAME="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='[^']*' versionCode='\([0-9]*\)' versionName='\([^']*\)'.*$/\2/p" | head -1)"
           VERSION_CODE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='[^']*' versionCode='\([0-9]*\)' versionName='\([^']*\)'.*$/\1/p" | head -1)"
           {
@@ -174,7 +180,7 @@ jobs:
             echo "version_code=$VERSION_CODE"
             echo "prerelease=$PRERELEASE"
           } >> "$GITHUB_OUTPUT"
-          echo "Tag=$TAG version=$VERSION versionName=$VERSION_NAME versionCode=$VERSION_CODE"
+          echo "Tag=$TAG version=$VERSION versionName=$VERSION_NAME versionCode=$VERSION_CODE from $APK"
 
       - name: Compose release notes from the audit report
         run: |
