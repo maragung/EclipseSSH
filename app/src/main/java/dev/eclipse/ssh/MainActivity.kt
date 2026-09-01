@@ -8,11 +8,11 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -199,6 +199,7 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
+import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
@@ -278,6 +279,15 @@ class MainActivity : FragmentActivity() {
      */
     private var restoreRequested = false
 
+    /**
+     * The one activity-scoped [MainViewModel] — the same instance the composition obtains through
+     * `hiltViewModel()`, since both resolve against this activity's `ViewModelStore`. Held here so
+     * [onCreate] and [onNewIntent] can hand a Quick Settings tile or widget tap straight to the view
+     * model: resolving the last host needs the host repository, which lives on the view model, not
+     * the activity. See [maybeQuickConnect].
+     */
+    private val viewModel: MainViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // Must run before super.onCreate so the splash theme can hand over to
         // Theme.EclipseSSH via postSplashScreenTheme; the manifest declares the splash
@@ -287,6 +297,7 @@ class MainActivity : FragmentActivity() {
         enableEdgeToEdge()
         deepLink.value = parseDeepLink(intent?.data)
         noteRestoreRequest(intent)
+        maybeQuickConnect(intent)
         setContent {
             val pending by deepLink.collectAsStateWithLifecycle()
             EclipseWorkspace(deepLinkHost = pending, onDeepLinkConsumed = { deepLink.value = null })
@@ -298,6 +309,7 @@ class MainActivity : FragmentActivity() {
         setIntent(intent)
         parseDeepLink(intent.data)?.let { deepLink.value = it }
         noteRestoreRequest(intent)
+        maybeQuickConnect(intent)
     }
 
     override fun onResume() {
@@ -333,6 +345,23 @@ class MainActivity : FragmentActivity() {
         // sticks around via getIntent() — does not reconnect all over again.
         intent.removeExtra(EclipseSessionService.EXTRA_RESTORE_SESSIONS)
         restoreRequested = true
+    }
+
+    /**
+     * Recognises a Quick Settings tile or home-screen widget tap — both launch this activity with
+     * [QuickConnectContract.EXTRA_QUICK_CONNECT_LAST] — and asks the view model to resolve and offer
+     * the most-recently-connected host. A launch without the extra falls straight through, which is
+     * the ordinary "open the app" path.
+     *
+     * The extra is consumed from the intent, exactly as [noteRestoreRequest] does, so returning to
+     * this `singleTask` activity later — `getIntent()` keeps handing back the launch intent — does
+     * not silently redial. The lookup and the dial live on [MainViewModel] because only it holds the
+     * host repository; this activity's whole job here is to spot the extra. See [QuickConnectContract].
+     */
+    private fun maybeQuickConnect(intent: Intent?) {
+        if (!QuickConnectContract.isQuickConnect(intent)) return
+        intent?.removeExtra(QuickConnectContract.EXTRA_QUICK_CONNECT_LAST)
+        viewModel.requestQuickConnectLastHost()
     }
 
     /**
@@ -784,6 +813,19 @@ private fun EclipseWorkspace(
         deepLinkHost?.let {
             showAuthHost = it
             onDeepLinkConsumed()
+        }
+    }
+    // A Quick Settings tile or home-screen widget tap resolves, on the view model, to the
+    // most-recently-connected host and arrives here as a pending value. Route it through the same
+    // auth prompt a deep link uses: a locked vault still gates it (showAuthHost is only shown in the
+    // unlocked branch below, so a tap made while locked fires the instant the PIN is entered), and a
+    // host with saved credentials still connects in one step. Null while nothing is pending, so this
+    // sits idle on a normal open.
+    val quickConnectHost by viewModel.pendingQuickConnect.collectAsStateWithLifecycle()
+    LaunchedEffect(quickConnectHost) {
+        quickConnectHost?.let {
+            showAuthHost = it
+            viewModel.consumeQuickConnect()
         }
     }
     var showGlobalSearch by remember { mutableStateOf(false) }

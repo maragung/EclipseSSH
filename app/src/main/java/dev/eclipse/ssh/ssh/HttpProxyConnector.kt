@@ -1,23 +1,10 @@
 package dev.eclipse.ssh.ssh
 
-import org.apache.sshd.client.SshClient
 import org.apache.sshd.common.AttributeRepository
-import org.apache.sshd.common.PropertyResolver
-import org.apache.sshd.common.io.DefaultIoConnectFuture
-import org.apache.sshd.common.io.IoConnectFuture
-import org.apache.sshd.common.io.IoConnector
-import org.apache.sshd.common.io.IoHandler
-import org.apache.sshd.common.io.IoSession
-import org.apache.sshd.common.io.nio2.Nio2Connector
-import org.apache.sshd.common.io.nio2.Nio2ServiceFactory
 import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.SocketAddress
 import java.nio.ByteBuffer
-import java.nio.channels.AsynchronousChannelGroup
 import java.nio.channels.AsynchronousSocketChannel
 import java.util.Base64
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 
 /**
@@ -55,33 +42,6 @@ data class HttpProxyConfig(
         val KEY = AttributeRepository.AttributeKey<HttpProxyConfig>()
 
         fun from(context: AttributeRepository?): HttpProxyConfig? = context?.getAttribute(KEY)
-    }
-}
-
-/**
- * A [SshClient] whose [IoConnector] tunnels connections through an HTTP CONNECT
- * proxy when an [HttpProxyConfig] is present in the connection context.
- */
-class HttpProxyClient : SshClient() {
-    override fun createConnector(): IoConnector {
-        val factory = getIoServiceFactory() as? Nio2ServiceFactory ?: return super.createConnector()
-        return try {
-            val group = Nio2ServiceFactory::class.java
-                .getDeclaredField("group").apply { isAccessible = true }
-                .get(factory) as AsynchronousChannelGroup
-            val resuming = Nio2ServiceFactory::class.java
-                .getDeclaredField("resuming").apply { isAccessible = true }
-                .get(factory) as ExecutorService
-            HttpProxyConnector(factory, this, getSessionFactory(), group, resuming)
-        } catch (t: Throwable) {
-            super.createConnector()
-        }
-    }
-
-    companion object {
-        fun setUpDefault(): SshClient = org.apache.sshd.client.ClientBuilder.builder()
-            .factory(org.apache.sshd.common.Factory { HttpProxyClient() })
-            .build()
     }
 }
 
@@ -179,55 +139,5 @@ object HttpConnectHandshake {
             if (value != '\r'.code) line.append(value.toChar())
             if (line.length > 16 * 1024) throw IOException("HTTP proxy response too long")
         }
-    }
-}
-
-/**
- * An [IoConnector] that routes through an HTTP CONNECT proxy before handing the socket
- * to SSHD, replicating [Nio2Connector]'s session bootstrap like the SOCKS connector.
- */
-class HttpProxyConnector(
-    factory: Nio2ServiceFactory,
-    propertyResolver: PropertyResolver,
-    handler: IoHandler,
-    group: AsynchronousChannelGroup,
-    resumeTasks: ExecutorService,
-) : Nio2Connector(factory, propertyResolver, handler, group, resumeTasks) {
-
-    override fun connect(
-        address: SocketAddress,
-        context: AttributeRepository?,
-        localAddress: SocketAddress?,
-    ): IoConnectFuture {
-        val proxy = HttpProxyConfig.from(context) ?: return super.connect(address, context, localAddress)
-
-        val future = DefaultIoConnectFuture(address, null)
-        var channel: AsynchronousSocketChannel? = null
-        try {
-            val target = address as? InetSocketAddress
-                ?: throw IOException("HTTP CONNECT requires an InetSocketAddress target")
-            val socket = setSocketOptions(AsynchronousSocketChannel.open(getChannelGroup()))
-            channel = socket
-            if (localAddress != null) socket.bind(localAddress)
-
-            socket.connect(InetSocketAddress(proxy.host, proxy.port))
-                .get(proxy.connectTimeoutMs, TimeUnit.MILLISECONDS)
-            HttpConnectHandshake.perform(socket, target.hostString, target.port, proxy)
-
-            val session = createSession(propertyResolver, getIoHandler(), socket)
-            if (context != null) session.setAttribute(AttributeRepository::class.java, context)
-            getIoHandler().sessionCreated(session)
-            (sessions as MutableMap<Long, IoSession>)[session.id] = session
-            future.setSession(session)
-            session.startReading()
-        } catch (t: Throwable) {
-            try {
-                channel?.close()
-            } catch (_: Exception) {
-                // Ignore secondary close failures.
-            }
-            future.setException(t)
-        }
-        return future
     }
 }

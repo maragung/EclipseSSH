@@ -106,4 +106,46 @@ class SessionRegistryRobolectricTest {
         assertThat(registry.credential("host-adopted")).isEqualTo("hunter2")
         assertThat(registry.activeHostIds.first()).contains("host-adopted")
     }
+
+    @Test
+    fun `unregister removes the key and passphrase, not only the password`() = runBlocking<Unit> {
+        // A key-with-passphrase login registers all three kinds of secret. unregister is what closeTab
+        // and deleteHost call when a host's session ends or the host is deleted, and it has to leave
+        // nothing decryptable behind: a key or its passphrase surviving would be a secret at rest for a
+        // session the user has finished with. This is the guarantee the delete path relies on - see the
+        // credential-sync note in the audit for why forgetCredentials/forgetAllCredentials must reach it.
+        registry.register(
+            "host-all",
+            password = "hunter2",
+            keyBytes = "PRIVATE-KEY-BYTES".toByteArray(),
+            keyPassphrase = "unlock-me",
+        )
+        assertThat(registry.credential("host-all")).isEqualTo("hunter2")
+        assertThat(registry.keyBytes("host-all")).isEqualTo("PRIVATE-KEY-BYTES".toByteArray())
+        assertThat(registry.keyPassphrase("host-all")).isEqualTo("unlock-me")
+
+        registry.unregister("host-all")
+
+        assertThat(registry.credential("host-all")).isNull()
+        assertThat(registry.keyBytes("host-all")).isNull()
+        assertThat(registry.keyPassphrase("host-all")).isNull()
+        assertThat(registry.activeHostIds.first()).doesNotContain("host-all")
+    }
+
+    @Test
+    fun `clear removes every stored secret kind for every host`() = runBlocking<Unit> {
+        // What the Settings "forget every saved credential" panic action must be able to rely on once it
+        // reaches this store: after clear, session_registry holds no decryptable password, key or
+        // passphrase for any host, and nothing is left listed active for the background service to redial.
+        registry.register("host-a", password = "pw-a", keyBytes = "KEY-A".toByteArray(), keyPassphrase = "pp-a")
+        registry.register("host-b", password = "pw-b")
+
+        registry.clear()
+
+        assertThat(registry.activeHostIds.first()).isEmpty()
+        assertThat(registry.credential("host-a")).isNull()
+        assertThat(registry.keyBytes("host-a")).isNull()
+        assertThat(registry.keyPassphrase("host-a")).isNull()
+        assertThat(registry.credential("host-b")).isNull()
+    }
 }

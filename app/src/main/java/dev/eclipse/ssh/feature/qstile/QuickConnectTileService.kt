@@ -21,8 +21,8 @@ import kotlinx.coroutines.flow.first
  * tile to the notification shade, taps it once, and a connect-to-last
  * happens in the background. The Android Quick Settings API is
  * `TileService` (API 24+); the tile's `onClick` opens the main activity
- * with a [MainActivity.EXTRA_QUICK_CONNECT_LAST] intent extra, and the
- * activity reads the last host and dials it.
+ * with a [QuickConnectContract.EXTRA_QUICK_CONNECT_LAST] intent extra, and
+ * the activity reads the last host and dials it.
  *
  * The tile shows the label "Connect to <host>" when a last host is
  * known, and "EclipseSSH" otherwise. The state is read from the host
