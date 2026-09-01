@@ -35,7 +35,9 @@ class MigrationTest {
 
     @After
     fun tearDown() {
-        database?.close()
+        // runCatching because one test opens a database whose migration is meant to throw; closing that
+        // half-opened instance must not turn a passing assertion into a failing tearDown.
+        runCatching { database?.close() }
         databaseFile().delete()
     }
 
@@ -254,23 +256,86 @@ class MigrationTest {
     }
 
     @Test
-    fun `a database older than the first migration is rebuilt instead of crashing`() = runTest {
-        // Production adds fallbackToDestructiveMigration for exactly this: a version with no
-        // migration path must cost the user their queue, never a crash loop on launch.
+    fun `a version 11 database - the oldest a device can hold - migrates to 13 with its row intact`() = runTest {
+        // Eleven is the real floor. The first public release (1.0.0) shipped at exactly this version, so
+        // it is the oldest schema any device in the field can be holding and the oldest upgrade a user
+        // actually runs. `seedVersion2` walks the same 11->12->13 steps, but from a hand-written schema;
+        // this one starts from the committed 11.json the shipped build validated against, and carries a
+        // fully configured row so the climb proves it preserves the values a user chose, not just that a
+        // fresh column lands on its default.
+        seedVersion11()
+
+        val db = openWithMigrations()
+
+        val host = db.hostDao().observeAll().first().single()
+        // Every value set at version 11 survives to 13, none of it reverted to a column default.
+        assertThat(host.id).isEqualTo("v11-host")
+        assertThat(host.port).isEqualTo(2211)
+        assertThat(host.authMethod).isEqualTo("KEY")
+        assertThat(host.groupName).isEqualTo("Prod")
+        assertThat(host.toDomain().tags).containsExactly("eu", "edge")
+        assertThat(host.isFavorite).isTrue()
+        assertThat(host.fingerprint).isEqualTo("SHA256:v11")
+        assertThat(host.proxyType).isEqualTo("SOCKS5")
+        assertThat(host.proxyJump).isEqualTo("bastion11.example.com")
+        assertThat(host.socksHost).isEqualTo("10.0.0.11")
+        assertThat(host.socksPort).isEqualTo(9051)
+        assertThat(host.socksUsername).isEqualTo("ops")
+        assertThat(host.accentColor).isEqualTo(0xFF2196F3)
+        assertThat(host.connectTimeoutSeconds).isEqualTo(33)
+        assertThat(host.keepAliveSeconds).isEqualTo(44)
+        // Off, and not the column's DEFAULT 1: a migration that rebuilt the table instead of extending
+        // it would silently flip this back on, which is the failure a fully configured row exists to catch.
+        assertThat(host.autoLoginSftp).isFalse()
+
+        // The columns added at 12 and 13 arrive absent or at their safe defaults, so a version-11 host
+        // connects exactly as it did before the upgrade.
+        assertThat(host.compression).isFalse()
+        assertThat(host.keepAliveEnabled).isTrue()
+        assertThat(host.hostKeyPolicy).isEqualTo("ASK")
+        assertThat(host.ciphers).isNull()
+        assertThat(host.kexAlgorithms).isNull()
+        assertThat(host.macs).isNull()
+        assertThat(host.hostKeyAlgorithms).isNull()
+        assertThat(host.startupCommand).isEmpty()
+        assertThat(host.environment).isEmpty()
+        assertThat(host.savedForwards).isEmpty()
+
+        // The transfer row and its version-11 columns survive the climb too.
+        val transfer = db.transferDao().observeAll().first().single()
+        assertThat(transfer.id).isEqualTo("v11-transfer")
+        assertThat(transfer.transferredBytes).isEqualTo(4_194_304L)
+        assertThat(transfer.totalBytes).isEqualTo(8_388_608L)
+        assertThat(transfer.retryCount).isEqualTo(3)
+        assertThat(transfer.scheduledAt).isEqualTo(1_750_000_000_001L)
+        assertThat(transfer.repeatMinutes).isEqualTo(15L)
+    }
+
+    @Test
+    fun `an upgrade with no migration path fails loudly instead of silently wiping`() = runTest {
+        // The reason the production fallback is downgrade-only. No release ever shipped below schema 11,
+        // so a version this build has no *upgrade* path for can only come from a developer bumping the
+        // version and forgetting the migration. Under the old blanket fallbackToDestructiveMigration that
+        // reached the user as every host and transfer silently dropped on the next launch; version 1
+        // stands in for that gap. Opening has to throw instead, so the mistake is caught in QA and CI.
         seedVersion2(userVersion = 1)
 
-        val db = Room.databaseBuilder(context, EclipseDatabase::class.java, DB_NAME)
-            .addMigrations(
-                Migrations.MIGRATION_2_3, Migrations.MIGRATION_3_4, Migrations.MIGRATION_4_5,
-                Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
-                Migrations.MIGRATION_8_9,
-                Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
-                Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
-            )
-            .fallbackToDestructiveMigration(dropAllTables = true)
-            .allowMainThreadQueries()
-            .build()
-            .also { database = it }
+        // Room opens lazily, so the missing 1_2 step surfaces on first access rather than at build().
+        val thrown = runCatching { openLikeProduction().hostDao().count() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(IllegalStateException::class.java)
+    }
+
+    @Test
+    fun `a database written by a newer build is reset rather than refused`() = runTest {
+        // The half the audit kept on purpose (AUDIT-REPORT.md sections 5 and 12.9): a downgrade - a file
+        // left by a build one version ahead, e.g. after a Play Store rollback - has no migration path
+        // back and never can, so refusing to open it would be a crash loop with no way out from inside
+        // the app. Resetting is the recoverable direction. user_version 14 is that newer build; the row
+        // shape beneath it is irrelevant, because a destructive downgrade drops every table first.
+        seedVersion2(userVersion = 14)
+
+        val db = openLikeProduction()
 
         assertThat(db.hostDao().count()).isEqualTo(0)
         assertThat(db.transferDao().count()).isEqualTo(0)
@@ -286,6 +351,25 @@ class MigrationTest {
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
+            .allowMainThreadQueries()
+            .build()
+            .also { database = it }
+
+    /**
+     * Opens the database the way `AppModule.provideDatabase` does: the full migration chain and the
+     * downgrade-only destructive fallback. The two fallback tests assert against this so they track the
+     * production decision rather than a copy of it that could drift from the wiring it is meant to prove.
+     */
+    private fun openLikeProduction(): EclipseDatabase =
+        Room.databaseBuilder(context, EclipseDatabase::class.java, DB_NAME)
+            .addMigrations(
+                Migrations.MIGRATION_2_3, Migrations.MIGRATION_3_4, Migrations.MIGRATION_4_5,
+                Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
+                Migrations.MIGRATION_8_9,
+                Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
+                Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
+            )
+            .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .allowMainThreadQueries()
             .build()
             .also { database = it }
@@ -319,6 +403,48 @@ class MigrationTest {
                 "'Legacy edge',1.0,'COMPLETE','12 KB')",
         )
         db.execSQL("PRAGMA user_version = $userVersion")
+        db.close()
+    }
+
+    /**
+     * Writes the version-11 schema from its committed file, with one fully configured host and one
+     * transfer in it.
+     *
+     * Version 11 is what the first public release shipped, so `11.json` is the oldest schema in the
+     * repository and the floor every real upgrade starts at or above. Reconstructed from that file
+     * rather than from SQL pasted here, for the reason [seedVersion12] gives: a hand-copied `CREATE
+     * TABLE` is a second definition that keeps passing after the shipped one is found to differ.
+     */
+    private fun seedVersion11() {
+        val schema = JSONObject(schemaFile(11).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
+            "INSERT INTO host_profiles (id, name, host, username, port, authMethod, groupName, tags, " +
+                "isFavorite, lastConnectedAt, fingerprint, proxyType, proxyJump, socksHost, socksPort, " +
+                "socksUsername, socksPassword, accentColor, connectTimeoutSeconds, keepAliveSeconds, " +
+                "autoLoginSftp) " +
+                "VALUES ('v11-host','V11 edge','edge11.example.com','ops',2211,'KEY','Prod'," +
+                "'eu' || char(31) || 'edge',1,1750000000000,'SHA256:v11','SOCKS5'," +
+                "'bastion11.example.com','10.0.0.11',9051,'ops'," +
+                // socksPassword stays NULL for the same reason as seedVersion12: no fixture in this repo
+                // carries anything shaped like a credential. autoLoginSftp is 0, not its DEFAULT 1.
+                "NULL,4280391411,33,44,0)",
+        )
+        db.execSQL(
+            "INSERT INTO transfer_queue (id, name, direction, hostName, progress, status, sizeLabel, " +
+                "hostId, remotePath, localUri, transferredBytes, totalBytes, retryCount, scheduledAt, " +
+                "repeatMinutes) " +
+                "VALUES ('v11-transfer','v11.bin','DOWNLOAD','V11 edge',0.5,'RUNNING','8 MB'," +
+                "'v11-host','/srv/v11.bin','content://docs/v11.bin',4194304,8388608,3,1750000000001,15)",
+        )
+        db.execSQL("PRAGMA user_version = 11")
         db.close()
     }
 

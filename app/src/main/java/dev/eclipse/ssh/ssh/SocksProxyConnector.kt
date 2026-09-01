@@ -8,7 +8,6 @@ import org.apache.sshd.common.io.DefaultIoConnectFuture
 import org.apache.sshd.common.io.IoConnectFuture
 import org.apache.sshd.common.io.IoConnector
 import org.apache.sshd.common.io.IoHandler
-import org.apache.sshd.common.io.IoSession
 import org.apache.sshd.common.io.nio2.Nio2Connector
 import org.apache.sshd.common.io.nio2.Nio2ServiceFactory
 import java.io.ByteArrayOutputStream
@@ -60,6 +59,81 @@ data class SocksProxyConfig(
 }
 
 /**
+ * The two [Nio2ServiceFactory] internals a proxying [IoConnector] has to be constructed with: the
+ * asynchronous channel group every socket it opens is bound to, and the executor MINA uses to resume
+ * suspended reads. A proxy connector reuses the pair the framework already built rather than standing
+ * up a second set, so its sockets live in the channel group MINA actually manages.
+ */
+internal class Nio2Internals(
+    val group: AsynchronousChannelGroup,
+    val resuming: ExecutorService,
+)
+
+/**
+ * Lifts [Nio2Internals] out of [factory] by reflection, or returns null when either field cannot be
+ * reached.
+ *
+ * MINA 2.14 keeps `group` and `resuming` private with no accessor, so reflection is the only route to
+ * them and this is the one place that takes it. Null rather than a thrown exception on failure is the
+ * whole reason it exists: [ProxyAwareClient.createConnector] turns a null into a graceful fall back to
+ * MINA's own default connector, so a later MINA that renames, retypes or locks these fields down
+ * degrades to a direct connection instead of throwing from inside connector creation on a MINA I/O
+ * thread. [groupField] and [resumingField] default to the real names and are parameters only so a test
+ * can drive the failure path with a name that does not exist — on 2.14 the defaults resolve.
+ */
+internal fun nio2Internals(
+    factory: Nio2ServiceFactory,
+    groupField: String = "group",
+    resumingField: String = "resuming",
+): Nio2Internals? {
+    val group = reflectPrivateField(Nio2ServiceFactory::class.java, factory, groupField) as? AsynchronousChannelGroup
+    val resuming = reflectPrivateField(Nio2ServiceFactory::class.java, factory, resumingField) as? ExecutorService
+    return if (group != null && resuming != null) Nio2Internals(group, resuming) else null
+}
+
+/**
+ * Reads the field named [name] declared on [declaringClass] out of [instance], returning null instead
+ * of propagating when the field is missing or the read is refused. Split out from the typed casts in
+ * [nio2Internals] so the graceful-degradation behaviour can be unit-tested against an ordinary object
+ * with a bogus field name, rather than needing a real MINA factory to stand one up.
+ */
+internal fun reflectPrivateField(declaringClass: Class<*>, instance: Any, name: String): Any? = try {
+    declaringClass.getDeclaredField(name).apply { isAccessible = true }.get(instance)
+} catch (_: Throwable) {
+    null
+}
+
+/**
+ * Puts [key] to [value] in [map] when [map] can actually be written, reporting whether it was.
+ *
+ * Guards the one write these connectors make to a map they did not create: MINA's private `sessions`
+ * map, which they add the hand-built proxied session to because [Nio2Connector]'s own completion
+ * handler — the code that normally registers a session — never runs on the proxy path. That field is
+ * typed as a read-only [Map], and a blind `as MutableMap` cast asserted two separate things about it:
+ * that it is a map, and that it takes writes. Both hold on MINA 2.14, where it is a `ConcurrentHashMap`;
+ * neither is promised for the next release, and one that returned an unmodifiable view would have
+ * surfaced as a ClassCastException or an UnsupportedOperationException raised from connector code with
+ * no connect future to carry it — a failure on a MINA I/O thread rather than a message the user sees.
+ * Reporting false lets the caller fail that future with something a person can read. The `as?` handles
+ * "not a map"; the try/catch handles the unmodifiable-view case, which `as?` cannot — a Kotlin [Map]
+ * and [MutableMap] are one JVM type, so the cast always succeeds and only the write tells them apart.
+ */
+internal fun <K, V> putIfMutable(map: Map<K, V>, key: K, value: V): Boolean {
+    @Suppress("UNCHECKED_CAST")
+    val mutable = map as? MutableMap<K, V> ?: return false
+    return try {
+        mutable[key] = value
+        true
+    } catch (_: UnsupportedOperationException) {
+        false
+    }
+}
+
+/** The connect-future error when [putIfMutable] cannot register a session; names no host or address. */
+private const val SESSION_MAP_UNAVAILABLE =
+    "This MINA release does not expose a writable session map; the proxied connection cannot be registered"
+
+/**
  * A [SshClient] whose [IoConnector] transparently tunnels connections through a
  * SOCKS5 proxy when a [SocksProxyConfig] is present in the connection context.
  *
@@ -69,20 +143,14 @@ data class SocksProxyConfig(
 class ProxyAwareClient : SshClient() {
     override fun createConnector(): IoConnector {
         val factory = getIoServiceFactory() as? Nio2ServiceFactory ?: return super.createConnector()
-        return try {
-            // Nio2ServiceFactory keeps its channel group and resume executor private,
-            // so we extract them once to build the connector ourselves.
-            val group = Nio2ServiceFactory::class.java
-                .getDeclaredField("group").apply { isAccessible = true }
-                .get(factory) as AsynchronousChannelGroup
-            val resuming = Nio2ServiceFactory::class.java
-                .getDeclaredField("resuming").apply { isAccessible = true }
-                .get(factory) as ExecutorService
-            ProxyAwareConnector(factory, this, getSessionFactory(), group, resuming)
-        } catch (t: Throwable) {
-            // Fall back to a plain connector if reflection is ever restricted.
-            super.createConnector()
-        }
+        // MINA keeps the channel group and resume executor these connectors need private on
+        // Nio2ServiceFactory, so [nio2Internals] lifts them out by reflection. It returns null rather
+        // than throwing if a future MINA renames, retypes or locks those fields down, and a null here
+        // falls back to the framework's own plain connector instead of failing connector creation with
+        // a reflection error on a MINA I/O thread. On 2.14 the fields are present and this path is not
+        // taken; the degradation is exercised through [reflectPrivateField] in the tests.
+        val internals = nio2Internals(factory) ?: return super.createConnector()
+        return ProxyAwareConnector(factory, this, getSessionFactory(), internals.group, internals.resuming)
     }
 
     companion object {
@@ -139,7 +207,9 @@ class ProxyAwareConnector(
             val session = createSession(propertyResolver, getIoHandler(), socket)
             if (context != null) session.setAttribute(AttributeRepository::class.java, context)
             getIoHandler().sessionCreated(session)
-            (sessions as MutableMap<Long, IoSession>)[session.id] = session
+            if (!putIfMutable(sessions, session.id, session)) {
+                throw IOException(SESSION_MAP_UNAVAILABLE)
+            }
             future.setSession(session)
             session.startReading()
         } catch (t: Throwable) {
@@ -425,7 +495,9 @@ class SocksProxyConnector(
             val session = createSession(propertyResolver, getIoHandler(), socket)
             if (context != null) session.setAttribute(AttributeRepository::class.java, context)
             getIoHandler().sessionCreated(session)
-            (sessions as MutableMap<Long, IoSession>)[session.id] = session
+            if (!putIfMutable(sessions, session.id, session)) {
+                throw IOException(SESSION_MAP_UNAVAILABLE)
+            }
             future.setSession(session)
             session.startReading()
         } catch (t: Throwable) {

@@ -81,6 +81,20 @@ class MigrationInstrumentedTest {
         assertThat(db.transferDao().count()).isEqualTo(0)
     }
 
+    @Test
+    fun aDatabaseFromANewerBuildIsResetRatherThanRefused() = runTest {
+        // The production fallback is now downgrade-only (see AppModule.provideDatabase). On real SQLite
+        // as on the JVM, a file left by a build one version ahead - user_version 14 here - has no path
+        // back, so it is destructively recreated at the current version rather than refused. A missing
+        // *upgrade* migration is left to throw, which is the loud half the unit suite pins.
+        seedVersion2(userVersion = 14)
+
+        val db = openLikeProduction()
+
+        assertThat(db.hostDao().count()).isEqualTo(0)
+        assertThat(db.transferDao().count()).isEqualTo(0)
+    }
+
     private fun open(): EclipseDatabase =
         Room.databaseBuilder(context, EclipseDatabase::class.java, DB_NAME)
             .addMigrations(
@@ -94,7 +108,21 @@ class MigrationInstrumentedTest {
             .build()
             .also { database = it }
 
-    private fun seedVersion2() {
+    /** Opens as `AppModule.provideDatabase` does, so the downgrade fallback is exercised on-device. */
+    private fun openLikeProduction(): EclipseDatabase =
+        Room.databaseBuilder(context, EclipseDatabase::class.java, DB_NAME)
+            .addMigrations(
+                Migrations.MIGRATION_2_3, Migrations.MIGRATION_3_4, Migrations.MIGRATION_4_5,
+                Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8,
+                Migrations.MIGRATION_8_9,
+                Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
+                Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
+            )
+            .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
+            .build()
+            .also { database = it }
+
+    private fun seedVersion2(userVersion: Int = 2) {
         val file = context.getDatabasePath(DB_NAME).apply { parentFile?.mkdirs() }
         val db = SQLiteDatabase.openOrCreateDatabase(file, null)
         db.execSQL(
@@ -119,7 +147,7 @@ class MigrationInstrumentedTest {
             "INSERT INTO transfer_queue VALUES ('legacy-transfer','old.log','UPLOAD'," +
                 "'Legacy edge',1.0,'COMPLETE','12 KB')",
         )
-        db.execSQL("PRAGMA user_version = 2")
+        db.execSQL("PRAGMA user_version = $userVersion")
         db.close()
     }
 

@@ -158,6 +158,20 @@ class MainViewModel @Inject constructor(
     val frames: StateFlow<Map<String, TerminalFrame>> = terminalFrames
 
     /**
+     * The host a Quick Settings tile or home-screen widget tap has asked to dial, or null when no
+     * such tap is pending.
+     *
+     * [MainActivity] recognises the intent extra and calls [requestQuickConnectLastHost]; this flow
+     * then carries the resolved profile to the workspace, which routes it through the very auth
+     * prompt a deep link uses. Modelled on that deep-link flow on purpose: a value the UI consumes
+     * exactly once, and one the PIN gate leaves untouched because the gate composes a different
+     * branch rather than clearing state — so a tap made while the vault is locked dials the moment
+     * it is unlocked, instead of being swallowed by the lock screen.
+     */
+    private val quickConnectHost = MutableStateFlow<HostProfile?>(null)
+    val pendingQuickConnect: StateFlow<HostProfile?> = quickConnectHost
+
+    /**
      * How far each terminal is scrolled back, in lines above the live bottom. Absent means "live".
      *
      * Held here rather than in the composable because it has to be *adjusted* as output arrives: the
@@ -594,6 +608,29 @@ class MainViewModel @Inject constructor(
 
     fun setQuery(value: String) { query.value = value }
     fun selectHost(host: HostProfile) { selectedHostId.value = host.id }
+
+    /**
+     * Resolves the most-recently-connected saved host and offers it to the workspace as a pending
+     * quick-connect — the action behind the Quick Settings tile and the home-screen widget.
+     *
+     * Fire-and-forget rather than `suspend` because its callers are [MainActivity.onCreate] and
+     * [MainActivity.onNewIntent], which are not coroutines; the single repository read runs on
+     * [viewModelScope]. When no saved host has ever connected the request resolves to null and
+     * nothing is shown, so a tap on a fresh install opens the app normally rather than flashing an
+     * empty prompt. The choice itself is [mostRecentlyConnectedHost], kept in step with the
+     * tile/widget's own resolver so every entry point dials the same host.
+     */
+    fun requestQuickConnectLastHost() {
+        viewModelScope.launch {
+            val hosts = runCatching { hostRepository.hosts.first() }.getOrDefault(emptyList())
+            quickConnectHost.value = mostRecentlyConnectedHost(hosts)
+        }
+    }
+
+    /** Clears the pending quick-connect once the workspace has opened its auth prompt for that host. */
+    fun consumeQuickConnect() {
+        quickConnectHost.value = null
+    }
 
     fun connect(
         host: HostProfile,
@@ -2904,6 +2941,13 @@ class MainViewModel @Inject constructor(
     /** Drops the saved password, key and passphrase for a host without touching the profile. */
     fun forgetCredentials(host: HostProfile) {
         viewModelScope.launch {
+            // Both stores, together. The credential store is what the host form reads, but the session
+            // registry keeps its own encrypted mirror of the same password/key/passphrase so the
+            // reconnect ladder can redial a host whose UI is gone. Forgetting only the first leaves a
+            // still-decryptable copy behind for any host with a live or recent session — exactly the
+            // secret the user just asked to be rid of. Silent like [deleteHost]'s unregister: the
+            // credential-store result below is the one worth a sentence.
+            runCatching { sessionRegistry.unregister(host.id) }
             runCatching { credentialStore.forget(host.id) }
                 .onSuccess { report("Forgot saved credentials for ${host.name}") }
                 .onFailure { error -> report("Could not forget credentials for ${host.name}", error) }
@@ -2913,6 +2957,11 @@ class MainViewModel @Inject constructor(
     /** Drops every saved credential in the app, for the Settings screen's panic action. */
     fun forgetAllCredentials() {
         viewModelScope.launch {
+            // Clears the session registry alongside the credential store. The registry keeps an
+            // encrypted mirror of every active/recent host's secrets for the reconnect ladder, so a
+            // "forget everything" that skipped it would leave a decryptable copy of exactly the
+            // secrets this panic action exists to destroy.
+            runCatching { sessionRegistry.clear() }
             runCatching { credentialStore.forgetAll() }
                 .onSuccess { report("Forgot every saved credential") }
                 .onFailure { error -> report("Could not clear saved credentials", error) }
@@ -3753,3 +3802,15 @@ internal fun serverRefusedYoungSession(end: SessionEnd, upForMs: Long?): Boolean
     if (upForMs == null || upForMs >= NEVER_RAN_MS) return false
     return end is SessionEnd.Disconnected && end.byPeer
 }
+
+/**
+ * Picks the saved host with the greatest [HostProfile.lastConnectedAt], or null when no host has ever
+ * connected.
+ *
+ * Top-level and `internal` for the same reason as the other resolvers above: the choice is testable
+ * without standing up the whole view model. Kept deliberately in step with the Quick Settings tile
+ * and home-screen widget's own resolver (`LastHostProvider`) so all three entry points dial the
+ * identical host — the newest of the hosts that have actually connected, and nothing when none have.
+ */
+internal fun mostRecentlyConnectedHost(hosts: List<HostProfile>): HostProfile? =
+    hosts.filter { it.lastConnectedAt != null }.maxByOrNull { it.lastConnectedAt ?: 0L }

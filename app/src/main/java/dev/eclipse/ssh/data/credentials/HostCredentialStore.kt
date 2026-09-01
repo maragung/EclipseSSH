@@ -216,15 +216,6 @@ class HostCredentialStore @Inject constructor(
     }
 
     /**
-     * Decrypts one stored field, or returns null.
-     *
-     * Failure is swallowed on purpose, and it is a case that really happens: a payload encrypted
-     * under a vault key that no longer exists — the app's data restored onto another device, or the
-     * keystore cleared — cannot be decrypted by anyone, ever. Throwing would take the connection
-     * attempt down with it; returning null falls back to asking the user, which is what the app did
-     * before the credential was saved.
-     */
-    /**
      * Every write goes through here so none of them runs on the caller's dispatcher.
      *
      * DataStore invokes an `edit` transform with `withContext(callerContext)`, so a transform started
@@ -235,6 +226,15 @@ class HostCredentialStore @Inject constructor(
     private suspend fun editPrefs(block: suspend (MutablePreferences) -> Unit): Preferences =
         withContext(Dispatchers.IO) { dataStore.edit(block) }
 
+    /**
+     * Decrypts one stored field, or returns null.
+     *
+     * Failure is swallowed on purpose, and it is a case that really happens: a payload encrypted
+     * under a vault key that no longer exists — the app's data restored onto another device, or the
+     * keystore cleared — cannot be decrypted by anyone, ever. Throwing would take the connection
+     * attempt down with it; returning null falls back to asking the user, which is what the app did
+     * before the credential was saved.
+     */
     private suspend fun secret(key: Preferences.Key<String>): String? {
         val payload = dataStore.data
             .catch { error -> if (error is IOException) emit(emptyPreferences()) else throw error }

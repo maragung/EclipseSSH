@@ -62,8 +62,9 @@ class QuickConnectWidget : AppWidgetProvider() {
         views.setTextViewText(R.id.widget_title, title)
         views.setTextViewText(R.id.widget_subtitle, subtitle)
 
-        // Click action: the widget taps trigger a connect to the last
-        // host. MainActivity reads EXTRA_QUICK_CONNECT_LAST and dials.
+        // Click action: the widget tap triggers a connect to the last host. It carries
+        // QuickConnectContract.EXTRA_QUICK_CONNECT_LAST; MainActivity recognises that through
+        // QuickConnectContract.isQuickConnect and dials the most-recently-used host.
         val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(QuickConnectContract.EXTRA_QUICK_CONNECT_LAST, true)
