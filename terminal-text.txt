@@ -1,0 +1,29 @@
+Buatkan instruksi desain ulang antarmuka (UI/UX) untuk aplikasi terminal/SSH emulator seluler berbasis layar sentuh dengan fokus utama pada kerapian teks dan tata letak output command-line.
+
+Masalah Utama yang Harus Diperbaiki:
+1. Pemotongan Kata dan Baris (Text Wrapping & Line Breaks): Teks dan output terminal sering terpotong secara sembarangan di tengah kata, menghasilkan spasi acak, dan terbagi ke banyak baris terpisah secara berantakan saat lebar layar seluler terbatas.
+2. Perataan Kolom (Alignment & Multi-Column Layout): Output perintah seperti daftar direktori/file (`ls`) atau teks bantuan (`help`) bertebaran tidak rata, tidak simetris, dan sulit dibaca secara visual.
+3. Proporsi Font dan Resolusi Terminal: Ukuran font terlalu besar/tebal atau rendering font monospace yang tidak pas sehingga jumlah kolom terminal (seperti 80x35) terpaksa memotong kata secara paksa.
+
+Spesifikasi Desain dan Kerapian Teks yang Diinginkan:
+
+1. Sistem Monospace Font & Scaling:
+   - Gunakan font monospace modern khusus pemrograman (seperti JetBrains Mono, Fira Code, atau Roboto Mono) dengan ukuran font yang sedikit lebih kecil, presisi, dan proporsional.
+   - Pastikan kerapatan antarkarakter (letter-spacing) dan tinggi baris (line-height) cukup longgar agar teks dapat memuat lebih banyak karakter horizontal tanpa terlihat menumpuk.
+
+2. Struktur Output Teks Vertikal (Single-Column First Layout):
+   - Format output daftar file (`ls`) dan teks dokumentasi bantuan wajib disesuaikan agar tampil rapi secara vertikal dalam satu kolom konsisten (per baris satu item) atau menggunakan tabulasi kolom yang sangat presisi sesuai lebar layar.
+   - Hindari pemotongan kata acak di tengah kalimat. Terapkan aturan kata utuh atau gunakan pemendekan berupa ellipsis (...) jika nama file atau baris teks terlalu panjang.
+
+3. Tata Letak Promos & Command Prompt:
+   - Tampilkan baris perintah (user@hostname:~$ command) secara bersih, sejajar di sebelah kiri (left-aligned), tanpa ada pemotongan string nama host.
+   - Pisahkan area status bar/header aplikasi dengan area aktif terminal secara jelas dan bersih.
+
+4. Skema Warna dan Kontras Teks:
+   - Terapkan kontras tinggi tetapi nyaman di mata (dark theme dengan latar belakang biru gelap/hitam pekat).
+   - Gunakan pewarnaan sintaks (syntax highlighting) yang konsisten: warna hijau terang untuk prompt/user, warna putih atau abu-abu terang untuk output teks biasa, warna oranye/merah untuk file arsip/kompresi (.zip), dan warna biru terang untuk nama folder/file executable.
+
+5. Toolbar Navigasi dan Keyboard Tambahan:
+   - Letakkan pintasan tombol keyboard khusus terminal (seperti TAB, CTRL, SHIFT, ALT, ESC, Panah) secara rapi di baris bawah layar dengan kisi-kisi (grid) yang simetris, tegas, dan mudah ditekan.
+
+Tujuan Akhir: Tampilan output terminal harus terlihat rapi, terstruktur lurus dari atas ke bawah, responsif terhadap rasio layar HP, dan mudah dibaca secara cepat tanpa ada teks berantakan atau kolom yang melompat-lompat.
