@@ -88,18 +88,44 @@ interface FileSystemProvider {
      */
     suspend fun write(path: String, data: ByteArray, onlyIfUnmodifiedSince: Long? = null)
 
-    /** Creates an empty file (or truncates an existing one) and returns its entry. */
-    suspend fun createFile(path: String): FsEntry
+    /**
+     * Creates an empty file named [name] inside [parentPath] and returns its entry.
+     *
+     * The destination is a parent plus a name — never a full destination path — because that is the
+     * one shape both backends can serve: SFTP joins a POSIX path, while SAF can only create *inside*
+     * a document (`createFile` on the parent [androidx.documentfile.provider.DocumentFile]) and has
+     * no notion of a local file at an arbitrary path. A full-path spelling would force one of the two
+     * implementations to invent directories or paths that do not exist.
+     *
+     * Implementations that cannot create atomically (SAF may adjust the name to match the MIME type)
+     * return the entry as it actually landed, so the caller can show the user the real name.
+     */
+    suspend fun createFile(parentPath: String, name: String): FsEntry
 
-    suspend fun createDirectory(path: String)
+    /** Creates an empty directory named [name] inside [parentPath]. Same parent-plus-name rule. */
+    suspend fun createDirectory(parentPath: String, name: String)
 
-    suspend fun rename(from: String, to: String)
+    /**
+     * Renames the entry at [path] to [newName], staying in its parent directory.
+     *
+     * SAF's only rename is a display-name change on the document itself; a *cross-directory* move is
+     * a different operation ([move]) on every backend, so the two are not conflated here.
+     */
+    suspend fun rename(path: String, newName: String)
 
-    /** Copies [from] to [to]; a directory copies recursively. */
-    suspend fun copy(from: String, to: String)
+    /**
+     * Copies the entry at [sourcePath] into [targetDirectoryPath], keeping its name.
+     *
+     * The destination is a directory the caller listed, not a full destination path — for the same
+     * reason as [createFile]. A directory copies recursively.
+     */
+    suspend fun copy(sourcePath: String, targetDirectoryPath: String)
 
-    /** Moves [from] to [to], falling back to copy-then-delete when the backend cannot rename across the gap. */
-    suspend fun move(from: String, to: String)
+    /**
+     * Moves the entry at [sourcePath] into [targetDirectoryPath], keeping its name, falling back to
+     * copy-then-delete when the backend cannot rename across the gap.
+     */
+    suspend fun move(sourcePath: String, targetDirectoryPath: String)
 
     /** Deletes the file or (recursively) the directory at [path]. */
     suspend fun delete(path: String)

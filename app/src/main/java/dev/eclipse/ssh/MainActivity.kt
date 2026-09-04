@@ -109,14 +109,12 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -194,6 +192,8 @@ import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.TransferDirection
 import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.data.fs.FsEntry
+import dev.eclipse.ssh.data.fs.FileSystemProvider
 import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
@@ -203,10 +203,21 @@ import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
+import dev.eclipse.ssh.presentation.files.FilesExplorerController
+import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
+import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
 import dev.eclipse.ssh.presentation.transfersForDisplay
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.editor.EditorRequest
+import dev.eclipse.ssh.ui.editor.TextEditorScreen
+import dev.eclipse.ssh.ui.files.ExplorerFileActionsSheet
+import dev.eclipse.ssh.ui.files.ExplorerList
+import dev.eclipse.ssh.ui.files.ExplorerPropertiesDialog
+import dev.eclipse.ssh.ui.files.ExplorerSelectionBar
+import dev.eclipse.ssh.ui.files.ExplorerTopBar
+import dev.eclipse.ssh.ui.preview.FilePreviewSheet
 import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -227,7 +238,6 @@ import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
 import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
 import dev.eclipse.ssh.ssh.scrub
-import dev.eclipse.ssh.ssh.fallbackHome
 import dev.eclipse.ssh.data.saf.LocalFile
 import androidx.compose.ui.focus.FocusRequester
 import dev.eclipse.ssh.terminal.TerminalFrame
@@ -238,6 +248,7 @@ import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
 import dev.eclipse.ssh.ui.terminal.minTerminalColumns
 import dev.eclipse.ssh.ui.terminal.rememberTerminalCellMetrics
+import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
 import dev.eclipse.ssh.ui.terminal.rememberTerminalLatches
 import dev.eclipse.ssh.ui.terminal.terminalTextInset
 import dev.eclipse.ssh.terminal.TerminalExportRenderer
@@ -451,6 +462,30 @@ private fun EclipseWorkspace(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val activeHost = state.hosts.firstOrNull { it.id == state.selectedHostId } ?: state.hosts.firstOrNull()
+    /**
+     * The host a Files-tab transfer is addressed to: the one the explorer is browsing when it is
+     * browsing one, and otherwise the host selected elsewhere in the app.
+     *
+     * The explorer can be pointed at a server the Hosts list never selected - that is the point of
+     * its session chips - so a transfer launched from it must not assume [activeHost] or it would
+     * land on the wrong server, silently, with the progress row naming the right one. Read from the
+     * controller's current value at the moment of the tap rather than captured on recomposition,
+     * because the chip the user tapped is state the composition has already left behind.
+     */
+    val transferHost: () -> HostProfile? = {
+        val explorer = viewModel.filesExplorer.state.value
+        val hostId = explorer.activeSessionId.takeIf { !explorer.isLocal }?.removePrefix("sftp:")
+        state.hosts.firstOrNull { it.id == hostId } ?: activeHost
+    }
+    /**
+     * The directory the explorer is browsing, when it is browsing a server's - the destination a
+     * picked upload should land in. Null while the local session is active, so the pickers fall
+     * back to the path the ViewModel last listed.
+     */
+    val explorerRemoteDirectory: () -> String? = {
+        val explorer = viewModel.filesExplorer.state.value
+        explorer.path.takeIf { !explorer.isLocal }
+    }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     // Ask once, and only when the permission is actually missing: launching the request
     // unconditionally re-prompted on every rotation and on API < 33 asked for a permission
@@ -520,23 +555,12 @@ private fun EclipseWorkspace(
             openSessionHostId = null
         }
     }
-    // The file browser follows the sessions rather than the host list. It needs an authenticated
-    // transport to show anything at all, so arriving on Files with a host selected that has no session
-    // - the first saved host on a clean install, or whichever one was last tapped in Hosts - pointed
-    // the browser at a server it could not read and left "Not connected" on screen while a working
-    // session sat one tab away. Keyed on the set of open sessions so it also runs when one appears.
-    //
-    // It only ever moves the selection *onto* a session and never off one, so a session chosen in the
-    // switcher stays chosen, including while it is reconnecting. See [fileBrowserHostId].
-    LaunchedEffect(destination, state.selectedHostId, state.tabs.map(SessionTab::hostId)) {
-        if (destination != Destination.FILES) return@LaunchedEffect
-        val browse = fileBrowserHostId(state.selectedHostId, state.tabs) ?: return@LaunchedEffect
-        if (browse != state.selectedHostId) state.hosts.firstOrNull { it.id == browse }?.let(viewModel::selectHost)
-    }
-    LaunchedEffect(destination, state.selectedHostId) {
-        // announce = false: this fires because the user navigated here, not because they asked to
-        // talk to the server, and on a clean install no host is connected. See refreshFiles.
-        if (destination == Destination.FILES) activeHost?.let { viewModel.refreshFiles(it, announce = false) }
+    // The Files explorer keeps its own session list and its own listings, but it cannot see the
+    // rest of the app move: a host renamed or deleted in Hosts, a session that has just come up or
+    // dropped. Re-keyed on the hosts and the open sessions so its chips never offer a server that
+    // is no longer there, and always offer one that has just connected.
+    LaunchedEffect(state.hosts.map(HostProfile::id), state.tabs.map(SessionTab::hostId)) {
+        viewModel.filesExplorer.refreshSessions()
     }
     var selectedKeyBytes by remember { mutableStateOf<ByteArray?>(null) }
     var selectedKeyName by remember { mutableStateOf<String?>(null) }
@@ -580,7 +604,9 @@ private fun EclipseWorkspace(
     var pendingDownload by remember { mutableStateOf<RemoteFile?>(null) }
     val downloadPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri: Uri? ->
         pickerActive = false
-        val host = activeHost
+        // The explorer's session, not the app's selected host: the file being downloaded was
+        // picked in whichever server the Files tab was browsing - see [transferHost].
+        val host = transferHost()
         val remote = pendingDownload
         pendingDownload = null
         if (uri != null && host != null && remote != null) {
@@ -595,13 +621,15 @@ private fun EclipseWorkspace(
     }
     val uploadPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
         pickerActive = false
-        val host = activeHost
+        val host = transferHost()
         if (uris.isNotEmpty() && host != null) {
             uris.forEach { uri ->
                 runCatching {
                     context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                val directory = state.remotePath ?: viewModel.remoteDirectory(host)
+                // Where the explorer is browsing, so the file lands in the folder on screen; the
+                // ViewModel's own path only as a fallback, for uploads started outside the tab.
+                val directory = explorerRemoteDirectory() ?: state.remotePath ?: viewModel.remoteDirectory(host)
                 viewModel.startUpload(host, uri, directory)
             }
         }
@@ -616,8 +644,17 @@ private fun EclipseWorkspace(
                 )
             }
             viewModel.setLocalRoot(uri)
+            // The explorer keeps its own root (persisted, so it survives restarts) and its own
+            // listing of it; the ViewModel's copy above is what downloads and syncs read.
+            viewModel.filesExplorer.setLocalRoot(uri)
         }
     }
+    // The Files explorer's full-window overlays: a text editor and a file preview. They live here,
+    // at the window's root, rather than inside the Files tab, because both take the whole screen —
+    // the tab is padded and sits above the navigation bar, and that is chrome the user should not
+    // be looking at while reading or editing a document.
+    var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
+    var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
     var pendingExportPassphrase by remember { mutableStateOf<String?>(null) }
     var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
     var showExportDialog by remember { mutableStateOf(false) }
@@ -946,6 +983,9 @@ private fun EclipseWorkspace(
                     destination = destination,
                     state = state,
                     frames = viewModel.frames,
+                    filesExplorer = viewModel.filesExplorer,
+                    onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
+                    onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1001,30 +1041,21 @@ private fun EclipseWorkspace(
                         }
                     },
                     onClearCompleted = viewModel::clearCompletedTransfers,
-                    onRefreshFiles = { activeHost?.let(viewModel::refreshFiles) },
                     onUpload = { pickerActive = true; uploadPicker.launch(arrayOf("*/*")) },
                     onDownloadFile = { remote ->
-                        if (state.localDirUri != null) activeHost?.let { viewModel.downloadToLocal(it, remote) }
-                        else { pendingDownload = remote; pickerActive = true; downloadPicker.launch(remote.name) }
+                        // The explorer's session, not merely the selected host - see [transferHost].
+                        val host = transferHost()
+                        if (host != null) {
+                            if (state.localDirUri != null) viewModel.downloadToLocal(host, remote)
+                            else { pendingDownload = remote; pickerActive = true; downloadPicker.launch(remote.name) }
+                        }
                     },
-                    onNavigateRemote = { path -> activeHost?.let { viewModel.navigateRemote(it, path) } },
-                    onCreateFolder = { name -> activeHost?.let { viewModel.createDirectory(it, name) } },
-                    onDeleteFile = { file -> activeHost?.let { viewModel.deleteRemote(it, file) } },
-                    onDeleteFiles = { files -> activeHost?.let { viewModel.deleteRemoteFiles(it, files) } },
-                    onCopyFiles = { files, path -> activeHost?.let { viewModel.copyRemoteFiles(it, files, path) } },
-                    onMoveFiles = { files, path -> activeHost?.let { viewModel.moveRemoteFiles(it, files, path) } },
-                    onRenameFile = { file, name -> activeHost?.let { viewModel.renameRemote(it, file, name) } },
-                    onChmodFile = { file, mode -> activeHost?.let { viewModel.chmodRemote(it, file, mode) } },
-                    onCopyFile = { file, path -> activeHost?.let { viewModel.copyRemote(it, file, path) } },
-                    onMoveFile = { file, path -> activeHost?.let { viewModel.moveRemote(it, file, path) } },
                     onPickLocalFolder = { pickerActive = true; localFolderPicker.launch(null) },
-                    onNavigateLocal = viewModel::navigateLocal,
-                    onNavigateLocalUp = viewModel::navigateLocalUp,
-                    onUploadLocal = { file -> activeHost?.let { viewModel.uploadLocal(it, file) } },
-                    onScheduleDownload = { files, scheduledAt, repeatMinutes -> activeHost?.let { host -> files.forEach { viewModel.scheduleDownload(host, it, scheduledAt, repeatMinutes) } } },
-                    onScheduleUpload = { files, scheduledAt, repeatMinutes -> activeHost?.let { host -> files.forEach { viewModel.scheduleUpload(host, it, scheduledAt, repeatMinutes) } } },
-                    onSync = { direction -> activeHost?.let { host -> if (direction == SyncDirection.LOCAL_TO_REMOTE) viewModel.syncToRemote(host) else viewModel.syncFromRemote(host) } },
-                    onSendToHost = { file, destHost, destPath -> activeHost?.let { viewModel.sendRemoteTo(it, file, destHost, destPath) } },
+                    onUploadLocal = { file -> transferHost()?.let { viewModel.uploadLocal(it, file) } },
+                    onScheduleDownload = { files, scheduledAt, repeatMinutes -> transferHost()?.let { host -> files.forEach { viewModel.scheduleDownload(host, it, scheduledAt, repeatMinutes) } } },
+                    onScheduleUpload = { files, scheduledAt, repeatMinutes -> transferHost()?.let { host -> files.forEach { viewModel.scheduleUpload(host, it, scheduledAt, repeatMinutes) } } },
+                    onSync = { direction -> transferHost()?.let { host -> if (direction == SyncDirection.LOCAL_TO_REMOTE) viewModel.syncToRemote(host) else viewModel.syncFromRemote(host) } },
+                    onSendToHost = { file, destHost, destPath -> transferHost()?.let { viewModel.sendRemoteTo(it, file, destHost, destPath) } },
                     onPauseTransfer = viewModel::pauseTransfer,
                     onResumeTransfer = viewModel::resumeTransfer,
                     onCancelTransfer = viewModel::cancelTransfer,
@@ -1101,6 +1132,9 @@ private fun EclipseWorkspace(
                     destination = destination,
                     state = state,
                     frames = viewModel.frames,
+                    filesExplorer = viewModel.filesExplorer,
+                    onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
+                    onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1156,30 +1190,21 @@ private fun EclipseWorkspace(
                         }
                     },
                     onClearCompleted = viewModel::clearCompletedTransfers,
-                    onRefreshFiles = { activeHost?.let(viewModel::refreshFiles) },
                     onUpload = { pickerActive = true; uploadPicker.launch(arrayOf("*/*")) },
                     onDownloadFile = { remote ->
-                        if (state.localDirUri != null) activeHost?.let { viewModel.downloadToLocal(it, remote) }
-                        else { pendingDownload = remote; pickerActive = true; downloadPicker.launch(remote.name) }
+                        // The explorer's session, not merely the selected host - see [transferHost].
+                        val host = transferHost()
+                        if (host != null) {
+                            if (state.localDirUri != null) viewModel.downloadToLocal(host, remote)
+                            else { pendingDownload = remote; pickerActive = true; downloadPicker.launch(remote.name) }
+                        }
                     },
-                    onNavigateRemote = { path -> activeHost?.let { viewModel.navigateRemote(it, path) } },
-                    onCreateFolder = { name -> activeHost?.let { viewModel.createDirectory(it, name) } },
-                    onDeleteFile = { file -> activeHost?.let { viewModel.deleteRemote(it, file) } },
-                    onDeleteFiles = { files -> activeHost?.let { viewModel.deleteRemoteFiles(it, files) } },
-                    onCopyFiles = { files, path -> activeHost?.let { viewModel.copyRemoteFiles(it, files, path) } },
-                    onMoveFiles = { files, path -> activeHost?.let { viewModel.moveRemoteFiles(it, files, path) } },
-                    onRenameFile = { file, name -> activeHost?.let { viewModel.renameRemote(it, file, name) } },
-                    onChmodFile = { file, mode -> activeHost?.let { viewModel.chmodRemote(it, file, mode) } },
-                    onCopyFile = { file, path -> activeHost?.let { viewModel.copyRemote(it, file, path) } },
-                    onMoveFile = { file, path -> activeHost?.let { viewModel.moveRemote(it, file, path) } },
                     onPickLocalFolder = { pickerActive = true; localFolderPicker.launch(null) },
-                    onNavigateLocal = viewModel::navigateLocal,
-                    onNavigateLocalUp = viewModel::navigateLocalUp,
-                    onUploadLocal = { file -> activeHost?.let { viewModel.uploadLocal(it, file) } },
-                    onScheduleDownload = { files, scheduledAt, repeatMinutes -> activeHost?.let { host -> files.forEach { viewModel.scheduleDownload(host, it, scheduledAt, repeatMinutes) } } },
-                    onScheduleUpload = { files, scheduledAt, repeatMinutes -> activeHost?.let { host -> files.forEach { viewModel.scheduleUpload(host, it, scheduledAt, repeatMinutes) } } },
-                    onSync = { direction -> activeHost?.let { host -> if (direction == SyncDirection.LOCAL_TO_REMOTE) viewModel.syncToRemote(host) else viewModel.syncFromRemote(host) } },
-                    onSendToHost = { file, destHost, destPath -> activeHost?.let { viewModel.sendRemoteTo(it, file, destHost, destPath) } },
+                    onUploadLocal = { file -> transferHost()?.let { viewModel.uploadLocal(it, file) } },
+                    onScheduleDownload = { files, scheduledAt, repeatMinutes -> transferHost()?.let { host -> files.forEach { viewModel.scheduleDownload(host, it, scheduledAt, repeatMinutes) } } },
+                    onScheduleUpload = { files, scheduledAt, repeatMinutes -> transferHost()?.let { host -> files.forEach { viewModel.scheduleUpload(host, it, scheduledAt, repeatMinutes) } } },
+                    onSync = { direction -> transferHost()?.let { host -> if (direction == SyncDirection.LOCAL_TO_REMOTE) viewModel.syncToRemote(host) else viewModel.syncFromRemote(host) } },
+                    onSendToHost = { file, destHost, destPath -> transferHost()?.let { viewModel.sendRemoteTo(it, file, destHost, destPath) } },
                     onPauseTransfer = viewModel::pauseTransfer,
                     onResumeTransfer = viewModel::resumeTransfer,
                     onCancelTransfer = viewModel::cancelTransfer,
@@ -1398,6 +1423,22 @@ private fun EclipseWorkspace(
             },
         )
     }
+    // Drawn last so they cover the workspace; see the state declarations above for why the editor
+    // and the preview live at the window's root rather than inside the Files tab.
+    editorRequest?.let { request ->
+        TextEditorScreen(request) { editorRequest = null }
+    }
+    previewTarget?.let { target ->
+        FilePreviewSheet(
+            entry = target.entry,
+            provider = target.provider,
+            onDismiss = { previewTarget = null },
+            onEdit = { entry ->
+                previewTarget = null
+                editorRequest = EditorRequest(entry, target.provider)
+            },
+        )
+    }
     }
     }
 }
@@ -1477,6 +1518,16 @@ private fun WorkspaceScaffold(
      * background. The pty keeps being drained the whole time; only the copies stop.
      */
     frames: StateFlow<Map<String, TerminalFrame>>,
+    /**
+     * The Files tab's own state and actions. Passed whole rather than as a bag of collected values,
+     * for the same reason [frames] is: the explorer's state changes on every listing, and reading it
+     * here would recompose this scaffold for the sake of a destination that is not on screen.
+     */
+    filesExplorer: FilesExplorerController,
+    /** Opens a file in the full-window preview - see the overlay state in [EclipseWorkspace]. */
+    onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
+    /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
+    onEditFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     onDestination: (Destination) -> Unit,
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
@@ -1512,22 +1563,9 @@ private fun WorkspaceScaffold(
     onSaveText: (String, String) -> Unit = { _, _ -> },
     onSaveScreen: (String, String) -> Unit = { _, _ -> },
     onClearCompleted: () -> Unit = {},
-    onRefreshFiles: () -> Unit = {},
     onUpload: () -> Unit = {},
     onDownloadFile: (RemoteFile) -> Unit = {},
-    onNavigateRemote: (String) -> Unit = {},
-    onCreateFolder: (String) -> Unit = {},
-    onDeleteFile: (RemoteFile) -> Unit = {},
-    onDeleteFiles: (List<RemoteFile>) -> Unit = {},
-    onRenameFile: (RemoteFile, String) -> Unit = { _, _ -> },
-    onChmodFile: (RemoteFile, Int) -> Unit = { _, _ -> },
-    onCopyFile: (RemoteFile, String) -> Unit = { _, _ -> },
-    onCopyFiles: (List<RemoteFile>, String) -> Unit = { _, _ -> },
-    onMoveFile: (RemoteFile, String) -> Unit = { _, _ -> },
-    onMoveFiles: (List<RemoteFile>, String) -> Unit = { _, _ -> },
     onPickLocalFolder: () -> Unit = {},
-    onNavigateLocal: (Uri) -> Unit = {},
-    onNavigateLocalUp: () -> Unit = {},
     onUploadLocal: (LocalFile) -> Unit = {},
     onScheduleDownload: (List<RemoteFile>, Long, Long?) -> Unit = { _, _, _ -> },
     onScheduleUpload: (List<LocalFile>, Long, Long?) -> Unit = { _, _, _ -> },
@@ -1668,7 +1706,20 @@ private fun WorkspaceScaffold(
         // Branching here gives Files a bounded window, which is what lets one tab own the whole of it.
         if (destination == Destination.FILES) {
             Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).padding(horizontal = 20.dp)) {
-                FilesScreen(state, onSelectHost, onRefreshFiles, onUpload, onDownloadFile, onNavigateRemote, onCreateFolder, onDeleteFile, onDeleteFiles, onRenameFile, onChmodFile, onCopyFile, onCopyFiles, onMoveFile, onMoveFiles, onPickLocalFolder, onNavigateLocal, onNavigateLocalUp, onUploadLocal, onScheduleDownload, onScheduleUpload, onSync, onSendToHost)
+                FilesScreen(
+                    state,
+                    filesExplorer,
+                    onPreviewFile,
+                    onEditFile,
+                    onUpload,
+                    onDownloadFile,
+                    onPickLocalFolder,
+                    onUploadLocal,
+                    onScheduleDownload,
+                    onScheduleUpload,
+                    onSync,
+                    onSendToHost,
+                )
             }
             return@Scaffold
         }
@@ -1952,7 +2003,7 @@ private fun TerminalScreen(
     var pinchBase by remember { mutableIntStateOf(0) }
     LaunchedEffect(fontSize) { if (pinchSize == fontSize) pinchSize = null }
     val liveFontSize = pinchSize ?: fontSize
-    val textStyle = remember(liveFontSize) { TextStyle(fontFamily = FontFamily.Monospace, fontSize = liveFontSize.sp) }
+    val textStyle = remember(liveFontSize) { TextStyle(fontFamily = TerminalMonoFontFamily, fontSize = liveFontSize.sp) }
     val metrics = rememberTerminalCellMetrics(textStyle)
     // Measured against the screen rather than against this box, deliberately. The box loses height to
     // the software keyboard, and a margin derived from it would shrink every time the keyboard opened -
@@ -2941,7 +2992,7 @@ private fun TerminalCommandBar(
         },
         placeholder = { Text("Type a command…", color = foreground.copy(alpha = 0.5f)) },
         singleLine = true,
-        textStyle = TextStyle(color = foreground, fontFamily = FontFamily.Monospace, fontSize = fontSize.sp),
+        textStyle = TextStyle(color = foreground, fontFamily = TerminalMonoFontFamily, fontSize = fontSize.sp),
         trailingIcon = { Button(onClick = onSend, enabled = command.isNotBlank()) { Text("Send") } },
         colors = OutlinedTextFieldDefaults.colors(unfocusedContainerColor = background, focusedContainerColor = background),
     )
@@ -3014,637 +3065,338 @@ private fun SaveSnippetDialog(initialCommand: String, label: String, onLabelChan
 }
 
 /**
- * The file browser: one server's directory and one of the phone's, and a way from either to the other.
+ * The Files Explorer: every place files live, behind one interface.
  *
- * A `ColumnScope` member rather than a plain composable, because the point of this screen is that the
- * listing fills the window: the header above it is a fixed height, the selection bar below it appears
- * only when something is selected, and everything left over belongs to the files. `weight(1f)` is how
- * that is said, and it can only be said by something that knows it is in a Column.
+ * A `ColumnScope` member rather than a plain composable, because the listing fills the window: the
+ * bar above it is a fixed height, the selection bar below it appears only when something is
+ * selected, and everything left over belongs to the files. `weight(1f)` is how that is said, and
+ * it can only be said by something that knows it is in a Column.
+ *
+ * The screen owns almost nothing. Which sessions exist, which one is active, the listing, the
+ * selection, the sort — all of it is [FilesExplorerController]'s, collected here. What this
+ * composable adds is the dialogs and banners that turn one tap into one operation, and the routing
+ * into the two full-window overlays (preview and editor) that [EclipseWorkspace] draws.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ColumnScope.FilesScreen(
     state: MainUiState,
-    onSelectHost: (HostProfile) -> Unit,
-    onRefresh: () -> Unit,
+    filesExplorer: FilesExplorerController,
+    onPreviewFile: (FsEntry, FileSystemProvider) -> Unit,
+    onEditFile: (FsEntry, FileSystemProvider) -> Unit,
     onUpload: () -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
-    onNavigateRemote: (String) -> Unit,
-    onCreateFolder: (String) -> Unit,
-    onDeleteFile: (RemoteFile) -> Unit,
-    onDeleteFiles: (List<RemoteFile>) -> Unit,
-    onRenameFile: (RemoteFile, String) -> Unit,
-    onChmodFile: (RemoteFile, Int) -> Unit,
-    onCopyFile: (RemoteFile, String) -> Unit,
-    onCopyFiles: (List<RemoteFile>, String) -> Unit,
-    onMoveFile: (RemoteFile, String) -> Unit,
-    onMoveFiles: (List<RemoteFile>, String) -> Unit,
     onPickLocalFolder: () -> Unit,
-    onNavigateLocal: (Uri) -> Unit,
-    onNavigateLocalUp: () -> Unit,
     onUploadLocal: (LocalFile) -> Unit,
     onScheduleDownload: (List<RemoteFile>, Long, Long?) -> Unit,
     onScheduleUpload: (List<LocalFile>, Long, Long?) -> Unit,
     onSync: (SyncDirection) -> Unit,
     onSendToHost: (RemoteFile, HostProfile, String) -> Unit,
 ) {
-    Spacer(Modifier.height(8.dp))
-    val host = state.hosts.firstOrNull { it.id == state.selectedHostId } ?: state.hosts.firstOrNull()
-    if (host == null) { EmptyState("No remote file system", "Connect to a host to browse SFTP files.", null); return }
-    // Placeholder only until the first listing arrives and sets remotePath; fallbackHome
-    // at least gets root (/root) and blank usernames right.
-    val path = state.remotePath ?: fallbackHome(host.username)
+    val explorer by filesExplorer.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    // The active session's provider, for the two actions that must hand one to a full-window
+    // overlay. Rebuilt when the session changes, not on every recomposition.
+    val provider = remember(explorer.activeSessionId) { filesExplorer.providerFor(explorer.activeSessionId) }
+    // The selection resolved against the listing it was made in — the controller guarantees the
+    // two belong together by clearing the selection on every listing.
+    val selectedEntries = explorer.entries.filter { it.path in explorer.selection }
+
+    // The explorer's own first listing: local, always, granted folder or not. Keyed on the session
+    // list rather than run once, because the sessions arrive from the database a moment after the
+    // tab does. Gated on `path == null` rather than on a flag, so a process death — which resets
+    // the controller but restores this screen — lands back in the local session rather than on a
+    // permanently blank listing.
+    LaunchedEffect(explorer.sessions) {
+        if (explorer.sessions.isNotEmpty() && explorer.path == null) filesExplorer.openSession(LOCAL_SESSION_ID)
+    }
+
+    var actionEntry by remember { mutableStateOf<FsEntry?>(null) }
+    var renameEntry by remember { mutableStateOf<FsEntry?>(null) }
+    var chmodEntry by remember { mutableStateOf<FsEntry?>(null) }
+    var propertiesEntry by remember { mutableStateOf<FsEntry?>(null) }
+    // Confirmed before it happens, like every deletion in this app. Nothing on either backend has
+    // a trash can, and the action sits one row above "Properties" on a bottom sheet.
+    var deleteEntries by remember { mutableStateOf<List<FsEntry>>(emptyList()) }
+    var sendEntry by remember { mutableStateOf<FsEntry?>(null) }
+    var showNewFile by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
-    var actionFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var renameFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var chmodFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var propertiesFile by remember { mutableStateOf<RemoteFile?>(null) }
-    // Confirmed before it happens, like the batch path already was. Deleting a remote file is
-    // irreversible — there is no trash on the far side of SFTP — and the action sat on a bottom sheet
-    // one row below "Send to host", so a mis-tap destroyed the file with nothing to undo it.
-    var deleteFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var copyFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var moveFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var batchCopy by remember { mutableStateOf(false) }
-    var batchMove by remember { mutableStateOf(false) }
-    var batchDelete by remember { mutableStateOf(false) }
+    var showSync by remember { mutableStateOf(false) }
     var scheduleRemote by remember { mutableStateOf(false) }
     var scheduleLocal by remember { mutableStateOf(false) }
-    var showSync by remember { mutableStateOf(false) }
-    var sendFile by remember { mutableStateOf<RemoteFile?>(null) }
-    var selectedRemote by remember { mutableStateOf<Set<String>>(emptySet()) }
-    var selectedLocal by remember { mutableStateOf<Set<Uri>>(emptySet()) }
-    // A selection belongs to the directory it was made in. Both sets hold absolute identifiers
-    // (remote paths, local document URIs) while every batch action resolves them against the
-    // *current* listing, so a selection carried across a navigation became a count the screen could
-    // not act on: pick three files in one folder, open another, and the bar still claimed "3
-    // selected" while Download and Upload had nothing to match and did nothing at all. The delete
-    // confirmation, which counts the filtered list rather than the set, then disagreed with the bar
-    // about how many items were about to go. Nothing was ever deleted from the wrong folder, since
-    // absolute paths cannot collide, but a button that silently does nothing is indistinguishable
-    // from a broken transfer, and that is what the user was left to interpret.
-    LaunchedEffect(path) { selectedRemote = emptySet() }
-    LaunchedEffect(state.localDirUri) { selectedLocal = emptySet() }
+    // A copy or move whose destination is still being chosen: the entries wait while the user
+    // navigates. Browsing to the destination is the one honest way to name a folder on both a
+    // POSIX server and a SAF document tree — neither can be typed as a path by someone who does
+    // not already know it, and the old typed-path dialog could not address the local one at all.
+    var pendingRelocate by remember { mutableStateOf<PendingRelocate?>(null) }
 
-    val browsedTab = state.tabs.firstOrNull { it.hostId == host.id }
-    if (state.tabs.isNotEmpty()) {
-        FilesSessionSwitcher(state, host.id, onSelectHost)
-        Spacer(Modifier.height(10.dp))
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(Icons.Default.FolderOpen, null, tint = MaterialTheme.colorScheme.primary)
-        Spacer(Modifier.width(10.dp))
-        Text(path, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-        IconButton(onClick = { showNewFolder = true }) { Icon(Icons.Default.CreateNewFolder, "New folder") }
-        IconButton(onClick = onUpload) { Icon(Icons.Default.CloudUpload, "Upload file") }
-        IconButton(onClick = { showSync = true }) { Icon(Icons.Default.SwapVert, "Sync folder") }
-        IconButton(onClick = onRefresh) { Icon(Icons.Default.Refresh, "Refresh") }
-    }
+    Spacer(Modifier.height(8.dp))
+    ExplorerTopBar(
+        state = explorer,
+        crumbs = ellipsizeCrumbs(explorer.crumbs),
+        onSession = filesExplorer::openSession,
+        onCrumb = { crumb -> filesExplorer.navigate(crumb.path, crumb.name) },
+        onUp = filesExplorer::goUp,
+        onRefresh = filesExplorer::refresh,
+        onNewFolder = { showNewFolder = true },
+        onNewFile = { showNewFile = true },
+        onSearch = filesExplorer::search,
+        onClearSearch = filesExplorer::clearSearch,
+        onSort = filesExplorer::setSort,
+        onViewMode = filesExplorer::setViewMode,
+        onPickFolder = onPickLocalFolder,
+        onUpload = onUpload.takeIf { !explorer.isLocal },
+        onSync = { showSync = true }.takeIf { !explorer.isLocal },
+    )
     Spacer(Modifier.height(12.dp))
 
-    // The one place the two listings are laid out, and the only thing that differs between a phone and
-    // a tablet: whether there is room to show both at once. `weight(1f)` claims everything the header
-    // above and the selection bar below do not use, so whichever listing is on screen is full height.
-    BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
-        val isWide = maxWidth >= 700.dp
-        if (isWide) {
-            // Room for both: side by side, each the full height of the window. A tablet has the width to
-            // show a transfer's two ends at the same time, which is worth more than either pane's width.
-            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                RemoteListing(
-                    state,
-                    path,
-                    onNavigateRemote,
-                    onDownloadFile,
-                    onOpenActions = { actionFile = it },
-                    selected = selectedRemote,
-                    onToggleSelect = { file -> selectedRemote = if (file.path in selectedRemote) selectedRemote - file.path else selectedRemote + file.path },
-                    modifier = Modifier.weight(1f).fillMaxHeight(),
+    pendingRelocate?.let { pending ->
+        // "Here" is the folder on screen — disabled during a search, whose results span
+        // subfolders and so have no single destination.
+        Surface(
+            Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            shape = RoundedCornerShape(14.dp),
+            color = MaterialTheme.colorScheme.secondaryContainer,
+        ) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+                Text(
+                    "${pending.action} ${pending.entries.size} item(s) — open the destination folder",
+                    style = MaterialTheme.typography.bodyMedium,
                 )
-                LocalListing(
-                    state,
-                    onPickLocalFolder,
-                    onNavigateLocal,
-                    onNavigateLocalUp,
-                    onUploadLocal,
-                    selected = selectedLocal,
-                    onToggleSelect = { file -> selectedLocal = if (file.uri in selectedLocal) selectedLocal - file.uri else selectedLocal + file.uri },
-                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                )
-            }
-        } else {
-            // A phone shows one listing, filling the screen, chosen by a tab.
-            //
-            // Stacked they shared a screen that was already too short, and the server's directory - the
-            // reason this screen exists - took the top half of it with the phone's files below the fold,
-            // so browsing a server meant scrolling a page rather than a directory. Tabs rather than a
-            // pager: both panes scroll, and a horizontal drag across a file list is how a user *starts*
-            // a scroll on a phone, so a pager would take the gesture and change panes under them.
-            //
-            // `rememberSaveable`, because a rotation is not a decision: the pane the user chose has to
-            // survive one, and survive the activity being recreated behind a file picker.
-            var pane by rememberSaveable { mutableIntStateOf(SERVER_PANE) }
-            Column(Modifier.fillMaxSize()) {
-                PrimaryTabRow(
-                    selectedTabIndex = pane,
-                    // The screen's own background rather than a raised surface: the tabs divide this
-                    // screen, they are not a bar sitting on top of it.
-                    containerColor = MaterialTheme.colorScheme.background,
-                ) {
-                    Tab(
-                        selected = pane == SERVER_PANE,
-                        onClick = { pane = SERVER_PANE },
-                        text = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                // The same dot as the session switcher and the terminal's tab strip, so
-                                // the tab says whether the directory under it belongs to a live session
-                                // or to one that has since dropped.
-                                Box(
-                                    Modifier.size(7.dp).clip(RoundedCornerShape(50)).background(
-                                        statusColor(
-                                            browsedTab?.state ?: SessionConnectionState.IDLE,
-                                            browsedTab?.networkHeld == true,
-                                        ),
-                                    ),
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                // Counted only once there is a listing, for the same reason Local is
-                                // counted only once a folder is chosen, and it matters more here: an
-                                // empty `remoteFiles` means "not connected" and "the directory is
-                                // empty" alike, so "Server · 0" would state the one thing this tab
-                                // cannot know. The body under it says which of the two it is.
-                                Text(listingTabLabel("Server", state.remoteFiles.size.takeIf { it > 0 }))
+                Spacer(Modifier.height(6.dp))
+                Row {
+                    Button(
+                        onClick = {
+                            val destination = explorer.path ?: return@Button
+                            pendingRelocate = null
+                            filesExplorer.run(pending.action) { p ->
+                                pending.entries.forEach {
+                                    if (pending.copy) p.copy(it.path, destination) else p.move(it.path, destination)
+                                }
                             }
                         },
-                    )
-                    Tab(
-                        selected = pane == LOCAL_PANE,
-                        onClick = { pane = LOCAL_PANE },
-                        // Counted only once a folder has been chosen: "Local · 0" would read as an empty
-                        // folder where the truth is that no folder has been picked yet.
-                        text = { Text(listingTabLabel("Local", state.localFiles.size.takeIf { state.localDirUri != null })) },
-                    )
-                }
-                Spacer(Modifier.height(12.dp))
-                // Only the chosen pane is composed. Both would defeat the point - the unseen one would
-                // claim half the height again - and keeping the discarded one alive buys nothing: its
-                // contents come from `state`, and its scroll position is worth less than the full screen.
-                if (pane == SERVER_PANE) {
-                    RemoteListing(
-                        state,
-                        path,
-                        onNavigateRemote,
-                        onDownloadFile,
-                        onOpenActions = { actionFile = it },
-                        selected = selectedRemote,
-                        onToggleSelect = { file -> selectedRemote = if (file.path in selectedRemote) selectedRemote - file.path else selectedRemote + file.path },
-                        modifier = Modifier.fillMaxWidth().weight(1f),
-                    )
-                } else {
-                    LocalListing(
-                        state,
-                        onPickLocalFolder,
-                        onNavigateLocal,
-                        onNavigateLocalUp,
-                        onUploadLocal,
-                        selected = selectedLocal,
-                        onToggleSelect = { file -> selectedLocal = if (file.uri in selectedLocal) selectedLocal - file.uri else selectedLocal + file.uri },
-                        modifier = Modifier.fillMaxWidth().weight(1f),
-                    )
+                        enabled = explorer.path != null && explorer.searchQuery == null,
+                    ) { Text("${pending.action} here") }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = { pendingRelocate = null }) { Text("Cancel") }
                 }
             }
         }
     }
 
-    if (selectedRemote.isNotEmpty() || selectedLocal.isNotEmpty()) {
-        Spacer(Modifier.height(12.dp))
-        Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("${selectedRemote.size + selectedLocal.size} selected", style = MaterialTheme.typography.labelLarge)
-                Spacer(Modifier.width(16.dp))
-                TextButton(onClick = { selectedRemote = emptySet(); selectedLocal = emptySet() }) { Text("Clear") }
-                if (selectedRemote.isNotEmpty()) {
-                    Button(
-                        onClick = {
-                            state.remoteFiles.filter { it.path in selectedRemote }.forEach(onDownloadFile)
-                            selectedRemote = emptySet()
-                        },
-                        enabled = state.localDirUri != null,
-                    ) { Text("Download") }
-                    TextButton(onClick = { scheduleRemote = true }, enabled = state.localDirUri != null) { Text("Schedule") }
-                    TextButton(onClick = { batchCopy = true }) { Text("Copy") }
-                    TextButton(onClick = { batchMove = true }) { Text("Move") }
-                    TextButton(onClick = { batchDelete = true }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
-                }
-                if (selectedLocal.isNotEmpty()) {
-                    Button(
-                        onClick = {
-                            state.localFiles.filter { it.uri in selectedLocal }.forEach(onUploadLocal)
-                            selectedLocal = emptySet()
-                        },
-                    ) { Text("Upload") }
-                    TextButton(onClick = { scheduleLocal = true }) { Text("Schedule") }
-                }
-            }
-        }
-    }
-
-    if (showNewFolder) {
-        NewFolderDialog(onDismiss = { showNewFolder = false }, onConfirm = { name -> showNewFolder = false; onCreateFolder(name) })
-    }
-    actionFile?.let { file ->
-        FileActionsSheet(
-            file = file,
-            onDismiss = { actionFile = null },
-            onRename = { actionFile = null; renameFile = file },
-            onProperties = { actionFile = null; propertiesFile = file },
-            onChmod = { actionFile = null; chmodFile = file },
-            onCopy = { actionFile = null; copyFile = file },
-            onMove = { actionFile = null; moveFile = file },
-            onSendToHost = { actionFile = null; sendFile = file },
-            onDelete = { actionFile = null; deleteFile = file },
+    Box(Modifier.fillMaxWidth().weight(1f)) {
+        ExplorerList(
+            state = explorer,
+            onOpen = { entry ->
+                if (entry.isDirectory) filesExplorer.navigate(entry.path, entry.name) else provider?.let { onPreviewFile(entry, it) }
+            },
+            onToggleSelect = filesExplorer::toggleSelected,
         )
     }
-    deleteFile?.let { file ->
+
+    if (explorer.selection.isNotEmpty()) {
+        Spacer(Modifier.height(12.dp))
+        ExplorerSelectionBar(
+            count = explorer.selection.size,
+            onClear = filesExplorer::clearSelection,
+            onDownload = if (!explorer.isLocal) {
+                { selectedEntries.forEach(onDownloadFile); filesExplorer.clearSelection() }
+            } else null,
+            onUpload = if (explorer.isLocal) {
+                { selectedEntries.forEach(onUploadLocal); filesExplorer.clearSelection() }
+            } else null,
+            onSchedule = if (explorer.isLocal) ({ scheduleLocal = true }) else ({ scheduleRemote = true }),
+            onCopy = { pendingRelocate = PendingRelocate(copy = true, entries = selectedEntries); filesExplorer.clearSelection() },
+            onMove = { pendingRelocate = PendingRelocate(copy = false, entries = selectedEntries); filesExplorer.clearSelection() },
+            onDelete = { deleteEntries = selectedEntries },
+        )
+    }
+
+    actionEntry?.let { entry ->
+        ExplorerFileActionsSheet(
+            entry = entry,
+            isLocal = explorer.isLocal,
+            supportsPermissions = explorer.supportsPermissions,
+            onDismiss = { actionEntry = null },
+            onPreview = { actionEntry = null; provider?.let { onPreviewFile(entry, it) } },
+            onEdit = { actionEntry = null; provider?.let { onEditFile(entry, it) } },
+            onRename = { actionEntry = null; renameEntry = entry },
+            onCopy = { actionEntry = null; pendingRelocate = PendingRelocate(copy = true, entries = listOf(entry)) },
+            onMove = { actionEntry = null; pendingRelocate = PendingRelocate(copy = false, entries = listOf(entry)) },
+            onDelete = { actionEntry = null; deleteEntries = listOf(entry) },
+            onProperties = { actionEntry = null; propertiesEntry = entry },
+            onChmod = if (explorer.supportsPermissions) ({ actionEntry = null; chmodEntry = entry }) else null,
+            onTransfer = {
+                actionEntry = null
+                if (explorer.isLocal) onUploadLocal(entry.toLocalFile()) else onDownloadFile(entry.toRemoteFile())
+            },
+            onSendToHost = if (!explorer.isLocal) ({ actionEntry = null; sendEntry = entry }) else null,
+        )
+    }
+
+    if (showNewFile) {
+        NewFileDialog(
+            onDismiss = { showNewFile = false },
+            onConfirm = { name ->
+                showNewFile = false
+                // Created before it is edited, on both backends: a SAF document cannot be
+                // addressed until it exists, and a remote path cannot be written through before
+                // something makes it. The editor opens on the entry the provider handed back.
+                scope.launch {
+                    val entry = filesExplorer.createFileHere(name) ?: return@launch
+                    provider?.let { onEditFile(entry, it) }
+                }
+            },
+        )
+    }
+    if (showNewFolder) {
+        // The parent is captured at the tap, not inside the operation: by the time the operation
+        // runs, the user may have navigated and "the folder on screen" would have moved.
+        val parent = explorer.path
+        NewFolderDialog(
+            onDismiss = { showNewFolder = false },
+            onConfirm = { name ->
+                showNewFolder = false
+                if (parent != null) filesExplorer.run("New folder") { it.createDirectory(parent, name) }
+            },
+        )
+    }
+    renameEntry?.let { entry ->
+        RenameDialog(
+            name = entry.name,
+            onDismiss = { renameEntry = null },
+            onConfirm = { name ->
+                renameEntry = null
+                filesExplorer.run("Rename") { it.rename(entry.path, name) }
+            },
+        )
+    }
+    chmodEntry?.let { entry ->
+        ChmodDialog(
+            name = entry.name,
+            permissions = entry.permissions,
+            onDismiss = { chmodEntry = null },
+            onConfirm = { mode ->
+                chmodEntry = null
+                filesExplorer.run("Permissions") { it.setPermissions(entry.path, mode) }
+            },
+        )
+    }
+    propertiesEntry?.let { entry ->
+        ExplorerPropertiesDialog(entry = entry, isLocal = explorer.isLocal, onDismiss = { propertiesEntry = null })
+    }
+    deleteEntries.takeIf { it.isNotEmpty() }?.let { entries ->
         AlertDialog(
-            onDismissRequest = { deleteFile = null },
-            title = { Text(if (file.isDirectory) "Delete folder \"${file.name}\"?" else "Delete \"${file.name}\"?") },
+            onDismissRequest = { deleteEntries = emptyList() },
+            title = {
+                Text(if (entries.size == 1) "Delete \"${entries[0].name}\"?" else "Delete ${entries.size} selected item(s)?")
+            },
             text = {
                 Text(
-                    if (file.isDirectory) {
-                        "This permanently removes the folder from the server. It must already be empty."
+                    if (entries.size == 1 && entries[0].isDirectory) {
+                        "This permanently removes the folder and everything in it."
                     } else {
-                        "This permanently removes the file from the server."
+                        "This permanently removes the selection. Neither backend has a trash can."
                     },
                 )
             },
             confirmButton = {
-                TextButton(onClick = { deleteFile = null; onDeleteFile(file) }) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
-                }
+                TextButton(onClick = {
+                    val items = entries
+                    deleteEntries = emptyList()
+                    filesExplorer.run("Delete") { p -> items.forEach { p.delete(it.path) } }
+                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
             },
-            dismissButton = { TextButton(onClick = { deleteFile = null }) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = { deleteEntries = emptyList() }) { Text("Cancel") } },
         )
     }
-    renameFile?.let { file ->
-        RenameDialog(file, onDismiss = { renameFile = null }, onConfirm = { name -> renameFile = null; onRenameFile(file, name) })
-    }
-    chmodFile?.let { file ->
-        ChmodDialog(file, onDismiss = { chmodFile = null }, onConfirm = { mode -> chmodFile = null; onChmodFile(file, mode) })
-    }
-    propertiesFile?.let { file ->
-        FilePropertiesDialog(file, onDismiss = { propertiesFile = null })
-    }
-    sendFile?.let { file ->
+    sendEntry?.let { entry ->
         SendToHostDialog(
-            file = file,
+            file = entry.toRemoteFile(),
             hosts = state.hosts,
-            onDismiss = { sendFile = null },
-            onConfirm = { destHost, destPath -> sendFile = null; onSendToHost(file, destHost, destPath) },
+            onDismiss = { sendEntry = null },
+            onConfirm = { destHost, destPath ->
+                sendEntry = null
+                onSendToHost(entry.toRemoteFile(), destHost, destPath)
+            },
         )
     }
     if (showSync) {
-        SyncDialog(
-            onDismiss = { showSync = false },
-            onConfirm = { direction -> showSync = false; onSync(direction) },
-        )
-    }
-    copyFile?.let { file ->
-        PathDialog(file, "Copy", onDismiss = { copyFile = null }, onConfirm = { dest -> copyFile = null; onCopyFile(file, dest) })
-    }
-    moveFile?.let { file ->
-        PathDialog(file, "Move", onDismiss = { moveFile = null }, onConfirm = { dest -> moveFile = null; onMoveFile(file, dest) })
-    }
-    val selectedRemoteFiles = state.remoteFiles.filter { it.path in selectedRemote }
-    if (batchCopy) {
-        BatchPathDialog(
-            count = selectedRemoteFiles.size,
-            action = "Copy",
-            onDismiss = { batchCopy = false },
-            onConfirm = { destination -> batchCopy = false; onCopyFiles(selectedRemoteFiles, destination); selectedRemote = emptySet() },
-        )
-    }
-    if (batchMove) {
-        BatchPathDialog(
-            count = selectedRemoteFiles.size,
-            action = "Move",
-            onDismiss = { batchMove = false },
-            onConfirm = { destination -> batchMove = false; onMoveFiles(selectedRemoteFiles, destination); selectedRemote = emptySet() },
-        )
+        SyncDialog(onDismiss = { showSync = false }, onConfirm = { direction -> showSync = false; onSync(direction) })
     }
     if (scheduleRemote) {
+        val files = selectedEntries.map { it.toRemoteFile() }
         ScheduleTransferDialog(
-            count = selectedRemoteFiles.size,
+            count = files.size,
             direction = "download",
             onDismiss = { scheduleRemote = false },
             onConfirm = { scheduledAt, repeatMinutes ->
                 scheduleRemote = false
-                onScheduleDownload(selectedRemoteFiles, scheduledAt, repeatMinutes)
-                selectedRemote = emptySet()
+                onScheduleDownload(files, scheduledAt, repeatMinutes)
+                filesExplorer.clearSelection()
             },
         )
     }
     if (scheduleLocal) {
+        val files = selectedEntries.map { it.toLocalFile() }
         ScheduleTransferDialog(
-            count = selectedLocal.size,
+            count = files.size,
             direction = "upload",
             onDismiss = { scheduleLocal = false },
             onConfirm = { scheduledAt, repeatMinutes ->
                 scheduleLocal = false
-                onScheduleUpload(state.localFiles.filter { it.uri in selectedLocal }, scheduledAt, repeatMinutes)
-                selectedLocal = emptySet()
+                onScheduleUpload(files, scheduledAt, repeatMinutes)
+                filesExplorer.clearSelection()
             },
         )
     }
-    if (batchDelete) {
-        AlertDialog(
-            onDismissRequest = { batchDelete = false },
-            title = { Text("Delete ${selectedRemoteFiles.size} selected item(s)?") },
-            text = { Text("This action permanently removes the selected remote files or empty directories.") },
-            confirmButton = {
-                TextButton(onClick = { batchDelete = false; onDeleteFiles(selectedRemoteFiles); selectedRemote = emptySet() }) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = { TextButton(onClick = { batchDelete = false }) { Text("Cancel") } },
-        )
-    }
 }
 
-/**
- * Which session the file browser should be pointed at, given the host the rest of the app has selected.
- *
- * Pure so the rule is readable in one place and testable without a screen. Two rules, in order:
- *
- *  1. A selected host that has a session of its own keeps the browser, whatever state that session is
- *     in. A session the user picked in the switcher - including one that is reconnecting, or one whose
- *     SFTP failed - is a deliberate choice, and moving the browser off it would be the app arguing.
- *  2. Otherwise the first *live* session takes it, because a host with no session at all cannot show a
- *     directory: SFTP is a channel on an authenticated transport, so with nothing connected the screen
- *     has only "Not connected" to say. Live rather than merely open - a session still authenticating
- *     has no more to offer than no session at all.
- *
- * Null means "nothing to move to": no session is worth switching to, so whatever the screen already
- * resolved stays. That is the clean-install case, and the case where every session is still connecting.
- */
-internal fun fileBrowserHostId(selectedHostId: String?, tabs: List<SessionTab>): String? = when {
-    tabs.any { it.hostId == selectedHostId } -> selectedHostId
-    else -> tabs.firstOrNull { it.state.isLive }?.hostId
-}
+/** The preview overlay's subject: an entry plus the provider it must be read through. */
+private data class PreviewTarget(
+    val entry: FsEntry,
+    val provider: FileSystemProvider,
+)
 
-/**
- * The open sessions, as one tappable chip each: which server the file browser is reading, and the way
- * to any of the others.
- *
- * The screen used to name no host at all. It showed a path - "/root", "/var/log" - for whichever host
- * happened to be selected somewhere else in the app, with no way to tell which server that was and no
- * way to change it without going back to Hosts and tapping a row. With several sessions open, which is
- * the case this app is built for, the file browser was effectively stuck on one of them.
- *
- * Deliberately the same shape as [TerminalTabStrip]: a status dot in [statusColor] and the host's name,
- * the current one filled in. A chip is enabled only while its host profile is still around, since it is
- * the profile - not the tab - that every file operation is addressed to.
- */
-@Composable
-private fun FilesSessionSwitcher(state: MainUiState, browsedHostId: String, onSelectHost: (HostProfile) -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        state.tabs.forEach { tab ->
-            val sessionHost = state.hosts.firstOrNull { it.id == tab.hostId }
-            val label = sessionHost?.name ?: tab.title
-            val browsing = tab.hostId == browsedHostId
-            Surface(
-                modifier = Modifier
-                    .clickable(enabled = sessionHost != null, role = Role.Tab) { sessionHost?.let(onSelectHost) }
-                    // One description per chip, naming the server, so the row is navigable by a screen
-                    // reader as a list of servers rather than of coloured dots.
-                    .semantics { contentDescription = if (browsing) "Browsing files on $label" else "Browse files on $label" },
-                shape = RoundedCornerShape(12.dp),
-                color = if (browsing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-            ) {
-                Row(
-                    Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(
-                        Modifier.size(7.dp).clip(RoundedCornerShape(50))
-                            .background(statusColor(tab.state, tab.networkHeld)),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        label,
-                        style = MaterialTheme.typography.labelLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.widthIn(max = 168.dp),
-                    )
-                    // The one thing worth saying about a session before it is tapped: its shell is fine
-                    // and its file browser is not, which is a state this app deliberately allows.
-                    if (tab.sftpState == SftpSessionState.FAILED) {
-                        Spacer(Modifier.width(6.dp))
-                        Icon(
-                            Icons.Default.Warning,
-                            "SFTP unavailable",
-                            modifier = Modifier.size(14.dp),
-                            tint = EclipseWarning,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun RemoteListing(
-    state: MainUiState,
-    path: String,
-    onNavigateRemote: (String) -> Unit,
-    onDownloadFile: (RemoteFile) -> Unit,
-    onOpenActions: (RemoteFile) -> Unit,
-    selected: Set<String>,
-    onToggleSelect: (RemoteFile) -> Unit,
-    modifier: Modifier = Modifier,
+/** A copy or move waiting on the user to browse to its destination — see [FilesScreen]. */
+private data class PendingRelocate(
+    val copy: Boolean,
+    val entries: List<FsEntry>,
 ) {
-    Card(modifier, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        // Lazy, now that the pane is given a height instead of taking one. Eagerly composing a directory
-        // was only affordable while the page above scrolled and nobody could see how many rows were being
-        // built; a pane that fills the screen has to build the screenful and no more.
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
-            item(key = "..") {
-                FileRow("..", "Parent directory", "—", true) { onNavigateRemote(parentOf(path)) }
-            }
-            if (state.remoteFiles.isEmpty()) {
-                // "Empty directory" is only true when there was a session to list one with. Without
-                // one the contents are simply unknown, and calling them empty describes the server
-                // instead of the connection — which on a clean install, where nothing is connected
-                // yet, is the first thing this pane ever says and is wrong.
-                item(key = "state") {
-                    val connected = state.tabs.any { it.hostId == state.selectedHostId && it.state.isLive }
-                    Text(
-                        if (connected) "Empty directory" else "Not connected",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(16.dp),
-                    )
-                }
-            } else {
-                // See [MAX_LISTED_ENTRIES] for why this is bounded and why the remainder is named. The
-                // cap protects the SFTP listing and the batch actions, not the composition, so it stays
-                // exactly as it was now that the composition no longer needs protecting.
-                items(state.remoteFiles.take(MAX_LISTED_ENTRIES), key = { it.path }) { file ->
-                    FileRow(
-                        file.name,
-                        if (file.isDirectory) "Directory" else "${file.size} bytes",
-                        file.permissions,
-                        file.isDirectory,
-                        onClick = { if (file.isDirectory) onNavigateRemote(file.path) else onDownloadFile(file) },
-                        selected = file.path in selected,
-                        onToggleSelect = if (file.isDirectory) null else fun() { onToggleSelect(file) },
-                        trailing = {
-                            IconButton(onClick = { onOpenActions(file) }, modifier = Modifier.size(28.dp)) { Icon(Icons.Default.MoreVert, "Actions", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        },
-                    )
-                }
-                item(key = "truncated") {
-                    TruncatedListingNotice(
-                        state.remoteFiles.size,
-                        "entries in this directory",
-                        "Open a subfolder to narrow it down, or use Sync to transfer the whole folder.",
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun LocalListing(
-    state: MainUiState,
-    onPickFolder: () -> Unit,
-    onNavigate: (Uri) -> Unit,
-    onNavigateUp: () -> Unit,
-    onUpload: (LocalFile) -> Unit,
-    selected: Set<Uri>,
-    onToggleSelect: (LocalFile) -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Column(modifier) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Folder, null, tint = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.width(10.dp))
-            Text("Local files", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-            IconButton(onClick = onPickFolder) { Icon(Icons.Default.Add, "Choose local folder") }
-        }
-        Spacer(Modifier.height(12.dp))
-        // Takes the rest of this pane's height, so the header above stays put while the files scroll -
-        // and so the card ends at the bottom of the screen rather than at the end of the folder.
-        Card(Modifier.fillMaxWidth().weight(1f), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-            if (state.localDirUri == null) {
-                // Nothing to scroll and one thing to do: not a list, so not a LazyColumn.
-                Column(Modifier.padding(vertical = 8.dp)) {
-                    Text("Choose a local folder to browse and transfer files.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
-                    TextButton(onClick = onPickFolder, modifier = Modifier.padding(horizontal = 12.dp)) { Text("Pick local folder") }
-                }
-            } else {
-                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
-                    item(key = "..") {
-                        FileRow("..", "Parent folder", "—", true) { onNavigateUp() }
-                    }
-                    if (state.localFiles.isEmpty()) {
-                        item(key = "state") {
-                            Text("Empty folder", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
-                        }
-                    } else {
-                        items(state.localFiles.take(MAX_LISTED_ENTRIES), key = { it.uri.toString() }) { file ->
-                            FileRow(
-                                file.name,
-                                if (file.isDirectory) "Directory" else "${file.size} bytes",
-                                "Local",
-                                file.isDirectory,
-                                onClick = { if (file.isDirectory) onNavigate(file.uri) else onUpload(file) },
-                                selected = file.uri in selected,
-                                onToggleSelect = if (file.isDirectory) null else fun() { onToggleSelect(file) },
-                            )
-                        }
-                        item(key = "truncated") {
-                            TruncatedListingNotice(
-                                state.localFiles.size,
-                                "files in this folder",
-                                "Open a subfolder, or pick a narrower folder, to reach the rest.",
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
+    val action: String get() = if (copy) "Copy" else "Move"
 }
 
 /**
- * Says how much of a list was left undrawn, and what to do about it — or nothing at all when the
- * whole list is on screen, which is every ordinary case.
+ * An [FsEntry] as the transfer pipeline's remote file, for the operations that still speak that
+ * type. The unknowns become the pipeline's own "not reported" values rather than guesses a
+ * transfer row would then present as fact.
  */
+private fun FsEntry.toRemoteFile() = RemoteFile(
+    name = name,
+    path = path,
+    isDirectory = isDirectory,
+    size = size ?: 0L,
+    modifiedEpochSeconds = (modifiedEpochMillis ?: 0L) / 1000L,
+    permissions = permissions ?: "",
+)
+
+/** An [FsEntry] as the transfer pipeline's local file; the provider path *is* the document URI. */
+private fun FsEntry.toLocalFile() = LocalFile(
+    name = name,
+    uri = Uri.parse(path),
+    isDirectory = isDirectory,
+    size = size ?: 0L,
+)
+
 @Composable
-private fun TruncatedListingNotice(total: Int, what: String, advice: String) {
-    if (total <= MAX_LISTED_ENTRIES) return
-    Text(
-        "Showing the first $MAX_LISTED_ENTRIES of $total $what. $advice",
-        style = MaterialTheme.typography.labelMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+private fun NewFileDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New file") },
+        text = { OutlinedTextField(name, { name = it }, label = { Text("File name") }, singleLine = true) },
+        confirmButton = { Button(onClick = { onConfirm(name.trim()) }, enabled = name.isNotBlank()) { Text("Create") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
-}
-
-/**
- * Which of the file browser's two panes a phone is showing.
- *
- * Indices rather than an enum because that is what `PrimaryTabRow` is given, and named rather than
- * written as 0 and 1 because `pane == 1` at the call site says nothing about which listing that is.
- */
-private const val SERVER_PANE = 0
-private const val LOCAL_PANE = 1
-
-/**
- * A tab's label: what the pane is, and how much is in it.
- *
- * The count is the whole directory, not the drawn part of it, so a folder that is showing the first 500
- * of 4,000 entries still says 4,000 - the number the user needs is how much is there, and the notice at
- * the end of the list is what explains the difference. [count] is null when there is nothing to count
- * yet, which is not the same as a count of zero: "Local · 0" describes an empty folder, where the truth
- * before one is chosen is that there is no folder.
- */
-private fun listingTabLabel(what: String, count: Int?): String =
-    if (count == null) what else "$what · $count"
-
-private fun parentOf(path: String): String = path.trimEnd('/').substringBeforeLast('/', "").ifBlank { "/" }
-
-@Composable
-private fun FileRow(
-    name: String,
-    metadata: String,
-    modified: String,
-    isDirectory: Boolean,
-    onClick: () -> Unit = {},
-    selected: Boolean = false,
-    onToggleSelect: (() -> Unit)? = null,
-    trailing: (@Composable () -> Unit)? = null,
-) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (onToggleSelect != null) {
-            Checkbox(checked = selected, onCheckedChange = { onToggleSelect() }, modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(8.dp))
-        }
-        Icon(if (isDirectory) Icons.Default.FolderOpen else Icons.Default.Terminal, null, tint = if (isDirectory) EclipseWarning else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(21.dp))
-        Spacer(Modifier.width(14.dp)); Column(Modifier.weight(1f)) { Text(name, fontWeight = FontWeight.SemiBold); Text(metadata, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        Text(modified, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        trailing?.invoke()
-    }
 }
 
 @Composable
@@ -3660,30 +3412,13 @@ private fun NewFolderDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) 
 }
 
 @Composable
-private fun RenameDialog(file: RemoteFile, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
-    var name by remember { mutableStateOf(file.name) }
+private fun RenameDialog(name: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var newName by remember { mutableStateOf(name) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Rename ${file.name}") },
-        text = { OutlinedTextField(name, { name = it }, label = { Text("New name") }, singleLine = true) },
-        confirmButton = { Button(onClick = { onConfirm(name.trim()) }, enabled = name.isNotBlank()) { Text("Rename") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
-private fun BatchPathDialog(count: Int, action: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
-    var path by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("$action $count selected item(s)") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Enter the destination directory. Original file names will be preserved.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                OutlinedTextField(path, { path = it }, label = { Text("Destination directory") }, placeholder = { Text("/home/user/archive") }, singleLine = true)
-            }
-        },
-        confirmButton = { Button(onClick = { onConfirm(path.trim()) }, enabled = path.isNotBlank()) { Text(action) } },
+        title = { Text("Rename $name") },
+        text = { OutlinedTextField(newName, { newName = it }, label = { Text("New name") }, singleLine = true) },
+        confirmButton = { Button(onClick = { onConfirm(newName.trim()) }, enabled = newName.isNotBlank()) { Text("Rename") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -3790,26 +3525,6 @@ private fun formatScheduledAt(epochMillis: Long): String = DateTimeFormatter.ofP
     .withZone(ZoneId.systemDefault())
     .format(Instant.ofEpochMilli(epochMillis))
 
-@Composable
-private fun PathDialog(file: RemoteFile, action: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
-    var path by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("$action ${file.name}") },
-        text = {
-            OutlinedTextField(
-                path,
-                { path = it },
-                label = { Text("Destination path") },
-                placeholder = { Text("/home/user/${file.name}") },
-                singleLine = true,
-            )
-        },
-        confirmButton = { Button(onClick = { onConfirm(path.trim()) }, enabled = path.isNotBlank()) { Text(action) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
 /**
  * Picks new permissions for [file]. Tapping a row applies it, so there is no confirm button.
  *
@@ -3818,15 +3533,17 @@ private fun PathDialog(file: RemoteFile, action: String, onDismiss: () -> Unit, 
  * hold instead, and what it did to people's files, is written up there.
  */
 @Composable
-private fun ChmodDialog(file: RemoteFile, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+private fun ChmodDialog(name: String, permissions: String?, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
     // Shown so the change can be judged against what is already there — and, on the first release
     // where these presets do what they say, so a file left mis-set by an earlier one is visible.
-    val current = file.permissions.toIntOrNull(radix = 8)
-        ?.let { "${file.permissions} · ${symbolicPermissions(it)}" }
-        ?: file.permissions
+    val current = permissions
+        ?.toIntOrNull(radix = 8)
+        ?.let { "$permissions · ${symbolicPermissions(it)}" }
+        ?: permissions
+        ?: "unknown"
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Permissions · ${file.name}") },
+        title = { Text("Permissions · $name") },
         text = {
             Column {
                 Text(
@@ -3847,38 +3564,6 @@ private fun ChmodDialog(file: RemoteFile, onDismiss: () -> Unit, onConfirm: (Int
     )
 }
 
-@Composable
-private fun FilePropertiesDialog(file: RemoteFile, onDismiss: () -> Unit) {
-    val modified = if (file.modifiedEpochSeconds > 0) {
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
-            .withZone(ZoneId.systemDefault())
-            .format(Instant.ofEpochSecond(file.modifiedEpochSeconds))
-    } else "Unknown"
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Properties") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                PropertyRow("Name", file.name)
-                PropertyRow("Type", if (file.isDirectory) "Directory" else "File")
-                PropertyRow("Size", if (file.isDirectory) "—" else formatFileSize(file.size))
-                PropertyRow("Permissions", file.permissions)
-                PropertyRow("Modified", modified)
-                PropertyRow("Path", file.path)
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
-}
-
-@Composable
-private fun PropertyRow(label: String, value: String) {
-    Column {
-        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(value, style = MaterialTheme.typography.bodyMedium, maxLines = 3, overflow = TextOverflow.Ellipsis)
-    }
-}
-
 /**
  * Accent choices, each paired with a name. The name is the swatch's accessibility label: the
  * swatches carry no text, so without it TalkBack announces six identical unlabelled buttons and
@@ -3895,40 +3580,15 @@ private val ACCENT_COLORS = listOf(
 
 private fun safeFileName(value: String): String = value.trim().replace(Regex("[^A-Za-z0-9._-]+"), "_").ifBlank { "account" }
 
-private fun formatFileSize(bytes: Long): String = when {
-    bytes >= 1_000_000_000L -> "%.1f GB".format(bytes / 1_000_000_000.0)
-    bytes >= 1_000_000L -> "%.1f MB".format(bytes / 1_000_000.0)
-    bytes >= 1_000L -> "%.1f KB".format(bytes / 1_000.0)
-    else -> "$bytes B"
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FileActionsSheet(file: RemoteFile, onDismiss: () -> Unit, onProperties: () -> Unit, onRename: () -> Unit, onChmod: () -> Unit, onCopy: () -> Unit, onMove: () -> Unit, onSendToHost: () -> Unit, onDelete: () -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 22.dp).navigationBarsPadding().padding(bottom = 18.dp)) {
-            Text(file.name, style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            // formatFileSize, as the properties dialog has always used: "4294967296 bytes" is a
-            // number the reader has to count digits in to understand.
-            Text(
-                if (file.isDirectory) "Directory · permissions ${file.permissions}"
-                else "${formatFileSize(file.size)} · permissions ${file.permissions}",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(14.dp))
-            TextButton(onClick = onProperties, modifier = Modifier.fillMaxWidth()) { Text("Properties", modifier = Modifier.fillMaxWidth()) }
-            TextButton(onClick = onRename, modifier = Modifier.fillMaxWidth()) { Text("Rename", modifier = Modifier.fillMaxWidth()) }
-            TextButton(onClick = onCopy, modifier = Modifier.fillMaxWidth()) { Text("Copy to…", modifier = Modifier.fillMaxWidth()) }
-            TextButton(onClick = onMove, modifier = Modifier.fillMaxWidth()) { Text("Move to…", modifier = Modifier.fillMaxWidth()) }
-            TextButton(onClick = onSendToHost, modifier = Modifier.fillMaxWidth()) { Text("Send to another server…", modifier = Modifier.fillMaxWidth()) }
-            // Offered for directories as well. It was files only, yet three of the five presets
-            // (755, 700, 777) are the modes a directory needs and are meaningless on a data file —
-            // the picker was built for both and then only reachable for one, leaving no way to fix a
-            // directory's permissions from here.
-            TextButton(onClick = onChmod, modifier = Modifier.fillMaxWidth()) { Text("Change permissions", modifier = Modifier.fillMaxWidth()) }
-            TextButton(onClick = onDelete, modifier = Modifier.fillMaxWidth()) { Text("Delete", color = MaterialTheme.colorScheme.error, modifier = Modifier.fillMaxWidth()) }
-        }
-    }
+private fun TruncatedListingNotice(total: Int, what: String, advice: String) {
+    if (total <= MAX_LISTED_ENTRIES) return
+    Text(
+        "Showing the first $MAX_LISTED_ENTRIES of $total $what. $advice",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+    )
 }
 
 @Composable
@@ -4089,7 +3749,7 @@ private fun SettingsScreen(
         SettingRow(Icons.Default.Settings, "Dark appearance", "Optimized for terminal work") { Switch(checked = state.settings.darkTheme, onCheckedChange = onDarkTheme) }
         SettingRow(Icons.Default.Wifi, "Keep-alive interval", "Every ${state.settings.keepAliveSeconds} seconds") { TextButton(onClick = { showKeepAliveDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Clipboard auto-clear", if (state.settings.clearClipboardAfterSeconds == 0) "Never clear copied secrets automatically" else "Clear secrets after ${state.settings.clearClipboardAfterSeconds} seconds") { TextButton(onClick = { showClipboardDialog = true }) { Text("Change") } }
-        SettingRow(Icons.Default.Terminal, "Terminal font size", "${state.settings.terminalFontSize} sp monospace") { TextButton(onClick = { showFontDialog = true }) { Text("Change") } }
+        SettingRow(Icons.Default.Terminal, "Terminal font size", "${state.settings.terminalFontSize} sp JetBrains Mono") { TextButton(onClick = { showFontDialog = true }) { Text("Change") } }
         SettingRow(
             Icons.Default.Terminal,
             "Terminal width",

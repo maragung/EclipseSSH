@@ -4,6 +4,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -358,7 +359,11 @@ private fun TerminalKeyCap(
             label,
             color = if (armed) MaterialTheme.colorScheme.onPrimary else KEY_FOREGROUND,
             style = MaterialTheme.typography.labelLarge,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                // A thumb misses; 44dp is the smallest cap that stays easy to hit, and every cap the
+                // same height is what makes the row read as one firm, even strip.
+                .heightIn(min = 24.dp),
         )
     }
 }

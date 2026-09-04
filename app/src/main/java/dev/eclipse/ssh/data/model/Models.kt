@@ -691,7 +691,13 @@ data class AppSettings(
     val clearClipboardAfterSeconds: Int = 30,
     val keepAliveSeconds: Int = 30,
     val reconnectBaseSeconds: Int = 5,
-    val terminalFontSize: Int = 13,
+    /**
+     * Terminal text size in sp. 12 by default: with JetBrains Mono's fixed advance — designed to stay
+     * legible smaller than the platform's default monospace — 12sp keeps the near-ambiguous pairs a
+     * shell is full of (`l1I`, `O0`) distinguishable while fitting more columns on a phone than 13sp
+     * did, which is what stops the server from wrapping lines the screen could have held whole.
+     */
+    val terminalFontSize: Int = 12,
     /**
      * Whether the row of keys a phone keyboard does not have is on screen.
      *
@@ -756,6 +762,19 @@ data class AppSettings(
      * 0 = no limit; the row in Settings is bounded to 0..50 MiB/s.
      */
     val transferBytesPerSecond: Long = 0L,
+    /**
+     * The SAF tree URI the Local file browser was last pointed at, or null before the user has ever
+     * granted a folder.
+     *
+     * The grant behind the URI already survives a reboot — [android.content.ContentResolver.takePersistableUriPermission]
+     * records it at the OS level — but the *choice of which granted folder to reopen* did not: it lived
+     * in a `MainViewModel` field that died with the process, so every cold start dropped Local back to
+     * "no folder picked" even though the permission was still held. Persisting the string here lets the
+     * Files Explorer restore Local to exactly where it was on the last run. Only the URI is stored,
+     * never file contents, and a URI whose grant was later revoked simply fails to list and prompts the
+     * user to pick again — the same recoverable path as a never-granted folder.
+     */
+    val localRootUri: String? = null,
 )
 
 /**

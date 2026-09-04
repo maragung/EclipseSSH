@@ -13,8 +13,10 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.printToString
+import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.presentation.MainViewModel
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -32,8 +34,8 @@ import org.robolectric.shadows.ShadowDialog
  * actual targetSdk rather than whatever image happens to be installed. Both are kept: this one runs
  * everywhere and catches regressions early, the instrumentation one is the real-device signal.
  *
- * `qualifiers` pins a normal phone width on purpose. Both [FilesScreen] and the workspace shell
- * branch at `maxWidth >= 700.dp`, and Robolectric's default screen is narrow enough to be ambiguous;
+ * `qualifiers` pins a normal phone width on purpose. The workspace shell branches at
+ * `maxWidth >= 700.dp`, and Robolectric's default screen is narrow enough to be ambiguous;
  * 411dp puts this on the same side of the breakpoint as a phone.
  *
  * Assertions match a clean install, which is *seeded*, not empty: both repositories call
@@ -50,6 +52,9 @@ class NavigationRobolectricTest {
 
     /** The tab, not the identically-titled top app bar; only the tab is clickable. */
     private fun tab(label: String) = compose.onNode(hasText(label) and hasClickAction())
+
+    /** The activity's [MainViewModel], for raising a message the way the UI's own flows do. */
+    private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
 
     /**
      * A Settings section header.
@@ -196,16 +201,19 @@ class NavigationRobolectricTest {
      * report raises one — the five tabs were untappable and a tap produced nothing at all. It is now
      * the narrow layout's `Scaffold` snackbar slot, which offsets it above the bottom bar.
      *
-     * Reached the way a user would: tapping a directory on a host that is not connected reports why,
-     * and nothing is connected on a clean install. The assertion is that the *next* tap still works.
+     * The message is raised through [MainViewModel.reportUiMessage] — the same public entry point the
+     * UI's own failures call — rather than by driving a failing flow, because the old trigger
+     * (browsing a disconnected host from Files) now reports *inline* in the explorer by design, and
+     * the remaining snackbar raisers need pickers, prompts or live sockets a clean install cannot
+     * offer. The property under test is the layout's, not the trigger's: a showing snackbar, however
+     * it got there, must leave the bar tappable. The assertion is that the *next* tap still works.
      */
     @Test
     fun aStatusMessageDoesNotBlockTheNavigationBar() {
         compose.waitForIdle()
 
         tab("Files").performClick()
-        waitForText("Parent directory")
-        compose.onNodeWithText("Parent directory").performClick()
+        compose.runOnUiThread { viewModel().reportUiMessage("Production edge is not connected") }
         waitForTextContaining("is not connected")
 
         tab("Transfers").performClick()
@@ -224,17 +232,19 @@ class NavigationRobolectricTest {
         assertDisplayed("No active sessions")
 
         tab("Files").performClick()
-        // Not "No remote file system": that branch needs zero hosts, and the seeded demo hosts plus
-        // MainViewModel's `selectedHostId = selected ?: hosts.firstOrNull()` mean one is always
-        // selected. The browser composes disconnected instead, so the remote listing shows its
-        // parent-directory row over a body that says so — "Not connected", not "Empty directory",
-        // which would be a claim about the server rather than about the session. Both are on the
-        // Server tab, which is the one a phone opens on; [FilesTabsRobolectricTest] covers the tabs
-        // themselves. assertExists rather than assertIsDisplayed because a listing longer than the
-        // pane legitimately keeps its later rows below the fold.
-        waitForText("Parent directory")
-        compose.onNodeWithText("Parent directory").assertExists()
-        compose.onNodeWithText("Not connected").assertExists()
+        // The explorer's first run: the device's own session, first and always, with its front door
+        // on screen because a SAF folder is the one thing this screen cannot grant itself — and an
+        // honest "no folder chosen yet" rather than a claim about an empty folder. The seeded demo
+        // hosts' chips are here too: every saved host stays reachable from Files, connected or not.
+        // [FilesExplorerLayoutRobolectricTest] covers the chip order and the listing's layout.
+        waitForText("This device")
+        // Clickable rather than merely present: the path bar also reads "This device" before any
+        // folder is granted, and only the chip is the tappable one.
+        compose.onNode(hasText("This device") and hasClickAction()).assertExists()
+        compose.onNode(hasText("Pick folder") and hasClickAction()).assertExists()
+        waitForTextContaining("No folder chosen yet")
+        waitForText("Production edge")
+        compose.onNode(hasText("Production edge") and hasClickAction()).assertExists()
 
         tab("Transfers").performClick()
         // The header renders unconditionally; the queue is not empty on a clean install, so assert

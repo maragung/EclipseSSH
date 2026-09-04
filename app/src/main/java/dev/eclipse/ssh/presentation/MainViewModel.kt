@@ -41,6 +41,7 @@ import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
+import dev.eclipse.ssh.presentation.files.FilesExplorerController
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.connectFailureIsFinal
 import dev.eclipse.ssh.ssh.SessionDiagnostics
@@ -133,6 +134,7 @@ class MainViewModel @Inject constructor(
     private val credentialStore: HostCredentialStore,
     private val diagnostics: SessionDiagnostics,
     private val livenessProbe: SessionLivenessProbe,
+    val filesExplorer: FilesExplorerController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     private val query = MutableStateFlow("")
@@ -524,6 +526,12 @@ class MainViewModel @Inject constructor(
                 if (it is CancellationException) throw it
                 report("Could not prepare local storage", it)
             }
+            // The folder the Files explorer last picked as this device's root, remembered across
+            // restarts by the SAF grant that outlives the process. Restored here so a download
+            // works on a cold start instead of telling the user to pick a folder they already
+            // picked — the in-memory [localDirUri] starts null and nothing else seeds it.
+            runCatching { settingsRepository.settings.first().localRootUri }
+                .onSuccess { persisted -> if (persisted != null && localDirUri.value == null) localDirUri.value = persisted }
         }
         knownHostsState.value = sshConnectionManager.knownHosts()
         // Idempotent, and started from here as well as from the service because either can be the only

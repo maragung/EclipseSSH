@@ -2,10 +2,12 @@ package dev.eclipse.ssh
 
 import android.os.Looper
 import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.compose.ui.test.onAllNodesWithContentDescription
+import androidx.compose.ui.test.onAllNodes
+import androidx.compose.ui.test.onNode
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import androidx.lifecycle.ViewModelProvider
@@ -16,7 +18,8 @@ import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
-import dev.eclipse.ssh.ssh.RemoteFile
+import dev.eclipse.ssh.presentation.files.ExplorerState
+import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -45,25 +48,25 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 /**
- * The file browser, with two sessions open at once, against two local SSH servers in this JVM.
+ * The Files explorer's session model, with two servers open at once, against two local SSH servers
+ * in this JVM.
  *
- * The Files screen used to hold exactly one listing for the whole app: one path and one list of rows,
- * whoever had asked for them. With a single session that is invisible, and every one of these tests
- * would have passed. With two it is the difference between a file browser and a coin toss — the last
- * listing to arrive was the one on screen, and listings arrive on their own schedule: an auto-login
- * finishing on a session that just reconnected, a refresh on the host the user has switched away from.
- * The rows are also what Download, Rename, Chmod and Delete resolve their paths from, so a listing
- * that belonged to another session was not merely the wrong picture; it was an absolute path about to
- * be sent to a server that had never listed it.
+ * The explorer is one screen over many places files live: this device first, then every saved host.
+ * The separation that has to hold is the same one the old single-listing browser lost — each session
+ * keeps its own directory, and switching moves the browser rather than shuffling rows — but the
+ * stakes are higher now, because the listing is also what Download, Rename, Chmod and Delete resolve
+ * their paths against, and what per-session memory restores on return. A listing that belonged to
+ * another session was never merely the wrong picture.
  *
- * So the assertions here are mostly about *separation*: each session keeps its own directory and its
- * own rows, switching shows the one that belongs to the host being browsed, and a listing that lands
- * for another session never reaches the screen. Two servers rather than two directories on one, each
- * with its own root and its own uniquely-named files, because "this listing came from that host" has
- * to be provable from the contents rather than argued from the path.
+ * So the assertions here are about *separation* and *return*: each session's rows come from its own
+ * socket (one uniquely-named file per directory per server, so "alpha's listing is on screen" is a
+ * claim about bytes that came off a particular wire), switching follows the chip that was tapped,
+ * and coming back to a session lands in the folder it was left in rather than in home. Plus the
+ * state the spec demands of a disconnected host: its chip stays, browsing it says why it cannot, and
+ * the device's own session keeps working — files on this phone do not depend on a server being up.
  *
- * Both servers are bound to loopback inside this JVM, authenticate one pair of credentials that exists
- * nowhere else, and die with the process.
+ * Both servers are bound to loopback inside this JVM, authenticate one pair of credentials that
+ * exists nowhere else, and die with the process.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = EclipseApp::class, sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
@@ -97,34 +100,36 @@ class FilesSessionSwitchRobolectricTest {
     // ---------------------------------------------------------------- the tests
 
     /**
-     * Two connected hosts, two listings: the screen shows the one belonging to the host being browsed,
-     * and switching moves it.
+     * Two connected hosts, two listings: the screen shows the one belonging to the chip that was
+     * tapped, and only that one.
      *
-     * The negative half is the one that used to fail. Each server's home directory holds a file the
-     * other's does not, so "alpha's listing is on screen" and "beta's listing is not" are both claims
-     * about bytes that came off a particular socket rather than about which state happened to be
-     * written last.
+     * Each server's home directory holds a file the other's does not, so "alpha's listing is on
+     * screen" and "beta's is not" are both claims about bytes that came off a particular socket
+     * rather than about which state happened to be written last. And the trip is made three times,
+     * because a browser that can be pointed at another session once and then sticks there is the
+     * same bug from the other side.
      */
     @Test
-    fun eachSessionKeepsItsOwnListingAndSwitchingFollowsTheSelectedHost() {
+    fun eachSessionKeepsItsOwnListingAndSwitchingFollowsTheChips() {
         val alpha = connect(ALPHA_NAME, alphaPort)
         val beta = connect(BETA_NAME, betaPort)
         awaitSftp(alpha, beta)
+        openFilesScreen()
 
-        // Connecting selects, so beta - dialled second - is the host the app is pointing at.
-        assertThat(viewModel().uiState.value.selectedHostId).isEqualTo(beta)
-        browse(beta, BETA_HOME_FILE)
+        browse(ALPHA_NAME, ALPHA_HOME_FILE)
+        assertThat(names()).doesNotContain(BETA_HOME_FILE)
+        assertThat(explorer().activeSessionId).isEqualTo("sftp:$alpha")
+
+        browse(BETA_NAME, BETA_HOME_FILE)
         assertThat(names()).doesNotContain(ALPHA_HOME_FILE)
+        assertThat(explorer().activeSessionId).isEqualTo("sftp:$beta")
 
-        browse(alpha, ALPHA_HOME_FILE)
+        browse(ALPHA_NAME, ALPHA_HOME_FILE)
         assertThat(names()).doesNotContain(BETA_HOME_FILE)
 
-        // And back, because a browser that can be pointed at another session once and then sticks
-        // there is the same bug from the other side.
-        browse(beta, BETA_HOME_FILE)
-        assertThat(names()).doesNotContain(ALPHA_HOME_FILE)
-        // Neither session was disturbed by any of the switching: SFTP is a channel on the transport
-        // the shell is on, and a file browser changing its mind must not touch either.
+        // Neither session was disturbed by any of the switching: the explorer rides on the SFTP
+        // channel the shell's transport already authenticated, and switching its mind must not
+        // touch either.
         assertThat(tabFor(alpha)?.state).isEqualTo(SessionConnectionState.CONNECTED)
         assertThat(tabFor(beta)?.state).isEqualTo(SessionConnectionState.CONNECTED)
         assertThat(tabFor(alpha)?.sftpState).isEqualTo(SftpSessionState.READY)
@@ -134,100 +139,59 @@ class FilesSessionSwitchRobolectricTest {
     /**
      * A session that is switched away from and come back to is still in the directory it was browsing.
      *
-     * Two directories deep enough to tell apart: alpha is left in its subdirectory, beta is sent into
-     * its own, and the assertion is that alpha's path and rows come back exactly as they were rather
-     * than the browser landing in the home directory again — which is what a single shared listing did,
-     * because the only path it had was whatever the other host had just written into it.
+     * The spec's "semua session harus mempertahankan lokasi terakhirnya": Local → Server A → Server B
+     * → Server A lands back in A's subdirectory, not in A's home. Two directories deep enough to tell
+     * apart, each holding a file the other's does not, because "came back to the right folder" is a
+     * claim about rows that came off that server's wire, and the path alone could be satisfied by a
+     * remembered string with someone else's listing under it.
      */
     @Test
     fun switchingBackToASessionRestoresTheDirectoryItWasBrowsing() {
         val alpha = connect(ALPHA_NAME, alphaPort)
         val beta = connect(BETA_NAME, betaPort)
         awaitSftp(alpha, beta)
+        openFilesScreen()
 
-        browse(alpha, ALPHA_HOME_FILE)
-        val alphaDir = dirPath(ALPHA_DIR)
-        enter(alpha, alphaDir, ALPHA_PROOF)
+        browse(ALPHA_NAME, ALPHA_HOME_FILE)
+        openDirectory(ALPHA_DIR, ALPHA_PROOF)
+        val alphaDir = browsedPath()
 
-        browse(beta, BETA_HOME_FILE)
-        val betaDir = dirPath(BETA_DIR)
-        enter(beta, betaDir, BETA_PROOF)
+        browse(BETA_NAME, BETA_HOME_FILE)
+        openDirectory(BETA_DIR, BETA_PROOF)
+        val betaDir = browsedPath()
 
-        select(alpha)
-        pumpUntil(describe = { "alpha did not come back to $alphaDir: " + diagnose() }) {
-            browsedPath() == alphaDir && names().contains(ALPHA_PROOF)
-        }
+        browse(ALPHA_NAME, ALPHA_PROOF)
+        assertThat(browsedPath()).isEqualTo(alphaDir)
         assertThat(names()).doesNotContain(BETA_PROOF)
 
-        select(beta)
-        pumpUntil(describe = { "beta did not come back to $betaDir: " + diagnose() }) {
-            browsedPath() == betaDir && names().contains(BETA_PROOF)
-        }
+        browse(BETA_NAME, BETA_PROOF)
+        assertThat(browsedPath()).isEqualTo(betaDir)
         assertThat(names()).doesNotContain(ALPHA_PROOF)
-    }
-
-    /**
-     * A listing that arrives for another session never appears on the screen.
-     *
-     * This is the race the shared listing lost, made deliberate: alpha is being browsed in its
-     * subdirectory while beta is told to list its own — which is what a reconnect's SFTP auto-login,
-     * or a refresh on the session just switched away from, does without anyone asking.
-     *
-     * Both halves are needed. The invariant is checked on every frame rather than once at the end,
-     * because a listing that flashes onto the screen and is corrected a frame later is still a file
-     * browser showing the wrong server's files. And the wait is on beta's *own* recorded directory, so
-     * the invariant cannot pass merely because nothing happened yet: it holds while a listing for the
-     * other session provably lands.
-     */
-    @Test
-    fun aListingForAnotherSessionNeverReachesTheBrowsedOne() {
-        val alpha = connect(ALPHA_NAME, alphaPort)
-        val beta = connect(BETA_NAME, betaPort)
-        awaitSftp(alpha, beta)
-
-        browse(beta, BETA_HOME_FILE)
-        val betaDir = dirPath(BETA_DIR)
-        browse(alpha, ALPHA_HOME_FILE)
-        val alphaDir = dirPath(ALPHA_DIR)
-        enter(alpha, alphaDir, ALPHA_PROOF)
-
-        refresh(beta, betaDir)
-        pumpUntil(describe = { "beta's own listing never landed: " + diagnose() }) {
-            assertThat(browsedPath()).isEqualTo(alphaDir)
-            assertThat(names()).doesNotContain(BETA_PROOF)
-            viewModel().remoteDirectory(hostFor(beta)) == betaDir
-        }
-
-        // And the listing that was kept off the screen is exactly what beta shows when it is asked for.
-        select(beta)
-        pumpUntil(describe = { "beta's listing was lost rather than kept: " + diagnose() }) {
-            browsedPath() == betaDir && names().contains(BETA_PROOF)
-        }
     }
 
     /**
      * Refresh re-reads the directory on screen instead of navigating home.
      *
      * The proof of the re-read is a file created on the server after the listing was taken: it can only
-     * appear if the directory was read again. The proof that it stayed put is the path, which used to
-     * resolve back to the home directory whenever it was not spelled out — so Refresh, arriving on the
-     * Files tab, and switching sessions all teleported the user out of the folder they were in.
+     * appear if the directory was read again. The proof that it stayed put is the path, which a
+     * refresh that resolved back to the home directory whenever it was not spelled out would
+     * teleport the user out of the folder they were in.
      */
     @Test
     fun refreshingListsTheDirectoryOnScreenRatherThanTheHomeDirectory() {
         val alpha = connect(ALPHA_NAME, alphaPort)
         awaitSftp(alpha)
+        openFilesScreen()
 
-        browse(alpha, ALPHA_HOME_FILE)
-        val alphaDir = dirPath(ALPHA_DIR)
-        enter(alpha, alphaDir, ALPHA_PROOF)
+        browse(ALPHA_NAME, ALPHA_HOME_FILE)
+        openDirectory(ALPHA_DIR, ALPHA_PROOF)
+        val alphaDir = browsedPath()
 
         val appeared = alphaRoot.resolve(ALPHA_DIR).resolve(REFRESH_PROOF)
         Files.deleteIfExists(appeared)
         Files.write(appeared, "written after the listing\n".toByteArray())
 
-        // No path, which is what the Refresh button passes.
-        refresh(alpha, path = null)
+        compose.onNodeWithContentDescription("Refresh").performClick()
         pumpUntil(describe = { "the refresh never re-read $alphaDir: " + diagnose() }) {
             names().contains(REFRESH_PROOF)
         }
@@ -237,59 +201,56 @@ class FilesSessionSwitchRobolectricTest {
     }
 
     /**
-     * The switcher on the Files screen, tapped: one chip per open session, and the browser follows the
-     * chip.
+     * A host that is saved but not connected: its chip is still offered, browsing it says why it
+     * cannot, and the device's own session keeps working.
      *
-     * Through the screen rather than the view model because the complaint was about the screen. The
-     * state was addressable all along — the Files tab simply named no host and offered no way to change
-     * which one it was reading, so with two sessions open the browser was stuck on whichever host the
-     * rest of the app had selected. The content descriptions are the assertion that a screen reader
-     * gets the same affordance: a list of servers, one of them the one being read.
+     * The spec is explicit on all three — a disconnected session stays in the list so the user can
+     * reconnect, the failure is a sentence on the screen rather than a crash, and Local works no
+     * matter what the servers are doing. Reached through the chip because that is the only way a
+     * user reaches a session at all.
      */
     @Test
-    fun theSwitcherChipMovesTheFileBrowserToTheOtherSession() {
-        val alpha = connect(ALPHA_NAME, alphaPort)
-        val beta = connect(BETA_NAME, betaPort)
-        awaitSftp(alpha, beta)
-        browse(beta, BETA_HOME_FILE)
-
+    fun aDisconnectedHostIsReportedOnScreenAndTheDeviceSessionKeepsWorking() {
+        saveOnly(ALPHA_NAME, alphaPort)
         openFilesScreen()
-        pumpUntil(describe = { "the session switcher never appeared on the Files screen" }) {
-            chips("Browse files on $ALPHA_NAME") == 1 && chips("Browsing files on $BETA_NAME") == 1
-        }
 
-        compose.onNodeWithContentDescription("Browse files on $ALPHA_NAME").performClick()
-        pumpUntil(describe = { "the chip did not move the browser to alpha: " + diagnose() }) {
-            viewModel().uiState.value.selectedHostId == alpha && names().contains(ALPHA_HOME_FILE)
+        pumpUntil(describe = { "the disconnected host's chip never appeared: " + diagnose() }) {
+            explorer().sessions.any { it.label == ALPHA_NAME && !it.live }
         }
-        assertThat(names()).doesNotContain(BETA_HOME_FILE)
-        // The chips swap roles, so the row still says which session is being read.
-        pumpUntil(describe = { "the chips did not follow the switch" }) {
-            chips("Browsing files on $ALPHA_NAME") == 1 && chips("Browse files on $BETA_NAME") == 1
+        // The device's session is first and present throughout — the spec's "local selalu first".
+        assertThat(explorer().sessions.first().id).isEqualTo(LOCAL_SESSION_ID)
+
+        browse(ALPHA_NAME, proof = null)
+        pumpUntil(describe = { "browsing the dead host said nothing: " + diagnose() }) {
+            explorer().error == "$ALPHA_NAME is not connected"
         }
+        compose.onNode(hasText("$ALPHA_NAME is not connected")).assertIsDisplayed()
+
+        // And Local is untouched by the failure: one tap and it is its own front-door state again.
+        browse("This device", proof = null)
+        pumpUntil(describe = { "Local never came back: " + diagnose() }) {
+            explorer().isLocal && explorer().error == null && explorer().path == null
+        }
+        compose.onNode(hasText("Pick folder") and hasClickAction()).assertIsDisplayed()
+
+        // The app is still standing: the navigation bar is there and Terminal is a tap away.
+        compose.onNode(hasText("Terminal") and hasClickAction()).assertIsDisplayed()
     }
 
     // ---------------------------------------------------------------- driving the app
 
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
 
+    /** The explorer's own snapshot — what the Files tab renders, distinct from the app-wide uiState. */
+    private fun explorer(): ExplorerState = viewModel().filesExplorer.state.value
+
     private fun tabFor(hostId: String): SessionTab? =
         viewModel().uiState.value.tabs.firstOrNull { it.hostId == hostId }
 
-    private fun hostFor(hostId: String): HostProfile =
-        viewModel().uiState.value.hosts.first { it.id == hostId }
+    /** What the explorer is showing: the names of the active session's listing. */
+    private fun names(): List<String> = explorer().entries.map { it.name }
 
-    /** What the file browser is showing: the listing of whichever host is selected. */
-    private fun names(): List<String> = viewModel().uiState.value.remoteFiles.map(RemoteFile::name)
-
-    private fun browsedPath(): String? = viewModel().uiState.value.remotePath
-
-    private fun chips(description: String): Int =
-        compose.onAllNodesWithContentDescription(description).fetchSemanticsNodes().size
-
-    private fun select(hostId: String) {
-        compose.runOnUiThread { viewModel().selectHost(hostFor(hostId)) }
-    }
+    private fun browsedPath(): String? = explorer().path
 
     /**
      * Navigates to Files the way a user with a session open has to.
@@ -301,36 +262,41 @@ class FilesSessionSwitchRobolectricTest {
      * by reaching for the state keeps this a test of the route a user actually takes.
      */
     private fun openFilesScreen() {
-        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
-        pumpUntil(describe = { "the navigation bar never came back after leaving the shell" }) {
-            compose.onAllNodes(hasText("Files") and hasClickAction()).fetchSemanticsNodes().size == 1
+        compose.waitForIdle()
+        // Only a session leaves the app in the full-screen shell; with none open the bar is already
+        // there and Back would be the exit-the-activity gesture instead.
+        if (compose.onAllNodes(hasText("Files") and hasClickAction()).fetchSemanticsNodes().isEmpty()) {
+            compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+            pumpUntil(describe = { "the navigation bar never came back after leaving the shell" }) {
+                compose.onAllNodes(hasText("Files") and hasClickAction()).fetchSemanticsNodes().size == 1
+            }
         }
         compose.onNode(hasText("Files") and hasClickAction()).performClick()
     }
 
-    /** Points the browser at [hostId] and waits until the listing on screen is that host's own. */
-    private fun browse(hostId: String, proof: String) {
-        select(hostId)
-        pumpUntil(describe = { "$proof never appeared for $hostId: " + diagnose() }) {
+    /**
+     * Taps the session chip named [label] and waits for [proof] to be listed.
+     *
+     * Through the chip because that is the assertion: the chip is the affordance, and a controller
+     * call could not fail the way this is meant to fail — by the browser not following the tap.
+     * Matched on text plus a click action rather than on a role, because the one label that could
+     * be ambiguous ("This device", also the local title before any folder is granted) is only
+     * clickable as the chip.
+     */
+    private fun browse(label: String, proof: String?) {
+        compose.onNode(hasText(label) and hasClickAction()).performClick()
+        pumpUntil(describe = { "tapping the $label chip never listed anything: " + diagnose() }) {
+            proof == null || names().contains(proof)
+        }
+    }
+
+    /** Opens the subdirectory named [name] the way tapping its row does, and waits for its contents. */
+    private fun openDirectory(name: String, proof: String) {
+        compose.onNode(hasText(name) and hasClickAction()).performClick()
+        pumpUntil(describe = { "$name never opened: " + diagnose() }) {
             names().contains(proof)
         }
     }
-
-    /** Opens [path] on [hostId] the way tapping a directory row does, and waits for its contents. */
-    private fun enter(hostId: String, path: String, proof: String) {
-        compose.runOnUiThread { viewModel().navigateRemote(hostFor(hostId), path) }
-        pumpUntil(describe = { "$hostId never opened $path: " + diagnose() }) {
-            browsedPath() == path && names().contains(proof)
-        }
-    }
-
-    private fun refresh(hostId: String, path: String?) {
-        compose.runOnUiThread { viewModel().refreshFiles(hostFor(hostId), path) }
-    }
-
-    /** The path of the subdirectory named [name] in the listing on screen. */
-    private fun dirPath(name: String): String =
-        viewModel().uiState.value.remoteFiles.first { it.name == name && it.isDirectory }.path
 
     private fun awaitSftp(vararg hostIds: String) {
         pumpUntil(describe = { "SFTP never became ready: " + diagnose() }) {
@@ -342,10 +308,29 @@ class FilesSessionSwitchRobolectricTest {
      * Saves a profile pointing at [port] and connects it, accepting the host key the way the dialog's
      * button does.
      *
-     * Auto-login is on for every host here: it is what puts a listing on the screen without anyone
-     * navigating, and therefore what made two sessions overwrite each other.
+     * Auto-login is on for every host here: it exercises the SFTP channel the explorer rides on, and
+     * proves the explorer neither needs nor disturbs it.
      */
     private fun connect(name: String, port: Int): String {
+        val hostId = saveOnly(name, port)
+        compose.runOnUiThread { viewModel().connect(hostFor(hostId), password = PASSWORD) }
+
+        // Every challenge is answered, not only the first: each server generates its own host key, so
+        // the first connection to either is genuinely a trust-on-first-use prompt, and accepting it is
+        // what retries the connection.
+        var accepts = 0
+        pumpUntil(describe = { "$name never connected: accepts=$accepts " + diagnose() }) {
+            if (viewModel().uiState.value.hostKeyChallenge != null) {
+                accepts++
+                compose.runOnUiThread { viewModel().acceptHostKey() }
+            }
+            tabFor(hostId)?.state == SessionConnectionState.CONNECTED
+        }
+        return hostId
+    }
+
+    /** Saves a profile without connecting it — the state a user is in between sessions. */
+    private fun saveOnly(name: String, port: Int): String {
         compose.waitForIdle()
         val viewModel = viewModel()
         val profile = HostProfile(
@@ -364,34 +349,20 @@ class FilesSessionSwitchRobolectricTest {
         pumpUntil(describe = { "the host was never saved" }) {
             viewModel.uiState.value.hosts.any { it.id == profile.id }
         }
-        val saved = viewModel.uiState.value.hosts.first { it.id == profile.id }
-        compose.runOnUiThread { viewModel.connect(saved, password = PASSWORD) }
-
-        // Every challenge is answered, not only the first: each server generates its own host key, so
-        // the first connection to either is genuinely a trust-on-first-use prompt, and accepting it is
-        // what retries the connection.
-        var accepts = 0
-        pumpUntil(describe = { "$name never connected: accepts=$accepts " + diagnose() }) {
-            if (viewModel.uiState.value.hostKeyChallenge != null) {
-                accepts++
-                compose.runOnUiThread { viewModel.acceptHostKey() }
-            }
-            tabFor(profile.id)?.state == SessionConnectionState.CONNECTED
-        }
-        return saved.id
+        return profile.id
     }
+
+    private fun hostFor(hostId: String): HostProfile =
+        viewModel().uiState.value.hosts.first { it.id == hostId }
 
     /**
      * Drives frames and main-looper work until [condition] holds, then fails with [describe].
      *
      * Not `compose.waitUntil`: when composition throws, that reports only "Condition still not
      * satisfied" and loses the real exception. `sendApplyNotifications` publishes state written outside
-     * a frame — `connect`, `loginSftp` and `refreshFiles` all write from plain function calls — which is
+     * a frame — `connect` and the explorer's own scope both write from plain function calls — which is
      * what invalidates the recomposer at all. `idleFor` rather than `idle` because this code is full of
      * real `delay`, and `idle()` leaves the looper's virtual clock where it was.
-     *
-     * [condition] may assert as well as answer, which is how an invariant is held across a wait rather
-     * than checked once it is over.
      */
     private fun pumpUntil(timeoutMs: Long = SSH_TIMEOUT_MS, describe: () -> String, condition: () -> Boolean) {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
@@ -403,18 +374,15 @@ class FilesSessionSwitchRobolectricTest {
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
     }
 
-    /** Everything worth knowing when the browser is not showing what it should be. */
+    /** Everything worth knowing when the explorer is not showing what it should be. */
     private fun diagnose(): String {
         val viewModel = viewModel()
         return buildString {
-            append("selected=").append(viewModel.uiState.value.selectedHostId)
-            append(" remotePath=").append(viewModel.uiState.value.remotePath)
-            append(" remoteFiles=").append(names())
+            append("explorer=").append(explorer())
             append(" tabs=").append(viewModel.uiState.value.tabs)
             append(" status=").append(viewModel.statusMessage.value)
             append(" challenge=").append(viewModel.uiState.value.hostKeyChallenge)
             append(" alphaPort=").append(alphaPort).append(" betaPort=").append(betaPort)
-            append(" diagnostics=").append(viewModel.uiState.value.diagnostics.map { it.line() })
         }
     }
 
@@ -436,8 +404,8 @@ class FilesSessionSwitchRobolectricTest {
         const val LOOPBACK = "127.0.0.1"
 
         /**
-         * Local test credentials, and only local: both servers below are bound to loopback inside this
-         * JVM, authenticate nothing but this pair, and die with the process.
+         * Local test credentials, and only local: both servers below are bound to loopback inside
+         * this JVM, authenticate nothing but this pair, and die with the process.
          */
         const val USER = "testuser"
         const val PASSWORD = "testpass123"

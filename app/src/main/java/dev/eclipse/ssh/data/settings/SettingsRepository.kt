@@ -64,6 +64,7 @@ internal object Keys {
     val terminalScrollback = intPreferencesKey("terminal_scrollback")
     val terminalCursorStyle = stringPreferencesKey("terminal_cursor_style")
     val transferBytesPerSecond = androidx.datastore.preferences.core.longPreferencesKey("transfer_bytes_per_second")
+    val localRootUri = stringPreferencesKey("local_root_uri")
 }
 
 /**
@@ -98,6 +99,7 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     terminalCursorStyle = prefs[Keys.terminalCursorStyle] ?: "block",
     transferBytesPerSecond = (prefs[Keys.transferBytesPerSecond] ?: 0L)
         .coerceIn(0L, SettingsRepository.MAX_BANDWIDTH_BYTES_PER_SECOND),
+    localRootUri = prefs[Keys.localRootUri],
 )
 
 class SettingsRepository(private val context: Context) {
@@ -178,6 +180,16 @@ class SettingsRepository(private val context: Context) {
      */
     suspend fun setTransferBytesPerSecond(bytesPerSecond: Long) = editPrefs {
         it[Keys.transferBytesPerSecond] = bytesPerSecond.coerceIn(0L, MAX_BANDWIDTH_BYTES_PER_SECOND)
+    }
+
+    /**
+     * Remember (or forget) which SAF folder the Local file browser is pointed at.
+     *
+     * Null clears the key rather than storing an empty string, so a reader sees "no folder ever
+     * picked" and "folder cleared" as the same absent value — there is no meaningful third state.
+     */
+    suspend fun setLocalRootUri(uri: String?) = editPrefs {
+        if (uri == null) it.remove(Keys.localRootUri) else it[Keys.localRootUri] = uri
     }
     /**
      * The terminal's text size in sp, clamped to what the app is willing to draw.
