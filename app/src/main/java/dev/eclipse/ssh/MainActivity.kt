@@ -63,6 +63,7 @@ import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
@@ -191,6 +192,7 @@ import dev.eclipse.ssh.data.model.Snippet
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.TransferDirection
+import dev.eclipse.ssh.data.MAX_TRANSFER_RETRIES
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
@@ -994,6 +996,9 @@ private fun EclipseWorkspace(
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
+                    onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
+                    onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
+                    onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionHostId = openSessionHostId,
@@ -1059,6 +1064,10 @@ private fun EclipseWorkspace(
                     onPauseTransfer = viewModel::pauseTransfer,
                     onResumeTransfer = viewModel::resumeTransfer,
                     onCancelTransfer = viewModel::cancelTransfer,
+                    onPauseAllTransfers = viewModel::pauseAllTransfers,
+                    onResumeAllTransfers = viewModel::resumeAllTransfers,
+                    onCancelAllTransfers = viewModel::cancelAllTransfers,
+                    onRunTransferNow = viewModel::runTransferNow,
                     onAddForward = { type, localPort, remoteHost, remotePort ->
                         activeHost?.let { host ->
                             when (type) {
@@ -1143,6 +1152,9 @@ private fun EclipseWorkspace(
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
+                    onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
+                    onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
+                    onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionHostId = openSessionHostId,
@@ -1208,6 +1220,10 @@ private fun EclipseWorkspace(
                     onPauseTransfer = viewModel::pauseTransfer,
                     onResumeTransfer = viewModel::resumeTransfer,
                     onCancelTransfer = viewModel::cancelTransfer,
+                    onPauseAllTransfers = viewModel::pauseAllTransfers,
+                    onResumeAllTransfers = viewModel::resumeAllTransfers,
+                    onCancelAllTransfers = viewModel::cancelAllTransfers,
+                    onRunTransferNow = viewModel::runTransferNow,
                     onAddForward = { type, localPort, remoteHost, remotePort ->
                         activeHost?.let { host ->
                             when (type) {
@@ -1283,12 +1299,6 @@ private fun EclipseWorkspace(
             stats = state.serverStats[host.id],
             credentials = state.savedCredentials[host.id] ?: StoredCredentials(),
             onDismiss = { showHostDetails = null },
-            onToggleFavorite = { viewModel.saveHost(host.copy(isFavorite = !host.isFavorite)) },
-            onExportAccount = {
-                showHostDetails = null
-                pendingAccountExportHost = host
-                showAccountExportDialog = true
-            },
             onForgetCredentials = { viewModel.forgetCredentials(host) },
             onRefreshStats = { viewModel.refreshStats(host) },
         )
@@ -1536,6 +1546,12 @@ private fun WorkspaceScaffold(
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
+    /** Toggles the star on one host - the card menu's Favorite item. */
+    onToggleFavoriteHost: (HostProfile) -> Unit = {},
+    /** Opens the per-host account export dialog - the card menu's Export account item. */
+    onExportAccount: (HostProfile) -> Unit = {},
+    /** Saves a copy of one host under a new id - the card menu's Duplicate item. */
+    onDuplicateHost: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
     /** The session whose shell is on screen; null shows the list of sessions instead. */
@@ -1574,6 +1590,10 @@ private fun WorkspaceScaffold(
     onPauseTransfer: (String) -> Unit = {},
     onCancelTransfer: (String) -> Unit = {},
     onResumeTransfer: (String) -> Unit = {},
+    onPauseAllTransfers: () -> Unit = {},
+    onResumeAllTransfers: () -> Unit = {},
+    onCancelAllTransfers: () -> Unit = {},
+    onRunTransferNow: (String) -> Unit = {},
     onAddForward: (ForwardType, Int, String?, Int?) -> Unit = { _, _, _, _ -> },
     onStopForward: (String) -> Unit = {},
     onExportVault: () -> Unit = {},
@@ -1725,10 +1745,16 @@ private fun WorkspaceScaffold(
         }
         Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
             when (destination) {
-                Destination.HOSTS -> HostsScreen(state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost)
+                Destination.HOSTS -> HostsScreen(
+                    state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost,
+                    onToggleFavoriteHost, onExportAccount, onDuplicateHost,
+                )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
-                Destination.TRANSFERS -> TransfersScreen(state.transfers, onClearCompleted, onPauseTransfer, onResumeTransfer, onCancelTransfer)
+                Destination.TRANSFERS -> TransfersScreen(
+                    state.transfers, onClearCompleted, onPauseTransfer, onResumeTransfer, onCancelTransfer,
+                    onPauseAllTransfers, onResumeAllTransfers, onCancelAllTransfers, onRunTransferNow,
+                )
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
                     onImportVault, onKeepAlive, onClipboard, onTerminalFontSize,
@@ -1764,6 +1790,9 @@ private fun HostsScreen(
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
+    onToggleFavoriteHost: (HostProfile) -> Unit,
+    onExportAccount: (HostProfile) -> Unit,
+    onDuplicateHost: (HostProfile) -> Unit,
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
@@ -1793,7 +1822,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost)
+                HostCard(host, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost)
             }
         }
     }
@@ -1810,9 +1839,12 @@ private fun HostsScreen(
  * the three into a kebab menu is what makes every row the same shape whatever the host, which is the
  * property a list needs and a per-row button cannot have.
  *
- * Both trailing controls carry the host's name in their content description. With one card per host,
+ * One trailing control carries the host's name in its content description. With one card per host,
  * "More actions" alone is ambiguous to a screen reader and to a test: it names the control but not the
- * row it belongs to, and there are as many of them as there are hosts.
+ * row it belongs to, and there are as many of them as there are hosts. The arrow that used to sit
+ * beside it went away when everything it opened moved into this menu, so the menu is now the one way
+ * into everything a host can do - which is also why it no longer needs a second control competing for
+ * the row's trailing edge.
  */
 @Composable
 private fun HostCard(
@@ -1822,6 +1854,9 @@ private fun HostCard(
     onDetails: (HostProfile) -> Unit,
     onEdit: (HostProfile) -> Unit,
     onRemove: (HostProfile) -> Unit,
+    onToggleFavorite: (HostProfile) -> Unit,
+    onExportAccount: (HostProfile) -> Unit,
+    onDuplicate: (HostProfile) -> Unit,
 ) {
     // Keyed on the host id so a list that reorders (a favourite toggled, a search narrowed) cannot
     // leave the menu open over a different host than the one it was opened on.
@@ -1847,11 +1882,6 @@ private fun HostCard(
                     }
                     Text("${host.username}@${host.host}:${host.port}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                // The arrow is the way into everything about this host that is not an action on it:
-                // the saved configuration, what the last connection learned about the server, and the
-                // export of the account. Named for that, because "Open" described a screen this app
-                // does not have and told a screen reader nothing about what the tap would do.
-                IconButton(onClick = { onDetails(host) }) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Details and export for ${host.name}") }
                 Box {
                     IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "More actions for ${host.name}") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
@@ -1860,10 +1890,33 @@ private fun HostCard(
                             leadingIcon = { Icon(Icons.Default.Wifi, null) },
                             onClick = { menuOpen = false; onConnect(host) },
                         )
+                        // The arrow this item replaced used to sit beside the kebab as a second way
+                        // into the details sheet; now this is the way in, so it sits directly under
+                        // Connect, where the eye lands first.
+                        DropdownMenuItem(
+                            text = { Text("Details") },
+                            leadingIcon = { Icon(Icons.AutoMirrored.Filled.ArrowForward, null) },
+                            onClick = { menuOpen = false; onDetails(host) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (host.isFavorite) "Unfavorite" else "Favorite") },
+                            leadingIcon = { Icon(if (host.isFavorite) Icons.Default.Star else Icons.Default.StarBorder, null) },
+                            onClick = { menuOpen = false; onToggleFavorite(host) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Export account") },
+                            leadingIcon = { Icon(Icons.Default.Upload, null) },
+                            onClick = { menuOpen = false; onExportAccount(host) },
+                        )
                         DropdownMenuItem(
                             text = { Text("Edit") },
                             leadingIcon = { Icon(Icons.Default.Edit, null) },
                             onClick = { menuOpen = false; onEdit(host) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Duplicate") },
+                            leadingIcon = { Icon(Icons.Default.ContentCopy, null) },
+                            onClick = { menuOpen = false; onDuplicate(host) },
                         )
                         // Confirmed by the caller, never here: the menu closes on the tap, so a
                         // confirmation owned by this composable would be dismissed with it.
@@ -3600,21 +3653,72 @@ private fun TransfersScreen(
     onPause: (String) -> Unit,
     onResume: (String) -> Unit,
     onCancel: (String) -> Unit,
+    onPauseAll: () -> Unit,
+    onResumeAll: () -> Unit,
+    onCancelAll: () -> Unit,
+    onRunNow: (String) -> Unit,
 ) {
     Spacer(Modifier.height(8.dp))
-    Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Transfer queue", style = MaterialTheme.typography.titleLarge); Text("${transfers.count { it.status == TransferStatus.RUNNING }} active · ${transfers.size} total", color = MaterialTheme.colorScheme.onSurfaceVariant) }; OutlinedButton(onClick = onClearCompleted) { Text("Clear completed") } }
-    Spacer(Modifier.height(16.dp))
+    val running = transfers.count { it.status == TransferStatus.RUNNING }
+    val scheduled = transfers.count { it.scheduledAt != null && it.status == TransferStatus.QUEUED }
+    val failed = transfers.count { it.status == TransferStatus.FAILED }
+    val complete = transfers.count { it.status == TransferStatus.COMPLETE }
+    val unfinished = transfers.size - complete
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Transfer queue", style = MaterialTheme.typography.titleLarge)
+            // Only the counts that carry information. A queue with nothing scheduled showing
+            // "0 scheduled" is answering a question nobody asked, and the fixed two-count line this
+            // replaced could not say the one thing that most needs saying — that something failed.
+            Text(
+                listOfNotNull(
+                    "$running active",
+                    scheduled.takeIf { it > 0 }?.let { "$it scheduled" },
+                    failed.takeIf { it > 0 }?.let { "$it failed" },
+                    "${transfers.size} total",
+                ).joinToString(" · "),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
     if (transfers.isEmpty()) {
         EmptyState("No transfers", "Upload or download files to see them here.", null)
+        return
+    }
+    // The bulk actions that are applicable right now, and only those. A screen with one running
+    // transfer offering "Pause all" beside "Resume all" beside "Cancel all" is three buttons wide to
+    // reach one meaning, so each appears only when there is something for it to act on.
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (running > 0) OutlinedButton(onClick = onPauseAll) { Text("Pause all") }
+        if (unfinished > 0) OutlinedButton(onClick = onResumeAll) { Text("Resume all") }
+        if (unfinished > 0) OutlinedButton(onClick = onCancelAll) { Text("Cancel all") }
+        if (complete > 0) OutlinedButton(onClick = onClearCompleted) { Text("Clear completed") }
+    }
+    Spacer(Modifier.height(12.dp))
+    // Filters over the same list, shown only where they would separate something. A filter whose
+    // count is zero filters nothing, and five chips on a queue of two transfers is most of a row
+    // spent on ways to see fewer items.
+    var filter by remember { mutableStateOf(TransferFilter.ALL) }
+    val filterable = TransferFilter.entries.filter { f ->
+        f == TransferFilter.ALL || transfers.any { it.matches(f) }
+    }
+    if (filterable.size > 1) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            filterable.forEach { f -> FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f.label) }) }
+        }
+        Spacer(Modifier.height(12.dp))
+    }
+    // Bounded for the same reason the file listings are — see [MAX_LISTED_ENTRIES] — and this is
+    // the screen where the count actually runs away: a directory sync writes one row per file and
+    // never deletes them, so syncing a few thousand files leaves a few thousand cards to compose
+    // on every visit to this tab, each heavier than a file row. Which rows survive the cut is a
+    // rule with a test, in [transfersForDisplay].
+    val visible = remember(transfers) { transfersForDisplay(transfers) }.filter { it.matches(filter) }
+    if (visible.isEmpty()) {
+        EmptyState(filter.emptyTitle, "Nothing in this state right now.", null)
     } else {
-        // Bounded for the same reason the file listings are — see [MAX_LISTED_ENTRIES] — and this is
-        // the screen where the count actually runs away: a directory sync writes one row per file and
-        // never deletes them, so syncing a few thousand files leaves a few thousand cards to compose
-        // on every visit to this tab, each heavier than a file row. Which rows survive the cut is a
-        // rule with a test, in [transfersForDisplay].
-        val visible = remember(transfers) { transfersForDisplay(transfers) }
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            visible.forEach { TransferCard(it, onPause, onResume, onCancel) }
+            visible.forEach { TransferCard(it, onPause, onResume, onCancel, onRunNow) }
             TruncatedListingNotice(
                 transfers.size,
                 "transfers",
@@ -3624,8 +3728,28 @@ private fun TransfersScreen(
     }
 }
 
+/** The Transfers tab's filter chips. Everything unfinished and unscheduled reads as "active". */
+private enum class TransferFilter(val label: String, val emptyTitle: String) {
+    ALL("All", "No transfers"),
+    ACTIVE("Active", "Nothing active"),
+    SCHEDULED("Scheduled", "Nothing scheduled"),
+    FAILED("Failed", "Nothing failed"),
+    DONE("Done", "Nothing completed"),
+}
+
+private fun TransferItem.matches(filter: TransferFilter): Boolean = when (filter) {
+    TransferFilter.ALL -> true
+    // PAUSED belongs here rather than nowhere: it is a transfer part-way through, one Resume away
+    // from running, and a filter list that hid it would make a paused queue look empty.
+    TransferFilter.ACTIVE -> status == TransferStatus.RUNNING || status == TransferStatus.PAUSED ||
+        (status == TransferStatus.QUEUED && scheduledAt == null)
+    TransferFilter.SCHEDULED -> status == TransferStatus.QUEUED && scheduledAt != null
+    TransferFilter.FAILED -> status == TransferStatus.FAILED
+    TransferFilter.DONE -> status == TransferStatus.COMPLETE
+}
+
 @Composable
-private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume: (String) -> Unit, onCancel: (String) -> Unit) {
+private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume: (String) -> Unit, onCancel: (String) -> Unit, onRunNow: (String) -> Unit) {
     Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -3634,7 +3758,15 @@ private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume
                 when (item.status) {
                     TransferStatus.COMPLETE -> Icon(Icons.Default.CheckCircle, "Complete", tint = EclipseSuccess)
                     TransferStatus.RUNNING -> IconButton(onClick = { onPause(item.id) }) { Icon(Icons.Default.Pause, "Pause", tint = MaterialTheme.colorScheme.primary) }
-                    else -> IconButton(onClick = { onResume(item.id) }) { Icon(Icons.Default.PlayArrow, "Resume") }
+                    // A retry is a resume with a different name, and the icon says which: the arrow
+                    // asks to continue what was interrupted, the refresh says start over because the
+                    // last try did not work.
+                    else -> IconButton(onClick = { onResume(item.id) }) {
+                        Icon(
+                            if (item.status == TransferStatus.FAILED) Icons.Default.Refresh else Icons.Default.PlayArrow,
+                            if (item.status == TransferStatus.FAILED) "Retry ${item.name}" else "Resume",
+                        )
+                    }
                 }
                 if (item.status != TransferStatus.COMPLETE) {
                     IconButton(onClick = { onCancel(item.id) }) { Icon(Icons.Default.Close, "Cancel transfer", tint = MaterialTheme.colorScheme.error) }
@@ -3642,20 +3774,58 @@ private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume
             }
             if (item.status == TransferStatus.QUEUED && item.scheduledAt != null) {
                 Spacer(Modifier.height(8.dp))
-                Text("Scheduled for ${formatScheduledAt(item.scheduledAt)}" + if (item.repeatMinutes != null) " · repeats ${formatRepeat(item.repeatMinutes)}" else "", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Scheduled for ${formatScheduledAt(item.scheduledAt)}" + if (item.repeatMinutes != null) " · repeats ${formatRepeat(item.repeatMinutes)}" else "",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // The schedule's own start time is a suggestion this replaces: run-now cancels the
+                    // pending schedule and starts immediately, so a transfer queued for tonight does
+                    // not have to wait out the afternoon for it.
+                    TextButton(onClick = { onRunNow(item.id) }) { Text("Run now") }
+                }
             }
             if (item.status == TransferStatus.RUNNING || item.status == TransferStatus.PAUSED || item.status == TransferStatus.FAILED) {
                 Spacer(Modifier.height(14.dp))
                 LinearProgressIndicator(progress = { item.progress }, modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)))
                 Spacer(Modifier.height(5.dp))
                 Text(
-                    "${(item.progress * 100).toInt()}% · ${item.status.name.lowercase()}" + if (item.retryCount > 0) " · retry ${item.retryCount}/5" else "",
+                    listOfNotNull(
+                        "${(item.progress * 100).toInt()}%",
+                        item.status.name.lowercase(),
+                        item.retryCount.takeIf { it > 0 }?.let { "retry $it/${MAX_TRANSFER_RETRIES}" },
+                        // The byte pair when the size is known, because a percentage alone rounds
+                        // everything below 1% to "0%" — a transfer 40 MB into a 4 GB file looks
+                        // stalled at "0%" while the bytes beside it say otherwise.
+                        item.totalBytes?.takeIf { it > 0 }?.let { "${formatTransferBytes(item.transferredBytes)} / ${formatTransferBytes(it)}" },
+                    ).joinToString(" · "),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                // Why it failed, in the server's own words when it gave any. A FAILED row without
+                // this asks the user to guess between a dead network, a full disk and a permission
+                // the transfer never had.
+                if (item.status == TransferStatus.FAILED && !item.errorMessage.isNullOrBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(item.errorMessage, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                }
             }
         }
     }
+}
+
+/** Bytes in the units transfers actually reach, for the "4.2 GB / 1.8 GB" progress line. */
+private fun formatTransferBytes(bytes: Long): String {
+    var value = bytes.toDouble()
+    var unit = "B"
+    for (next in listOf("KB", "MB", "GB", "TB")) {
+        if (value < 1024) break
+        value /= 1024
+        unit = next
+    }
+    return if (unit == "B") "$bytes B" else "${"%.1f".format(value)} $unit"
 }
 
 @Composable
@@ -5009,8 +5179,6 @@ private fun HostDetailsSheet(
     stats: ServerStats?,
     credentials: StoredCredentials,
     onDismiss: () -> Unit,
-    onToggleFavorite: () -> Unit,
-    onExportAccount: () -> Unit,
     onForgetCredentials: () -> Unit,
     onRefreshStats: () -> Unit,
 ) {
@@ -5032,17 +5200,13 @@ private fun HostDetailsSheet(
             // the answer to the question this line exists to answer, and leaving the row out when the
             // answer is "nothing" makes its absence indistinguishable from the app not tracking it.
             DetailLine("Credentials", credentials.describe())
-            // Only what the card's own menu does not already offer. Connect, Edit and Remove are one
-            // tap away on every row through the kebab, and having them here as well meant two paths to
-            // each with different labels for the same act - "Delete" against "Remove" - and a sheet
-            // whose row of five buttons had to be scrolled sideways to reach the last of them. What is
-            // left is what only this sheet can do: the favourite flag, dropping the saved secrets, and
-            // the export.
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onToggleFavorite) { Text(if (host.isFavorite) "Unfavorite" else "Favorite") }
-                if (!credentials.isEmpty) {
-                    OutlinedButton(onClick = onForgetCredentials) { Text("Forget credentials") }
-                }
+            // Only what the card's own menu does not already offer. Connect, Details, Favorite,
+            // Export account, Edit and Remove are all one tap away on every row through the kebab, so
+            // repeating them here meant two paths to each act. What is left is the one action only
+            // this sheet can do: dropping the saved secrets, which lives here because it belongs with
+            // the Credentials line above it rather than in a menu the user opens for other reasons.
+            if (!credentials.isEmpty) {
+                OutlinedButton(onClick = onForgetCredentials) { Text("Forget credentials") }
             }
             Spacer(Modifier.height(18.dp))
             Text("Monitoring".uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.2.sp)
@@ -5055,9 +5219,6 @@ private fun HostDetailsSheet(
                 DetailLine("Disk /", "${stats.diskUsed} / ${stats.diskTotal}")
                 TextButton(onClick = onRefreshStats) { Text("Refresh stats") }
             }
-            // The export is the one action this sheet is the home of, so it gets the emphasis the
-            // Connect button used to have here. Connecting is what the card's menu is for.
-            Spacer(Modifier.height(18.dp)); Button(onClick = onExportAccount, Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) { Icon(Icons.Default.Upload, null); Spacer(Modifier.width(8.dp)); Text("Export account") }
         }
     }
 }

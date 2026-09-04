@@ -174,10 +174,12 @@ class TransferCoordinator @Inject constructor(
      * this was the list lying about state rather than lost data, on every completion and every pause.
      */
     private suspend fun guarded(item: TransferItem, body: suspend () -> Unit) {
-        repository.save(item.copy(status = TransferStatus.RUNNING))
+        // The reason a previous attempt failed does not survive the attempt that replaces it: a row
+        // that kept its error after succeeding would go on accusing a healthy transfer.
+        repository.save(item.copy(status = TransferStatus.RUNNING, errorMessage = null))
         try {
             body()
-            val finished = withObservedProgress(item).copy(progress = 1f, status = TransferStatus.COMPLETE)
+            val finished = withObservedProgress(item).copy(progress = 1f, status = TransferStatus.COMPLETE, errorMessage = null)
             repository.save(finished)
             notifier.notifyComplete(finished)
             scheduleNextIfRecurring(item)
@@ -185,8 +187,11 @@ class TransferCoordinator @Inject constructor(
             // Progress is already persisted, so a resume picks up at the right offset.
             persistCancelledTransfer(withObservedProgress(item), repository::save)
             throw cancelled
-        } catch (_: Throwable) {
-            scheduleRetryOrFail(withObservedProgress(item))
+        } catch (error: Throwable) {
+            // The reason is persisted rather than only reported, because the row is the one place the
+            // user looks: a FAILED transfer on the list used to say nothing about why, and the reason
+            // was discarded here exactly where it was still in hand.
+            scheduleRetryOrFail(withObservedProgress(item), failureReason(error))
         } finally {
             lastPersistedAt.remove(item.id)
             lastObserved.remove(item.id)
@@ -223,18 +228,27 @@ class TransferCoordinator @Inject constructor(
         repository.save(item.copy(progress = fraction.coerceIn(0f, 1f), transferredBytes = bytes, totalBytes = total ?: item.totalBytes, status = TransferStatus.RUNNING))
     }
 
-    private suspend fun scheduleRetryOrFail(item: TransferItem) {
+    private suspend fun scheduleRetryOrFail(item: TransferItem, reason: String? = null) {
         when (val next = item.afterFailedAttempt()) {
             is TransferRetry.Again -> {
-                repository.save(next.item)
+                repository.save(next.item.copy(errorMessage = reason))
                 scheduler.enqueue(next.item.id, delaySeconds = next.delaySeconds)
             }
             is TransferRetry.GiveUp -> {
-                repository.save(next.item)
+                repository.save(next.item.copy(errorMessage = reason))
                 notifier.notifyFailed(next.item)
             }
         }
     }
+
+    /**
+     * One line a card can show. `Throwable.message` is often the server's own sentence ("No such
+     * file"), but some throwables carry null or an empty message and the class name alone ("SshException")
+     * is still more than the nothing the list used to say.
+     */
+    private fun failureReason(error: Throwable): String? =
+        error.message?.trim()?.takeIf(String::isNotEmpty) ?: error.javaClass.simpleName.takeIf(String::isNotEmpty)
+
 
     private suspend fun scheduleNextIfRecurring(item: TransferItem) {
         val repeatMinutes = item.repeatMinutes ?: return

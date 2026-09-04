@@ -678,6 +678,13 @@ data class TransferItem(
     val retryCount: Int = 0,
     val scheduledAt: Long? = null,
     val repeatMinutes: Long? = null,
+    /**
+     * Why the last attempt failed, shown on the card so a FAILED row says something more useful
+     * than that it failed. Null while the transfer is healthy, and cleared the moment a new
+     * attempt starts - a reason that outlived its failure would keep accusing a transfer that
+     * has since succeeded.
+     */
+    val errorMessage: String? = null,
 )
 
 enum class TransferDirection(val label: String) { UPLOAD("Upload"), DOWNLOAD("Download") }

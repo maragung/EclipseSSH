@@ -159,4 +159,19 @@ object Migrations {
             db.execSQL("ALTER TABLE host_profiles ADD COLUMN savedForwards TEXT NOT NULL DEFAULT ''")
         }
     }
+
+    /**
+     * Why the last transfer attempt failed, so a FAILED row on the Transfers tab can say more than
+     * that it failed.
+     *
+     * Nullable rather than NOT NULL DEFAULT '' for the same reason the algorithm lists are: an empty
+     * string would be a claim that the failure had a reason and the reason was "", while NULL means
+     * "no failure is recorded" - which is true for every row that predates the column, because the
+     * reason used to be discarded at the catch site and never stored at all.
+     */
+    val MIGRATION_13_14 = object : Migration(13, 14) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE transfer_queue ADD COLUMN errorMessage TEXT")
+        }
+    }
 }

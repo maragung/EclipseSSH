@@ -17,7 +17,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
- * The database has grown from version 2 to 13 through hand-written `ALTER TABLE` migrations.
+ * The database has grown from version 2 to 14 through hand-written `ALTER TABLE` migrations.
  * Room validates the migrated schema against the entities when it opens, so a single missing
  * or mistyped column turns an app update into a crash on launch.
  *
@@ -42,7 +42,7 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 2 database migrates all the way to 13 with its rows intact`() = runTest {
+    fun `a version 2 database migrates all the way to 14 with its rows intact`() = runTest {
         seedVersion2()
 
         val db = openWithMigrations()
@@ -138,6 +138,9 @@ class MigrationTest {
         assertThat(transfer.retryCount).isEqualTo(0)
         assertThat(transfer.scheduledAt).isNull()
         assertThat(transfer.repeatMinutes).isNull()
+        // Version 14's column is null for the same reason the algorithm lists are: null is the only
+        // value that can mean "no failure is recorded", which is true of every row that predates it.
+        assertThat(transfer.errorMessage).isNull()
     }
 
     @Test
@@ -162,6 +165,7 @@ class MigrationTest {
                 retryCount = 2,
                 scheduledAt = 1_800_000_000_000L,
                 repeatMinutes = 60L,
+                errorMessage = "Connection reset by peer",
             ),
         )
 
@@ -169,6 +173,10 @@ class MigrationTest {
         assertThat(stored.transferredBytes).isEqualTo(2_621_440L)
         assertThat(stored.repeatMinutes).isEqualTo(60L)
         assertThat(stored.scheduledAt).isEqualTo(1_800_000_000_000L)
+        // The failure reason is the one new column a real failure writes, and a sentence with spaces
+        // and lowercase is the shape most likely to be mangled by a mis-typed affinity or a NOT NULL
+        // default that silently empties it.
+        assertThat(stored.errorMessage).isEqualTo("Connection reset by peer")
     }
 
     @Test
@@ -256,7 +264,7 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 11 database - the oldest a device can hold - migrates to 13 with its row intact`() = runTest {
+    fun `a version 11 database - the oldest a device can hold - migrates to 14 with its row intact`() = runTest {
         // Eleven is the real floor. The first public release (1.0.0) shipped at exactly this version, so
         // it is the oldest schema any device in the field can be holding and the oldest upgrade a user
         // actually runs. `seedVersion2` walks the same 11->12->13 steps, but from a hand-written schema;
@@ -268,7 +276,7 @@ class MigrationTest {
         val db = openWithMigrations()
 
         val host = db.hostDao().observeAll().first().single()
-        // Every value set at version 11 survives to 13, none of it reverted to a column default.
+        // Every value set at version 11 survives to 14, none of it reverted to a column default.
         assertThat(host.id).isEqualTo("v11-host")
         assertThat(host.port).isEqualTo(2211)
         assertThat(host.authMethod).isEqualTo("KEY")
@@ -331,9 +339,9 @@ class MigrationTest {
         // The half the audit kept on purpose (AUDIT-REPORT.md sections 5 and 12.9): a downgrade - a file
         // left by a build one version ahead, e.g. after a Play Store rollback - has no migration path
         // back and never can, so refusing to open it would be a crash loop with no way out from inside
-        // the app. Resetting is the recoverable direction. user_version 14 is that newer build; the row
+        // the app. Resetting is the recoverable direction. user_version 15 is that newer build; the row
         // shape beneath it is irrelevant, because a destructive downgrade drops every table first.
-        seedVersion2(userVersion = 14)
+        seedVersion2(userVersion = 15)
 
         val db = openLikeProduction()
 
@@ -349,6 +357,7 @@ class MigrationTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
+                Migrations.MIGRATION_13_14,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()
@@ -368,6 +377,7 @@ class MigrationTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
+                Migrations.MIGRATION_13_14,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .allowMainThreadQueries()
