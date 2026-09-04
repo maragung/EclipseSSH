@@ -157,7 +157,13 @@ fun ExplorerTopBar(
         Spacer(Modifier.height(10.dp))
 
         // ---- Search, then the actions that belong to the session ----
+        // Held to the spec's phone budget — search, new, upload, sync, refresh, overflow — because
+        // a toolbar wider than the screen is what this row used to be: the icon buttons measured
+        // first and the weighted count was squeezed to zero width on the remote session's eight
+        // actions, which hid "60 item(s)" entirely on a phone. "New" and the kebab carry the rest.
         var searchOpen by remember { mutableStateOf(false) }
+        var newMenuOpen by remember { mutableStateOf(false) }
+        var moreMenuOpen by remember { mutableStateOf(false) }
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (searchOpen || state.searchQuery != null) {
                 OutlinedTextField(
@@ -170,6 +176,10 @@ fun ExplorerTopBar(
                         TextButton(onClick = { searchOpen = false; onClearSearch() }) { Text("Close") }
                     },
                 )
+            } else if (state.isLocal && state.path == null) {
+                // Local's front door: nothing can be listed until a folder is granted, and the
+                // picker is the user's to open.
+                Button(onClick = onPickFolder) { Text("Pick folder") }
             } else {
                 Text(
                     "${state.entries.size} item(s)",
@@ -178,34 +188,63 @@ fun ExplorerTopBar(
                     modifier = Modifier.weight(1f),
                 )
             }
-            IconButton(onClick = { searchOpen = true }) { Icon(Icons.Default.Search, "Search") }
-            SortMenu(state.sort, onSort)
-            IconButton(onClick = { onViewMode(if (state.viewMode == ExplorerViewMode.LIST) ExplorerViewMode.GRID else ExplorerViewMode.LIST) }) {
-                Text("▦", style = MaterialTheme.typography.titleMedium)
+            if (!searchOpen && state.searchQuery == null) {
+                IconButton(onClick = { searchOpen = true }) { Icon(Icons.Default.Search, "Search") }
             }
-            if (state.isLocal) {
-                if (state.path == null) {
-                    // Local's front door: nothing can be listed until a folder is granted, and
-                    // the picker is the user's to open.
-                    Button(onClick = onPickFolder) { Text("Pick folder") }
-                } else {
-                    IconButton(onClick = onNewFile) { Icon(Icons.Default.Add, "New file") }
-                    IconButton(onClick = onNewFolder) { Icon(Icons.Default.CreateNewFolder, "New folder") }
-                    // SAF offers no navigation above the granted root, so choosing a different
-                    // root is the only "up" there is.
-                    IconButton(onClick = onPickFolder) { Icon(Icons.Default.FolderOpen, "Choose a different folder") }
+            Box {
+                IconButton(onClick = { newMenuOpen = true }) { Icon(Icons.Default.Add, "New") }
+                DropdownMenu(expanded = newMenuOpen, onDismissRequest = { newMenuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("New file") },
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.InsertDriveFile, null) },
+                        onClick = { newMenuOpen = false; onNewFile() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("New folder") },
+                        leadingIcon = { Icon(Icons.Default.CreateNewFolder, null) },
+                        onClick = { newMenuOpen = false; onNewFolder() },
+                    )
                 }
-            } else {
+            }
+            if (!state.isLocal) {
                 if (onUpload != null) {
                     IconButton(onClick = onUpload) { Icon(Icons.Default.CloudUpload, "Upload files to this folder") }
                 }
                 if (onSync != null) {
                     IconButton(onClick = onSync) { Icon(Icons.Default.SwapVert, "Sync this folder") }
                 }
-                IconButton(onClick = onNewFile) { Icon(Icons.Default.Add, "New file") }
-                IconButton(onClick = onNewFolder) { Icon(Icons.Default.CreateNewFolder, "New folder") }
             }
             IconButton(onClick = onRefresh) { Icon(Icons.Default.Refresh, "Refresh") }
+            Box {
+                IconButton(onClick = { moreMenuOpen = true }) { Icon(Icons.Default.MoreVert, "More actions") }
+                DropdownMenu(expanded = moreMenuOpen, onDismissRequest = { moreMenuOpen = false }) {
+                    ExplorerSort.entries.forEach { sort ->
+                        DropdownMenuItem(
+                            text = { Text(sort.label) },
+                            trailingIcon = { if (sort == state.sort) { Icon(Icons.Default.CheckCircle, null, Modifier.size(18.dp)) } },
+                            onClick = { onSort(sort); moreMenuOpen = false },
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = {
+                            Text(if (state.viewMode == ExplorerViewMode.LIST) "Switch to grid view" else "Switch to list view")
+                        },
+                        onClick = {
+                            onViewMode(if (state.viewMode == ExplorerViewMode.LIST) ExplorerViewMode.GRID else ExplorerViewMode.LIST)
+                            moreMenuOpen = false
+                        },
+                    )
+                    if (state.isLocal && state.path != null) {
+                        // SAF offers no navigation above the granted root, so choosing a different
+                        // root is the only "up" there is.
+                        DropdownMenuItem(
+                            text = { Text("Choose a different folder") },
+                            leadingIcon = { Icon(Icons.Default.FolderOpen, null) },
+                            onClick = { moreMenuOpen = false; onPickFolder() },
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -241,22 +280,6 @@ private fun SessionChip(session: ExplorerSession, selected: Boolean, onClick: ()
     )
 }
 
-@Composable
-private fun SortMenu(current: ExplorerSort, onSort: (ExplorerSort) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        IconButton(onClick = { open = true }) { Icon(Icons.Default.MoreVert, "Sort and view") }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            ExplorerSort.entries.forEach { sort ->
-                DropdownMenuItem(
-                    text = { Text(sort.label) },
-                    trailingIcon = { if (sort == current) { Icon(Icons.Default.CheckCircle, null, Modifier.size(18.dp)) } },
-                    onClick = { onSort(sort); open = false },
-                )
-            }
-        }
-    }
-}
 
 /**
  * The entries, as a list or a grid.
