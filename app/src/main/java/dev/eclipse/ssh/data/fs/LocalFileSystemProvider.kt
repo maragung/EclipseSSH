@@ -119,8 +119,10 @@ class LocalFileSystemProvider @Inject constructor(
     override suspend fun createDirectory(parentPath: String, name: String) =
         withContext(Dispatchers.IO) {
             val parent = docOrNull(parentPath) ?: throw LocalAccessUnavailableException(Uri.parse(parentPath))
-            parent.createDirectory(name)
-                ?: throw IOException("Could not create folder $name in ${parent.name ?: "this folder"}")
+            // `if` rather than `?:` so the block's last statement is Unit, like the contract says.
+            if (parent.createDirectory(name) == null) {
+                throw IOException("Could not create folder $name in ${parent.name ?: "this folder"}")
+            }
         }
 
     override suspend fun rename(path: String, newName: String) = withContext(Dispatchers.IO) {

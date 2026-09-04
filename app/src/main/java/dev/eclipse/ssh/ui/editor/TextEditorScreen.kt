@@ -630,7 +630,7 @@ private class MatchHighlightTransformation(
     private val otherMatchColor: Color,
     private val currentMatchColor: Color,
 ) : VisualTransformation {
-    override fun transform(text: AnnotatedString): TransformedText {
+    override fun filter(text: AnnotatedString): TransformedText {
         val spans = ArrayList<AnnotatedString.Range<SpanStyle>>()
         findAllMatches(text.text, query, caseSensitive).forEachIndexed { index, range ->
             spans.add(

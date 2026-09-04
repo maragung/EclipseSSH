@@ -3199,10 +3199,12 @@ private fun ColumnScope.FilesScreen(
             count = explorer.selection.size,
             onClear = filesExplorer::clearSelection,
             onDownload = if (!explorer.isLocal) {
-                { selectedEntries.forEach(onDownloadFile); filesExplorer.clearSelection() }
+                // The bar works on the explorer's FsEntry rows; the transfer queue wants the
+                // backend-shaped RemoteFile those rows stand for.
+                { selectedEntries.map { it.toRemoteFile() }.forEach(onDownloadFile); filesExplorer.clearSelection() }
             } else null,
             onUpload = if (explorer.isLocal) {
-                { selectedEntries.forEach(onUploadLocal); filesExplorer.clearSelection() }
+                { selectedEntries.map { it.toLocalFile() }.forEach(onUploadLocal); filesExplorer.clearSelection() }
             } else null,
             onSchedule = if (explorer.isLocal) ({ scheduleLocal = true }) else ({ scheduleRemote = true }),
             onCopy = { pendingRelocate = PendingRelocate(copy = true, entries = selectedEntries); filesExplorer.clearSelection() },

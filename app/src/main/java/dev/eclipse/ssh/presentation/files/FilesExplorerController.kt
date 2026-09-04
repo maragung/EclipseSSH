@@ -16,6 +16,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -355,11 +356,16 @@ class FilesExplorerController @Inject constructor(
             } else {
                 segmentPosixPath(path)
             }
+            // Resolved before the state write because parentPath is suspend and updateIfCurrent's
+            // transform is not — and because a "can I go up" answer that arrived after the listing
+            // would be stale by the time it rendered anyway.
+            val canGoUp = provider.parentPath(path) != null ||
+                (sessionId == LOCAL_SESSION_ID && localTrail.size > 1)
             updateIfCurrent(sessionId) {
                 it.copy(
                     entries = entries,
                     loading = false,
-                    canGoUp = provider.parentPath(path) != null || (it.isLocal && localTrail.size > 1),
+                    canGoUp = canGoUp,
                     title = title,
                     crumbs = crumbs,
                 )
