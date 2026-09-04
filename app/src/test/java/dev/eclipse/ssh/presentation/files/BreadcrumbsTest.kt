@@ -82,9 +82,11 @@ class BreadcrumbsTest {
 
     @Test
     fun aTrailExactlyAtTheLimitIsNotCollapsed() {
-        // At the limit there is nothing to gain by collapsing, and an ellipsis that replaced a
-        // visible crumb would hide a folder that fit.
-        val crumbs = segmentPosixPath("/a/b/c/d")
+        // Four crumbs — the root plus three segments — because that is what the limit of four is
+        // measured in; "/a/b/c/d" would be five. At the limit there is nothing to gain by
+        // collapsing, and an ellipsis that replaced a visible crumb would hide a folder that fit.
+        val crumbs = segmentPosixPath("/a/b/c")
+        assertThat(crumbs).hasSize(4)
 
         assertThat(ellipsizeCrumbs(crumbs, maxVisible = 4)).isEqualTo(crumbs)
         assertThat(ellipsizeCrumbs(crumbs, maxVisible = 4).count { it == null }).isEqualTo(0)

@@ -174,7 +174,7 @@ class FilesExplorerLayoutRobolectricTest {
             names().contains(bulkName(0))
         }
 
-        listing().performScrollToIndex(FILE_COUNT)
+        listing().performScrollToIndex(FILE_COUNT - 1)
         compose.waitForIdle()
 
         // The far end of the directory is on screen...

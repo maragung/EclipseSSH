@@ -76,6 +76,19 @@ class NavigationRobolectricTest {
     }
 
     /**
+     * Waits for text that must also be *tappable* — a session chip, not the identically-worded
+     * path-bar title.
+     *
+     * The explorer's path bar reads "This device" from its first frame, but the chips arrive one
+     * coroutine hop later (the session list is refreshed by a LaunchedEffect reading Room), so
+     * waiting on the bare text passes on the title and then races the chip — which is exactly how
+     * this failed once on a loaded runner. Waiting on the clickable form waits for the chip itself.
+     */
+    private fun waitForClickable(text: String) = compose.waitUntil(timeoutMillis = 10_000) {
+        compose.onAllNodes(hasText(text) and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
+    }
+
+    /**
      * Asserts the text is on screen, and says *why* if it is not.
      *
      * `assertIsDisplayed` fails with nothing but "The component is not displayed!", which does not
@@ -237,13 +250,13 @@ class NavigationRobolectricTest {
         // honest "no folder chosen yet" rather than a claim about an empty folder. The seeded demo
         // hosts' chips are here too: every saved host stays reachable from Files, connected or not.
         // [FilesExplorerLayoutRobolectricTest] covers the chip order and the listing's layout.
-        waitForText("This device")
         // Clickable rather than merely present: the path bar also reads "This device" before any
         // folder is granted, and only the chip is the tappable one.
+        waitForClickable("This device")
         compose.onNode(hasText("This device") and hasClickAction()).assertExists()
         compose.onNode(hasText("Pick folder") and hasClickAction()).assertExists()
         waitForTextContaining("No folder chosen yet")
-        waitForText("Production edge")
+        waitForClickable("Production edge")
         compose.onNode(hasText("Production edge") and hasClickAction()).assertExists()
 
         tab("Transfers").performClick()
