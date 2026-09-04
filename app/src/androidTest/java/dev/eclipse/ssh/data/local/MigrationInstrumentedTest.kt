@@ -84,10 +84,10 @@ class MigrationInstrumentedTest {
     @Test
     fun aDatabaseFromANewerBuildIsResetRatherThanRefused() = runTest {
         // The production fallback is now downgrade-only (see AppModule.provideDatabase). On real SQLite
-        // as on the JVM, a file left by a build one version ahead - user_version 14 here - has no path
+        // as on the JVM, a file left by a build one version ahead - user_version 15 here - has no path
         // back, so it is destructively recreated at the current version rather than refused. A missing
         // *upgrade* migration is left to throw, which is the loud half the unit suite pins.
-        seedVersion2(userVersion = 14)
+        seedVersion2(userVersion = 15)
 
         val db = openLikeProduction()
 
@@ -103,6 +103,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
+                Migrations.MIGRATION_13_14,
             )
             // Deliberately no destructive fallback: a broken migration must fail, not wipe data.
             .build()
@@ -117,6 +118,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
+                Migrations.MIGRATION_13_14,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .build()

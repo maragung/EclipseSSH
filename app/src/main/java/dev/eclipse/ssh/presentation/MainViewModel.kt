@@ -13,6 +13,8 @@ import dev.eclipse.ssh.data.TransferRepository
 import dev.eclipse.ssh.data.backup.BackupFormatException
 import dev.eclipse.ssh.data.backup.VaultBackup
 import dev.eclipse.ssh.data.credentials.HostCredentialStore
+import dev.eclipse.ssh.data.credentials.KeyEdit
+import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.credentials.HostCredentialUpdate
 import dev.eclipse.ssh.data.credentials.StoredCredentials
 import dev.eclipse.ssh.data.saf.LocalAccessUnavailableException
@@ -2556,7 +2558,7 @@ class MainViewModel @Inject constructor(
     }
 
     private suspend fun failTransfer(item: TransferItem, message: String) {
-        runCatching { transferRepository.save(item.copy(status = TransferStatus.FAILED)) }
+        runCatching { transferRepository.save(item.copy(status = TransferStatus.FAILED, errorMessage = message)) }
         report(message)
     }
 
@@ -2790,6 +2792,67 @@ class MainViewModel @Inject constructor(
     fun pauseTransfer(id: String) = transferCoordinator.pause(id)
 
     /**
+     * Pauses every running transfer at once.
+     *
+     * The coordinator's pause already persists PAUSED through its own cancellation handler
+     * (see [persistCancelledTransfer]), so there is nothing to write here - only the loop. It runs
+     * over a snapshot of the ids, because each pause rewrites the row it acts on and the flow this
+     * list came from would otherwise be a list that changes while it is being iterated.
+     */
+    fun pauseAllTransfers() {
+        transportScope.launch {
+            val running = transferRepository.transfers.first().filter { it.status == TransferStatus.RUNNING }
+            running.forEach { transferCoordinator.pause(it.id) }
+        }
+    }
+
+    /**
+     * Resumes everything unfinished that is not waiting on a schedule of its own.
+     *
+     * A scheduled transfer is excluded because it already has a start time the user chose; resuming
+     * it here would be "run now", which is a separate per-item action ([runTransferNow]) that also
+     * has to cancel the pending schedule so the two cannot double-start it. Each resume dials its
+     * own host through [resumeTransfer], so a list spread over several servers does not serialize
+     * behind one connection attempt.
+     */
+    fun resumeAllTransfers() {
+        transportScope.launch {
+            transferRepository.transfers.first()
+                .filter { it.status != TransferStatus.COMPLETE && it.scheduledAt == null }
+                .forEach { resumeTransfer(it.id) }
+        }
+    }
+
+    /** Cancels every unfinished transfer: stops the job and drops its row, like [cancelTransfer]. */
+    fun cancelAllTransfers() {
+        launchGuarded("Could not cancel the transfers") {
+            transferRepository.transfers.first()
+                .filter { it.status != TransferStatus.COMPLETE }
+                .forEach { item ->
+                    transferCoordinator.pause(item.id)
+                    transferRepository.delete(item.id)
+                }
+        }
+    }
+
+    /**
+     * Starts a scheduled transfer now, instead of at the time it was queued for.
+     *
+     * The pending WorkManager request has to go first: it is what fires the schedule, and leaving it
+     * armed beside a transfer this method started by hand would run the same item twice. Clearing
+     * [TransferItem.scheduledAt] is what stops the card from still describing itself as scheduled
+     * while it is already moving.
+     */
+    fun runTransferNow(id: String) {
+        transportScope.launch {
+            val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launch
+            transferCoordinator.pause(id)
+            transferRepository.save(item.copy(scheduledAt = null, errorMessage = null))
+            resumeTransfer(id)
+        }
+    }
+
+    /**
      * Resumes a paused transfer, reconnecting the host first when the session is gone.
      *
      * Every step can fail (the host may be unreachable, the SAF document revoked), and an
@@ -2959,6 +3022,49 @@ class MainViewModel @Inject constructor(
             runCatching { credentialStore.forget(host.id) }
                 .onSuccess { report("Forgot saved credentials for ${host.name}") }
                 .onFailure { error -> report("Could not forget credentials for ${host.name}", error) }
+        }
+    }
+
+    /**
+     * Saves a copy of [host] under a new id, with its saved credentials carried over.
+     *
+     * The credentials are copied rather than left behind because duplicating is usually "the same
+     * box, different purpose" - the second connection wants the same password and key the first one
+     * has, and a duplicate that asked for a password on first connect would be a lesser copy of the
+     * host it came from. They are re-encrypted under the new id rather than the preference key
+     * being pointed at twice, so forgetting the original's credentials later leaves the copy's
+     * alone, the way two real hosts behave.
+     *
+     * The name carries "(copy)" so the new card is distinguishable from the one beside it, with a
+     * number when the obvious name is already taken - twice-duplicated means twice-named, or the
+     * third card is as anonymous as the second.
+     */
+    fun duplicateHost(host: HostProfile) {
+        launchGuarded("Could not duplicate ${host.name}") {
+            val existing = hostRepository.hosts.first().map { it.name }.toSet()
+            val base = "${host.name} (copy)"
+            val name = if (base !in existing) base else (2..100).firstOrNull { n -> "$base $n" !in existing }?.let { "$base $it" } ?: base
+            val copy = host.copy(id = java.util.UUID.randomUUID().toString(), name = name)
+            hostRepository.save(copy)
+            // The fingerprint travels with the profile row; the trust store entry is per-host, so it
+            // has to be granted to the copy too or its first connect asks to trust a key the
+            // original already accepted.
+            host.fingerprint?.trim()?.takeIf(String::isNotBlank)?.let { pinned ->
+                runCatching { sshConnectionManager.trustHost(copy, pinned) }
+            }
+            val stored = runCatching { credentialStore.stored(host.id) }.getOrDefault(StoredCredentials())
+            val update = HostCredentialUpdate(
+                password = credentialStore.password(host.id)?.let { SecretEdit.Replace(it) } ?: SecretEdit.Keep,
+                key = credentialStore.keyBytes(host.id)?.let { bytes ->
+                    KeyEdit.Replace(bytes, stored.keyLabel ?: "Private key", stored.keyType)
+                } ?: KeyEdit.Keep,
+                passphrase = credentialStore.passphrase(host.id)?.let { SecretEdit.Replace(it) } ?: SecretEdit.Keep,
+            )
+            if (!update.isNoop) {
+                runCatching { credentialStore.apply(copy.id, update) }
+                    .onFailure { error -> report("Duplicated ${host.name}, but its credentials could not be copied", error) }
+            }
+            report("Duplicated ${host.name} as $name")
         }
     }
 

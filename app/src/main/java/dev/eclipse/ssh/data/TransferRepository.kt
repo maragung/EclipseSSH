@@ -29,6 +29,7 @@ data class TransferEntity(
     val retryCount: Int = 0,
     val scheduledAt: Long? = null,
     val repeatMinutes: Long? = null,
+    val errorMessage: String? = null,
 )
 
 @Dao
@@ -99,6 +100,7 @@ internal fun TransferEntity.toDomain() = TransferItem(
     retryCount = retryCount,
     scheduledAt = scheduledAt,
     repeatMinutes = repeatMinutes,
+    errorMessage = errorMessage,
 )
 
 internal fun TransferItem.toEntity() = TransferEntity(
@@ -117,4 +119,5 @@ internal fun TransferItem.toEntity() = TransferEntity(
     retryCount = retryCount,
     scheduledAt = scheduledAt,
     repeatMinutes = repeatMinutes,
+    errorMessage = errorMessage,
 )

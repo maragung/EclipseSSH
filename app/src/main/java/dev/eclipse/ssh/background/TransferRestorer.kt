@@ -78,7 +78,7 @@ class TransferRestorer @Inject constructor(
                                     repository.save(latest)
                                 }
                             }
-                            repository.save(latest.copy(progress = 1f, status = TransferStatus.COMPLETE))
+                            repository.save(latest.copy(progress = 1f, status = TransferStatus.COMPLETE, errorMessage = null))
                         }
                         TransferDirection.UPLOAD -> {
                             val input = context.contentResolver.openInputStream(uri)
@@ -89,7 +89,7 @@ class TransferRestorer @Inject constructor(
                                     repository.save(latest)
                                 }
                             }
-                            repository.save(latest.copy(progress = 1f, status = TransferStatus.COMPLETE))
+                            repository.save(latest.copy(progress = 1f, status = TransferStatus.COMPLETE, errorMessage = null))
                         }
                     }
                     resumed++
@@ -103,14 +103,18 @@ class TransferRestorer @Inject constructor(
                     // pausing resumes at the right offset.
                     persistCancelledTransfer(latest, repository::save)
                     throw cancelled
-                } catch (_: Throwable) {
+                } catch (error: Throwable) {
+                    // Same as the coordinator's catch: the reason is kept on the row, not discarded,
+                    // so a FAILED transfer says why even when the failure happened in the background
+                    // where nobody was watching it happen.
+                    val reason = error.message?.trim()?.takeIf(String::isNotEmpty) ?: error.javaClass.simpleName
                     when (val next = latest.afterFailedAttempt()) {
                         is TransferRetry.Again -> {
-                            repository.save(next.item)
+                            repository.save(next.item.copy(errorMessage = reason))
                             scheduler.enqueue(next.item.id, delaySeconds = next.delaySeconds)
                         }
                         is TransferRetry.GiveUp -> {
-                            repository.save(next.item)
+                            repository.save(next.item.copy(errorMessage = reason))
                             // Absent until now, and this is the one path where it matters most: a
                             // restore only runs from the background service, so nobody is looking at
                             // the transfer list. Giving up silently meant the user's next sight of a
@@ -127,7 +131,7 @@ class TransferRestorer @Inject constructor(
 
     private fun TransferItem.asRunning(bytes: Long, total: Long?): TransferItem {
         val fraction = total?.takeIf { it > 0 }?.let { (bytes.toFloat() / it).coerceIn(0f, 1f) } ?: progress
-        return copy(progress = fraction, transferredBytes = bytes, totalBytes = total ?: totalBytes, status = TransferStatus.RUNNING)
+        return copy(progress = fraction, transferredBytes = bytes, totalBytes = total ?: totalBytes, status = TransferStatus.RUNNING, errorMessage = null)
     }
 
     private companion object {

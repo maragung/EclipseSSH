@@ -319,21 +319,22 @@ class HostAndThemeUiRobolectricTest {
     }
 
     /**
-     * The arrow opens what only the sheet has: the saved configuration and the export.
+     * The menu's Details item opens what only the sheet has: the saved configuration.
      *
-     * Both halves are the requested split. The sheet used to repeat Connect, Edit and Delete - three of
-     * its five buttons - which the kebab beside the very same arrow already offers, so the negative
-     * assertions are the ones that keep the duplication from creeping back. What it must still carry is
-     * everything the menu has nowhere to put: the detail lines, the favourite flag, and the export that
-     * this arrow is now named for.
+     * The arrow this test used to drive sat beside the kebab as a second way into the same sheet, and
+     * the sheet carried buttons for the favourite flag and the export, which the menu now owns too. So
+     * the negative assertions are the ones that keep the duplication from creeping back, and the detail
+     * lines are what must survive: everything the menu has nowhere else to put.
      */
     @Test
-    fun theArrowOpensDetailsAndExportAndLeavesTheMenuActionsToTheMenu() {
+    fun detailsFromTheMenuOpensTheSheetAndLeavesTheMenuActionsToTheMenu() {
         val host = addHost("Detailed", hostname = "details.example.test", username = "reader", port = 2022)
 
-        compose.onNodeWithContentDescription("Details and export for ${host.name}").performClick()
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pump()
+        compose.onNodeWithText("Details").performClick()
         pumpUntil(describe = { "the details sheet never composed" }) {
-            compose.onAllNodesWithText("Export account").fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText("Authentication").fetchSemanticsNodes().isNotEmpty()
         }
 
         // The detail half: what is saved about this host, and what the vault holds for it.
@@ -341,17 +342,95 @@ class HostAndThemeUiRobolectricTest {
             assertWithMessage("the sheet no longer shows $label")
                 .that(compose.onAllNodesWithText(label).fetchSemanticsNodes()).isNotEmpty()
         }
-        // The export half, and the two actions that have no home in the kebab.
-        assertThat(compose.onAllNodesWithText("Export account").fetchSemanticsNodes()).isNotEmpty()
-        assertThat(compose.onAllNodesWithText("Favorite").fetchSemanticsNodes()).isNotEmpty()
-
-        // And none of what the kebab already does. "Connect securely" rather than "Connect": the
-        // sheet's button carried that label, and matching the short form would also match the menu
-        // item behind it.
-        listOf("Connect securely", "Edit", "Delete").forEach { duplicate ->
+        // And none of what the kebab now offers. "Connect securely" rather than "Connect": the sheet's
+        // old button carried that label, and matching the short form would also match the menu item
+        // behind it.
+        listOf("Connect securely", "Edit", "Delete", "Favorite", "Unfavorite", "Export account", "Duplicate").forEach { duplicate ->
             assertWithMessage("$duplicate is back in the sheet, where the kebab already offers it")
                 .that(compose.onAllNodesWithText(duplicate).fetchSemanticsNodes()).isEmpty()
         }
+    }
+
+    /**
+     * Favorite from the menu toggles the star without leaving the list.
+     *
+     * Asserted on the host's own row in the view model's state rather than on the star icon, because
+     * the star's content description is not host-scoped and the seeded "Production edge" carries one
+     * from the start - a toggle on another host that silently did nothing would otherwise look exactly
+     * like a star that appeared. The state is also what the Favorites filter reads, so a toggle that
+     * failed to persist is a star that filter then cannot find.
+     */
+    @Test
+    fun favoriteFromTheMenuTogglesTheStarOnTheCard() {
+        val host = addHost("Starred", hostname = "star.example.test", username = "starer")
+
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pump()
+        compose.onNodeWithText("Favorite").performClick()
+        pumpUntil(describe = { "the star never appeared" }) {
+            viewModel().uiState.value.hosts.firstOrNull { it.id == host.id }?.isFavorite == true
+        }
+
+        // And back off, through the item's other label.
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pump()
+        compose.onNodeWithText("Unfavorite").performClick()
+        pumpUntil(describe = { "the star never left" }) {
+            viewModel().uiState.value.hosts.firstOrNull { it.id == host.id }?.isFavorite == false
+        }
+    }
+
+    /**
+     * Export account from the menu opens the same passphrase dialog the sheet's button used to.
+     *
+     * The export never had a screen of its own, only this prompt, so reaching the prompt is the whole
+     * wiring under test - the encryption and file writing behind it are covered by the vault tests.
+     *
+     * Asserted at window level, like [editingAHostOpensItsOwnFormPrefilled] and unlike every
+     * non-dialog assertion in this class: `fetchSemanticsNodes` waits for the compose tree to go
+     * idle before it reads, and an open Compose dialog under Robolectric never gets there - the
+     * password field keeps the clock busy - so a semantics query after this click would hang for
+     * sixty seconds and die as AppNotIdleException rather than answer the question.
+     */
+    @Test
+    fun exportAccountFromTheMenuOpensTheExportDialog() {
+        val host = addHost("Exportable", hostname = "export.example.test", username = "exporter")
+        val before = ShadowDialog.getShownDialogs().size
+
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pump()
+        compose.onNodeWithText("Export account").performClick()
+        pump()
+
+        // The only dialog this menu item can open is the export prompt, so the latest showing one
+        // being new is the prompt. Nothing else was tapped that would raise a dialog of its own.
+        assertWithMessage("the export dialog never opened")
+            .that(ShadowDialog.getShownDialogs().size > before && ShadowDialog.getLatestDialog()?.isShowing == true)
+            .isTrue()
+    }
+
+    /**
+     * Duplicate saves a second host with the same settings and a name of its own.
+     *
+     * A copy that reused the id would overwrite the original - the assertion that both rows exist with
+     * different ids is the one that catches it - and a copy named identically would be a card the user
+     * cannot tell apart from the one they duplicated.
+     */
+    @Test
+    fun duplicateFromTheMenuSavesAnIndependentCopy() {
+        val host = addHost("Original", hostname = "dup.example.test", username = "duper", port = 2222)
+
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pump()
+        compose.onNodeWithText("Duplicate").performClick()
+        pumpUntil(describe = { "the copy never appeared" }) {
+            compose.onAllNodesWithContentDescription("More actions for Original (copy)").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        val copies = viewModel().uiState.value.hosts.filter { it.host == "dup.example.test" }
+        assertThat(copies).hasSize(2)
+        assertThat(copies.map { it.id }.toSet()).hasSize(2)
+        assertThat(copies.map { it.name }).containsExactly("Original", "Original (copy)")
     }
 
     // ---------------------------------------------------------------- driving the app
