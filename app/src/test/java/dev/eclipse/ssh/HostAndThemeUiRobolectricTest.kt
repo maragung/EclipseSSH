@@ -385,17 +385,28 @@ class HostAndThemeUiRobolectricTest {
      *
      * The export never had a screen of its own, only this prompt, so reaching the prompt is the whole
      * wiring under test - the encryption and file writing behind it are covered by the vault tests.
+     *
+     * Asserted at window level, like [editingAHostOpensItsOwnFormPrefilled] and unlike every
+     * non-dialog assertion in this class: `fetchSemanticsNodes` waits for the compose tree to go
+     * idle before it reads, and an open Compose dialog under Robolectric never gets there - the
+     * password field keeps the clock busy - so a semantics query after this click would hang for
+     * sixty seconds and die as AppNotIdleException rather than answer the question.
      */
     @Test
     fun exportAccountFromTheMenuOpensTheExportDialog() {
         val host = addHost("Exportable", hostname = "export.example.test", username = "exporter")
+        val before = ShadowDialog.getShownDialogs().size
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
         pump()
         compose.onNodeWithText("Export account").performClick()
-        pumpUntil(describe = { "the export dialog never opened" }) {
-            compose.onAllNodesWithText("Export account profile").fetchSemanticsNodes().isNotEmpty()
-        }
+        pump()
+
+        // The only dialog this menu item can open is the export prompt, so the latest showing one
+        // being new is the prompt. Nothing else was tapped that would raise a dialog of its own.
+        assertWithMessage("the export dialog never opened")
+            .that(ShadowDialog.getShownDialogs().size > before && ShadowDialog.getLatestDialog()?.isShowing == true)
+            .isTrue()
     }
 
     /**
