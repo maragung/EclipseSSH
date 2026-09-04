@@ -36,6 +36,12 @@ data class AboutInfo(
  */
 val OPEN_SOURCE_LICENSES: List<OpenSourceLicense> = listOf(
     OpenSourceLicense(
+        name = "JetBrains Mono",
+        version = "2.3.0 (bundled font)",
+        license = "SIL Open Font License 1.1",
+        url = "https://github.com/JetBrains/JetBrainsMono",
+    ),
+    OpenSourceLicense(
         name = "Apache MINA SSHD",
         version = "2.14.0",
         license = "Apache License 2.0",

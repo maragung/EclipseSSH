@@ -70,12 +70,14 @@ class AppNavigationTest {
             .assertIsDisplayed()
 
         tab("Files").performClick()
-        // Not "No remote file system": that branch needs `state.hosts` to be empty, and the
-        // seeded demo hosts plus MainViewModel's `selectedHostId = selected ?: hosts.firstOrNull()`
-        // mean a host is always selected here. The browser composes disconnected instead, so the
-        // remote listing shows its parent-directory row over an empty body.
-        compose.onNodeWithText("Parent directory").assertIsDisplayed()
-        compose.onNodeWithText("Empty directory").assertIsDisplayed()
+        // The explorer's first run: the device's own session, first and always, with its front door
+        // on screen because a SAF folder is the one thing this screen cannot grant itself — and an
+        // honest "no folder chosen yet" rather than a claim about an empty folder. The seeded demo
+        // hosts' chips are here too: every saved host stays reachable from Files, connected or not.
+        // [NavigationRobolectricTest] asserts the same on the JVM; this is the real-device signal.
+        compose.onNode(hasText("This device") and hasClickAction()).assertIsDisplayed()
+        compose.onNode(hasText("Pick folder") and hasClickAction()).assertIsDisplayed()
+        compose.onNode(hasText("No folder chosen yet", substring = true)).assertIsDisplayed()
 
         tab("Transfers").performClick()
         // The header renders unconditionally; the queue itself is not empty on a clean install,

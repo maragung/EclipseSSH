@@ -1,0 +1,1196 @@
+REDESIGN & FULLY IMPLEMENT FILES EXPLORER
+
+Tujuan utama:
+Ubah halaman Files menjadi Files Explorer yang jauh lebih rapi, compact, modern, dan usable. Gunakan desain target berikut sebagai acuan visual utama:
+
+- Layout harus mengikuti konsep UI target:
+  - Tab/session selector di bagian atas
+  - "Local" harus SELALU tersedia dan selalu menjadi item pertama.
+  - Setelah Local, tampilkan seluruh sesi SFTP yang sedang aktif/tersedia.
+  - User dapat berpindah antara Local dan banyak sesi SFTP dengan cepat.
+  - Toolbar file explorer berada tepat di bawah session/tab selector.
+  - File/folder list menggunakan card/container yang clean, dark, rounded, dan compact.
+  - Bottom navigation tetap tersedia pada mobile.
+- Jangan hanya melakukan perubahan kosmetik. Implementasikan Files Explorer secara penuh dan benar-benar fungsional.
+
+==================================================
+1. SESSION / LOCATION NAVIGATION
+==================================================
+
+Buat sistem location/session selector:
+
+[ Local ] [ Server 1 ] [ Server 2 ] [ Server 3 ] ...
+
+Rules:
+
+1. "Local" HARUS SELALU ditampilkan.
+2. Local selalu berada di posisi paling kiri/pertama.
+3. Local digunakan untuk browsing file dan folder filesystem lokal.
+4. Setelah Local, tampilkan sesi/server SFTP.
+5. Jumlah sesi SFTP tidak dibatasi secara desain.
+6. Jika sesi terlalu banyak:
+   - horizontal scroll pada mobile
+   - jangan membuat header menjadi berantakan
+   - gunakan compact session chips/tabs
+   - session yang aktif harus sangat jelas terlihat.
+7. Setiap SFTP session harus memiliki status:
+   - Connected
+   - Connecting
+   - Disconnected
+   - Error
+8. Gunakan indicator warna/status yang jelas.
+9. User dapat berpindah session tanpa kehilangan state folder dari session sebelumnya.
+10. Setiap session menyimpan:
+    - current path
+    - selected files
+    - sorting
+    - view mode
+    - scroll position jika memungkinkan.
+
+Contoh:
+
+Files
+
+[ 🟢 Local ] [ 🟢 Server · 25 ] [ 🟢 VPS ] [ + ]
+
+/     [ New Folder ] [ Upload ] [ Transfer ] [ Refresh ]
+
+------------------------------------------------
+
+Parent directory
+boot
+dev
+etc
+home
+...
+
+Jika session terlalu banyak:
+
+[ Local ] [ Server 1 ] [ Server 2 ] [ Server 3 ] ...
+< horizontal scrolling >
+
+==================================================
+2. LOCAL FILE EXPLORER
+==================================================
+
+Local bukan sekadar tab visual.
+
+Implementasikan Local Files Explorer secara penuh.
+
+Local harus bisa:
+
+- browse directories
+- open folders
+- navigate parent directory
+- create folder
+- create file
+- rename file/folder
+- delete file/folder
+- copy
+- cut
+- paste
+- move
+- duplicate
+- select multiple files
+- upload/import files
+- download/export files jika relevan
+- share file jika platform mendukung
+- open file
+- preview file
+- edit file
+- search files
+- sort files
+- refresh
+- show file information
+- show permissions jika filesystem mendukung
+- show file size
+- show modified date
+- show file type
+- handle empty directories
+- handle permission denied
+- handle unavailable paths
+- handle filesystem errors gracefully.
+
+Jangan menggunakan mock action untuk fitur yang seharusnya benar-benar bekerja.
+
+==================================================
+3. SFTP FILE EXPLORER
+==================================================
+
+Setiap SFTP session harus memiliki Files Explorer sendiri.
+
+Fungsinya harus mencakup:
+
+- browse remote directory
+- navigate parent directory
+- create remote folder
+- create remote file
+- rename
+- delete
+- copy
+- cut
+- paste
+- move
+- duplicate jika didukung
+- upload local -> remote
+- download remote -> local
+- transfer remote -> remote jika memungkinkan
+- multi-select
+- search
+- sort
+- refresh
+- file information
+- permissions
+- chmod jika backend mendukung
+- open file
+- edit remote file
+- save remote file
+- create new file
+- create new folder.
+
+Gunakan operasi SFTP yang benar-benar sesuai backend.
+
+Jangan menganggap Local filesystem API sama dengan SFTP API. Pisahkan abstraction/interface filesystem dengan jelas.
+
+==================================================
+4. FILE LIST UI
+==================================================
+
+Gunakan list/card seperti target UI.
+
+Setiap item minimal memiliki:
+
+[icon] filename
+       File / Directory / symlink
+       size / metadata
+
+Untuk directory:
+
+📁 boot
+   Directory                         755   ⋮
+
+Untuk file:
+
+📄 config.json
+   JSON · 12 KB                     -rw-r--r--   ⋮
+
+Permissions seperti:
+
+755
+
+harus ditampilkan jika informasi permission tersedia.
+
+Untuk Local filesystem yang tidak menyediakan Unix permissions, jangan menampilkan data palsu.
+
+==================================================
+5. FILE/FOLDER ACTION MENU
+==================================================
+
+Setiap item memiliki kebab menu:
+
+⋮
+
+Menu harus kontekstual.
+
+Untuk folder:
+
+- Open
+- Rename
+- Copy
+- Cut
+- Paste Into
+- Delete
+- Properties / Info
+
+Untuk file:
+
+- Open
+- Edit as Text
+- Preview
+- Rename
+- Copy
+- Cut
+- Duplicate
+- Download
+- Share
+- Delete
+- Properties / Info
+
+Untuk executable/script:
+
+- Open
+- Edit as Text
+- Run/Open in Terminal jika fitur tersebut memang tersedia
+- Rename
+- Copy
+- Cut
+- Delete
+- Properties
+
+Untuk image:
+
+- Preview
+- Open
+- Download
+- Rename
+- Copy
+- Delete
+- Properties
+
+Jangan menampilkan action yang tidak didukung oleh tipe file/backend.
+
+==================================================
+6. MULTI-SELECT
+==================================================
+
+Implementasikan multi-selection yang proper.
+
+User dapat:
+
+- long press item pada mobile
+- tap selection checkbox jika selection mode aktif
+- Ctrl/Cmd click pada desktop
+- Shift selection jika memungkinkan.
+
+Ketika item dipilih, toolbar berubah menjadi:
+
+[ Selected: 3 ]
+
+[ Copy ] [ Cut ] [ Delete ] [ Move ] [ More ]
+
+Untuk mobile gunakan bottom action bar atau contextual toolbar agar tidak memenuhi layar.
+
+==================================================
+7. EDIT AS TEXT
+==================================================
+
+Implementasikan fitur:
+
+"Edit as Text"
+
+Ini harus menjadi salah satu fitur utama Files Explorer.
+
+Ketika user memilih:
+
+Edit as Text
+
+buka text editor fullscreen/page/modal sesuai platform.
+
+Editor harus mendukung:
+
+- line numbers
+- syntax-aware editing jika memungkinkan
+- monospaced font
+- horizontal scrolling untuk long lines
+- vertical scrolling
+- cursor
+- selection
+- copy
+- paste
+- undo
+- redo
+- find
+- find & replace
+- go to line
+- select all
+- save
+- save as jika relevan
+- cancel
+- unsaved changes detection
+- confirmation sebelum meninggalkan editor jika ada perubahan.
+
+Contoh:
+
+┌──────┬─────────────────────────────────────┐
+│  1   │ {                                   │
+│  2   │   "name": "example",                │
+│  3   │   "version": "1.0.0"                │
+│  4   │ }                                   │
+└──────┴─────────────────────────────────────┘
+
+Line numbers harus tetap terlihat ketika melakukan horizontal scroll.
+
+Editor harus mampu membuka file text umum seperti:
+
+.txt
+.log
+.md
+.json
+.jsonc
+.yaml
+.yml
+.xml
+.csv
+.ini
+.conf
+.cfg
+.env
+.sh
+.bash
+.zsh
+.py
+.js
+.ts
+.tsx
+.jsx
+.css
+.html
+.rs
+.go
+.java
+.kt
+.dart
+.sql
+.sol
+dockerfile
+dan extension text lainnya.
+
+Untuk binary file jangan memaksa membuka sebagai text.
+
+Jika file terlalu besar:
+
+- tampilkan warning
+- gunakan safe loading strategy
+- jangan membuat UI freeze
+- gunakan streaming/chunking bila memungkinkan.
+
+==================================================
+8. REMOTE FILE EDITING
+==================================================
+
+Untuk SFTP:
+
+Ketika user memilih:
+
+Edit as Text
+
+download/load remote file ke editor.
+
+Setelah user menekan Save:
+
+1. simpan perubahan
+2. upload/write kembali ke remote file
+3. tampilkan saving state
+4. tampilkan success/error
+5. jangan kehilangan perubahan user jika upload gagal.
+
+Contoh status:
+
+Saving...
+Saved
+Failed to save
+
+Jika remote file berubah sebelum user menyimpan:
+
+- lakukan conflict detection jika memungkinkan
+- jangan overwrite secara diam-diam
+- berikan pilihan reload / overwrite / cancel.
+
+==================================================
+9. CREATE NEW FILE
+==================================================
+
+Toolbar "+" atau New harus menyediakan:
+
+New Folder
+New File
+Upload File
+Upload Folder jika didukung
+
+New File:
+
+[ filename __________ ]
+
+[Cancel] [Create]
+
+Setelah file dibuat, user dapat langsung memilih:
+
+Edit as Text
+
+==================================================
+10. UPLOAD / DOWNLOAD
+==================================================
+
+Implementasikan transfer dengan UX yang jelas.
+
+Upload:
+
+Local -> SFTP
+
+Download:
+
+SFTP -> Local
+
+Tampilkan:
+
+- filename
+- progress
+- percentage
+- transferred size
+- speed jika tersedia
+- status
+- success/error.
+
+Contoh:
+
+Transfers
+
+config.zip
+██████████████░░ 82%
+12.4 MB / 15.1 MB
+
+Jika transfer berlangsung, user tetap dapat berpindah ke Files atau Terminal.
+
+==================================================
+11. TRANSFERS INTEGRATION
+==================================================
+
+Integrasikan Files Explorer dengan halaman/tab Transfers.
+
+Setiap transfer harus memiliki:
+
+- source
+- destination
+- filename
+- direction
+- progress
+- speed
+- status
+- error message
+- cancel
+- retry.
+
+Jangan membuat transfer mengunci Files Explorer.
+
+User tetap dapat browsing filesystem ketika transfer berjalan.
+
+==================================================
+12. SEARCH
+==================================================
+
+Tambahkan search button di header.
+
+Search harus bekerja berdasarkan current session/location.
+
+Contoh:
+
+Local:
+/home/user
+
+Search:
+config
+
+Hasil:
+
+config.json
+config.yaml
+config.old
+app/config.ts
+
+Untuk SFTP:
+
+search harus dilakukan pada remote filesystem sesuai kemampuan backend.
+
+Search harus:
+
+- support filename search
+- case insensitive option
+- filter by type
+- filter by extension
+- filter file/folder
+- clear search.
+
+==================================================
+13. SORTING
+==================================================
+
+Tambahkan sorting.
+
+Options:
+
+- Name
+- Name descending
+- Size
+- Size descending
+- Modified
+- Modified descending
+- Type
+- Type descending
+
+Default:
+
+Directories first
+then files
+sorted by name.
+
+Preference dapat disimpan per session.
+
+==================================================
+14. VIEW MODE
+==================================================
+
+Support minimal:
+
+- List View
+- Grid View
+
+List View menjadi default.
+
+Grid View berguna untuk image/media.
+
+View mode dapat diubah dari toolbar/menu.
+
+==================================================
+15. FILE PREVIEW
+==================================================
+
+Implementasikan preview berdasarkan file type.
+
+Images:
+- image preview
+- zoom
+- fit to screen
+
+Text:
+- text preview
+- option Edit as Text
+
+JSON:
+- formatted JSON preview
+- Edit as Text
+
+Markdown:
+- rendered preview
+- Edit as Text
+
+PDF:
+- preview jika platform/library mendukung
+
+Audio/video:
+- preview jika platform mendukung
+
+Binary/unknown:
+- file information
+- no unsafe automatic execution.
+
+==================================================
+16. FILE INFORMATION / PROPERTIES
+==================================================
+
+Properties harus menampilkan:
+
+Name
+Type
+Path
+Size
+Modified
+Created jika tersedia
+Permissions jika tersedia
+Owner/group jika tersedia
+Extension
+MIME type
+Location/session
+
+Untuk SFTP tampilkan metadata remote jika tersedia.
+
+==================================================
+17. CONTEXT MENU / LONG PRESS
+==================================================
+
+Desktop:
+
+Right click -> context menu.
+
+Mobile:
+
+Long press -> context menu / selection mode.
+
+Context menu harus menggunakan action yang sama dengan kebab menu.
+
+Jangan membuat dua sistem action yang berbeda.
+
+==================================================
+18. NAVIGATION
+==================================================
+
+Path bar harus jelas.
+
+Contoh:
+
+📁  /  home  user  projects
+
+atau:
+
+/home/user/projects
+
+Jika path panjang:
+
+/ ... / projects / frontend
+
+Breadcrumb harus dapat diklik untuk kembali ke folder sebelumnya.
+
+Parent directory:
+
+..
+
+tetap dapat digunakan tetapi tampilkan secara konsisten.
+
+==================================================
+19. MOBILE UX
+==================================================
+
+Prioritaskan mobile.
+
+Pastikan:
+
+- tidak ada horizontal overflow kecuali session tabs yang memang scrollable
+- toolbar tidak terlalu padat
+- icon memiliki touch target minimal sekitar 44px
+- kebab menu mudah disentuh
+- long press support
+- bottom navigation tetap terlihat
+- editor fullscreen pada mobile
+- session selector mudah digeser
+- keyboard tidak menutupi editor/input
+- dialogs responsive
+- file names panjang menggunakan ellipsis
+- permission/metadata tidak membuat layout rusak.
+
+Untuk mobile:
+
+Files
+
+[ Local ] [ Server · 25 ] [ VPS ] →
+
+📁 /
+[ + ] [ Upload ] [ Transfer ] [ Refresh ] [ ⋮ ]
+
+------------------------------------------------
+
+📁 boot
+   Directory                         755   ⋮
+
+📁 dev
+   Directory                         755   ⋮
+
+📁 etc
+   Directory                         755   ⋮
+
+==================================================
+20. DESKTOP UX
+==================================================
+
+Pada layar besar manfaatkan ruang secara lebih optimal.
+
+Pertimbangkan:
+
+- wider file list
+- breadcrumb/path bar
+- toolbar
+- optional details panel
+- multi-column metadata
+- resizable layout jika cocok.
+
+Namun jangan membuat desain desktop berbeda terlalu jauh dari mobile.
+
+Gunakan responsive layout yang konsisten.
+
+==================================================
+21. SESSION MANAGEMENT
+==================================================
+
+SFTP sessions dapat berjumlah banyak.
+
+Jangan membuat setiap server menjadi permanent full-size tab.
+
+Gunakan compact horizontal session tabs/chips.
+
+Contoh:
+
+[ ● Local ] [ ● Server 25 ] [ ● Production ] [ ● VPS ] [ + ]
+
+Active:
+
+[ ● Server 25 ]
+
+Jika >5 session:
+
+[ Local ] [ Server 25 ] [ Production ] [ VPS ] [ Dev ] → 
+
+Horizontal scrolling.
+
+Tambahkan opsi:
+
++ Add SFTP Session
+
+Jika session disconnected:
+
+[ ○ Server 25 ]
+
+Tetap tampilkan session sehingga user dapat reconnect.
+
+Jangan menghapus session hanya karena disconnect.
+
+==================================================
+22. SESSION STATE
+==================================================
+
+Setiap session menyimpan:
+
+sessionId
+connection status
+current path
+last visited directory
+sort preference
+view mode
+selected items
+pending operations jika ada.
+
+Ketika user:
+
+Local -> Server A -> Server B -> Local
+
+semua session harus mempertahankan lokasi terakhirnya.
+
+Contoh:
+
+Local:
+/storage/emulated/0
+
+Server A:
+/home/user/project
+
+Server B:
+/var/www/app
+
+Ketika kembali ke Server A:
+
+langsung kembali ke:
+
+/home/user/project
+
+==================================================
+23. OFFLINE / DISCONNECTED STATE
+==================================================
+
+Local harus tetap bekerja meskipun semua SFTP disconnected.
+
+Jika SFTP disconnect:
+
+Tampilkan:
+
+Server 25
+Disconnected
+
+[Reconnect]
+
+Jangan crash Files Explorer.
+
+Ketika reconnect berhasil:
+
+restore current path.
+
+==================================================
+24. ERROR HANDLING
+==================================================
+
+Semua filesystem operation harus memiliki proper error handling.
+
+Contoh:
+
+Permission denied
+File not found
+Directory not found
+Connection lost
+Connection timeout
+File already exists
+Insufficient storage
+Transfer failed
+Save failed
+Invalid filename
+
+Gunakan toast/dialog yang jelas.
+
+Jangan hanya console.log error.
+
+==================================================
+25. SECURITY
+==================================================
+
+Jangan pernah:
+
+- mengeksekusi file secara otomatis
+- menjalankan script hanya karena file dibuka
+- membuka binary sebagai text tanpa konfirmasi
+- menyimpan credential SFTP di plaintext
+- mengekspos private credentials di UI/log.
+
+Gunakan secure credential/session handling yang sudah tersedia pada aplikasi.
+
+==================================================
+26. PERFORMANCE
+==================================================
+
+Files Explorer harus tetap responsive pada directory besar.
+
+Jika directory memiliki banyak file:
+
+- gunakan virtualization bila diperlukan
+- lazy loading
+- pagination/chunking jika backend mendukung
+- jangan render ribuan item sekaligus jika tidak diperlukan.
+
+Untuk file besar pada editor:
+
+- jangan load seluruh file secara blocking jika bisa dihindari.
+
+==================================================
+27. VISUAL DESIGN
+==================================================
+
+Visual direction:
+
+- dark modern UI
+- rounded containers
+- clean spacing
+- compact tetapi tetap mudah disentuh
+- soft borders
+- subtle separators
+- consistent iconography
+- strong typography hierarchy
+- blue/purple accent sesuai design system aplikasi
+- directory icon
+- file-type icons
+- status indicators.
+
+Jangan membuat UI terlalu ramai.
+
+Prioritas:
+
+1. Files/session navigation
+2. File list
+3. Primary actions
+4. Contextual actions
+5. Metadata
+
+==================================================
+28. TOOLBAR
+==================================================
+
+Toolbar harus menyesuaikan current session.
+
+Minimal:
+
+[ Path ]
+[ New + ]
+[ Upload ]
+[ Transfer ]
+[ Refresh ]
+[ Search ]
+
+Jika selection aktif:
+
+[ 3 selected ]
+[ Copy ]
+[ Cut ]
+[ Move ]
+[ Delete ]
+[ More ]
+
+Jangan menampilkan terlalu banyak icon sekaligus di mobile.
+
+Action sekunder masuk ke More menu.
+
+==================================================
+29. LOCAL VS SFTP BEHAVIOR
+==================================================
+
+Pastikan action yang sama memiliki behavior sesuai backend.
+
+Contoh:
+
+LOCAL
+Create folder -> local filesystem
+
+SFTP
+Create folder -> SFTP mkdir
+
+LOCAL
+Edit file -> local read/write
+
+SFTP
+Edit file -> SFTP download/read + save/write
+
+LOCAL
+Delete -> local filesystem
+
+SFTP
+Delete -> SFTP remove
+
+Jangan membuat abstraction yang menyebabkan operasi salah target.
+
+==================================================
+30. ARCHITECTURE
+==================================================
+
+Pisahkan UI dari filesystem implementation.
+
+Buat abstraction seperti:
+
+FileSystemProvider
+
+dengan implementasi:
+
+LocalFileSystemProvider
+SftpFileSystemProvider
+
+API konseptual:
+
+list(path)
+stat(path)
+readFile(path)
+writeFile(path, data)
+createFile(path)
+mkdir(path)
+rename(oldPath, newPath)
+copy(source, destination)
+move(source, destination)
+delete(path)
+search(path, query)
+upload(...)
+download(...)
+chmod(...) jika tersedia
+
+UI Files Explorer tidak boleh bergantung langsung pada implementasi Local atau SFTP.
+
+Dengan demikian Files Explorer bisa digunakan untuk banyak backend.
+
+==================================================
+31. STATE MANAGEMENT
+==================================================
+
+Gunakan state management yang clean.
+
+Pisahkan:
+
+- activeSession
+- sessions
+- currentPath
+- directoryEntries
+- selectedEntries
+- loading
+- error
+- searchQuery
+- sort
+- viewMode
+- editorState
+- transferState.
+
+Jangan membuat satu giant component untuk seluruh Files Explorer.
+
+Pisahkan menjadi component yang reusable:
+
+FilesPage
+SessionTabs
+PathBreadcrumb
+FileToolbar
+FileList
+FileListItem
+FileContextMenu
+FileProperties
+FilePreview
+TextEditor
+CreateFileDialog
+CreateFolderDialog
+UploadDialog
+TransferPanel
+SearchDialog
+SessionSelector
+
+==================================================
+32. TEXT EDITOR UI
+==================================================
+
+Editor harus terasa seperti proper code/text editor.
+
+Header:
+
+[ ← ] filename                     [ Save ] [ ⋮ ]
+
+Toolbar:
+
+[ Undo ] [ Redo ] [ Find ] [ Go to Line ]
+
+Editor:
+
+Line | Code
+-----|--------------------------------
+1    | ...
+2    | ...
+3    | ...
+
+Footer/status:
+
+Ln 12, Col 8
+UTF-8
+LF
+
+Jika language detection tersedia:
+
+JSON
+JavaScript
+TypeScript
+Python
+Rust
+etc.
+
+Gunakan syntax highlighting jika library editor yang digunakan mendukungnya.
+
+==================================================
+33. UNSAVED CHANGES
+==================================================
+
+Jika user mengedit:
+
+config.json
+
+lalu mencoba keluar:
+
+Tampilkan:
+
+Unsaved changes
+
+Save changes before leaving?
+
+[Cancel] [Discard] [Save]
+
+Jangan kehilangan data secara diam-diam.
+
+==================================================
+34. EMPTY STATE
+==================================================
+
+Jika directory kosong:
+
+This folder is empty
+
+[ + New File ]
+[ + New Folder ]
+[ Upload ]
+
+Jika SFTP belum terhubung:
+
+Server disconnected
+
+[Reconnect]
+
+Jika Local gagal diakses:
+
+Unable to access directory
+
+[Retry]
+
+==================================================
+35. IMPLEMENTATION QUALITY
+==================================================
+
+Jangan hanya membuat mockup.
+
+Semua button/action yang ditampilkan harus:
+
+- memiliki handler
+- memiliki loading state
+- memiliki success state
+- memiliki error handling
+- terhubung ke backend/provider yang benar.
+
+Hapus placeholder action yang tidak bekerja.
+
+Jangan menggunakan fake filesystem data.
+
+==================================================
+36. FINAL ACCEPTANCE CRITERIA
+==================================================
+
+Implementasi dianggap selesai hanya jika:
+
+[ ] Local selalu muncul sebagai session pertama
+[ ] Multiple SFTP sessions dapat ditampilkan
+[ ] Session tabs/chips responsive
+[ ] User dapat berpindah Local <-> SFTP dengan cepat
+[ ] Current directory tersimpan per session
+[ ] Local filesystem benar-benar dapat dibrowse
+[ ] SFTP filesystem benar-benar dapat dibrowse
+[ ] Create folder bekerja
+[ ] Create file bekerja
+[ ] Rename bekerja
+[ ] Delete bekerja
+[ ] Copy/Cut/Paste bekerja
+[ ] Multi-select bekerja
+[ ] Upload bekerja
+[ ] Download bekerja
+[ ] Search bekerja
+[ ] Sorting bekerja
+[ ] List/Grid view bekerja
+[ ] File preview bekerja sesuai tipe
+[ ] File Properties bekerja
+[ ] Context menu bekerja
+[ ] Long press bekerja pada mobile
+[ ] Edit as Text bekerja
+[ ] Editor memiliki line numbers
+[ ] Editor memiliki undo/redo
+[ ] Editor memiliki find
+[ ] Editor memiliki find & replace
+[ ] Editor memiliki Go To Line
+[ ] Editor memiliki Save
+[ ] Unsaved changes ditangani
+[ ] Remote SFTP file dapat diedit dan disimpan kembali
+[ ] Transfer berjalan tanpa mengunci Files Explorer
+[ ] Transfer progress terlihat
+[ ] Reconnect SFTP bekerja
+[ ] Permission/error handling bekerja
+[ ] Tidak ada crash ketika SFTP disconnect
+[ ] Tidak ada horizontal overflow yang tidak diperlukan
+[ ] Mobile UX nyaman digunakan
+[ ] Desktop UX tetap optimal
+[ ] Tidak ada mock action
+[ ] Tidak ada fake filesystem data
+[ ] UI mengikuti design system aplikasi yang sudah ada
+[ ] Existing functionality tidak rusak
+
+==================================================
+HASIL AKHIR YANG DIINGINKAN
+==================================================
+
+Files harus terasa seperti sebuah proper file manager + SFTP client, bukan sekadar halaman daftar file.
+
+Struktur UX utama:
+
+Files
+
+[ 🟢 Local ] [ 🟢 Server · 25 ] [ 🟢 Production ] [ 🟢 Dev ] [ + ]
+
+📁 /home/user/project
+
+[ + ] [ Upload ] [ Transfer ] [ Refresh ] [ Search ] [ ⋮ ]
+
+┌──────────────────────────────────────────────┐
+│ 📁 src                                      │
+│    Directory                         755  ⋮  │
+│                                              │
+│ 📁 public                                   │
+│    Directory                         755  ⋮  │
+│                                              │
+│ 📄 package.json                              │
+│    JSON · 2.4 KB                       ⋮    │
+│                                              │
+│ 📄 README.md                                 │
+│    Markdown · 8 KB                     ⋮    │
+└──────────────────────────────────────────────┘
+
+Bottom navigation:
+
+[ Hosts ] [ Terminal ] [ Files ] [ Transfers ] [ Settings ]
+
+PRIORITAS TERBESAR:
+Jangan berhenti pada redesign visual. Bangun Files Explorer yang benar-benar usable, dengan Local filesystem sebagai session permanen pertama dan unlimited/multiple SFTP sessions setelahnya, serta editor text lengkap dengan line numbering dan kemampuan edit/save untuk local maupun remote files.
