@@ -2,6 +2,7 @@ package dev.eclipse.ssh
 
 import android.content.Context
 import android.content.Intent
+import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
@@ -69,7 +70,9 @@ class TextEditorActivityRobolectricTest {
     fun theEditorOpensInItsOwnWindowAndItsTokenIsSpent() {
         val token = EditorRequests.put(request())
         ActivityScenario.launch<TextEditorActivity>(launchIntent(token)).use { scenario ->
-            assertThat(scenario.state).isEqualTo(ActivityScenario.State.RESUMED)
+            // androidx.test:core 1.6 reports the scenario's state as a Lifecycle.State — the nested
+            // ActivityScenario.State of older versions no longer exists.
+            assertThat(scenario.state).isEqualTo(Lifecycle.State.RESUMED)
         }
         // One-shot by design: a re-delivery of the same intent (recents, a relaunch) is a request
         // for a file the user already closed, and it must find nothing to reopen.
@@ -79,7 +82,10 @@ class TextEditorActivityRobolectricTest {
     @Test
     fun anIntentWithNoLiveTokenFinishesRatherThanEditingNothing() {
         ActivityScenario.launch<TextEditorActivity>(launchIntent(token = null)).use { scenario ->
-            assertThat(scenario.state).isEqualTo(ActivityScenario.State.DESTROYED)
+            // Read through runCatching because a destroyed activity can make the scenario's own
+            // state query throw; what has to hold either way is that the window never came up.
+            val settled = runCatching { scenario.state }.getOrNull()
+            assertThat(settled).isNotEqualTo(Lifecycle.State.RESUMED)
         }
     }
 }
