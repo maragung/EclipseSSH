@@ -1,0 +1,85 @@
+# One-off: mint the release signing key and publish it as repository secrets.
+#
+# The keystore is generated ON THIS RUNNER and goes nowhere else: the private key
+# never touches a developer machine, an artifact, or a log. The two values the
+# release build needs (RELEASE_KEYSTORE_BASE64, RELEASE_KEYSTORE_PROPERTIES) are
+# uploaded straight to the repository's secret store with `gh secret set`, which
+# seals them with the repo's public key before they leave this process. The only
+# thing printed is the certificate's SHA-256 fingerprint, which is public by
+# design — it is what a user checks an installed APK against.
+#
+# SETUP_SIGNING_TOKEN is a repository secret holding a token with secrets:write,
+# because the workflow's own GITHUB_TOKEN cannot administer secrets. That secret
+# is deleted once this has run, and so is this whole workflow.
+name: Set up release signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate-and-publish:
+    name: Mint the release key
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Generate the keystore and publish it as secrets
+        env:
+          GH_TOKEN: ${{ secrets.SETUP_SIGNING_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # The same secret guards the store and the key; neither is ever printed.
+          PASS="$(openssl rand -hex 24)"
+          JKS="$RUNNER_TEMP/eclipse-release.jks"
+          PROPS="$RUNNER_TEMP/keystore.properties"
+          B64="$RUNNER_TEMP/eclipse-release.jks.b64"
+
+          # RSA 2048, valid 30 years: every device from minSdk 28 up verifies it,
+          # and the v3 signing scheme (enabled in app/build.gradle.kts) carries the
+          # rotation proof for when this key is ever replaced.
+          keytool -genkeypair \
+            -keystore "$JKS" \
+            -alias eclipse-release \
+            -keyalg RSA -keysize 2048 -validity 10950 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=EclipseSSH, O=Eclipse, C=ID" \
+            >/dev/null
+
+          # storeFile is the path the CI restore step writes the keystore to.
+          printf 'storeFile=keystore/eclipse-release.jks\nstorePassword=%s\nkeyAlias=eclipse-release\nkeyPassword=%s\n' \
+            "$PASS" "$PASS" > "$PROPS"
+
+          # The fingerprint is the certificate's public hash: the one string from a
+          # keystore that is safe — and useful — to publish.
+          echo "== Release certificate fingerprint (public, safe to publish):"
+          keytool -list -v -keystore "$JKS" -storepass "$PASS" \
+            | grep -m 1 'SHA256:'
+
+          base64 -w0 "$JKS" > "$B64"
+
+          # Values travel by stdin, sealed client-side by gh before they leave this
+          # process. Nothing here echoes either value.
+          gh secret set RELEASE_KEYSTORE_BASE64 -R maragung/EclipseSSH < "$B64"
+          gh secret set RELEASE_KEYSTORE_PROPERTIES -R maragung/EclipseSSH < "$PROPS"
+
+          echo "== Secrets now on the repository:"
+          gh secret list -R maragung/EclipseSSH
+
+      - name: Shred everything the key touched
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/eclipse-release.jks" \
+                "$RUNNER_TEMP/keystore.properties" \
+                "$RUNNER_TEMP/eclipse-release.jks.b64"
+          echo "keystore material removed from the runner"
