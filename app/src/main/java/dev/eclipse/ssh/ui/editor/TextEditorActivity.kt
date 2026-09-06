@@ -3,9 +3,9 @@ package dev.eclipse.ssh.ui.editor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
-import androidx.compose.ui.platform.isSystemInDarkTheme
 import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.ui.EclipseTheme
