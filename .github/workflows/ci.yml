@@ -309,7 +309,12 @@ jobs:
 
       - name: Stop the OpenSSH sandbox
         if: always()
-        run: tools/local-sshd.sh clean
+        # `stop`, not `clean`: the sandbox's sshd.log is the only honest witness to a heartbeat
+        # failure, because it names every login and every keepalive the run produced, from every
+        # port, with timestamps. `clean` deletes it before the artifact upload below can reach it,
+        # which cost a full 65-minute stress round once already. The runner is ephemeral, so leaving
+        # the sandbox directory behind costs nothing.
+        run: tools/local-sshd.sh stop
 
       - name: Upload the test report
         if: always()
@@ -319,4 +324,5 @@ jobs:
           path: |
             app/build/reports/tests/
             app/build/test-results/
+            .tmp-build/sshd-test/sshd.log
           retention-days: 14
