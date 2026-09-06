@@ -1001,19 +1001,29 @@ class RealOpenSshInteropRobolectricTest {
         // `debug1: kex: client->server cipher: … MAC: <implicit> compression: none [preauth]` - one line
         // per direction, and the trailing `[preauth]` is why this takes the first token rather than the
         // rest of the line.
-        val negotiated = appendedLog(log, logOffset).lineSequence()
+        //
+        // The window is a shared log, not this session's: a connection any other test's session opens
+        // while this one is logging in lands its own kex lines in the same bytes. So the verdict below
+        // carries the raw lines and the window's login count - with those two, the next failure names
+        // its own cause (one login that negotiated none, against a foreign login's lines interleaved)
+        // instead of a bare list that cannot distinguish them.
+        val kexLines = appendedLog(log, logOffset).lineSequence()
             .filter { it.contains("kex:") && it.contains("compression: ") }
+            .toList()
+        val negotiated = kexLines
             .map { it.substringAfter("compression: ").trim().substringBefore(' ') }
             .toList()
-        assertWithMessage("the server logged no negotiated compression for this session")
+        val windowLogins = loginsByPort(log, logOffset)
+        val window = "logins in this window: $windowLogins; kex lines:\n${kexLines.joinToString("\n")}"
+        assertWithMessage("the server logged no negotiated compression for this session. $window")
             .that(negotiated.size)
             .isAtLeast(2)
         if (compression) {
-            assertWithMessage("compression was on for this host and the server compressed nothing")
+            assertWithMessage("compression was on for this host and the server compressed nothing. $window")
                 .that(negotiated.filterNot { it.startsWith("zlib") })
                 .isEmpty()
         } else {
-            assertWithMessage("compression was off for this host and the server compressed anyway")
+            assertWithMessage("compression was off for this host and the server compressed anyway. $window")
                 .that(negotiated.filterNot { it == "none" })
                 .isEmpty()
         }

@@ -77,6 +77,21 @@
         </activity>
 
         <!--
+          The text editor, in its own window so it reads as an editor rather
+          than as a panel over the app: launched on top of MainActivity by the
+          Files explorer, the file preview and the New File dialog. Not
+          exported — it is only ever started from inside the app, and its one
+          extra is a token into an in-process handoff (EditorRequests), not a
+          path or a URI anyone else could name.
+        -->
+        <activity
+            android:name=".ui.editor.TextEditorActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:parentActivityName=".MainActivity"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!--
           Long-lived work host: terminal shells, SFTP transfers and port
           forwards all run inside this service so that the process survives
           minimise / screen-off. dataSync is the correct FGS type for

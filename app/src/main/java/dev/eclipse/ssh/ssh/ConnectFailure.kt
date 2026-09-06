@@ -48,6 +48,37 @@ private val HANDSHAKE_CLOSED_MARKERS = listOf(
     "No session attached",
 )
 
+/**
+ * The messages a server leaves when what it refused was the *credential*, not the connection.
+ *
+ * Matched case-insensitively across the whole cause chain because the same refusal arrives in more
+ * than one wrapper: OpenSSH sends `SSH2_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE` once the client
+ * has exhausted its methods, a keyboard-interactive refusal often surfaces only as the server's own
+ * "Permission denied", and a PAM stack reports "authentication failed" from deep inside MINA.
+ */
+private val CREDENTIAL_REJECTION_MARKERS = listOf(
+    "no more authentication methods available",
+    "authentication failed",
+    "auth fail",
+    "permission denied",
+    "too many authentication failures",
+)
+
+/**
+ * Whether the server was reached and turned the *login* away — the password, the key, or the right
+ * to use either — as against a transport that never got that far.
+ *
+ * The distinction drives what the app does next: a rejected credential is the one failure whose fix
+ * is a dialog rather than a retry, because the user is holding the thing that has to change. A
+ * refused socket or a timeout must stay on the retry path this function excludes them from.
+ */
+fun isCredentialRejection(error: Throwable?): Boolean {
+    if (error == null) return false
+    if ((error as? SshException)?.disconnectCode == SshConstants.SSH2_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE) return true
+    val messages = causeMessages(error).lowercase()
+    return CREDENTIAL_REJECTION_MARKERS.any { marker -> marker in messages }
+}
+
 /** How far down a `cause` chain to look, so a self-referencing chain cannot spin here. */
 private const val MAX_CAUSE_DEPTH = 8
 
@@ -120,6 +151,14 @@ fun describeConnectFailure(error: Throwable?): String {
         return "The server accepted the connection and then closed it during the SSH handshake. " +
             "It may be refusing connections from this address, limiting how many start at once, " +
             "or sharing no algorithm with this client."
+    }
+    // Before the passthrough, because the credential case is the one whose raw text points the wrong
+    // way: "No more authentication methods available" reads like a server configuration problem, and
+    // "Permission denied" like a filesystem one, when both mean the password or key was refused and
+    // the next move is the user's. The server's sentence is kept after the rewrite for diagnosis.
+    if (isCredentialRejection(error)) {
+        return "The server refused the login. The password or key may be wrong, or the account may " +
+            "not be allowed to sign in this way. ($message)"
     }
     val negotiation = (error as? SshException)?.disconnectCode == SshConstants.SSH2_DISCONNECT_KEY_EXCHANGE_FAILED ||
         "Unable to negotiate" in message
