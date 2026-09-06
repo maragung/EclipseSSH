@@ -78,21 +78,82 @@ class RealOpenSshInteropRobolectricTest {
      * a five-minute hold. The app was doing exactly what it says; the harness was measuring the wrong
      * sessions.
      *
+     * Closing the tabs is only half of that, though, and the second leak came through the half it did
+     * not cover: a session the app never installed in its store has no tab to close, so
+     * `disconnectAll` said "nothing to do" and the socket stayed open. Tabs are the app's *opinion*
+     * about what is connected; the kernel's socket table is the fact. So after the tabs are gone the
+     * socket table is asked directly - see [leakedSandboxSockets] - and a descriptor this JVM is still
+     * holding to a sandbox port fails the test that leaked it, here and now, rather than surfacing as
+     * doubled heartbeat counts in an idle test forty minutes later where it reads like a keep-alive bug.
+     *
      * A session that will not close is a failure worth reporting, so this asserts rather than hoping.
      * JUnit reports an `@After` failure alongside the test's own, so nothing is masked by it.
      */
     @After
     fun closeEverySession() {
-        if (viewModel().uiState.value.tabs.isEmpty()) return
-        compose.runOnUiThread { viewModel().disconnectAll() }
-        pumpUntil(
-            timeoutMs = 10_000,
-            describe = { "a session was still open after disconnectAll" },
-        ) { viewModel().uiState.value.tabs.isEmpty() }
+        if (viewModel().uiState.value.tabs.isNotEmpty()) {
+            compose.runOnUiThread { viewModel().disconnectAll() }
+            pumpUntil(
+                timeoutMs = 10_000,
+                describe = { "a session was still open after disconnectAll" },
+            ) { viewModel().uiState.value.tabs.isEmpty() }
+        }
         // The tab going away is the app's decision; the socket closing is MINA finishing it. Give the
         // close futures a moment on the looper so the next test's log offset lands after the server has
         // logged the disconnect rather than in the middle of it.
         pumpFor(CLOSE_SETTLE_MS)
+        // Retried rather than asked once: a close that MINA has accepted is finished by its I/O
+        // thread, not by the looper, so the descriptor can leave the table a moment after the tab
+        // does. What is still here after [LEAK_SETTLE_MS] is not a close in flight - nothing is
+        // coming to close it.
+        var leaked = leakedSandboxSockets()
+        val settleDeadline = System.nanoTime() + LEAK_SETTLE_MS * 1_000_000
+        while (leaked.isNotEmpty() && System.nanoTime() < settleDeadline) {
+            Thread.sleep(100)
+            leaked = leakedSandboxSockets()
+        }
+        check(leaked.isEmpty()) {
+            "this test left ${leaked.values.sum()} socket(s) open to the sandbox " +
+                "(by port: $leaked) after every tab was closed - a session the app authenticated and " +
+                "then lost track of, with no tab to close and a keep-alive still running. The leak is " +
+                "in this test's connect path, not in whichever idle test counts the heartbeats later."
+        }
+    }
+
+    /**
+     * The sockets this JVM still holds open to the sandbox, counted by the port on the far end.
+     *
+     * `/proc/net/tcp` is the kernel's own socket table for this process, so it sees a connection
+     * nothing in the app remembers: a session that authenticated, never reached the session store,
+     * and went out of scope with its transport still up. Robolectric does not redirect it - the file
+     * reads are plain JVM I/O against the real process, the same as the sandbox files above.
+     *
+     * Only sockets whose *remote* port is a sandbox listening port are counted, which excludes
+     * sshd's own side of each connection (its remote port is the client's ephemeral one) and
+     * everything else the JVM talks to. `ESTABLISHED` and `CLOSE_WAIT` are the two states that mean
+     * a file descriptor is still open on this side - a close that is still in flight is gone in
+     * milliseconds, so the caller waits before asking, and what is left after that is a leak.
+     */
+    private fun leakedSandboxSockets(): Map<Int, Int> {
+        val sandbox = sandbox() ?: return emptyMap()
+        val ports = sequenceOf("port", "port-silent", "port-no-shell")
+            .mapNotNull { name -> File(sandbox, name).takeIf(File::isFile)?.readText()?.trim()?.toIntOrNull() }
+            .toSet()
+        if (ports.isEmpty()) return emptyMap()
+        return runCatching {
+            val counts = mutableMapOf<Int, Int>()
+            // The client side of every sandbox connection is IPv4: the tests dial LOOPBACK, which is
+            // 127.0.0.1, so /proc/net/tcp alone is the whole story.
+            File("/proc/net/tcp").readLines().drop(1).forEach { line ->
+                val columns = line.trim().split(Regex("\\s+"))
+                val state = columns.getOrNull(3) ?: return@forEach
+                if (state == "01" || state == "08") {
+                    val remotePort = columns.getOrNull(2)?.substringAfterLast(':')?.toIntOrNull(16) ?: return@forEach
+                    if (remotePort in ports) counts[remotePort] = (counts[remotePort] ?: 0) + 1
+                }
+            }
+            counts
+        }.getOrDefault(emptyMap())
     }
 
     /**
@@ -1689,6 +1750,14 @@ class RealOpenSshInteropRobolectricTest {
 
         /** How long the close futures get after the last tab has gone. */
         const val CLOSE_SETTLE_MS = 500L
+
+        /**
+         * How long a socket this test should have closed may take to leave the kernel's table before
+         * that counts as a leak. Far longer than any real close (the I/O thread finishes one in
+         * milliseconds) and far shorter than the heartbeat interval a leaked session would be
+         * discovered by, which is the alternative this replaces.
+         */
+        const val LEAK_SETTLE_MS = 5_000L
 
         /**
          * Long enough for a keystroke aimed at a dead session to have reached a server if it could.
