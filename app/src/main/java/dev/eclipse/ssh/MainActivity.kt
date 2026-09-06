@@ -210,10 +210,12 @@ import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
 import dev.eclipse.ssh.presentation.transfersForDisplay
+import dev.eclipse.ssh.presentation.AuthFailurePrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.ui.editor.EditorRequest
-import dev.eclipse.ssh.ui.editor.TextEditorScreen
+import dev.eclipse.ssh.ui.editor.EditorRequests
+import dev.eclipse.ssh.ui.editor.TextEditorActivity
 import dev.eclipse.ssh.ui.files.ExplorerFileActionsSheet
 import dev.eclipse.ssh.ui.files.ExplorerList
 import dev.eclipse.ssh.ui.files.ExplorerPropertiesDialog
@@ -651,10 +653,10 @@ private fun EclipseWorkspace(
             viewModel.filesExplorer.setLocalRoot(uri)
         }
     }
-    // The Files explorer's full-window overlays: a text editor and a file preview. They live here,
-    // at the window's root, rather than inside the Files tab, because both take the whole screen —
-    // the tab is padded and sits above the navigation bar, and that is chrome the user should not
-    // be looking at while reading or editing a document.
+    // The Files explorer's full-window surfaces. The preview is a sheet at this root because it is
+    // still part of the workspace; the editor is only *triggered* here — it opens in its own
+    // activity on top of the app (see the launch effect below), because a document being edited
+    // deserves a window of its own rather than a layer over whatever the workspace was showing.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
     var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
     var pendingExportPassphrase by remember { mutableStateOf<String?>(null) }
@@ -773,6 +775,43 @@ private fun EclipseWorkspace(
         // somewhere to pass through on the way in.
         openSessionHostId = host.id
         destination = Destination.TERMINAL
+    }
+    /**
+     * Saves what the refused-login dialog collected, so the next connect is one tap again.
+     *
+     * The key is probed off the main thread because an encrypted OpenSSH key derives its wrapping
+     * key with bcrypt-pbkdf, deliberately slow — see the comment in [connectAndStart] for why that
+     * work must never run inside a click. The save also does not block the retry it follows: the
+     * dial takes the typed credentials directly (caller-supplied beats stored in
+     * `resolveCredentials`), so the two proceed in parallel.
+     */
+    fun saveAnsweredCredentials(host: HostProfile, password: String?, passphrase: String?) {
+        val typedPassword = password?.takeIf(String::isNotBlank)
+        val typedPassphrase = passphrase?.takeIf(String::isNotBlank)
+        val keyBytes = selectedKeyBytes
+        val keyName = selectedKeyName
+        scope.launch {
+            val keyEdit = if (keyBytes == null || keyName == null) {
+                KeyEdit.Keep
+            } else {
+                // Only a key that parses is stored — the Add Host form holds the same line, for the
+                // same reason: a saved key that cannot authenticate is indistinguishable from a
+                // server refusing the account at the next connect. The retry itself still goes out
+                // with the picked bytes and reports a parse failure in its own words.
+                when (val probe = probeSshKey(keyBytes, keyName, typedPassphrase)) {
+                    is SshKeyProbe.Ready -> KeyEdit.Replace(keyBytes, keyName, probe.type)
+                    else -> KeyEdit.Keep
+                }
+            }
+            viewModel.saveHost(
+                host,
+                HostCredentialUpdate(
+                    password = typedPassword?.let(SecretEdit::Replace) ?: SecretEdit.Keep,
+                    key = keyEdit,
+                    passphrase = typedPassphrase?.let(SecretEdit::Replace) ?: SecretEdit.Keep,
+                ),
+            )
+        }
     }
     // Applied here rather than once in onCreate because the setting can be toggled while the app is
     // open, and the flag has to follow it in both directions. Keyed on the setting, so a recomposition
@@ -1350,6 +1389,29 @@ private fun EclipseWorkspace(
             onReject = viewModel::rejectHostKey,
         )
     }
+    // Looked up rather than carried on the prompt so a host deleted while the dialog was open cannot
+    // be resurrected by its own Retry button — see [AuthFailurePrompt].
+    state.authFailure?.let { prompt ->
+        val failedHost = state.hosts.firstOrNull { it.id == prompt.hostId }
+        if (failedHost != null) {
+            AuthFailureDialog(
+                prompt = prompt,
+                host = failedHost,
+                onDismiss = viewModel::consumeAuthFailure,
+                onPickKey = { pickerActive = true; keyPicker.launch(KEY_FILE_MIME_TYPES) },
+                selectedKeyName = selectedKeyName,
+                onEditHost = {
+                    viewModel.consumeAuthFailure()
+                    showEditHost = failedHost
+                },
+                onRetry = { password, passphrase, save ->
+                    viewModel.consumeAuthFailure()
+                    if (save) saveAnsweredCredentials(failedHost, password, passphrase)
+                    connectAndStart(failedHost, password, passphrase)
+                },
+            )
+        }
+    }
     if (showGlobalSearch) {
         GlobalSearchDialog(
             state = state,
@@ -1433,10 +1495,18 @@ private fun EclipseWorkspace(
             },
         )
     }
-    // Drawn last so they cover the workspace; see the state declarations above for why the editor
-    // and the preview live at the window's root rather than inside the Files tab.
-    editorRequest?.let { request ->
-        TextEditorScreen(request) { editorRequest = null }
+    // The editor opens in its own window (see [TextEditorActivity]) so it sits fully on top of the
+    // workspace instead of floating over it; the request itself travels through the process-wide
+    // [EditorRequests] handoff because it carries a live provider an intent cannot parcel. Cleared
+    // as soon as the launch is issued, so every place that sets `editorRequest` — the explorer, the
+    // preview sheet, the New File dialog — keeps working unchanged.
+    LaunchedEffect(editorRequest) {
+        val request = editorRequest ?: return@LaunchedEffect
+        editorRequest = null
+        val token = EditorRequests.put(request)
+        context.startActivity(
+            Intent(context, TextEditorActivity::class.java).putExtra(TextEditorActivity.EXTRA_REQUEST_TOKEN, token),
+        )
     }
     previewTarget?.let { target ->
         FilePreviewSheet(
@@ -4642,6 +4712,86 @@ private fun AuthenticationDialog(host: HostProfile, onDismiss: () -> Unit, onPic
         },
         confirmButton = { Button(onClick = { onConnect(password.ifBlank { null }, passphrase) }) { Text("Connect") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * The answer to a login the server refused.
+ *
+ * The failure used to land only on the terminal's status line, in the server's own words
+ * ("No more authentication methods available"), with the re-prompt a Reconnect tap away — so the
+ * user read "no methods available" and had to *know* it meant "wrong password" before knowing what
+ * to do about it. This dialog says which credential was refused and puts the field to fix it on
+ * screen: the password again, a different private key, or both — plus the choice to update what is
+ * stored on the host so the correction outlives this attempt.
+ */
+@Composable
+private fun AuthFailureDialog(
+    prompt: AuthFailurePrompt,
+    host: HostProfile,
+    onDismiss: () -> Unit,
+    onPickKey: () -> Unit,
+    selectedKeyName: String?,
+    onEditHost: () -> Unit,
+    onRetry: (password: String?, passphrase: String?, save: Boolean) -> Unit,
+) {
+    var password by remember { mutableStateOf("") }
+    var passphrase by remember { mutableStateOf("") }
+    // On by default: the credential the user is about to type is the corrected one, and leaving it
+    // off would have them retype it at every connect until they open the host form themselves.
+    var saveCredentials by remember { mutableStateOf(true) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Default.Lock, null, tint = MaterialTheme.colorScheme.error) },
+        title = { Text("Login to ${prompt.hostName} failed") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Text(prompt.reason, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("${host.username}@${host.host}:${host.port}", fontWeight = FontWeight.SemiBold)
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password — type it again") },
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    keyboardOptions = SecretFieldKeyboard,
+                )
+                OutlinedButton(onClick = onPickKey, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Default.Key, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(selectedKeyName ?: "Import a different private key")
+                }
+                if (selectedKeyName != null) {
+                    OutlinedTextField(
+                        value = passphrase,
+                        onValueChange = { passphrase = it },
+                        label = { Text("Key passphrase (optional)") },
+                        singleLine = true,
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        keyboardOptions = SecretFieldKeyboard,
+                    )
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = saveCredentials, onCheckedChange = { saveCredentials = it })
+                    Text(
+                        "Save these credentials to the host",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onRetry(password.ifBlank { null }, passphrase.ifBlank { null }, saveCredentials) }) {
+                Text("Retry")
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onEditHost) { Text("Edit host") }
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            }
+        },
     )
 }
 

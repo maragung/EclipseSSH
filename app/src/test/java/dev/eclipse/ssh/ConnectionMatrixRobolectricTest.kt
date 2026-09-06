@@ -181,6 +181,35 @@ class ConnectionMatrixRobolectricTest {
             .that(shellsStarted.get()).isEqualTo(0)
     }
 
+    /**
+     * A refused login asks the user for the credential rather than leaving a sentence on the status
+     * line: the prompt carries the host and a reason with no secret in it, and a fresh dial with
+     * the corrected password both succeeds and retires the prompt.
+     */
+    @Test
+    fun aRefusedLoginRaisesThePromptAndARetryWithTheRightPasswordSucceeds() {
+        val hostId = connectExpectingFailure(port = serverPort, password = "not-the-password")
+        val viewModel = viewModel()
+
+        // Pumped rather than read on the spot: the prompt is written inside the dial's coroutine and
+        // reaches this StateFlow a dispatch later than the tab state the wait above observed.
+        pumpUntil(describe = { "the refused-login prompt never arrived: " + diagnose(hostId) }) {
+            viewModel.uiState.value.authFailure != null
+        }
+        val prompt = checkNotNull(viewModel.uiState.value.authFailure) { "a refused login with no prompt to answer it" }
+        assertThat(prompt.hostId).isEqualTo(hostId)
+        assertThat(prompt.reason).contains("refused the login")
+        assertThat(prompt.reason).doesNotContain("not-the-password")
+
+        compose.runOnUiThread { viewModel.consumeAuthFailure() }
+        pumpUntil(describe = { "the refused-login prompt never left the state" }) {
+            viewModel.uiState.value.authFailure == null
+        }
+        // What the dialog's Retry does: the corrected password as a fresh manual dial.
+        connectSaved(hostId, password = PASSWORD, expect = SessionConnectionState.CONNECTED)
+        assertThat(viewModel.uiState.value.authFailure).isNull()
+    }
+
     /** Nothing listening: reported as a connection problem, not as a crash and not as a hang. */
     @Test
     fun anUnreachableHostSettlesOnAnErrorStateWithAReadableError() {

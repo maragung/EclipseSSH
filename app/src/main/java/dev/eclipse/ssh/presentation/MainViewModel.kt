@@ -58,6 +58,7 @@ import dev.eclipse.ssh.ssh.describeConnectFailure
 import dev.eclipse.ssh.ssh.describeSessionEnd
 import dev.eclipse.ssh.ssh.describeSftpFailure
 import dev.eclipse.ssh.ssh.fallbackHome
+import dev.eclipse.ssh.ssh.isCredentialRejection
 import dev.eclipse.ssh.ssh.joinRemote
 import dev.eclipse.ssh.ssh.OpenSshConfigParser
 import dev.eclipse.ssh.background.NetworkMonitor
@@ -266,6 +267,16 @@ class MainViewModel @Inject constructor(
     private val releaseScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val serverStats = MutableStateFlow<Map<String, ServerStats>>(emptyMap())
     private val hostKeyChallenge = MutableStateFlow<HostKeyChallenge?>(null)
+    /**
+     * The refused login a dialog should answer, or null.
+     *
+     * A rejected credential is the one failure whose fix is a dialog rather than another attempt:
+     * the password or the key has to change, and the user is holding both. Only a manual dial
+     * raises it — the reconnect ladder never reaches a second attempt with a wrong password
+     * (a rejection is final, so the ladder stops after the first), and a background restore dials
+     * through the service, which has no dialog to show.
+     */
+    private val authFailure = MutableStateFlow<AuthFailurePrompt?>(null)
     private val knownHostsState = MutableStateFlow<Map<String, String>>(emptyMap())
     /**
      * The live sessions, their shells and their scrollback — owned by [SshSessionStore], not by this
@@ -467,7 +478,8 @@ class MainViewModel @Inject constructor(
             BaseState(state, challenge, activeForwards, savedSnippets, stats)
         },
         securityState,
-    ) { base, security ->
+        authFailure,
+    ) { base, security, refusedLogin ->
         base.state.copy(
             hostKeyChallenge = base.challenge,
             forwardings = base.forwards,
@@ -475,6 +487,7 @@ class MainViewModel @Inject constructor(
             serverStats = base.stats,
             knownHosts = security.knownHosts,
             savedCredentials = security.credentials,
+            authFailure = refusedLogin,
         )
     }
 
@@ -642,6 +655,11 @@ class MainViewModel @Inject constructor(
         quickConnectHost.value = null
     }
 
+    /** Clears the refused-login prompt once the UI has answered it. */
+    fun consumeAuthFailure() {
+        authFailure.value = null
+    }
+
     fun connect(
         host: HostProfile,
         password: String? = null,
@@ -660,6 +678,9 @@ class MainViewModel @Inject constructor(
         // Reconnect on a tab that gave up) is entitled to all of it. The ladder's own attempt passes
         // `resuming` and must not reset anything - that is the whole point of counting.
         if (!resuming) reconnectAttempts.remove(host.id)
+        // A fresh manual dial retires any prompt a previous one raised: the user has already acted,
+        // and a dialog about an attempt they replaced would sit on top of the one they are watching.
+        if (!resuming) authFailure.value = null
         // A reconnect stays RECONNECTING for the whole attempt, keeping the sentence the ladder wrote
         // ("attempt 2 of 5"). Overwriting it with CONNECTING each time round would tell the user the
         // app had started something new, when what is happening is that it has not given up yet.
@@ -800,6 +821,12 @@ class MainViewModel @Inject constructor(
                     } else {
                         tab
                     }
+                }
+                // A refused login asks the user for the one thing that can change the outcome: the
+                // credential. Everything else stays a status line, because for those the answer is
+                // "wait" or "check the network", not a field to type into.
+                if (isCurrentDial(host.id, dial) && !resuming && isCredentialRejection(lastError)) {
+                    authFailure.value = AuthFailurePrompt(hostId = host.id, hostName = host.name, reason = reason)
                 }
                 diagnostics.record(
                     host.id,
@@ -3557,6 +3584,21 @@ class MainViewModel @Inject constructor(
     }
 }
 
+/**
+ * A login the server refused, for the dialog that asks the user to answer it.
+ *
+ * Carries no credential and no reason beyond the sentence the status line already shows — the
+ * dialog's job is to collect a *new* password, passphrase or key file, not to repeat the failure.
+ * [hostId] rather than the profile itself, so a host deleted while the dialog was open cannot be
+ * resurrected by its own Retry button: the UI looks the host up and drops the prompt if it is gone.
+ */
+data class AuthFailurePrompt(
+    val hostId: String,
+    val hostName: String,
+    /** What the terminal status line says, safe to show — see `describeConnectFailure`. */
+    val reason: String,
+)
+
 data class MainUiState(
     val hosts: List<HostProfile> = emptyList(),
     val filteredHosts: List<HostProfile> = emptyList(),
@@ -3568,6 +3610,11 @@ data class MainUiState(
     val terminalOutput: Map<String, String> = emptyMap(),
     val commandHistory: Map<String, List<String>> = emptyMap(),
     val hostKeyChallenge: HostKeyChallenge? = null,
+    /**
+     * The login a server just refused, for the dialog that asks the user to type the credential
+     * again. See [AuthFailurePrompt]. Null whenever no refusal is waiting to be answered.
+     */
+    val authFailure: AuthFailurePrompt? = null,
     val knownHosts: Map<String, String> = emptyMap(),
     /**
      * Saved-credential metadata per host id — which hosts can connect without a prompt, and what key

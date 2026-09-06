@@ -34,6 +34,58 @@ class ConnectFailureTest {
         assertThat(connectFailureIsFinal(SshException(SshConstants.SSH2_DISCONNECT_ILLEGAL_USER_NAME, "no such user"))).isTrue()
     }
 
+    /**
+     * Which failures mean "the credential was refused" — the set the login-failure dialog answers.
+     *
+     * The boundary has to hold in both directions. Every refusal marker, wherever it sits in the
+     * cause chain, must count: a server that says "Permission denied" over keyboard-interactive and
+     * a PAM stack that reports "authentication failed" from inside MINA are both wrong-password
+     * moments the user can fix by typing. And every transport failure must stay out, because the
+     * dialog for those would ask for a password the network has no use for.
+     */
+    @Test
+    fun `a refused credential is told apart from a transport failure`() {
+        val refusals = listOf(
+            SshException(SshConstants.SSH2_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE, "No more authentication methods available"),
+            SshException("No more authentication methods available"),
+            SshException("Permission denied"),
+            IOException("wrapped", SshException("Authentication failed")),
+            SshException("Too many authentication failures"),
+        )
+        refusals.forEach { error ->
+            assertThat(isCredentialRejection(error)).isTrue()
+        }
+
+        val transport = listOf(
+            null,
+            ConnectException("Connection refused"),
+            SocketTimeoutException("connect timed out"),
+            UnknownHostException("no.such.host"),
+            TimeoutException("timeout"),
+            IOException("Connection reset by peer"),
+            SshException(SshConstants.SSH2_DISCONNECT_KEY_EXCHANGE_FAILED, "Unable to negotiate"),
+            SshException("Server key did not validate"),
+        )
+        transport.forEach { error ->
+            assertThat(isCredentialRejection(error)).isFalse()
+        }
+    }
+
+    @Test
+    fun `a refused login names the credential as what was rejected`() {
+        val message = describeConnectFailure(
+            SshException(
+                SshConstants.SSH2_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE,
+                "No more authentication methods available",
+            ),
+        )
+        // The sentence says what to fix rather than quoting the protocol's reason code; the server's
+        // own text survives it for anyone diagnosing the account.
+        assertThat(message).contains("refused the login")
+        assertThat(message).contains("password or key")
+        assertThat(message).contains("No more authentication methods available")
+    }
+
     @Test
     fun `an unverified host key is not retried behind the challenge dialog`() {
         assertThat(
