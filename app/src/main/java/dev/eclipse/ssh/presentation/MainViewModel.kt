@@ -748,8 +748,24 @@ class MainViewModel @Inject constructor(
                         // saying so: a server that accepts the password and then cannot give out a pty
                         // used to spend that whole time claiming to be connecting.
                         markOpeningShell(host.id, dial, resuming)
-                        val terminal =
+                        // The session is authenticated but still unowned: [SshSessionStore.install] is
+                        // what hands it to the app, and it runs only after the shell is open. A server
+                        // that logs the user in and then refuses the channel - `MaxSessions 0`,
+                        // `ForceCommand internal-sftp`, a chroot with no shell - throws out of
+                        // `openTerminal` while the transport is held by this local variable, and nothing
+                        // else can close it: not `closeTab`, which forgets by host id and was never
+                        // given this session, and not `connect`'s own catch, which has already
+                        // returned. Every retry of the loop below leaked one such session -
+                        // authenticated, heartbeating at its configured interval, invisible to the UI
+                        // and to `disconnectAll` for the rest of the process. Closing it here is what
+                        // makes the catch block's promise ("retries do not accumulate half-open
+                        // sessions") true for the one phase it did not cover: after auth, before shell.
+                        val terminal = try {
                             sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
+                        } catch (error: Throwable) {
+                            runCatching { session.close(false) }
+                            throw error
+                        }
                         // Never replaces a live session with this one: if another dialler installed one
                         // for this host while this handshake was in flight, that session is the one the
                         // app keeps and this one is the redundant half of a duplicate - the opposite of
