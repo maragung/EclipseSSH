@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
@@ -465,10 +467,15 @@ private fun EditorBody(
         onScrollHandled()
     }
 
-    Column(Modifier.fillMaxSize().imePadding()) {
+    // navigationBarsPadding rather than leaving the root to imePadding alone: with edge-to-edge the
+    // text area would otherwise run under the gesture bar on every device, and placing the two
+    // inset paddings side by side takes the larger of them rather than summing, so an open IME
+    // does not double-pad. The status bar is handled on the toolbar Row below, inside the Surface,
+    // so the tonal-elevation toolbar keeps painting behind it.
+    Column(Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
         Surface(tonalElevation = 3.dp) {
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 IconButton(onClick = onClose) {

@@ -57,6 +57,7 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.CloudDownload
@@ -226,6 +227,7 @@ import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
+import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
 import dev.eclipse.ssh.ssh.GeneratedKeyPair
 import dev.eclipse.ssh.ssh.PERMISSION_PRESETS
 import dev.eclipse.ssh.ssh.SshKeyAlgorithm
@@ -430,6 +432,29 @@ internal fun parseSshDeepLink(uri: Uri?): HostProfile? {
 private val SecretFieldKeyboard = androidx.compose.foundation.text.KeyboardOptions(
     keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
 )
+
+/**
+ * The clipboard-paste affordance for any field created by [SecretFieldKeyboard] above.
+ *
+ * Long-press paste in a password field is unreliable in exactly the situation it is needed most:
+ * the IME's toolbar over a `TYPE_TEXT_VARIATION_PASSWORD` field varies by keyboard, and a clip
+ * copied by a password manager often carries a trailing newline a `singleLine` field cannot
+ * accept. A button the user can see sidesteps both - and [onPaste] goes through the ViewModel, so
+ * the read is subject to the same audited clipboard boundary and newline normalization as every
+ * other clipboard access in the app.
+ *
+ * [what] only exists for the screen reader: the Add-host dialog can show a password, a passphrase
+ * and a proxy password at once, and three buttons all announcing "Paste" would be a list nobody
+ * can tell apart. The paste *replaces* the field's contents rather than appending to them - these
+ * fields are never pre-filled from storage, so whatever is in one is either empty or a typo being
+ * corrected.
+ */
+@Composable
+private fun SecretPasteButton(what: String, onPaste: () -> String?, into: (String) -> Unit) {
+    IconButton(onClick = { onPaste()?.let(into) }) {
+        Icon(Icons.Default.ContentPaste, contentDescription = "Paste $what from clipboard")
+    }
+}
 
 private enum class Destination(val label: String, val icon: ImageVector) {
     HOSTS("Hosts", Icons.Default.Computer),
@@ -1330,6 +1355,7 @@ private fun EclipseWorkspace(
                 formKey = null
                 showAddHost = false
             },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     showHostDetails?.let { host ->
@@ -1355,6 +1381,7 @@ private fun EclipseWorkspace(
                 formKey = null
                 showEditHost = null
             },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     pendingDeleteHost?.let { host ->
@@ -1380,6 +1407,7 @@ private fun EclipseWorkspace(
                 showAuthHost = null
                 connectAndStart(host, password, passphrase)
             },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     state.hostKeyChallenge?.let { challenge ->
@@ -1409,6 +1437,7 @@ private fun EclipseWorkspace(
                     if (save) saveAnsweredCredentials(failedHost, password, passphrase)
                     connectAndStart(failedHost, password, passphrase)
                 },
+                onPasteSecret = viewModel::pasteSecret,
             )
         }
     }
@@ -1426,6 +1455,7 @@ private fun EclipseWorkspace(
             confirmLabel = "Export",
             onDismiss = { showExportDialog = false },
             onConfirm = { pass -> showExportDialog = false; pendingExportPassphrase = pass; pickerActive = true; exportPicker.launch("eclipse-backup.enc") },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     if (showImportDialog) {
@@ -1434,6 +1464,7 @@ private fun EclipseWorkspace(
             confirmLabel = "Import",
             onDismiss = { showImportDialog = false; pendingImportUri = null },
             onConfirm = { pass -> showImportDialog = false; pendingImportUri?.let { viewModel.importVault(pass, it) }; pendingImportUri = null },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     if (showAccountExportDialog) {
@@ -1447,6 +1478,7 @@ private fun EclipseWorkspace(
                 pickerActive = true
                 accountExportPicker.launch("${safeFileName(pendingAccountExportHost?.name ?: "account")}.eclipse-account")
             },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     if (showAccountImportDialog) {
@@ -1459,6 +1491,7 @@ private fun EclipseWorkspace(
                 pendingAccountImportUri?.let { viewModel.importAccount(pass, it) }
                 pendingAccountImportUri = null
             },
+            onPasteSecret = viewModel::pasteSecret,
         )
     }
     if (showKeyGenDialog) {
@@ -1795,7 +1828,10 @@ private fun WorkspaceScaffold(
         // themselves at full length and the *page* scrolled past the server's to reach the phone's.
         // Branching here gives Files a bounded window, which is what lets one tab own the whole of it.
         if (destination == Destination.FILES) {
-            Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).padding(horizontal = 20.dp)) {
+            // The horizontal padding is deliberately thin: a phone screen is the scarce resource here,
+            // and 8dp is enough to keep a card's ripple from touching the screen edge. (The 1280dp
+            // widthIn above still caps a tablet or desktop window at a readable column.)
+            Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).padding(horizontal = 8.dp)) {
                 FilesScreen(
                     state,
                     filesExplorer,
@@ -1813,7 +1849,7 @@ private fun WorkspaceScaffold(
             }
             return@Scaffold
         }
-        Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+        Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
             when (destination) {
                 Destination.HOSTS -> HostsScreen(
                     state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost,
@@ -4196,7 +4232,9 @@ private fun SessionWhySheet(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 LazyColumn(
-                    Modifier.heightIn(max = 320.dp),
+                    // 0.45 of the screen: a trace a page tall is a trace worth scrolling, and the
+                    // LazyColumn is the scroller. Replaces a fixed 320dp that assumed one phone.
+                    Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.45f)),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     items(trace, key = { it.sequence }) { entry ->
@@ -4260,7 +4298,7 @@ private fun DiagnosticsDialog(
         onDismissRequest = onDismiss,
         title = { Text("Connection diagnostics") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = 420.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f))) {
                 if (events.isEmpty()) {
                     Text(
                         "Nothing recorded yet. Connect a host and this becomes a timestamped trace of every connect, disconnect, reconnect and network change.",
@@ -4316,7 +4354,7 @@ private fun KnownHostsDialog(
         onDismissRequest = onDismiss,
         title = { Text("Known hosts") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = 420.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f))) {
                 if (entries.isEmpty()) {
                     Text("No trusted hosts yet. You'll be asked to verify a host's fingerprint the first time you connect.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else {
@@ -4679,7 +4717,14 @@ private fun EmptyState(
 }
 
 @Composable
-private fun AuthenticationDialog(host: HostProfile, onDismiss: () -> Unit, onPickKey: () -> Unit, selectedKeyName: String?, onConnect: (String?, String?) -> Unit) {
+private fun AuthenticationDialog(
+    host: HostProfile,
+    onDismiss: () -> Unit,
+    onPickKey: () -> Unit,
+    selectedKeyName: String?,
+    onConnect: (String?, String?) -> Unit,
+    onPasteSecret: () -> String?,
+) {
     var password by remember { mutableStateOf("") }
     var passphrase by remember { mutableStateOf("") }
     AlertDialog(
@@ -4695,6 +4740,7 @@ private fun AuthenticationDialog(host: HostProfile, onDismiss: () -> Unit, onPic
                     singleLine = true,
                     visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                     keyboardOptions = SecretFieldKeyboard,
+                    trailingIcon = { SecretPasteButton("password", onPasteSecret) { password = it } },
                 )
                 Text("Auth method: ${host.authMethod.label}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                 OutlinedButton(onClick = onPickKey) { Icon(Icons.Default.Key, null); Spacer(Modifier.width(8.dp)); Text(selectedKeyName ?: "Choose SSH private key") }
@@ -4706,6 +4752,7 @@ private fun AuthenticationDialog(host: HostProfile, onDismiss: () -> Unit, onPic
                         singleLine = true,
                         visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                         keyboardOptions = SecretFieldKeyboard,
+                        trailingIcon = { SecretPasteButton("passphrase", onPasteSecret) { passphrase = it } },
                     )
                 }
             }
@@ -4734,6 +4781,7 @@ private fun AuthFailureDialog(
     selectedKeyName: String?,
     onEditHost: () -> Unit,
     onRetry: (password: String?, passphrase: String?, save: Boolean) -> Unit,
+    onPasteSecret: () -> String?,
 ) {
     var password by remember { mutableStateOf("") }
     var passphrase by remember { mutableStateOf("") }
@@ -4755,6 +4803,7 @@ private fun AuthFailureDialog(
                     singleLine = true,
                     visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                     keyboardOptions = SecretFieldKeyboard,
+                    trailingIcon = { SecretPasteButton("password", onPasteSecret) { password = it } },
                 )
                 OutlinedButton(onClick = onPickKey, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Default.Key, null)
@@ -4769,6 +4818,7 @@ private fun AuthFailureDialog(
                         singleLine = true,
                         visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                         keyboardOptions = SecretFieldKeyboard,
+                        trailingIcon = { SecretPasteButton("passphrase", onPasteSecret) { passphrase = it } },
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -4836,7 +4886,7 @@ private fun GlobalSearchDialog(state: MainUiState, onDismiss: () -> Unit, onSele
             Column {
                 OutlinedTextField(query, { query = it }, modifier = Modifier.fillMaxWidth(), placeholder = { Text("Search hosts, snippets, terminal output") }, singleLine = true, leadingIcon = { Icon(Icons.Default.Search, null) })
                 Spacer(Modifier.height(12.dp))
-                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Column(Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f)).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (query.isBlank()) {
                         Text("Type to search across your workspace.", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
@@ -4898,7 +4948,13 @@ private fun KeyGenDialog(onDismiss: () -> Unit, onConfirm: (SshKeyAlgorithm) -> 
 }
 
 @Composable
-private fun PassphraseDialog(title: String, confirmLabel: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+private fun PassphraseDialog(
+    title: String,
+    confirmLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+    onPasteSecret: () -> String?,
+) {
     var value by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -4911,6 +4967,7 @@ private fun PassphraseDialog(title: String, confirmLabel: String, onDismiss: () 
                 singleLine = true,
                 visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                 keyboardOptions = SecretFieldKeyboard,
+                trailingIcon = { SecretPasteButton("passphrase", onPasteSecret) { value = it } },
             )
         },
         confirmButton = { Button(onClick = { onConfirm(value) }, enabled = value.isNotBlank()) { Text(confirmLabel) } },
@@ -4929,6 +4986,7 @@ private fun AddHostDialog(
     onForgetPickedKey: () -> Unit = {},
     onDismiss: () -> Unit,
     onSave: (HostProfile, HostCredentialUpdate) -> Unit,
+    onPasteSecret: () -> String?,
 ) {
     val editing = initialHost != null
     var name by remember(initialHost?.id) { mutableStateOf(initialHost?.name.orEmpty()) }
@@ -5063,6 +5121,16 @@ private fun AddHostDialog(
                     visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                     keyboardOptions = SecretFieldKeyboard,
                     modifier = Modifier.fillMaxWidth(),
+                    // The paste button sets the state directly, which bypasses the onValueChange
+                    // above — so the same "a replacement beats a pending forget" rule is restated
+                    // here. Without it, a pasted replacement would lose to a "Forget" the user
+                    // ticked before pasting, and the save would drop the password they just fixed.
+                    trailingIcon = {
+                        SecretPasteButton("password", onPasteSecret) {
+                            password = it
+                            if (it.isNotEmpty()) forgetPassword = false
+                        }
+                    },
                 )
                 if (storedCredentials.hasPassword && password.isEmpty()) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -5116,6 +5184,7 @@ private fun AddHostDialog(
                         visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                         keyboardOptions = SecretFieldKeyboard,
                         isError = !draft.keyReadable && keyProbe is SshKeyProbe.Unreadable,
+                        trailingIcon = { SecretPasteButton("passphrase", onPasteSecret) { passphrase = it } },
                         supportingText = {
                             Text(
                                 when {
@@ -5251,7 +5320,7 @@ private fun AddHostDialog(
                         OutlinedTextField(socksHost, { socksHost = it }, label = { Text(if (proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy host" else "SOCKS5 host") }, singleLine = true)
                         OutlinedTextField(socksPort, { socksPort = it.filter(Char::isDigit).take(5) }, label = { Text(if (proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy port" else "SOCKS5 port") }, singleLine = true)
                         OutlinedTextField(socksUsername, { socksUsername = it }, label = { Text("Proxy username (optional)") }, singleLine = true)
-                        OutlinedTextField(socksPassword, { socksPassword = it }, label = { Text("Proxy password (optional)") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), keyboardOptions = SecretFieldKeyboard)
+                        OutlinedTextField(socksPassword, { socksPassword = it }, label = { Text("Proxy password (optional)") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), keyboardOptions = SecretFieldKeyboard, trailingIcon = { SecretPasteButton("proxy password", onPasteSecret) { socksPassword = it } })
                     }
                     ProxyType.NONE -> Unit
                 }
