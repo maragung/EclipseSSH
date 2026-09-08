@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
 import java.io.File
 import java.text.DateFormat
@@ -108,7 +109,10 @@ fun FilePreviewSheet(
         Column(
             Modifier
                 .fillMaxWidth()
-                .heightIn(max = 620.dp)
+                // 0.85 of the screen: a bottom sheet is the one surface where "as tall as the
+                // screen allows" is the point, and the column scrolls. Replaces a fixed 620dp
+                // that assumed one phone. Must stay above the monospace body's 0.55 below.
+                .heightIn(max = rememberDialogBodyMaxHeight(0.85f))
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 22.dp)
                 .navigationBarsPadding()
@@ -478,7 +482,9 @@ private fun SelectionContainerMonospace(content: String) {
                 Modifier
                     .fillMaxWidth()
                     .padding(12.dp)
-                    .heightIn(max = 420.dp)
+                    // 0.55 of the screen: the sheet this sits in gets 0.85, and the monospace
+                    // body must stay under it so the header and this scroller both fit.
+                    .heightIn(max = rememberDialogBodyMaxHeight(0.55f))
                     .verticalScroll(rememberScrollState()),
                 fontFamily = TerminalMonoFontFamily,
                 fontSize = 12.sp,

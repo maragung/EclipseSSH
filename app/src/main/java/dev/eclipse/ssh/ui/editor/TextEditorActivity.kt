@@ -3,6 +3,7 @@ package dev.eclipse.ssh.ui.editor
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
@@ -36,6 +37,11 @@ class TextEditorActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // targetSdk 35 already forces edge-to-edge on Android 15, where this window's toolbar was
+        // drawing under the status bar with no opt-in at all; calling it here makes pre-35 devices
+        // behave the same way rather than differently for no reason. The screen below supplies its
+        // own inset padding, which either way is what keeps the toolbar and the text off the bars.
+        enableEdgeToEdge()
         val request = intent?.getStringExtra(EXTRA_REQUEST_TOKEN)?.let(EditorRequests::take)
         if (request == null) {
             finish()

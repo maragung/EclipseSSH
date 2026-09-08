@@ -15,6 +15,22 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
+ * Prepares a clipboard value for a credential field: carriage returns and newlines are removed,
+ * and nothing else.
+ *
+ * Password managers routinely copy the secret with a trailing newline, and a `singleLine` text
+ * field cannot receive one by typing, so stripping CR/LF cannot discard anything the user could
+ * have entered by hand. Spaces and tabs are deliberately kept: credentials are stored exactly as
+ * entered (the same policy `ProxyConfigTest` pins for proxy credentials), and a password with a
+ * trailing space is a real password that a trim would silently corrupt.
+ *
+ * A top-level function rather than a method on [SecureClipboard] so it stays testable without
+ * Android and can never be confused with [SecureClipboard.paste], which must keep newlines — the
+ * terminal paste depends on them.
+ */
+internal fun normalizePastedSecret(text: String): String = text.filterNot { it == '\r' || it == '\n' }
+
+/**
  * Copies short-lived secrets (passwords, key fingerprints, terminal selections) to the
  * system clipboard and wipes them again after the configured delay.
  */

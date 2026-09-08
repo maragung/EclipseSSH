@@ -76,6 +76,7 @@ import dev.eclipse.ssh.ssh.PortForwardingManager
 import dev.eclipse.ssh.ssh.ForwardingHandle
 import dev.eclipse.ssh.background.SessionRegistry
 import dev.eclipse.ssh.security.SecureClipboard
+import dev.eclipse.ssh.security.normalizePastedSecret
 import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
@@ -1954,6 +1955,30 @@ class MainViewModel @Inject constructor(
         if (text.isEmpty()) return
         val bracketed = terminalBuffers[hostId]?.bracketedPasteEnabled() ?: false
         writeToTerminal(hostId, TerminalKeys.paste(text, bracketed))
+    }
+
+    /**
+     * Whatever is on the system clipboard, ready for a credential field, or null when the clipboard
+     * holds nothing usable.
+     *
+     * The secret-field twin of [pasteFromClipboard]: the read lives here for the same reason (one
+     * audited clipboard boundary, not `LocalClipboardManager`), and an empty clipboard is reported
+     * for the same reason - a Paste that appears to do nothing is indistinguishable from a broken
+     * one. The difference is the normalization: [normalizePastedSecret] strips the newline password
+     * managers append, which a `singleLine` field would otherwise have to refuse. The caller owns
+     * what happens with the value; a field is never pre-filled from storage, so replacing its
+     * contents is the right semantics for a paste here.
+     *
+     * The report surfaces as a snackbar behind the open dialog's scrim, visible once the dialog
+     * closes - the same trade [pasteFromClipboard] already makes.
+     */
+    fun pasteSecret(): String? {
+        val text = secureClipboard.paste()?.let(::normalizePastedSecret)
+        if (text.isNullOrEmpty()) {
+            report("There is nothing on the clipboard to paste")
+            return null
+        }
+        return text
     }
 
     /** Scrolls [hostId] to [offset] lines above the live bottom; 0 follows the output again. */

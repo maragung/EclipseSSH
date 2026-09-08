@@ -137,6 +137,26 @@ class AppNavigationTest {
         compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
     }
 
+    /**
+     * The password field carries a visible paste affordance.
+     *
+     * Long-press paste over a `TYPE_TEXT_VARIATION_PASSWORD` field varies by keyboard, and a clip
+     * copied by a password manager often ends in a newline a single-line field cannot accept - so
+     * the field's trailing icon is the paste that always works. It is asserted here rather than in
+     * the Robolectric copy because an open Compose dialog never idles on the JVM; the wiring
+     * behind the button (the ViewModel read and the newline normalization) is covered there.
+     */
+    @Test
+    fun theAddHostDialogsPasswordFieldOffersAPasteButton() {
+        compose.waitForIdle()
+
+        compose.onNodeWithContentDescription("Add host").performClick()
+        compose.onNodeWithContentDescription("Paste password from clipboard").assertIsDisplayed()
+
+        compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
+        compose.waitForIdle()
+    }
+
     @Test
     fun theGlobalSearchOverlayOpensAndClosesFromAnyDestination() {
         compose.waitForIdle()

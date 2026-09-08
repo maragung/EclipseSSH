@@ -174,4 +174,30 @@ class SecureClipboardTest {
 
         assertThat(clipboardHelper.paste()).isEqualTo("hunter2")
     }
+
+    // -----------------------------------------------------------------------------------------
+    // normalizePastedSecret: the credential-field half of the paste path
+    // -----------------------------------------------------------------------------------------
+
+    @Test
+    fun `the newline a password manager appends is stripped from a pasted secret`() {
+        assertThat(normalizePastedSecret("hunter2\r\n")).isEqualTo("hunter2")
+        assertThat(normalizePastedSecret("\nhunter2")).isEqualTo("hunter2")
+        assertThat(normalizePastedSecret("line one\r\nline two")).isEqualTo("line oneline two")
+    }
+
+    @Test
+    fun `spaces and tabs in a pasted secret are kept exactly as they are`() {
+        // Credentials are stored exactly as entered - the same policy ProxyConfigTest pins for
+        // proxy credentials - and a password with a leading or trailing space is a real password
+        // that a trim would silently corrupt into a wrong one.
+        assertThat(normalizePastedSecret(" hunter2 ")).isEqualTo(" hunter2 ")
+        assertThat(normalizePastedSecret("\thunter2\t")).isEqualTo("\thunter2\t")
+        assertThat(normalizePastedSecret("pass word\twith\ttabs")).isEqualTo("pass word\twith\ttabs")
+    }
+
+    @Test
+    fun `a clip that was only newlines normalizes to nothing`() {
+        assertThat(normalizePastedSecret("\r\n\n")).isEmpty()
+    }
 }

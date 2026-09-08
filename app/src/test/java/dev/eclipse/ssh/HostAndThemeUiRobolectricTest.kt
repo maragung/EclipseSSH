@@ -319,6 +319,61 @@ class HostAndThemeUiRobolectricTest {
     }
 
     /**
+     * The Hosts column reaches the edges of a narrow screen, measured on the search field.
+     *
+     * The screen margins were deliberately thinned to 8dp - a phone screen is the scarce resource,
+     * and 20dp each side gave back 6% of a 320dp window for nothing. This pins the new margin from
+     * below: the search field is the first full-width thing in the column, so where its text starts
+     * is the margin plus the field's own inner padding (16dp in Material3), and where it ends is
+     * the same on the other side. The bounds are taken on whatever node the placeholder text
+     * resolves to - the merged field, or the placeholder inside it - which is why both bounds are
+     * loose enough to hold for either reading and still fail the 20dp margin they replaced.
+     */
+    @Test
+    @Config(qualifiers = "w320dp-h480dp-mdpi")
+    fun theHostsColumnUsesAlmostTheWholeWidthOfANarrowScreen() {
+        val search = compose.onNodeWithText("Search hosts, tags, or usernames")
+        search.performScrollTo().assertIsDisplayed()
+        val bounds = search.getUnclippedBoundsInRoot()
+
+        assertWithMessage("the content column is inset like the 20dp margin never left")
+            .that(bounds.left.value).isAtMost(28f)
+        assertWithMessage("the content column does not reach the right edge of the screen")
+            .that(bounds.right.value).isAtLeast(290f)
+    }
+
+    // ---------------------------------------------------------------- pasting a credential
+
+    /**
+     * The ViewModel's paste reads the clipboard through the audited boundary and hands a credential
+     * field a value it can actually hold.
+     *
+     * The dialog fields themselves cannot be driven here - an open Compose dialog never idles under
+     * Robolectric - so the wiring is asserted at the ViewModel boundary the dialogs call: what goes
+     * onto the clipboard (a password manager's copy, newline included) and what the paste button
+     * would receive. The empty case matters as much: a paste that returns a silent null is
+     * indistinguishable from a broken one, which is why it reports instead.
+     */
+    @Test
+    fun pastingASecretReadsTheClipboardAndStripsWhatASingleLineFieldCannotHold() {
+        val clipboard = compose.activity.getSystemService(android.content.ClipboardManager::class.java)!!
+        compose.runOnUiThread {
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("vault", "hunter2\r\n"))
+        }
+
+        var pasted: String? = null
+        compose.runOnUiThread { pasted = viewModel().pasteSecret() }
+        assertThat(pasted).isEqualTo("hunter2")
+
+        // A clip that held nothing but the newline: normalized to nothing, so it is reported
+        // rather than pasted as an empty password.
+        compose.runOnUiThread { clipboard.setPrimaryClip(android.content.ClipData.newPlainText("vault", "\n")) }
+        compose.runOnUiThread { assertThat(viewModel().pasteSecret()).isNull() }
+        assertThat(viewModel().statusMessage.value)
+            .isEqualTo("There is nothing on the clipboard to paste")
+    }
+
+    /**
      * The menu's Details item opens what only the sheet has: the saved configuration.
      *
      * The arrow this test used to drive sat beside the kebab as a second way into the same sheet, and
