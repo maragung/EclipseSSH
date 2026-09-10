@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -4444,6 +4445,7 @@ private fun SettingsScreen(
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var showAbout by remember { mutableStateOf(false) }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -4570,6 +4572,22 @@ private fun SettingsScreen(
                 "${state.diagnostics.size} event(s) recorded · no secrets"
             },
         ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
+    }
+    Spacer(Modifier.height(14.dp))
+    SettingsSection("About") {
+        SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
+            // Two "View" buttons sit on this screen once diagnostics is counted, and a screen reader
+            // hears both of them as just "View" — so the button carries the row it belongs to, the
+            // same "setting, action" shape the theme picker's content description uses.
+            TextButton(
+                onClick = { showAbout = true },
+                modifier = Modifier.semantics { contentDescription = "About EclipseSSH" },
+            ) { Text("View") }
+        }
+    }
+
+    if (showAbout) {
+        AboutDialog(onDismiss = { showAbout = false })
     }
 
     if (showDiagnostics) {
@@ -4819,6 +4837,92 @@ private fun DiagnosticsDialog(
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
+
+/**
+ * Version, credits and the library list — the screen a licence question or a "what is this app"
+ * question is answered from.
+ *
+ * The version is read from the PackageManager rather than from a generated `BuildConfig` field: the
+ * app builds with no buildConfig fields at all, and this answer is the one Android itself shows in
+ * system settings, so the dialog cannot disagree with it.
+ */
+@Composable
+private fun AboutDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("About EclipseSSH") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.70f))) {
+                Text("EclipseSSH", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Version ${packageInfo.versionName} (${packageInfo.longVersionCode})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "An SSH and SFTP client for Android: a full-screen VT/ANSI terminal, concurrent " +
+                        "sessions in tabs, a two-pane SFTP browser with resumable transfers, port " +
+                        "forwarding and remote desktop, with credentials kept in an Android " +
+                        "Keystore-backed vault.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("Created by Maragung", style = MaterialTheme.typography.titleSmall)
+                // The repo is private, so this link serves the owner and contributors rather than the
+                // public — anyone else lands on GitHub's sign-in, which is still the honest
+                // destination for "where is the source".
+                TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ABOUT_REPO_URL))) }) {
+                    Text("Source code · github.com/maragung/EclipseSSH")
+                }
+                Text("Libraries", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(ABOUT_LIBRARIES) { library ->
+                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text(library.name, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "${library.license} · ${library.purpose}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+/**
+ * One row of the About dialog's library list: what is bundled, under which license, and what it is
+ * here for. A row is prose rather than a link — the licenses' full texts live in the repository, not
+ * in the APK.
+ */
+private data class AboutLibrary(val name: String, val license: String, val purpose: String)
+
+// These versions are mirrored by hand from gradle/libs.versions.toml (and, for FreeRDP, the pin in
+// freerdp/build.gradle.kts) — there is no runtime path from a version catalog to a dialog, so the
+// mirror and the pins must be updated together. Keep the licenses exactly as written: they were
+// verified against each project's own licensing file.
+private val ABOUT_LIBRARIES = listOf(
+    AboutLibrary("Apache MINA SSHD 2.14.0", "Apache-2.0", "SSH transport, SFTP and port forwarding"),
+    AboutLibrary("vernacular-vnc (pinned to commit f39cbe2 via JitPack)", "MIT", "VNC remote desktop client"),
+    AboutLibrary(
+        "FreeRDP 3.31.1",
+        "Apache-2.0",
+        "RDP remote desktop client; its Java JNI bridge file is MPL-2.0; the native build bundles OpenSSL (Apache-2.0), cJSON (MIT) and uriparser (BSD-3-Clause)",
+    ),
+    AboutLibrary("Android Jetpack — Compose (BOM 2025.04.01), Room 2.7.1, Hilt 2.56.1, WorkManager 2.10.0, DataStore 1.1.4, Biometric 1.1.0", "Apache-2.0", "UI, storage and background work"),
+    AboutLibrary("Kotlin 2.1.20 + coroutines 1.10.1", "Apache-2.0", "language and async runtime"),
+    AboutLibrary("eddsa 0.3.0", "CC0-1.0", "Ed25519 key support"),
+    AboutLibrary("SLF4J 2.0.17", "MIT", "logging facade"),
+)
+
+/** Where the source lives. Private repository — see the comment on the dialog's link. */
+private const val ABOUT_REPO_URL = "https://github.com/maragung/EclipseSSH"
 
 @Composable
 private fun KnownHostsDialog(
