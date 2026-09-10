@@ -4165,8 +4165,10 @@ private fun TransferActionsSheet(
 }
 
 /** One row of the transfer action sheet, red where the action removes something. */
+// The click goes last so every row reads as `TransferActionRow(label) { ... }` — with a trailing
+// Boolean the trailing lambda would have nothing to bind to.
 @Composable
-private fun TransferActionRow(label: String, onClick: () -> Unit, destructive: Boolean = false) {
+private fun TransferActionRow(label: String, destructive: Boolean = false, onClick: () -> Unit) {
     Text(
         label,
         Modifier

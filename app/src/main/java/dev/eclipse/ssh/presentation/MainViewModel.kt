@@ -1567,7 +1567,7 @@ class MainViewModel @Inject constructor(
                 if (sessionStore.sessionKeysForHost(hostId).any { it != sessionKey && sessionStore.isLive(it) }) {
                     runCatching { hostRepository.hosts.first() }.getOrNull()
                         ?.firstOrNull { it.id == hostId }
-                        ?.let(startSavedForwards)
+                        ?.let { host -> startSavedForwards(host) }
                 }
             }
         }
