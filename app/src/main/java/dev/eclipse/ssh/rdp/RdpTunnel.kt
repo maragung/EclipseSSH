@@ -231,9 +231,9 @@ class RdpTunnel(private val forwarding: PortForwardingManager) {
         // The three builders are mutated in place - that is the JNI contract - and copied out of
         // the data class and into them only now, so the answer's strings are not held anywhere
         // the tunnel can leak them from after the engine has consumed them.
-        username.replace(0, username.length, credentials.username.orEmpty())
-        domain.replace(0, domain.length, credentials.domain.orEmpty())
-        password.replace(0, password.length, credentials.password.orEmpty())
+        username.replace(0, username.length, answer.username.orEmpty())
+        domain.replace(0, domain.length, answer.domain.orEmpty())
+        password.replace(0, password.length, answer.password.orEmpty())
         return true
     }
 
