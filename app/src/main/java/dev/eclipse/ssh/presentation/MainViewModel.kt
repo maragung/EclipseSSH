@@ -3294,7 +3294,8 @@ class MainViewModel @Inject constructor(
             val prefix = savedForwardIdPrefix(hostId)
             val oldIds = buildSet {
                 forwardings.value.forEach { if (it.id.startsWith(prefix)) add(it.id) }
-                forwardStates.value.keys.forEach { if (it.startsWith(prefix)) add(it.id) }
+                // Keys, not entries: a state row's key is already the entry id.
+                forwardStates.value.keys.forEach { if (it.startsWith(prefix)) add(it) }
             }
             val newIds = saved.map { it.id }.toSet()
             // A rebind still running for the previous column is working from stale rules; abandoning it
