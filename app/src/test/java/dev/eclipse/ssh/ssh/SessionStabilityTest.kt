@@ -849,7 +849,7 @@ class SessionStabilityTest {
             val started = shells.size
             val terminal = manager.openTerminal(session)
             awaitShell(started)
-            store.sessions[profile.id] = session
+            store.install(profile.id, session, profile.id)
             store.channels[profile.id] = terminal
             store.buffers[profile.id] = AnsiTerminalBuffer()
 
@@ -905,7 +905,7 @@ class SessionStabilityTest {
             val loginsBefore = logins.get()
             // Exactly what the restore pass leaves behind: install(), and no openTerminal().
             val session = trustedConnect(manager, profile)
-            assertThat(store.install(profile.id, session)).isSameInstanceAs(session)
+            assertThat(store.install(profile.id, session, profile.id)).isSameInstanceAs(session)
 
             // The terminal cannot adopt this: there is no stream to attach a tab to. That much was
             // always true and is deliberate.
@@ -974,7 +974,7 @@ class SessionStabilityTest {
             suspend fun dialOrAdopt(): ClientSession = store.dialing(profile.id) {
                 store.adoptable(profile.id)?.first ?: run {
                     val dialled = manager.connect(profile, PASSWORD, null)
-                    val installed = store.install(profile.id, dialled)
+                    val installed = store.install(profile.id, dialled, profile.id)
                     if (installed === dialled) store.channels[profile.id] = manager.openTerminal(dialled)
                     installed
                 }
@@ -1029,11 +1029,11 @@ class SessionStabilityTest {
             val started = shells.size
             val terminal = manager.openTerminal(live)
             val shell = awaitShell(started)
-            assertThat(store.install(profile.id, live)).isSameInstanceAs(live)
+            assertThat(store.install(profile.id, live, profile.id)).isSameInstanceAs(live)
             store.channels[profile.id] = terminal
 
             val redundant = trustedConnect(manager, profile)
-            assertThat(store.install(profile.id, redundant)).isSameInstanceAs(live)
+            assertThat(store.install(profile.id, redundant, profile.id)).isSameInstanceAs(live)
 
             // The newcomer is the one that closes.
             assertThat(awaitTrue { !redundant.isOpen }).isTrue()
@@ -1048,7 +1048,7 @@ class SessionStabilityTest {
 
             // Installing the same instance twice is what a restore pass does; it must be a no-op and
             // must not close the session it was asked to keep.
-            assertThat(store.install(profile.id, live)).isSameInstanceAs(live)
+            assertThat(store.install(profile.id, live, profile.id)).isSameInstanceAs(live)
             assertThat(live.isOpen).isTrue()
             assertThat(terminal.isOpen).isTrue()
         } finally {
@@ -1077,7 +1077,7 @@ class SessionStabilityTest {
             val started = shells.size
             val terminal = manager.openTerminal(session)
             awaitShell(started)
-            store.install(profile.id, session)
+            store.install(profile.id, session, profile.id)
             store.channels[profile.id] = terminal
             val (sink, collector) = collectText(terminal)
             try {
@@ -1114,8 +1114,8 @@ class SessionStabilityTest {
         try {
             val first = hostProfile()
             val second = hostProfile()
-            store.sessions[first.id] = trustedConnect(manager, first)
-            store.sessions[second.id] = trustedConnect(manager, second)
+            store.install(first.id, trustedConnect(manager, first), first.id)
+            store.install(second.id, trustedConnect(manager, second), second.id)
 
             assertThat(store.liveHostIds()).containsExactly(first.id, second.id)
 
@@ -1442,7 +1442,7 @@ class SessionStabilityTest {
                 val startedShells = shells.size
                 val terminal = manager.openTerminal(session)
                 awaitShell(startedShells)
-                store.install(profile.id, session)
+                store.install(profile.id, session, profile.id)
                 store.channels[profile.id] = terminal
                 store.buffers[profile.id] = AnsiTerminalBuffer()
                 Triple(profile, terminal, "host$index")
@@ -1490,6 +1490,141 @@ class SessionStabilityTest {
                 assertThat(terminal.isOpen).isTrue()
                 assertThat(terminal.endedDeliberately).isFalse()
             }
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * A service-restored session moves to the tab that adopts it, whole and still usable.
+     *
+     * The service files a restored session under its host-id slot, because no tab exists yet. When
+     * the UI arrives and claims it, the session must move to the tab's key — without a second dial,
+     * without losing the shell or the scrollback, and without the host-scoped questions losing sight
+     * of it, because the service and the SFTP client still ask about the *host* and would redial a
+     * session that had merely changed names.
+     */
+    @Test
+    fun `rekey moves a restored session to its tab without a second login`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile()
+            val loginsBefore = logins.get()
+            // Exactly what the service leaves behind: install() under the host's own id, and a shell
+            // the UI opens when it claims the session.
+            val session = trustedConnect(manager, profile)
+            val started = shells.size
+            val terminal = manager.openTerminal(session)
+            awaitShell(started)
+            store.install(profile.id, session, profile.id)
+            store.channels[profile.id] = terminal
+            store.buffers[profile.id] = AnsiTerminalBuffer()
+
+            // The UI's tab id is a UUID that shares nothing with the host id.
+            val tabKey = "tab-${profile.id}"
+            assertThat(store.rekey(profile.id, tabKey)).isTrue()
+
+            // Everything moved, and nothing is left under the old name.
+            assertThat(store.liveSession(tabKey)).isSameInstanceAs(session)
+            assertThat(store.channels[tabKey]).isSameInstanceAs(terminal)
+            assertThat(store.buffers).containsKey(tabKey)
+            assertThat(store.sessions).doesNotContainKey(profile.id)
+            assertThat(store.channels).doesNotContainKey(profile.id)
+            // The host-scoped questions follow the session, which is the whole point of hostOf.
+            assertThat(store.liveHostIds()).containsExactly(profile.id)
+            assertThat(store.adoptableHostIds()).containsExactly(profile.id)
+            assertThat(store.liveForHost(profile.id)).containsExactly(tabKey)
+            assertThat(store.primarySessionFor(profile.id)).isEqualTo(tabKey)
+            assertThat(store.sessionKeysForHost(profile.id)).containsExactly(tabKey)
+
+            // And the moved shell still works - the session object is the connection, and a re-key
+            // that lost it would leave a tab attached to nothing.
+            val (sink, collector) = collectText(terminal)
+            try {
+                terminal.write("still-here\r")
+                assertThat(awaitText(sink) { it.contains("still-here") }).contains("still-here")
+            } finally {
+                collector.cancel()
+            }
+            assertThat(logins.get()).isEqualTo(loginsBefore)
+
+            // Teardown by the new key reaches the session; by the old key there is nothing to reach.
+            store.forget(tabKey)
+            assertThat(store.isLive(tabKey)).isFalse()
+            assertThat(store.liveForHost(profile.id)).isEmpty()
+            assertThat(awaitTrue { !session.isOpen }).isTrue()
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * A re-key onto a key that already holds something is refused, moving nothing.
+     *
+     * The inverse rule of the one above: a key that is occupied belongs to a session that some tab
+     * is using, and a re-key that displaced it would be exactly the "the shell I was typing into
+     * died" bug the per-key rules exist to make impossible.
+     */
+    @Test
+    fun `rekey refuses a key that already holds a session and moves nothing`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile()
+            val restored = trustedConnect(manager, profile)
+            store.install(profile.id, restored, profile.id)
+            val claimed = trustedConnect(manager, profile)
+            val claimedKey = "tab-claimed"
+            store.install(claimedKey, claimed, profile.id)
+
+            assertThat(store.rekey(profile.id, claimedKey)).isFalse()
+
+            // Neither entry moved: the restored session is still under its slot and the claimed one
+            // still under its own key, and both are still live.
+            assertThat(store.liveSession(profile.id)).isSameInstanceAs(restored)
+            assertThat(store.liveSession(claimedKey)).isSameInstanceAs(claimed)
+            assertThat(store.liveForHost(profile.id)).containsExactly(profile.id, claimedKey)
+        } finally {
+            store.closeAll()
+            manager.close()
+        }
+    }
+
+    /**
+     * Two live sessions may share a host, and neither install nor close reaches across keys.
+     *
+     * The property the multi-terminal feature stands on. `install` keeps a live incumbent *per key*;
+     * a second terminal to the same host dials under its own fresh key, and the newcomer must not be
+     * judged redundant just because a sibling exists - nor must closing one terminal close the other.
+     * Before the keys were separated this exact shape was impossible to express: one of the two
+     * sessions was always "a duplicate dial" and was closed, whoever installed second.
+     */
+    @Test
+    fun `a second session under its own key is a sibling, not a duplicate to close`() = runBlocking {
+        val manager = newManager()
+        val store = SshSessionStore()
+        try {
+            val profile = hostProfile()
+            val first = trustedConnect(manager, profile)
+            assertThat(store.install("tab-one", first, profile.id)).isSameInstanceAs(first)
+            val second = trustedConnect(manager, profile)
+            assertThat(store.install("tab-two", second, profile.id)).isSameInstanceAs(second)
+
+            // Both live, both usable, both answering for the host.
+            assertThat(store.isLive("tab-one")).isTrue()
+            assertThat(store.isLive("tab-two")).isTrue()
+            assertThat(store.liveForHost(profile.id)).containsExactly("tab-one", "tab-two")
+            assertThat(store.liveHostIds()).containsExactly(profile.id)
+
+            // Closing one tab leaves the other's session alone.
+            store.forget("tab-one")
+            assertThat(store.isLive("tab-two")).isTrue()
+            assertThat(store.liveForHost(profile.id)).containsExactly("tab-two")
+            assertThat(awaitTrue { !first.isOpen }).isTrue()
+            assertThat(second.isOpen).isTrue()
         } finally {
             store.closeAll()
             manager.close()

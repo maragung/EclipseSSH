@@ -597,7 +597,7 @@ class ConnectionMatrixRobolectricTest {
         val manager = injected(viewModel, "sshConnectionManager", SshConnectionManager::class.java)
 
         val session = dialLikeARestorePass(manager, saved)
-        assertThat(store.install(host.id, session)).isSameInstanceAs(session)
+        assertThat(store.install(host.id, session, host.id)).isSameInstanceAs(session)
         awaitCount(authAttempts, 1, "passwords offered to the server")
         assertWithMessage("a restore pass opens no shell").that(shellsStarted.get()).isEqualTo(0)
 
@@ -659,7 +659,7 @@ class ConnectionMatrixRobolectricTest {
         }
 
         // Installed while the ladder waits out its backoff, exactly as a restore pass would.
-        assertThat(store.install(host.id, restored)).isSameInstanceAs(restored)
+        assertThat(store.install(host.id, restored, host.id)).isSameInstanceAs(restored)
 
         pumpUntil(describe = { "the ladder gave up on a live session with no shell: " + diagnose(host.id) }) {
             tabFor(host.id)?.state == SessionConnectionState.CONNECTED

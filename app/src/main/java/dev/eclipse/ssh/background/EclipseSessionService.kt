@@ -335,7 +335,7 @@ class EclipseSessionService : LifecycleService() {
             detail = "background restore",
             network = networkMonitor.describe(),
         )
-        sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)))
+        sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)), host.id)
     } catch (cancelled: CancellationException) {
         // The service is going away. Without this the cancellation was swallowed into a null session
         // and the loop went on to dial every remaining host on an already dead context — pointless

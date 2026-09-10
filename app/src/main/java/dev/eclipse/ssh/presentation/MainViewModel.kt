@@ -803,7 +803,7 @@ class MainViewModel @Inject constructor(
                         // for this host while this handshake was in flight, that session is the one the
                         // app keeps and this one is the redundant half of a duplicate - the opposite of
                         // what `put` did, which closed the session the user was already typing into.
-                        val installed = sessionStore.install(host.id, session)
+                        val installed = sessionStore.install(host.id, session, host.id)
                         if (installed !== session) {
                             // Ours lost, so its pty goes with it. Marked first so its collector reports
                             // the app's decision rather than an outage the reconnect ladder would answer.
@@ -3012,7 +3012,7 @@ class MainViewModel @Inject constructor(
                         dialFailure = error
                         null
                     }
-                    reconnected?.let { sessionStore.install(host.id, it) }
+                    reconnected?.let { sessionStore.install(host.id, it, host.id) }
                 }
             }
             if (session == null) {
