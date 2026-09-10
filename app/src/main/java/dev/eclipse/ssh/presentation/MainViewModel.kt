@@ -30,6 +30,7 @@ import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardRuntime
 import dev.eclipse.ssh.data.model.ForwardStatus
 import dev.eclipse.ssh.data.model.ForwardType
+import dev.eclipse.ssh.data.model.RemoteDesktopConfig
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.decodeRemoteDesktop
@@ -3418,9 +3419,10 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Persists [hostId]'s VNC endpoint. The encode/decode round trip is the validation - whatever
-     * the dialog's fields produced, only a target that survives the packed-text column's rules is
-     * written, so the next open reads back exactly what this save claimed to save.
+     * Persists [hostId]'s VNC endpoint. The encode/decode round trip is the validation - the
+     * dialog checks its own fields, but this is a public entry point, so the save re-derives what
+     * the packed-text column will actually read back and refuses an endpoint that does not
+     * survive the trip rather than writing a line the next open cannot parse.
      *
      * Nothing is started here: the viewer owns its tunnel and dials it when opened, which keeps
      * "save an endpoint" and "look at a desktop" as separate actions with separate failures.
@@ -3429,7 +3431,10 @@ class MainViewModel @Inject constructor(
         launchGuarded("Could not save the remote desktop target") {
             val host = hostRepository.hosts.first().firstOrNull { it.id == hostId }
                 ?: return@launchGuarded report("The host for this target no longer exists")
-            val text = encodeRemoteDesktop(decodeRemoteDesktop(encodeRemoteDesktop(target)))
+            val text = encodeRemoteDesktop(RemoteDesktopConfig(vnc = target))
+            if (decodeRemoteDesktop(text).vnc == null) {
+                return@launchGuarded report("That VNC endpoint could not be saved")
+            }
             hostRepository.save(host.copy(remoteDesktop = text))
         }
     }

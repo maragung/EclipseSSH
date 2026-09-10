@@ -141,7 +141,7 @@ class VncTunnel(private val forwarding: PortForwardingManager) {
                 forward = handle
                 val socket = Socket()
                 socket.tcpNoDelay = true
-                socket.connect(InetSocketAddress(LOOPBACK, handle.boundPort), CONNECT_TIMEOUT_MS.toLong())
+                socket.connect(InetSocketAddress(LOOPBACK, handle.boundPort), CONNECT_TIMEOUT_MS)
                 this.socket = socket
                 val config = VernacularConfig().apply {
                     targetFramesPerSecond = framesPerSecond
