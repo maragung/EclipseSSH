@@ -214,6 +214,17 @@ class VncTunnel(private val forwarding: PortForwardingManager) {
     }
 
     /**
+     * Ends the session before it began, with the caller's reason. For the viewer's precondition
+     * failures - no SSH session to ride - which are not the tunnel's own errors and so deserve
+     * a message the caller writes, not whatever a null session would have thrown.
+     */
+    fun abandon(reason: String) {
+        if (finished.getAndSet(true)) return
+        _state.value = VncTunnelState.Failed(reason)
+        release()
+    }
+
+    /**
      * Ends the session. Safe to call from any thread, any number of times, and from the UI's
      * disposal path - the closes run on [closeScope] because a tracker close is a network write,
      * and disposal runs on the main thread.

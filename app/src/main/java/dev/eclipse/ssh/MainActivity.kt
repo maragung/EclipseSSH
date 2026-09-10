@@ -62,6 +62,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
@@ -188,6 +189,8 @@ import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
+import dev.eclipse.ssh.data.model.RemoteDesktopTarget
+import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isBusy
@@ -229,6 +232,10 @@ import dev.eclipse.ssh.ui.files.ExplorerPropertiesDialog
 import dev.eclipse.ssh.ui.files.ExplorerSelectionBar
 import dev.eclipse.ssh.ui.files.ExplorerTopBar
 import dev.eclipse.ssh.ui.preview.FilePreviewSheet
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopConfigDialog
+import dev.eclipse.ssh.ui.remotedesktop.VncRequest
+import dev.eclipse.ssh.ui.remotedesktop.VncRequests
 import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -932,6 +939,10 @@ private fun EclipseWorkspace(
     // recomposition - a snapshot taken at open time would keep showing the pre-save rules after its
     // own Save button, and would keep showing a host the user has since removed.
     var forwardManagerHostId by remember { mutableStateOf<String?>(null) }
+    // The host whose remote-desktop endpoint dialog is open, by id for the same reason as the
+    // forwarding manager above: the dialog saves into the live profile, and a snapshot taken at
+    // open time would write a stale host back over a change made elsewhere while it was open.
+    var remoteDesktopHostId by remember { mutableStateOf<String?>(null) }
     var pendingDeleteHost by remember { mutableStateOf<HostProfile?>(null) }
     // The host whose duplication is waiting on the "also copy the forwarding rules?" answer. Null
     // when nothing is pending; a host with no rules never lands here at all, so the only dialog a
@@ -956,6 +967,35 @@ private fun EclipseWorkspace(
         } else {
             duplicateForwards = true
             duplicateAskHost = host
+        }
+    }
+    // The remote desktop opens in its own window (see [RemoteDesktopActivity]) through the same
+    // single-shot token handoff the editor uses - the request carries a live session provider an
+    // intent cannot parcel. Built per call rather than remembered: the provider must close over
+    // the view model, never over one session, so a reconnect inside the viewer re-asks it.
+    val openRemoteDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
+        val token = VncRequests.put(VncRequest(host.name, target, viewModel.vncSessionProvider(host.id)))
+        runCatching {
+            context.startActivity(
+                Intent(context, RemoteDesktopActivity::class.java)
+                    .putExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN, token),
+            )
+        }.onFailure { error ->
+            // The token was consumed by put; if the launch failed it is gone, and the next tap
+            // mints a fresh one - so this is only ever a message, never a stuck state.
+            viewModel.reportUiFailure("Could not open the remote desktop", error)
+        }
+    }
+    // The menu's Remote desktop item: a saved, enabled target opens the viewer straight away;
+    // anything else - never configured, or parked with "Offer in the menu" off - opens the
+    // endpoint dialog, because the entry point exists precisely so a first use does not have to
+    // hunt for a settings screen before it can type a port.
+    val requestRemoteDesktop: (HostProfile) -> Unit = { host ->
+        val target = decodeRemoteDesktop(host.remoteDesktop).vnc
+        if (target != null && target.enabled) {
+            openRemoteDesktop(host, target)
+        } else {
+            remoteDesktopHostId = host.id
         }
     }
     // A Quick Settings tile or home-screen widget tap resolves, on the view model, to the
@@ -1102,6 +1142,7 @@ private fun EclipseWorkspace(
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
+                    onRemoteDesktop = requestRemoteDesktop,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1260,6 +1301,7 @@ private fun EclipseWorkspace(
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
+                    onRemoteDesktop = requestRemoteDesktop,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1424,6 +1466,22 @@ private fun EclipseWorkspace(
                 onStartRule = { viewModel.startForwardRule(hostId, it) },
                 onStopRule = viewModel::stopForwardRule,
                 onSaveRules = { viewModel.saveForwardRules(hostId, it) },
+            )
+        }
+    }
+    remoteDesktopHostId?.let { hostId ->
+        // Resolved from the live hosts flow, like the forwarding manager above: the dialog's own
+        // saves rewrite this profile, and a host removed while the dialog was open closes it
+        // rather than offering to save a profile that no longer exists.
+        state.hosts.firstOrNull { it.id == hostId }?.let { host ->
+            RemoteDesktopConfigDialog(
+                host = host,
+                onSave = { viewModel.saveRemoteDesktopTarget(hostId, it) },
+                onOpen = { target ->
+                    remoteDesktopHostId = null
+                    openRemoteDesktop(host, target)
+                },
+                onDismiss = { remoteDesktopHostId = null },
             )
         }
     }
@@ -1793,6 +1851,13 @@ private fun WorkspaceScaffold(
      * survives the destination changing underneath it and keeps its state through a rule edit.
      */
     onManageForwards: (HostProfile) -> Unit = {},
+    /**
+     * Opens one host's remote desktop - the card menu's Remote desktop item. A host with a saved,
+     * enabled VNC target goes straight to the viewer window; the rest get the endpoint dialog
+     * first. Named `onRemoteDesktop` rather than `onOpenRemoteDesktop` because both of those are
+     * "open": which one depends on the host's saved target, and the caller does not care.
+     */
+    onRemoteDesktop: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
     /** Long-press on a terminal tab: opens a second shell on the same host. */
     onDuplicateSession: (SessionTab) -> Unit = {},
@@ -1999,6 +2064,7 @@ private fun WorkspaceScaffold(
                 Destination.HOSTS -> HostsScreen(
                     state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
                     onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards,
+                    onRemoteDesktop,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
@@ -2046,6 +2112,7 @@ private fun HostsScreen(
     onExportAccount: (HostProfile) -> Unit,
     onDuplicateHost: (HostProfile) -> Unit,
     onManageForwards: (HostProfile) -> Unit,
+    onRemoteDesktop: (HostProfile) -> Unit,
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
@@ -2075,7 +2142,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop)
             }
         }
     }
@@ -2111,6 +2178,7 @@ private fun HostCard(
     onExportAccount: (HostProfile) -> Unit,
     onDuplicate: (HostProfile) -> Unit,
     onPortForwarding: (HostProfile) -> Unit,
+    onRemoteDesktop: (HostProfile) -> Unit,
 ) {
     // Keyed on the host id so a list that reorders (a favourite toggled, a search narrowed) cannot
     // leave the menu open over a different host than the one it was opened on.
@@ -2154,6 +2222,16 @@ private fun HostCard(
                             text = { Text("Port forwarding") },
                             leadingIcon = { Icon(Icons.Default.SwapVert, null) },
                             onClick = { menuOpen = false; onPortForwarding(host) },
+                        )
+                        // Beside the tunnels, because it is built from the same parts - a desktop
+                        // rides an ad-hoc local forward - and it is the third thing a connected
+                        // host is opened for. A host with no saved endpoint gets the config
+                        // dialog rather than nothing: the menu item is the entry point, not the
+                        // reminder that a settings screen exists.
+                        DropdownMenuItem(
+                            text = { Text("Remote desktop") },
+                            leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
+                            onClick = { menuOpen = false; onRemoteDesktop(host) },
                         )
                         // The arrow this item replaced used to sit beside the kebab as a second way
                         // into the details sheet; now this is the way in, so it sits high in the

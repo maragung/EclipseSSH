@@ -30,7 +30,10 @@ import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardRuntime
 import dev.eclipse.ssh.data.model.ForwardStatus
 import dev.eclipse.ssh.data.model.ForwardType
+import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.data.model.decodeRemoteDesktop
+import dev.eclipse.ssh.data.model.encodeRemoteDesktop
 import dev.eclipse.ssh.data.model.describe
 import dev.eclipse.ssh.data.model.deviceListenAddress
 import dev.eclipse.ssh.data.model.encodeForwardRules
@@ -3413,6 +3416,32 @@ class MainViewModel @Inject constructor(
             job.invokeOnCompletion { forwardJobs.remove(hostId, job) }
         }
     }
+
+    /**
+     * Persists [hostId]'s VNC endpoint. The encode/decode round trip is the validation - whatever
+     * the dialog's fields produced, only a target that survives the packed-text column's rules is
+     * written, so the next open reads back exactly what this save claimed to save.
+     *
+     * Nothing is started here: the viewer owns its tunnel and dials it when opened, which keeps
+     * "save an endpoint" and "look at a desktop" as separate actions with separate failures.
+     */
+    fun saveRemoteDesktopTarget(hostId: String, target: RemoteDesktopTarget) {
+        launchGuarded("Could not save the remote desktop target") {
+            val host = hostRepository.hosts.first().firstOrNull { it.id == hostId }
+                ?: return@launchGuarded report("The host for this target no longer exists")
+            val text = encodeRemoteDesktop(decodeRemoteDesktop(encodeRemoteDesktop(target)))
+            hostRepository.save(host.copy(remoteDesktop = text))
+        }
+    }
+
+    /**
+     * Where the viewer's tunnel gets its SSH session, asked fresh on every (re)connect. A provider
+     * and not a session because the viewer outlives the session it started with: SSH's own
+     * reconnect ladder may have replaced the transport in between, and the viewer's Reconnect
+     * wants whatever the host has *then*, not the object it was handed at open.
+     */
+    fun vncSessionProvider(hostId: String): () -> ClientSession? =
+        { sessionStore.primarySession(hostId) }
 
     /**
      * Reads uptime, load, memory and disk usage from [host] for the server card.

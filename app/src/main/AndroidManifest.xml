@@ -92,6 +92,23 @@
             android:windowSoftInputMode="adjustResize" />
 
         <!--
+          The remote desktop viewer, in its own window for the same reasons
+          as the editor above - and for two more of its own: an immersive
+          fullscreen with no chrome to tap by accident, and an orientation
+          the user can lock from the viewer's toolbar without dragging the
+          terminal behind it along. The same configChanges list as the
+          editor so a rotation is a recomposition, not a relaunch: the
+          viewer owns a live tunnel an intent cannot parcel, and its
+          handoff token is single-shot by design. Not exported - it is only
+          ever started from inside the app.
+        -->
+        <activity
+            android:name=".ui.remotedesktop.RemoteDesktopActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
           Long-lived work host: terminal shells, SFTP transfers and port
           forwards all run inside this service so that the process survives
           minimise / screen-off. dataSync is the correct FGS type for

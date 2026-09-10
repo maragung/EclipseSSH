@@ -168,6 +168,24 @@ class VncTunnelTest {
     }
 
     @Test
+    fun `an abandon before any start fails with the caller's reason`() {
+        // The viewer's precondition failure - the host has no session to ride - is not the
+        // tunnel's own error, so the reason is the caller's sentence, not a stack trace's.
+        val t = VncTunnel(PortForwardingManager())
+        tunnel = t
+        t.abandon("the host is not connected")
+
+        assertThat(t.state.value).isEqualTo(VncTunnelState.Failed("the host is not connected"))
+        // And it stays single-shot: a start on an abandoned tunnel is refused rather than run
+        // over the teardown the abandon already did.
+        assertThat(runCatching { t.start(session, RemoteDesktopTarget(port = 5900)) }.isFailure).isTrue()
+        // A stop after an abandon is a no-op, not a second teardown or a state overwrite: the
+        // session ended against the user's will, and Closed would rewrite that story.
+        t.stop()
+        assertThat(t.state.value).isEqualTo(VncTunnelState.Failed("the host is not connected"))
+    }
+
+    @Test
     fun `a target nothing answers fails with the socket's own story`() {
         // A port nothing is listening on - borrowed from the OS and given straight back - which is
         // the exact shape a user hits when the VNC server is not running: the *forward* binds fine,
