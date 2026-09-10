@@ -130,7 +130,71 @@ val fetchFreerdpSource =
         outputs.file(freerdpTarball)
         outputs.dir(freerdpSourceRoot)
         doLast {
-            if (!freerdpSourceRoot.isDirectory) {
+            // The helpers below are local, not script-level `fun`s: a function
+            // declared at a .kts script's top level compiles to a member of the
+            // script class, so a task action calling one holds a reference to
+            // the script object - which the configuration cache
+            // (org.gradle.configuration-cache=true) refuses to serialize, and a
+            // refused store fails the whole build, not just skips the cache.
+            fun run(vararg command: String) {
+                logger.lifecycle("exec: ${command.joinToString(" ")}")
+                val process =
+                    ProcessBuilder(*command)
+                        .redirectErrorStream(true)
+                        .start()
+                // The CMake/Ninja output is the only trace of a native failure; print all of it.
+                process.inputStream.bufferedReader().forEachLine { line -> println(line) }
+                val exitCode = process.waitFor()
+                check(exitCode == 0) {
+                    "command failed with exit code $exitCode: ${command.joinToString(" ")}"
+                }
+            }
+
+            /** Downloads [url] to [target], following redirects (GitHub releases redirect to a CDN). */
+            fun download(url: String, target: File) {
+                val connection = URL(url).openConnection() as HttpURLConnection
+                connection.connectTimeout = 30_000
+                connection.readTimeout = 300_000
+                connection.instanceFollowRedirects = true
+                try {
+                    val code = connection.responseCode
+                    check(code in 200..299) { "downloading $url failed: HTTP $code" }
+                    connection.inputStream.use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+            }
+
+            /** Verifies [file] against [expected] (lowercase hex) before anything is built from it. */
+            fun verifySha256(file: File, expected: String) {
+                val digest = MessageDigest.getInstance("SHA-256")
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                val actual =
+                    digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
+                check(actual == expected) {
+                    "sha256 mismatch for ${file.name}: expected $expected, got $actual"
+                }
+            }
+
+            // The extraction guard is the bridge project, NOT the source root:
+            // Gradle pre-creates a task's declared output directories before the
+            // task's actions run (PreCreateOutputParentsStep), so the source
+            // root ALWAYS exists by the time this executes - on a cold tree it
+            // is an empty pre-created directory, and a directory check on it
+            // would skip the extraction that fills it. The bridge directory is
+            // only ever put there by a real extraction, and it is exactly the
+            // input the build below needs, so a tree missing it is re-extracted
+            // rather than trusted.
+            if (!freerdpBridgeCMakeDir.isDirectory) {
                 freerdpSrcDir.mkdirs()
                 if (!freerdpTarball.isFile) {
                     logger.lifecycle("Downloading FreeRDP $freerdpVersion ...")
@@ -142,8 +206,7 @@ val fetchFreerdpSource =
                 }
                 verifySha256(freerdpTarball, freerdpSha256)
                 logger.lifecycle("Extracting FreeRDP $freerdpVersion ...")
-                runProcess(
-                    logger,
+                run(
                     "tar",
                     "xzf",
                     freerdpTarball.absolutePath,
@@ -170,6 +233,22 @@ val buildFreerdpNative =
         inputs.property("abis", freerdpAbis.joinToString(","))
         outputs.dir(nativeJniLibs)
         doLast {
+            // Local for the same reason as fetchFreerdpSource's helpers: a
+            // script-level `fun` would make this action hold the script object,
+            // which the configuration cache refuses to serialize.
+            fun run(vararg command: String) {
+                logger.lifecycle("exec: ${command.joinToString(" ")}")
+                val process =
+                    ProcessBuilder(*command)
+                        .redirectErrorStream(true)
+                        .start()
+                process.inputStream.bufferedReader().forEachLine { line -> println(line) }
+                val exitCode = process.waitFor()
+                check(exitCode == 0) {
+                    "command failed with exit code $exitCode: ${command.joinToString(" ")}"
+                }
+            }
+
             val toolchain =
                 File(File(androidSdkRoot, "ndk/$freerdpNdkVersion"), "build/cmake/android.toolchain.cmake")
             check(toolchain.isFile) {
@@ -189,8 +268,7 @@ val buildFreerdpNative =
                     // on, every optional codec off. android-28, not the README's
                     // android-23: the .so must not require less than the app's
                     // minSdk, and must not promise more than it.
-                    runProcess(
-                        logger,
+                    run(
                         "cmake",
                         "-S", freerdpBridgeCMakeDir.absolutePath,
                         "-B", cmakeDir.absolutePath,
@@ -209,7 +287,7 @@ val buildFreerdpNative =
                         "-GNinja",
                     )
                 }
-                runProcess(logger, "cmake", "--build", cmakeDir.absolutePath)
+                run("cmake", "--build", cmakeDir.absolutePath)
 
                 val outDir = File(nativeJniLibs, abi)
                 outDir.mkdirs()
@@ -240,53 +318,3 @@ val buildFreerdpNative =
 // module whose Java wrapper loads `freerdp-android` must never compile green
 // while the .so it needs is missing.
 tasks.named("preBuild") { dependsOn(buildFreerdpNative) }
-
-/** Runs a command, streaming its output, and fails the build on a nonzero exit. */
-fun runProcess(logger: org.gradle.api.logging.Logger, vararg command: String) {
-    logger.lifecycle("exec: ${command.joinToString(" ")}")
-    val process =
-        ProcessBuilder(*command)
-            .redirectErrorStream(true)
-            .start()
-    // The CMake/Ninja output is the only trace of a native failure; print all of it.
-    process.inputStream.bufferedReader().forEachLine { line -> println(line) }
-    val exitCode = process.waitFor()
-    check(exitCode == 0) {
-        "command failed with exit code $exitCode: ${command.joinToString(" ")}"
-    }
-}
-
-/** Downloads [url] to [target], following redirects (GitHub releases redirect to a CDN). */
-fun download(url: String, target: File) {
-    val connection = URL(url).openConnection() as HttpURLConnection
-    connection.connectTimeout = 30_000
-    connection.readTimeout = 300_000
-    connection.instanceFollowRedirects = true
-    try {
-        val code = connection.responseCode
-        check(code in 200..299) { "downloading $url failed: HTTP $code" }
-        connection.inputStream.use { input ->
-            target.outputStream().use { output -> input.copyTo(output) }
-        }
-    } finally {
-        connection.disconnect()
-    }
-}
-
-/** Verifies [file] against [expected] (lowercase hex) before anything is built from it. */
-fun verifySha256(file: File, expected: String) {
-    val digest = MessageDigest.getInstance("SHA-256")
-    file.inputStream().use { input ->
-        val buffer = ByteArray(64 * 1024)
-        while (true) {
-            val read = input.read(buffer)
-            if (read < 0) break
-            digest.update(buffer, 0, read)
-        }
-    }
-    val actual =
-        digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
-    check(actual == expected) {
-        "sha256 mismatch for ${file.name}: expected $expected, got $actual"
-    }
-}
