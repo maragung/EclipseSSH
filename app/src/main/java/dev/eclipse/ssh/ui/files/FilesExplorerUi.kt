@@ -285,14 +285,16 @@ private fun SessionChip(session: ExplorerSession, selected: Boolean, onClick: ()
  * The entries, as a list or a grid.
  *
  * One composable with two bodies rather than two lists, so selection, empty and loading states —
- * the parts that have to agree — are written once. Tap opens; long-press selects; a selection
- * changes tap to select everywhere, which is the rule a touch file manager is judged by.
+ * the parts that have to agree — are written once. Tap opens; long-press opens the per-entry action
+ * sheet, whose Select row starts a selection; once a selection is active, tap selects everywhere,
+ * which is the rule a touch file manager is judged by.
  */
 @Composable
 fun ExplorerList(
     state: ExplorerState,
     onOpen: (FsEntry) -> Unit,
     onToggleSelect: (String) -> Unit,
+    onOpenActions: (FsEntry) -> Unit,
 ) {
     when {
         state.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -327,6 +329,7 @@ fun ExplorerList(
                     selecting = state.selection.isNotEmpty(),
                     onOpen = { onOpen(entry) },
                     onToggleSelect = { onToggleSelect(entry.path) },
+                    onOpenActions = { onOpenActions(entry) },
                 )
             }
         }
@@ -339,6 +342,7 @@ fun ExplorerList(
                     selecting = state.selection.isNotEmpty(),
                     onOpen = { onOpen(entry) },
                     onToggleSelect = { onToggleSelect(entry.path) },
+                    onOpenActions = { onOpenActions(entry) },
                 )
             }
         }
@@ -354,11 +358,15 @@ fun ExplorerRow(
     selecting: Boolean,
     onOpen: () -> Unit,
     onToggleSelect: () -> Unit,
+    onOpenActions: () -> Unit,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = if (selecting) onToggleSelect else onOpen, onLongClick = onToggleSelect)
+            // Long-press opens the action sheet rather than selecting: the sheet's Select row is
+            // where a selection starts now, so the gesture that used to start one leads to the same
+            // place in one extra tap while gaining every other per-entry action on the way.
+            .combinedClickable(onClick = if (selecting) onToggleSelect else onOpen, onLongClick = onOpenActions)
             .padding(horizontal = 4.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -407,6 +415,7 @@ private fun ExplorerGridCell(
     selecting: Boolean,
     onOpen: () -> Unit,
     onToggleSelect: () -> Unit,
+    onOpenActions: () -> Unit,
 ) {
     Column(
         Modifier
@@ -416,7 +425,7 @@ private fun ExplorerGridCell(
                 if (selected) MaterialTheme.colorScheme.primaryContainer
                 else MaterialTheme.colorScheme.surface,
             )
-            .combinedClickable(onClick = if (selecting) onToggleSelect else onOpen, onLongClick = onToggleSelect)
+            .combinedClickable(onClick = if (selecting) onToggleSelect else onOpen, onLongClick = onOpenActions)
             .padding(8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -485,6 +494,7 @@ fun ExplorerFileActionsSheet(
     isLocal: Boolean,
     supportsPermissions: Boolean,
     onDismiss: () -> Unit,
+    onSelect: () -> Unit,
     onPreview: () -> Unit,
     onEdit: () -> Unit,
     onRename: () -> Unit,
@@ -503,6 +513,10 @@ fun ExplorerFileActionsSheet(
                 Text(describeSize(it), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Spacer(Modifier.height(12.dp))
+            // Selection enters through here now: long-press used to be the gesture, and long-press
+            // opens this sheet, so this row is where that gesture lands. First, above Preview,
+            // because a started selection is the state the whole explorer reorganizes around.
+            ActionRow("Select", onSelect)
             ActionRow("Preview", onPreview)
             if (!entry.isDirectory) {
                 ActionRow("Edit as text", onEdit)

@@ -190,11 +190,14 @@ class FilesExplorerLayoutRobolectricTest {
     }
 
     /**
-     * A long-press selects, and the batch bar that follows offers the actions the session can serve.
+     * A long-press opens the per-entry action sheet; its Select row starts a selection; and the batch
+     * bar that follows offers the actions the session can serve.
      *
      * The bar is what a touch file manager is judged by: it appears on the gesture, counts what the
      * gesture caught, and offers Download and Schedule on a remote listing - the two a server's rows
-     * can do - alongside the ones both backends share.
+     * can do - alongside the ones both backends share. The gesture itself changed - long-press used
+     * to select directly - so this also pins the new half: the sheet is what the gesture opens, and
+     * selection is what its Select row starts.
      */
     @Test
     fun aSelectionBringsTheBatchBarAndItsActions() {
@@ -206,10 +209,40 @@ class FilesExplorerLayoutRobolectricTest {
         }
 
         compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
+        // The sheet, not the batch bar: the gesture's first consequence is the menu of everything
+        // this entry can do.
+        awaitDisplayed("Edit as text")
+        compose.onNode(hasText("Select") and hasClickAction()).performClick()
         awaitDisplayed("1 selected")
         compose.onNode(hasText("Download") and hasClickAction()).assertIsDisplayed()
         compose.onNode(hasText("Schedule") and hasClickAction()).assertIsDisplayed()
         compose.onNode(hasText("Delete") and hasClickAction()).assertIsDisplayed()
+    }
+
+    /**
+     * The sheet's Edit row opens the full-window editor for the file that was long-pressed.
+     *
+     * This is the reason the sheet exists: before it, the only way to edit a file was to open its
+     * preview and find the Edit button there - and only for the preview's text-ish kinds. The
+     * assertion is the editor activity starting, which is the whole of the promise; the editor's own
+     * behaviour has its own suites.
+     */
+    @Test
+    fun theActionsSheetsEditRowOpensTheEditor() {
+        connect()
+        openFiles()
+        openTheHostsListing()
+        pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
+            names().contains(bulkName(0))
+        }
+        val app = compose.activity.application
+
+        compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
+        compose.onNode(hasText("Edit as text") and hasClickAction()).performClick()
+        pumpUntil(describe = { "the editor activity never started: " + diagnose() }) {
+            runCatching { shadowOf(app).nextStartedActivity }.getOrNull()
+                ?.component?.className == "dev.eclipse.ssh.ui.editor.TextEditorActivity"
+        }
     }
 
     // ---------------------------------------------------------------- driving the app

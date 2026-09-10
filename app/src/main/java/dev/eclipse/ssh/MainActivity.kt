@@ -3348,6 +3348,7 @@ private fun ColumnScope.FilesScreen(
                 if (entry.isDirectory) filesExplorer.navigate(entry.path, entry.name) else provider?.let { onPreviewFile(entry, it) }
             },
             onToggleSelect = filesExplorer::toggleSelected,
+            onOpenActions = { actionEntry = it },
         )
     }
 
@@ -3377,6 +3378,9 @@ private fun ColumnScope.FilesScreen(
             isLocal = explorer.isLocal,
             supportsPermissions = explorer.supportsPermissions,
             onDismiss = { actionEntry = null },
+            // The sheet closes so the batch bar it summons is visible; the entry joins whatever
+            // selection is already active, which is the old long-press behaviour one tap deeper.
+            onSelect = { actionEntry = null; filesExplorer.toggleSelected(entry.path) },
             onPreview = { actionEntry = null; provider?.let { onPreviewFile(entry, it) } },
             onEdit = { actionEntry = null; provider?.let { onEditFile(entry, it) } },
             onRename = { actionEntry = null; renameEntry = entry },
