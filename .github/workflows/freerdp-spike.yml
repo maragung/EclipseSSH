@@ -7,15 +7,20 @@
 # module, the RdpTunnel, the viewer - assumes the answer is yes, so the answer
 # is bought first, on its own branch, with no app code involved.
 #
+# arm64-v8a was proven on 2026-09-10 (run 34515547889): the superbuild
+# cross-compiled OpenSSL and FreeRDP for android-28 in about seven minutes and
+# the verify step found every expected .so. This revision builds all four ABIs
+# the app ships, sequentially in one job - the SDK/NDK/cmake setup and the
+# source tarball are shared, and each ABI's superbuild is independent (its own
+# build dir, its own jniLibs dir), so the only thing shared between them is the
+# pristine extracted source, which no ABI build writes into.
+#
 # It builds only the native libraries, the way upstream's `qa` build type does:
 # OpenSSL and cJSON on, every optional codec (FFmpeg, OpenH264, Opus, WebP,
 # JPEG, PNG) off. The optional codecs cover audio, H.264 and lossy still-image
 # compression that a viewer on a phone can live without; OpenSSL is the one
 # dependency RDP cannot connect without (TLS/NLA), and cJSON stays on because
 # upstream keeps it on even in their leanest configuration.
-#
-# One ABI per run for the spike. arm64-v8a is where every real phone is; the
-# other three ABIs are proven once this one is green, not before.
 #
 # Pinned like ci.yml: every `uses:` by commit SHA, every tool by exact version,
 # the tarball by its published SHA256 - the build has to be reproducible and
@@ -50,13 +55,12 @@ env:
   # android-28, not the README's android-23: the .so must not require less
   # than the app's minSdk, and must not promise more than it.
   ANDROID_PLATFORM_LEVEL: 'android-28'
-  ABI: 'arm64-v8a'
 
 jobs:
   native-build:
-    name: Native FreeRDP build (arm64-v8a)
+    name: Native FreeRDP build (4 ABIs)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Set up Android SDK with the pinned NDK
@@ -83,53 +87,66 @@ jobs:
           tar xzf freerdp.tar.gz
           test -d "freerdp-${FREERDP_VERSION}"
 
-      # The configure+build pair is docs/README.android's "Building native
-      # libraries standalone" recipe, with the lean feature set of upstream's
-      # qa build type. The superbuild fetches and cross-compiles OpenSSL and
-      # cJSON itself, which is why this step is the long one.
-      - name: Configure the superbuild
-        run: |
-          export ANDROID_NDK="${ANDROID_HOME}/ndk/${NDK_VERSION}"
-          test -f "${ANDROID_NDK}/build/cmake/android.toolchain.cmake"
-          cmake -S "freerdp-${FREERDP_VERSION}/client/Android/Studio/freeRDPCore/src/main/cpp" \
-                -B "build/${ABI}" \
-                --toolchain "${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
-                -DANDROID_ABI="${ABI}" \
-                -DANDROID_PLATFORM="${ANDROID_PLATFORM_LEVEL}" \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DWITH_FFMPEG=OFF \
-                -DWITH_OPENH264=OFF \
-                -DWITH_OPUS=OFF \
-                -DWITH_WEBP=OFF \
-                -DWITH_JPEG=OFF \
-                -DWITH_PNG=OFF \
-                -DWITH_CJSON=ON \
-                -DWITH_OPENSSL=ON \
-                -GNinja
-
-      - name: Build
-        run: cmake --build "build/${ABI}"
-
-      # The spike's verdict step: the JNI bridge library exists, is a shared
-      # object for the right architecture, and did not come alone - the
-      # FreeRDP/WinPR/OpenSSL libraries it links are in the build tree too.
-      - name: Verify the native libraries
+      # One pass per ABI of the configure+build+verify cycle. The configure
+      # and build commands are docs/README.android's "Building native
+      # libraries standalone" recipe with the lean feature set of upstream's
+      # qa build type; the superbuild fetches and cross-compiles OpenSSL and
+      # cJSON itself, which is why each pass is the slow part. The ELF
+      # signature is per ABI - "ARM aarch64" proves nothing about an x86_64
+      # .so, and a wrong-ABI library is exactly the failure packaging would
+      # otherwise hide until install time.
+      - name: Build and verify every ABI
         run: |
           set -euo pipefail
-          find "build/${ABI}" -name '*.so*' | sort
-          bridge=$(find "build/${ABI}" -name 'libfreerdp-android.so' | head -1)
-          test -n "${bridge}"
-          file "${bridge}" | grep -F 'ELF 64-bit LSB shared object'
-          file "${bridge}" | grep -F 'ARM aarch64'
-          for lib in libfreerdp3 libfreerdp-client3 libwinpr3 libcrypto libssl; do
-            found=$(find "build/${ABI}" -name "${lib}*.so*" | head -1)
-            test -n "${found}" || { echo "missing: ${lib}"; exit 1; }
-          done
+          export ANDROID_NDK="${ANDROID_HOME}/ndk/${NDK_VERSION}"
+          test -f "${ANDROID_NDK}/build/cmake/android.toolchain.cmake"
+          declare -A ELF_SIGNATURE=(
+            [arm64-v8a]='ARM aarch64'
+            [armeabi-v7a]='ARM, EABI5'
+            [x86_64]='x86-64'
+            [x86]='Intel 80386'
+          )
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            echo "::group::Configure ${ABI}"
+            cmake -S "freerdp-${FREERDP_VERSION}/client/Android/Studio/freeRDPCore/src/main/cpp" \
+                  -B "build/${ABI}" \
+                  --toolchain "${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
+                  -DANDROID_ABI="${ABI}" \
+                  -DANDROID_PLATFORM="${ANDROID_PLATFORM_LEVEL}" \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DWITH_FFMPEG=OFF \
+                  -DWITH_OPENH264=OFF \
+                  -DWITH_OPUS=OFF \
+                  -DWITH_WEBP=OFF \
+                  -DWITH_JPEG=OFF \
+                  -DWITH_PNG=OFF \
+                  -DWITH_CJSON=ON \
+                  -DWITH_OPENSSL=ON \
+                  -GNinja
+            echo "::endgroup::"
+            echo "::group::Build ${ABI}"
+            cmake --build "build/${ABI}"
+            echo "::endgroup::"
 
+            bridge=$(find "build/${ABI}" -name 'libfreerdp-android.so' | head -1)
+            test -n "${bridge}" || { echo "missing bridge library for ${ABI}"; exit 1; }
+            file "${bridge}" | grep -F "${ELF_SIGNATURE[${ABI}]}"
+            for lib in libfreerdp3 libfreerdp-client3 libwinpr3 libcrypto libssl; do
+              found=$(find "build/${ABI}" -name "${lib}*.so*" | head -1)
+              test -n "${found}" || { echo "missing: ${lib} for ${ABI}"; exit 1; }
+            done
+            echo "verified ${ABI}: ${ELF_SIGNATURE[${ABI}]}"
+          done
+          find build -name '*.so' | sort
+
+      # The verdict step above is the spike's answer; the artifact is only a
+      # convenience copy for inspection, so a full storage quota must not
+      # report the build red - the same rule ci.yml's upload steps follow.
       - name: Upload the native libraries
+        continue-on-error: true
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.6.1
         with:
-          name: freerdp-native-${{ env.ABI }}
-          path: build/${{ env.ABI }}/**/*.so
+          name: freerdp-native-all-abis
+          path: build/**/*.so
           if-no-files-found: error
           retention-days: 7
