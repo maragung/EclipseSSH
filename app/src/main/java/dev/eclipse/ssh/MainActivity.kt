@@ -78,6 +78,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -1143,6 +1144,7 @@ private fun EclipseWorkspace(
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
                     onRemoteDesktop = requestRemoteDesktop,
+                    onWakeOnLan = viewModel::wakeHost,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1302,6 +1304,7 @@ private fun EclipseWorkspace(
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
                     onRemoteDesktop = requestRemoteDesktop,
+                    onWakeOnLan = viewModel::wakeHost,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1858,6 +1861,12 @@ private fun WorkspaceScaffold(
      * "open": which one depends on the host's saved target, and the caller does not care.
      */
     onRemoteDesktop: (HostProfile) -> Unit = {},
+    /**
+     * Sends one host's Wake-on-LAN packet - the card menu's Wake on LAN item. An injectable no-op
+     * default like the other per-host actions, so previews and the destinations that never show a
+     * host card do not have to name it.
+     */
+    onWakeOnLan: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
     /** Long-press on a terminal tab: opens a second shell on the same host. */
     onDuplicateSession: (SessionTab) -> Unit = {},
@@ -2064,7 +2073,7 @@ private fun WorkspaceScaffold(
                 Destination.HOSTS -> HostsScreen(
                     state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
                     onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards,
-                    onRemoteDesktop,
+                    onRemoteDesktop, onWakeOnLan,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
@@ -2113,6 +2122,7 @@ private fun HostsScreen(
     onDuplicateHost: (HostProfile) -> Unit,
     onManageForwards: (HostProfile) -> Unit,
     onRemoteDesktop: (HostProfile) -> Unit,
+    onWakeOnLan: (HostProfile) -> Unit,
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
@@ -2142,7 +2152,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop, onWakeOnLan)
             }
         }
     }
@@ -2179,6 +2189,7 @@ private fun HostCard(
     onDuplicate: (HostProfile) -> Unit,
     onPortForwarding: (HostProfile) -> Unit,
     onRemoteDesktop: (HostProfile) -> Unit,
+    onWakeOnLan: (HostProfile) -> Unit,
 ) {
     // Keyed on the host id so a list that reorders (a favourite toggled, a search narrowed) cannot
     // leave the menu open over a different host than the one it was opened on.
@@ -2232,6 +2243,16 @@ private fun HostCard(
                             text = { Text("Remote desktop") },
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRemoteDesktop(host) },
+                        )
+                        // Beside the things that use a *running* session, because it is the one action
+                        // that cannot: the whole point of waking the machine is that nothing is
+                        // listening yet. Not gated on a saved address - the item is the discoverable
+                        // half of the feature, and "no address saved" is an answer the snackbar can
+                        // give, pointing at Edit, rather than an item that quietly is not there.
+                        DropdownMenuItem(
+                            text = { Text("Wake on LAN") },
+                            leadingIcon = { Icon(Icons.Default.Bolt, null) },
+                            onClick = { menuOpen = false; onWakeOnLan(host) },
                         )
                         // The arrow this item replaced used to sit beside the kebab as a second way
                         // into the details sheet; now this is the way in, so it sits high in the
@@ -5442,6 +5463,8 @@ private fun AddHostDialog(
     // so clearing the field is expressible at all — a numeric field cannot represent "unset".
     var keepAlive by remember(initialHost?.id) { mutableStateOf(initialHost?.keepAliveSeconds?.toString().orEmpty()) }
     var fingerprint by remember(initialHost?.id) { mutableStateOf(initialHost?.fingerprint.orEmpty()) }
+    // The MAC as typed, blank for none - the same convention the profile column uses.
+    var wakeOnLanMac by remember(initialHost?.id) { mutableStateOf(initialHost?.wakeOnLanMac.orEmpty()) }
     // Seeded from the profile, and from the shipped default for a new one, so the box reflects what
     // this host will actually do rather than a hardcoded position.
     var autoLoginSftp by remember(initialHost?.id) {
@@ -5485,6 +5508,7 @@ private fun AddHostDialog(
         keepAlive = keepAlive,
         fingerprint = fingerprint,
         storedFingerprint = initialHost?.fingerprint,
+        wakeOnLanMac = wakeOnLanMac,
         proxyType = proxyType,
         proxyJump = proxyJump,
         socksHost = socksHost,
@@ -5710,6 +5734,24 @@ private fun AddHostDialog(
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                OutlinedTextField(
+                    wakeOnLanMac,
+                    { wakeOnLanMac = it },
+                    label = { Text("Wake-on-LAN MAC (optional)") },
+                    placeholder = { Text("AA:BB:CC:DD:EE:FF") },
+                    singleLine = true,
+                    isError = !draft.wakeOnLanMacValid,
+                    supportingText = {
+                        Text(
+                            if (!draft.wakeOnLanMacValid) "Six pairs of hex digits — AA:BB:CC:DD:EE:FF"
+                            // The same-LAN limit is stated here, in the field's own helper line, rather
+                            // than left to a failure to explain: a wake sent from another network stops
+                            // at the first router and nothing on screen would say why.
+                            else "Wakes the machine from the host menu — phone and machine must be on the same network",
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 // A switch rather than a chip row: it is one binary choice whose off state has to be
                 // as visible as its on state. The whole row is the target — `toggleable` puts the
                 // label, the explanation and the switch in a single accessible node, so TalkBack
@@ -5786,6 +5828,10 @@ private fun AddHostDialog(
                             connectTimeoutSeconds = draft.timeoutNumber ?: DEFAULT_CONNECT_TIMEOUT_SECONDS,
                             keepAliveSeconds = draft.keepAliveNumber,
                             autoLoginSftp = autoLoginSftp,
+                            // Trimmed rather than normalised to one spelling: the text as typed is
+                            // what the profile shows the next time the form opens, and parseMac takes
+                            // every spelling at the moment the address is used.
+                            wakeOnLanMac = wakeOnLanMac.trim(),
                         ).let(advanced::applyTo),
                         HostCredentialUpdate(
                             // A typed replacement beats a pending forget; a pending forget beats

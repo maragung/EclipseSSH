@@ -53,6 +53,8 @@ import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
+import dev.eclipse.ssh.feature.wakeonlan.WakeOnLan
+import dev.eclipse.ssh.feature.wakeonlan.parseMac
 import dev.eclipse.ssh.presentation.files.FilesExplorerController
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.connectFailureIsFinal
@@ -148,6 +150,7 @@ class MainViewModel @Inject constructor(
     private val credentialStore: HostCredentialStore,
     private val diagnostics: SessionDiagnostics,
     private val livenessProbe: SessionLivenessProbe,
+    private val wakeOnLan: WakeOnLan,
     val filesExplorer: FilesExplorerController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
@@ -3829,6 +3832,46 @@ class MainViewModel @Inject constructor(
                     .onFailure { error -> report("Duplicated ${host.name}, but its credentials could not be copied", error) }
             }
             report("Duplicated ${host.name} as $name")
+        }
+    }
+
+    /**
+     * Sends one host's Wake-on-LAN magic packet.
+     *
+     * Deliberately needs no session, no credentials and no reachability: the whole premise of the
+     * feature is that the machine is off and nothing on it can answer, so nothing here touches
+     * [SshConnectionManager], the session store or the reconnect ladder - a wake is not a connect and
+     * must never look like one on a tab.
+     *
+     * A host with no address saved (or one that no longer parses, which can only happen through a
+     * hand-edited backup, since the form refuses to save one) is answered with a sentence pointing
+     * at Edit rather than silence, because an item in the menu that does nothing is indistinguishable
+     * from a broken one.
+     *
+     * Reports "packet sent", never "host is awake": there is no acknowledgement in Wake-on-LAN, and
+     * the machine may take a minute to boot even when the wake worked. Whether it is up is answered
+     * by the user tapping Connect.
+     */
+    fun wakeHost(host: HostProfile) {
+        val mac = parseMac(host.wakeOnLanMac)
+        if (mac == null) {
+            report("No Wake-on-LAN address saved for ${host.name} — add one in Edit")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                // A socket call: Dispatchers.IO, never the main thread, exactly like every other
+                // network operation in this class. viewModelScope dispatches on Main.immediate.
+                withContext(Dispatchers.IO) { wakeOnLan.wake(mac) }
+                report("Wake-on-LAN packet sent to ${host.name}")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                // The socket's own story ("network unreachable", "no route to host") is the useful
+                // half here: it is the difference between the phone being off the LAN and the
+                // radio being off entirely.
+                report("Wake-on-LAN for ${host.name} failed", error)
+            }
         }
     }
 

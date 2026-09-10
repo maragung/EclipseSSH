@@ -188,4 +188,20 @@ object Migrations {
             db.execSQL("ALTER TABLE host_profiles ADD COLUMN remoteDesktop TEXT NOT NULL DEFAULT ''")
         }
     }
+
+    /**
+     * The per-host Wake-on-LAN MAC address, as one text column holding whatever spelling the user
+     * typed - the same shape the other optional per-host text columns use.
+     *
+     * NOT NULL DEFAULT '' like [MIGRATION_12_13]'s text columns rather than nullable like the
+     * algorithm lists: an empty string already means "this host has no address to wake", which is the
+     * only thing a null could add here, so nullable would hand every read site a second absence to
+     * handle. An upgraded row therefore configures nothing, which is what every host that predates
+     * the column means.
+     */
+    val MIGRATION_15_16 = object : Migration(15, 16) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN wakeOnLanMac TEXT NOT NULL DEFAULT ''")
+        }
+    }
 }
