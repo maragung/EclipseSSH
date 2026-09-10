@@ -184,6 +184,12 @@ class HostAndThemeUiRobolectricTest {
             .that(compose.onAllNodesWithText("Connect").fetchSemanticsNodes()).isEmpty()
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        // The menu's items compose on a later frame, and the wait is what makes their existence
+        // the precondition of touching them: a fixed pump once lost that race on a loaded
+        // runner, and the click on "Remove" then found no node at all.
+        pumpUntil(describe = { "the kebab menu never offered Connect" }) {
+            compose.onAllNodesWithText("Connect").fetchSemanticsNodes().isNotEmpty()
+        }
         pump()
 
         compose.onNodeWithText("Connect").assertIsDisplayed()
@@ -224,7 +230,11 @@ class HostAndThemeUiRobolectricTest {
         val before = ShadowDialog.getShownDialogs().size
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        // Waited rather than pumped: the click below is only honest against a menu that is on
+        // screen, and on a loaded runner the items can still be a frame away.
+        pumpUntil(describe = { "the kebab menu never offered Remove" }) {
+            compose.onAllNodesWithText("Remove").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Remove").performClick()
         pump()
 
@@ -246,7 +256,10 @@ class HostAndThemeUiRobolectricTest {
         val host = addHost("Editable", hostname = "edit.example.test", username = "editor", port = 2244)
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        // Same wait as the Remove test: the click must not race the menu's composition.
+        pumpUntil(describe = { "the kebab menu never offered Edit" }) {
+            compose.onAllNodesWithText("Edit").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Edit").performClick()
         pump()
 
