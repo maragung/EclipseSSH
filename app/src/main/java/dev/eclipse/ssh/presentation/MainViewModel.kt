@@ -25,10 +25,15 @@ import dev.eclipse.ssh.data.saf.LocalSyncIndex
 import dev.eclipse.ssh.data.saf.localDocumentLength
 import dev.eclipse.ssh.data.model.AppSettings
 import dev.eclipse.ssh.data.model.DEFAULT_MAX_RECONNECT_ATTEMPTS
+import dev.eclipse.ssh.data.model.DEFAULT_FORWARD_LISTEN_HOST
 import dev.eclipse.ssh.data.model.ForwardEntry
+import dev.eclipse.ssh.data.model.ForwardRuntime
+import dev.eclipse.ssh.data.model.ForwardStatus
 import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.describe
+import dev.eclipse.ssh.data.model.deviceListenAddress
+import dev.eclipse.ssh.data.model.encodeForwardRules
 import dev.eclipse.ssh.data.model.savedForwardIdPrefix
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
@@ -228,6 +233,31 @@ class MainViewModel @Inject constructor(
     private val localDirUri = MutableStateFlow<String?>(null)
     private val forwardings = MutableStateFlow<List<ForwardEntry>>(emptyList())
     private val forwardHandles = ConcurrentHashMap<String, ForwardingHandle>()
+
+    /**
+     * What each forward is doing right now, keyed by entry id — saved rules and hand-opened forwards
+     * alike, because a running forward is only a rule with a handle behind it and the forwarding sheet
+     * has to show both.
+     *
+     * A *recorded* state, not necessarily the one the UI is shown: [displayedForwardState] overlays the
+     * two states a rule cannot record for itself. A rule has no way to notice that the transport under
+     * its tracker died — MINA closes the listening socket from the session's own teardown and nothing
+     * calls back into this class — so RECONNECTING and this-session-gone STOPPED are derived where the
+     * statuses are produced rather than tracked live, from the session key in [forwardSessionKeys].
+     */
+    private val forwardStates = MutableStateFlow<Map<String, ForwardStatus>>(emptyMap())
+
+    /**
+     * The session key each forward was opened against, by entry id.
+     *
+     * Forwards always ride the host's primary session, but *which* key that is changes: a second
+     * terminal can hold the primary while the first one's transport dies, and "the host still has a
+     * live session" is then true while this particular tracker is dead. Without this map a hand-opened
+     * forward whose session died under a surviving sibling would show RUNNING for as long as the app
+     * stayed open — the one display state that is not merely wrong but unrecoverable, because nothing
+     * ever rewrites it. Cleared beside its handle in [releaseForwards].
+     */
+    private val forwardSessionKeys = ConcurrentHashMap<String, String>()
 
     /**
      * Where every coroutine that can reach an SSH transport runs. Not the main thread, ever.
@@ -486,9 +516,28 @@ class MainViewModel @Inject constructor(
         SecurityState(knownHosts = knownHosts, credentials = saved)
     }
 
+    /**
+     * The two halves of the forwarding picture - which forwards are up, and what every rule is doing -
+     * as one source, because the five-slot typed combine below is full and the two only make sense
+     * together: a list of running tunnels beside a list of rule states that cannot mention them is how
+     * "the sheet says stopped, the port is listening" happens.
+     *
+     * [tabs] is a source, not read off to the side, because the derived states turn on it: a session
+     * ending rewrites the tab in the same update that reports the ending, so the statuses are
+     * recomputed at exactly the moment their inputs changed rather than one emission later.
+     */
+    private val forwardingUi = combine(forwardings, forwardStates, tabs) { active, states, openTabs ->
+        ForwardingUiState(
+            active = active,
+            statuses = if (states.isEmpty()) states else states.mapValues { (_, status) ->
+                status.copy(state = displayedForwardState(status, openTabs))
+            },
+        )
+    }
+
     private val baseUiState = combine(
-        combine(coreUiState, hostKeyChallenge, forwardings, snippetRepository.snippets, serverStats) { state, challenge, activeForwards, savedSnippets, stats ->
-            BaseState(state, challenge, activeForwards, savedSnippets, stats)
+        combine(coreUiState, hostKeyChallenge, forwardingUi, snippetRepository.snippets, serverStats) { state, challenge, forwarding, savedSnippets, stats ->
+            BaseState(state, challenge, forwarding, savedSnippets, stats)
         },
         securityState,
         authFailure,
@@ -496,7 +545,8 @@ class MainViewModel @Inject constructor(
     ) { base, security, refusedLogin, droppedSession ->
         base.state.copy(
             hostKeyChallenge = base.challenge,
-            forwardings = base.forwards,
+            forwardings = base.forwarding.active,
+            forwardStatuses = base.forwarding.statuses,
             snippets = base.snippets,
             serverStats = base.stats,
             knownHosts = security.knownHosts,
@@ -1121,6 +1171,12 @@ class MainViewModel @Inject constructor(
      * transport, and all three need the rules rebound, because a `PortForwardingTracker` belongs to the
      * `ClientSession` that created it.
      *
+     * Only the enabled rules with autoStart are started. An enabled rule without autoStart is listed
+     * as STOPPED - it is the forwarding sheet's Start button, not a connect's business - and a
+     * disabled rule as DISABLED, and neither is ever bound here, because the flags are a standing
+     * instruction about what the app may start on its own. [startForwardRule] is the one deliberate
+     * exception: a user pressing Start outranks both flags for as long as the forward runs.
+     *
      * **A forward that fails may not cost the user their shell.** This is the whole rule the feature
      * turns on. Every ordinary reason a tunnel does not come up - the local port is already taken,
      * usually by the last run of this app or by another one; the server refuses a remote bind because
@@ -1140,8 +1196,27 @@ class MainViewModel @Inject constructor(
         // nothing claimed on its tab.
         stopSavedForwards(host.id)
         val rules = decodeForwardRules(host.savedForwards, host.id)
-        updateHostTabs(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size, forwardError = null) }
-        if (rules.isEmpty()) return
+        // Every rule gets a row before anything is started, so the sheet can say "Disabled" about a
+        // rule that will never bind and "Stopped" about one that only a hand can start - a rule that is
+        // not running is only invisible until the user looks for it. The started ones below overwrite
+        // their row with STARTING the moment their attempt exists.
+        forwardStates.update { current ->
+            current + rules.associate { entry ->
+                entry.id to ForwardStatus(
+                    entry,
+                    when {
+                        !entry.enabled -> ForwardRuntime.DISABLED
+                        // Enabled but not auto-start: a connect brings up the automatic rules and
+                        // deliberately leaves this one for the forwarding sheet's Start button.
+                        else -> ForwardRuntime.STOPPED
+                    },
+                )
+            }
+        }
+        refreshForwardCounters(host.id)
+        updateHostTabs(host.id) { it?.copy(forwardError = null) }
+        val toStart = rules.filter { it.enabled && it.autoStart }
+        if (toStart.isEmpty()) return
         val job = transportScope.launch {
             // Forwards belong to the host, not to whichever terminal came up last, so the session they
             // ride is the host's primary one - with a single terminal that is the session that just
@@ -1149,29 +1224,11 @@ class MainViewModel @Inject constructor(
             val session = sessionStore.primarySession(host.id)
             if (session == null) {
                 // Not an error worth a message: the only way to get here is a session that ended between
-                // the shell opening and this line, and whatever ended it is already on the tab.
-                updateHostTabs(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size) }
+                // the shell opening and this line, and whatever ended it is already on the tab. The rows
+                // above already say STOPPED, which is the truth about rules that were never attempted.
                 return@launch
             }
-            var open = 0
-            val failures = mutableListOf<String>()
-            rules.forEach { entry ->
-                try {
-                    forwardHandles[entry.id] = openForward(session, entry)
-                    forwardings.update { it + entry }
-                    open++
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Throwable) {
-                    // Recorded per rule and continued, not aborted: three rules where the first port is
-                    // taken must still give the user the other two, and "8080 is busy" is a different
-                    // problem from "this server does not allow forwarding at all".
-                    failures += "${entry.describe()}: ${error.message ?: error::class.java.simpleName}"
-                }
-                // Written as each one lands rather than once at the end, so a rule that takes a while to
-                // bind does not hide the ones that already worked.
-                updateHostTabs(host.id) { it?.copy(forwardsOpen = open, forwardsTotal = rules.size) }
-            }
+            val failures = startForwardBatch(host, session, toStart)
             if (failures.isEmpty()) return@launch
             val reason = failures.joinToString(" · ")
             updateHostTabs(host.id) { it?.copy(forwardError = reason) }
@@ -1184,19 +1241,174 @@ class MainViewModel @Inject constructor(
         job.invokeOnCompletion { forwardJobs.remove(host.id, job) }
     }
 
-    /** One saved rule, on the manager, bound to loopback on whichever side it lands. */
+    /**
+     * One rule, on the manager, binding whatever the rule says rather than a constant.
+     *
+     * [entry.listenHost] is the interface on whichever side the listener lands - this device for LOCAL
+     * and DYNAMIC, the server for REMOTE - and it defaults to loopback, so a rule that says nothing
+     * still binds exactly what it always did. The one place an explicit bind matters is a remote rule:
+     * `listenHost = 0.0.0.0` is the user asking, in writing, for the phone's port to be published on
+     * the server's network (on a `GatewayPorts yes` server), which is why nothing fills it in for them
+     * - see the codec's own notes on the bind slot.
+     *
+     * The REMOTE destination is [ForwardEntry.localHost] - the address the *phone* dials when the
+     * server's side is connected to - and null means this device's own loopback, `ssh -R`'s default.
+     */
     private suspend fun openForward(session: ClientSession, entry: ForwardEntry): ForwardingHandle = when (entry.type) {
         ForwardType.LOCAL -> portForwardingManager.startLocal(
             session,
-            "127.0.0.1",
+            entry.listenHost,
             entry.localPort,
             entry.remoteHost.orEmpty(),
             entry.remotePort ?: 0,
         )
-        // Server loopback, for the reason spelled out in [startRemoteForward]: a rule written as two
-        // port numbers has not asked for the phone's port to be published to the server's network.
-        ForwardType.REMOTE -> portForwardingManager.startRemote(session, "127.0.0.1", entry.remotePort ?: 0, "127.0.0.1", entry.localPort)
-        ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, "127.0.0.1", entry.localPort)
+        ForwardType.REMOTE -> portForwardingManager.startRemote(
+            session,
+            entry.listenHost,
+            entry.remotePort ?: 0,
+            entry.localHost ?: DEFAULT_FORWARD_LISTEN_HOST,
+            entry.localPort,
+        )
+        ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort)
+    }
+
+    /**
+     * Starts [entries] against [session], one state machine per rule, and answers with the failure
+     * sentences for the caller's aggregate report.
+     *
+     * Before any LOCAL or DYNAMIC rule is attempted, the device ports this batch is about to claim are
+     * pre-checked - against the forwards already running under [forwardHandles], and against the rules
+     * earlier in this same batch. Two rules wanting the same `listenHost:port` is a mistake in the
+     * rules, not a race for the socket: without this check the loser's fate depended on scheduling,
+     * its message was whatever the bind syscall said, and on a phone the port can also be held by
+     * another app, which the OS message names nothing about. The first rule in the batch wins and the
+     * loser is [ForwardRuntime.FAILED] with one fixed sentence, spec-mandated so the sheet can match
+     * it. A REMOTE rule claims nothing on this device, so it never conflicts here - what it would
+     * collide on is a server-side port, and the server is both the authority on that and the one that
+     * says so when the bind is refused.
+     *
+     * Recorded per rule and continued, never aborted: three rules where the first port is taken must
+     * still give the user the other two, and "8080 is busy" is a different problem from "this server
+     * does not allow forwarding at all".
+     */
+    private suspend fun startForwardBatch(host: HostProfile, session: ClientSession, entries: List<ForwardEntry>): List<String> {
+        val sessionKey = sessionStore.primarySessionFor(host.id)
+        val failures = mutableListOf<String>()
+        // Seeded with what is running, then grown by this batch: one `add` answers both halves of the
+        // pre-check, because a port claimed by a running forward and a port claimed by an earlier rule
+        // of this batch are the same refusal to whoever asks next. Only handles whose session is still
+        // live seed it - a tracker left over from a dead transport holds no port (the socket went with
+        // the session), and counting it would tell the user their own rule was in its own way.
+        val claimed = forwardings.value
+            .filter { candidate ->
+                forwardHandles.containsKey(candidate.id) &&
+                    forwardSessionKeys[candidate.id]?.let { sessionStore.isLive(it) } == true
+            }
+            .mapNotNull { it.deviceListenAddress() }
+            .toMutableSet()
+        entries.forEach { entry ->
+            val address = entry.deviceListenAddress()
+            if (address != null && !claimed.add(address)) {
+                // Fixed wording, on purpose: the sentence is the sheet's way of recognising "two rules
+                // want one port", and a message that varies with the loser's position in the batch
+                // would be a different sentence every time the same mistake was made.
+                val reason = "Port ${entry.localPort} is already in use by another forwarding rule."
+                setForwardState(entry, ForwardRuntime.FAILED, reason)
+                failures += "${entry.describe()}: $reason"
+                refreshForwardCounters(host.id)
+                return@forEach
+            }
+            setForwardState(entry, ForwardRuntime.STARTING)
+            try {
+                val handle = openForward(session, entry)
+                // A Stop that arrived while the bind was in flight found no handle to close and left
+                // STOPPED standing over the STARTING row. Honouring it here - closing what just opened
+                // and leaving the row stopped - is what keeps Stop a promise against its own race, and
+                // the same test tidies a rebind this batch replaced mid-bind, whose rules' rows were
+                // rewritten underneath it. Closed by hand because it never reached [forwardHandles],
+                // so no other path knows it exists.
+                if (forwardStates.value[entry.id]?.state == ForwardRuntime.STOPPED) {
+                    releaseScope.launch { runCatching { handle.close() } }
+                    refreshForwardCounters(host.id)
+                    return@forEach
+                }
+                forwardHandles[entry.id] = handle
+                if (sessionKey != null) forwardSessionKeys[entry.id] = sessionKey
+                forwardings.update { it + entry }
+                setForwardState(entry, ForwardRuntime.RUNNING)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                val reason = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+                setForwardState(entry, ForwardRuntime.FAILED, reason)
+                failures += "${entry.describe()}: $reason"
+            }
+            // Written as each one lands rather than once at the end, so a rule that takes a while to
+            // bind does not hide the ones that already worked.
+            refreshForwardCounters(host.id)
+        }
+        return failures
+    }
+
+    /** Records one rule's state, replacing whatever it was doing a moment ago. */
+    private fun setForwardState(entry: ForwardEntry, state: ForwardRuntime, error: String? = null) {
+        forwardStates.update { it + (entry.id to ForwardStatus(entry, state, error)) }
+    }
+
+    /**
+     * The state the UI should be shown for [status], which is not always the state last recorded.
+     *
+     * A tracker gives this app no callback when the transport under it dies, so two states cannot be
+     * recorded at all and are derived here instead, from the session key the forward rode:
+     *
+     *  - **RECONNECTING** - the rule was running, its session is gone, and the host's ladder is
+     *    bringing that session back. Restricted to saved rules with enabled *and* autoStart, because
+     *    those are the only ones the reconnect's own [startSavedForwards] will rebind: a hand-opened
+     *    forward or a manual rule on a reconnecting host is gone with the old transport, and showing
+     *    it "Reconnecting" would promise a tunnel the reconnect never starts. The host's tab state,
+     *    not [reconnectJobs], is the signal: the ladder parks the tab at RECONNECTING in the same
+     *    update that reports the ending, and the tab is a flow this map is already derived alongside.
+     *  - **STOPPED** - the rule was running (or starting) and its session is gone with no reconnect
+     *    coming for it. A stale RUNNING here would be the one display state nothing ever corrects.
+     *
+     * Anything else is passed through as recorded: FAILED keeps its reason across a reconnect until
+     * the new attempt overwrites it, which is honest - the rule *did* fail, and may again.
+     */
+    private fun displayedForwardState(status: ForwardStatus, openTabs: List<SessionTab>): ForwardRuntime {
+        val recorded = status.state
+        if (recorded != ForwardRuntime.RUNNING && recorded != ForwardRuntime.STARTING) return recorded
+        val sessionKey = forwardSessionKeys[status.entry.id] ?: return recorded
+        if (sessionStore.isLive(sessionKey)) return recorded
+        val hostId = status.entry.hostId
+        val comesBackWithTheLadder = hostId != null &&
+            status.entry.enabled &&
+            status.entry.autoStart &&
+            status.entry.id.startsWith(savedForwardIdPrefix(hostId)) &&
+            openTabs.any { it.hostId == hostId && it.state == SessionConnectionState.RECONNECTING }
+        return if (comesBackWithTheLadder) ForwardRuntime.RECONNECTING else ForwardRuntime.STOPPED
+    }
+
+    /**
+     * Rewrites the host's forward counters on the tab: how many of its tunnels are up, against how
+     * many enabled rules it has.
+     *
+     * Counted from [forwardStates] - which holds every rule [startSavedForwards] ever listed for the
+     * host, running or not - rather than from a number the start paths increment, because forwards
+     * also stop outside those paths (a user's Stop, an edit in [saveForwardRules]) and a counter that
+     * only the starter maintains is wrong the first time anything else stops one.
+     *
+     * `forwardsOpen` counts every RUNNING forward of the host, hand-opened ones included: a tunnel
+     * that is carrying traffic is up whether or not a rule asked for it. `forwardsTotal` counts only
+     * the host's *saved* enabled rules - that is the ratio the tab has always shown, and a hand-opened
+     * tunnel has no denominator. Open can therefore exceed total while a manual tunnel is up, which is
+     * the honest sentence: this host has one rule and two tunnels.
+     */
+    private fun refreshForwardCounters(hostId: String) {
+        val prefix = savedForwardIdPrefix(hostId)
+        val statuses = forwardStates.value.values.filter { it.entry.hostId == hostId }
+        val open = statuses.count { displayedForwardState(it, tabs.value) == ForwardRuntime.RUNNING }
+        val total = statuses.count { it.entry.id.startsWith(prefix) && it.entry.enabled }
+        updateHostTabs(hostId) { it?.copy(forwardsOpen = open, forwardsTotal = total) }
     }
 
     /**
@@ -1235,7 +1447,13 @@ class MainViewModel @Inject constructor(
         if (ids.isEmpty()) return
         val dropped = ids.toSet()
         val handles = dropped.mapNotNull { forwardHandles.remove(it) }
+        dropped.forEach { forwardSessionKeys.remove(it) }
         forwardings.update { entries -> entries.filterNot { it.id in dropped } }
+        // The status rows go with the handles: a released forward is not "stopped", it is gone - the
+        // rebind path that calls this re-lists every rule a moment later, and the stop paths that want
+        // a STOPPED row to remain on screen ([stopForwardRule]) write it back after this returns. A
+        // row left behind here would claim a tunnel nothing is holding.
+        forwardStates.update { states -> states.filterNot { it.key in dropped } }
         if (handles.isEmpty()) return
         releaseScope.launch { handles.forEach { handle -> runCatching { handle.close() } } }
     }
@@ -2903,38 +3121,62 @@ class MainViewModel @Inject constructor(
     fun startLocalForward(host: HostProfile, localPort: Int, remoteHost: String, remotePort: Int) {
         val entry = ForwardEntry(type = ForwardType.LOCAL, localPort = localPort, remoteHost = remoteHost, remotePort = remotePort, hostId = host.id)
         transportScope.launch {
-            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
-            runCatching { portForwardingManager.startLocal(session, "127.0.0.1", localPort, remoteHost, remotePort) }
-                .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
-                .onFailure { reportForwardFailure("Local forward on port $localPort failed", it) }
+            startHandForward(host, entry, "Local forward on port $localPort failed")
         }
     }
 
     fun startRemoteForward(host: HostProfile, remotePort: Int, localPort: Int) {
+        // Bind stays loopback on the server for a hand-opened remote forward, for the reason the
+        // comment this dialog's start path has always carried: nobody typing two port numbers into a
+        // form has chosen to publish anything, and on a server configured `GatewayPorts yes` an
+        // all-interfaces bind would put the phone's port on the server's whole network. A rule that
+        // *wants* that says so in its bind field; see [openForward].
         val entry = ForwardEntry(type = ForwardType.REMOTE, localPort = localPort, remoteHost = null, remotePort = remotePort, hostId = host.id)
         transportScope.launch {
-            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
-            // Bound on the server's loopback, not 0.0.0.0. The dialog only asks for two port numbers,
-            // so nobody using it has chosen to publish anything; requesting all interfaces meant that
-            // on any server configured `GatewayPorts yes` (or `clientspecified`) the phone's local
-            // port became reachable from the server's entire network. Most servers default to
-            // `GatewayPorts no` and force loopback regardless of what the client asks, which is why
-            // this went unnoticed — it only opened up on the servers where it mattered. Loopback is
-            // also what `ssh -R` gives you unless you spell out a bind address.
-            runCatching { portForwardingManager.startRemote(session, "127.0.0.1", remotePort, "127.0.0.1", localPort) }
-                .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
-                .onFailure { reportForwardFailure("Remote forward of port $remotePort failed", it) }
+            startHandForward(host, entry, "Remote forward of port $remotePort failed")
         }
     }
 
     fun startDynamicForward(host: HostProfile, localPort: Int) {
         val entry = ForwardEntry(type = ForwardType.DYNAMIC, localPort = localPort, hostId = host.id)
         transportScope.launch {
-            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
-            runCatching { portForwardingManager.startDynamic(session, "127.0.0.1", localPort) }
-                .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
-                .onFailure { reportForwardFailure("SOCKS proxy on port $localPort failed", it) }
+            startHandForward(host, entry, "SOCKS proxy on port $localPort failed")
         }
+    }
+
+    /**
+     * Opens one forward the user asked for by hand - the three dialogs' shared body.
+     *
+     * The state rows are written here for the same reason [startForwardBatch] writes them: the sheet
+     * that started a forward by hand is also the sheet that lists what everything is doing, and a
+     * hand-opened forward that only ever appeared in the running list could never be told from a saved
+     * rule's tunnel, stopped by id, or shown as failed with its reason. The one difference from the
+     * batch path is deliberate: no conflict pre-check, because the batch checks a set of rules the app
+     * is applying together, while a hand-opened port that is taken fails against whatever took it and
+     * the OS's own message is the more useful one - it names the condition, not a sibling rule that
+     * may not exist.
+     */
+    private suspend fun startHandForward(host: HostProfile, entry: ForwardEntry, failureTitle: String) {
+        val sessionKey = sessionStore.primarySessionFor(host.id)
+        val session = sessionStore.primarySession(host.id) ?: return report("${host.name} is not connected")
+        setForwardState(entry, ForwardRuntime.STARTING)
+        try {
+            val handle = openForward(session, entry)
+            forwardHandles[entry.id] = handle
+            if (sessionKey != null) forwardSessionKeys[entry.id] = sessionKey
+            forwardings.update { it + entry }
+            setForwardState(entry, ForwardRuntime.RUNNING)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            reportForwardFailure(failureTitle, error)
+            setForwardState(
+                entry,
+                ForwardRuntime.FAILED,
+                error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName,
+            )
+        }
+        refreshForwardCounters(host.id)
     }
 
     /**
@@ -2953,11 +3195,146 @@ class MainViewModel @Inject constructor(
         report(what, error)
     }
 
-    fun stopForwarding(id: String) {
+    fun stopForwarding(id: String) = stopForwardRule(id)
+
+    /**
+     * Stops one forward - a saved rule or one opened by hand - closing its handle and marking the rule
+     * STOPPED rather than removing it from the picture, because a rule the user just stopped is still a
+     * rule: the sheet keeps its row, with its Start button armed again.
+     *
+     * No-op for an id nothing is tracking, which is not an error: the forwarding sheet reads the same
+     * map this writes, so a Stop arriving for an already-stopped rule means the list was one frame
+     * stale, not that something went wrong.
+     */
+    fun stopForwardRule(ruleId: String) {
         // Called straight from a Compose click handler, so the close cannot happen here: see
         // [releaseForwards], which drops the entry now and says goodbye to the server off the main
         // thread. The entry goes either way - the forward is certainly not running if the close failed.
-        releaseForwards(listOf(id))
+        val entry = forwardings.value.firstOrNull { it.id == ruleId } ?: forwardStates.value[ruleId]?.entry
+        val hostId = entry?.hostId
+        releaseForwards(listOf(ruleId))
+        if (entry != null) {
+            forwardStates.update { it + (ruleId to ForwardStatus(entry, ForwardRuntime.STOPPED)) }
+            // The stopped rule still counts in the total, so only the open count moves.
+            if (hostId != null) refreshForwardCounters(hostId)
+        }
+    }
+
+    /**
+     * Starts one rule of [hostId] against the host's live session: the forwarding sheet's Start
+     * button, for a rule that is stopped or failed.
+     *
+     * Deliberately the only start path that ignores [ForwardEntry.enabled] and [ForwardEntry.autoStart]:
+     * those flags gate what a *connect* brings up on its own, and a user pressing Start on a disabled
+     * or manual rule is an instruction that outranks both - the rule runs until it is stopped, and the
+     * next reconnect will not resurrect it, because the reconnect's own path honours the flags.
+     *
+     * A host with no live session gets the rule marked STOPPED and one sentence saying why, rather
+     * than a failure row: "not connected" is a fact about the session, not about the rule, and a
+     * FAILED row would accuse a rule that was never attempted. An already-running rule is left alone -
+     * its port is claimed, and re-attempting it would report a conflict with itself.
+     */
+    fun startForwardRule(hostId: String, ruleId: String) {
+        transportScope.launch {
+            val host = runCatching { hostRepository.hosts.first() }.getOrNull()
+                ?.firstOrNull { it.id == hostId } ?: return@launch
+            // The rule comes from the recorded rows when the host has any, falling back to the saved
+            // column for a host whose rows are empty (never attached this process, or edited elsewhere).
+            val entry = forwardStates.value[ruleId]?.entry
+                ?: decodeForwardRules(host.savedForwards, host.id).firstOrNull { it.id == ruleId }
+                ?: return@launch
+            // Already up, or on its way up: re-attempting a running rule would find its own port
+            // claimed and report a conflict with itself. The *displayed* state is what decides,
+            // because a recorded RUNNING whose session has died is a tunnel that no longer exists.
+            val recorded = forwardStates.value[ruleId]
+            if (forwardHandles.containsKey(ruleId) && recorded != null &&
+                displayedForwardState(recorded, tabs.value) == ForwardRuntime.RUNNING
+            ) return@launch
+            val session = sessionStore.primarySession(hostId) ?: run {
+                setForwardState(entry, ForwardRuntime.STOPPED)
+                refreshForwardCounters(hostId)
+                report("${host.name} is not connected")
+                return@launch
+            }
+            val failures = startForwardBatch(host, session, listOf(entry))
+            if (failures.isEmpty()) return@launch
+            val reason = failures.joinToString(" · ")
+            updateHostTabs(hostId) { it?.copy(forwardError = reason) }
+            report("Port forwarding on ${host.name}: $reason")
+        }
+    }
+
+    /**
+     * Persists [hostId]'s forwarding rules and applies them to the host's live session without a
+     * reconnect, so an edit in the forwarding sheet is a change the tunnels feel immediately.
+     *
+     * The rules are re-derived from the encoded column after saving rather than trusted from the
+     * caller's objects, and that round trip is the whole mechanism: a rule's id is a function of its
+     * text, so "the same rule as before" and "a changed rule" are both answered by comparing ids -
+     * unchanged rules keep their running tunnels, removed and changed ones are stopped. Re-deriving
+     * also means the ids used here are exactly the ids the next connect will produce, whatever the
+     * sheet had in hand.
+     *
+     * The start half only touches rules that are not already up: a user who is editing the list while
+     * a tunnel of theirs carries traffic keeps that tunnel, which is what "stop the removed/changed
+     * rules" promises and a full stop-and-rebind would break. The cost of id-from-text is that
+     * reordering a list changes every shifted rule's id, so a reorder reads as changed rules and
+     * restarts them - a moment's blip on a socket the user has to be editing anyway.
+     */
+    fun saveForwardRules(hostId: String, rules: List<ForwardEntry>) {
+        launchGuarded("Could not save the forwarding rules") {
+            val host = hostRepository.hosts.first().firstOrNull { it.id == hostId }
+                ?: return@launchGuarded report("The host for these rules no longer exists")
+            val text = encodeForwardRules(rules)
+            // The encode/decode round trip also enforces MAX_SAVED_FORWARDS and drops anything that
+            // does not parse, so what runs is exactly what the next connect will read back.
+            val saved = decodeForwardRules(text, hostId)
+            hostRepository.save(host.copy(savedForwards = text))
+
+            val prefix = savedForwardIdPrefix(hostId)
+            val oldIds = buildSet {
+                forwardings.value.forEach { if (it.id.startsWith(prefix)) add(it.id) }
+                forwardStates.value.keys.forEach { if (it.startsWith(prefix)) add(it.id) }
+            }
+            val newIds = saved.map { it.id }.toSet()
+            // A rebind still running for the previous column is working from stale rules; abandoning it
+            // costs at most a STARTING row, which the rewrite below replaces.
+            forwardJobs.remove(hostId)?.cancel()
+            // Removed and changed rules only - unchanged ids keep their tunnels.
+            releaseForwards(oldIds - newIds)
+            forwardStates.update { current ->
+                val next = current.toMutableMap()
+                saved.forEach { entry ->
+                    // A handle on a live session is a tunnel that is up right now, whatever the row
+                    // said a moment ago - including a row a just-cancelled rebind never finished
+                    // writing. An id that survived the edit with its tunnel intact keeps both.
+                    val running = forwardHandles.containsKey(entry.id) &&
+                        forwardSessionKeys[entry.id]?.let { sessionStore.isLive(it) } == true
+                    next[entry.id] = when {
+                        !entry.enabled -> ForwardStatus(entry, ForwardRuntime.DISABLED)
+                        running -> ForwardStatus(entry, ForwardRuntime.RUNNING)
+                        else -> ForwardStatus(entry, ForwardRuntime.STOPPED)
+                    }
+                }
+                next
+            }
+            refreshForwardCounters(hostId)
+            updateHostTabs(hostId) { it?.copy(forwardError = null) }
+            val toStart = saved.filter { it.enabled && it.autoStart && !forwardHandles.containsKey(it.id) }
+            if (toStart.isEmpty() || sessionStore.primarySession(hostId) == null) return@launchGuarded
+            val job = transportScope.launch {
+                // Asked for here rather than carried from before the launch, so a session that died
+                // while the save was in flight is not handed to the bind as though it were alive.
+                val session = sessionStore.primarySession(hostId) ?: return@launch
+                val failures = startForwardBatch(host, session, toStart)
+                if (failures.isEmpty()) return@launch
+                val reason = failures.joinToString(" · ")
+                updateHostTabs(hostId) { it?.copy(forwardError = reason) }
+                report("Port forwarding on ${host.name}: $reason")
+            }
+            forwardJobs[hostId] = job
+            job.invokeOnCompletion { forwardJobs.remove(hostId, job) }
+        }
     }
 
     /**
@@ -3303,13 +3680,24 @@ class MainViewModel @Inject constructor(
      * The name carries "(copy)" so the new card is distinguishable from the one beside it, with a
      * number when the obvious name is already taken - twice-duplicated means twice-named, or the
      * third card is as anonymous as the second.
+     *
+     * [copyForwards] answers the question the UI asks when the host has rules: duplicating a host
+     * silently duplicated its tunnels too, which is a surprise on a copy made for a different
+     * purpose. When the user declines, the saved column is left empty on the copy. When they accept,
+     * the rules are copied as text and need no re-keying of their own: a saved rule's id is derived
+     * from its host's id at decode time, so the copy's rules get fresh ids for free and never share
+     * live handles with the original's.
      */
-    fun duplicateHost(host: HostProfile) {
+    fun duplicateHost(host: HostProfile, copyForwards: Boolean = true) {
         launchGuarded("Could not duplicate ${host.name}") {
             val existing = hostRepository.hosts.first().map { it.name }.toSet()
             val base = "${host.name} (copy)"
             val name = if (base !in existing) base else (2..100).firstOrNull { n -> "$base $n" !in existing }?.let { "$base $it" } ?: base
-            val copy = host.copy(id = java.util.UUID.randomUUID().toString(), name = name)
+            val copy = host.copy(
+                id = java.util.UUID.randomUUID().toString(),
+                name = name,
+                savedForwards = if (copyForwards) host.savedForwards else "",
+            )
             hostRepository.save(copy)
             // The fingerprint travels with the profile row; the trust store entry is per-host, so it
             // has to be granted to the copy too or its first connect asks to trust a key the
@@ -3629,6 +4017,10 @@ class MainViewModel @Inject constructor(
         // onto the list - it failed after binding, or the list write lost a race - still holds a
         // listening socket, and this is the last chance anything has to close it.
         releaseForwards(forwardHandles.keys.toList())
+        // And the rows that had no handle to close go with them: the view model is gone, and a status
+        // map that outlived its handles would be a claim about tunnels nobody can start or stop.
+        forwardStates.value = emptyMap()
+        forwardSessionKeys.clear()
         reconnectWake.close()
         // Sessions, shells and scrollback deliberately survive: they belong to [SshSessionStore] and
         // the foreground service is running to keep them. Closing them here is what used to kill every
@@ -3647,6 +4039,10 @@ class MainViewModel @Inject constructor(
 
     private fun stopForwardingsFor(hostId: String) {
         releaseForwards(forwardings.value.filter { it.hostId == hostId }.map { it.id })
+        // The rows with nothing to release - a disabled rule, a stopped one, a failure nobody is
+        // retrying - belong to a host whose last session just went, and leaving them would let the
+        // forwarding sheet list rules for a host it can no longer start them against.
+        forwardStates.update { states -> states.filterNot { it.value.entry.hostId == hostId } }
     }
 
     /**
@@ -3772,10 +4168,16 @@ class MainViewModel @Inject constructor(
         )
     }
 
+    /** The forwarding half of [BaseState]: the running forwards, and every rule's current status. */
+    private data class ForwardingUiState(
+        val active: List<ForwardEntry>,
+        val statuses: Map<String, ForwardStatus>,
+    )
+
     private data class BaseState(
         val state: MainUiState,
         val challenge: HostKeyChallenge?,
-        val forwards: List<ForwardEntry>,
+        val forwarding: ForwardingUiState,
         val snippets: List<Snippet>,
         val stats: Map<String, ServerStats>,
     )
@@ -3955,6 +4357,19 @@ data class MainUiState(
     val localFiles: List<LocalFile> = emptyList(),
     val localDirUri: String? = null,
     val forwardings: List<ForwardEntry> = emptyList(),
+    /**
+     * Every forwarding rule this process has touched, keyed by entry id, paired with what it is doing
+     * right now - saved rules and hand-opened forwards alike, so the forwarding sheet can show a
+     * disabled rule as Disabled and a failed one with its reason instead of only listing the tunnels
+     * that are up ([forwardings] above).
+     *
+     * The states here are the *displayed* ones: RECONNECTING, and the STOPPED of a rule whose session
+     * died, are derived at the source (see `MainViewModel.displayedForwardState`) rather than recorded,
+     * because a tracker gives this app no callback when the transport under it goes. No error string
+     * in here carries anything but hostnames, ports and a failure reason - forwarding failures come
+     * from bind and channel errors, which never see a credential.
+     */
+    val forwardStatuses: Map<String, ForwardStatus> = emptyMap(),
     val snippets: List<Snippet> = emptyList(),
     val serverStats: Map<String, ServerStats> = emptyMap(),
     /**
