@@ -57,7 +57,6 @@ class VncTunnelTest {
     private lateinit var sshClient: SshClient
     private lateinit var session: ClientSession
     private var tunnel: VncTunnel? = null
-
     @Before
     fun connectSession() {
         sshClient = SshClient.setUpDefaultClient().apply {
@@ -230,9 +229,6 @@ class VncTunnelTest {
         const val USER = "vnc-user"
         const val PASSWORD = "vnc-pass-456"
 
-        const val FRAME_WIDTH = 16
-        const val FRAME_HEIGHT = 8
-
         var serverPort = 0
 
         private lateinit var server: SshServer
@@ -268,6 +264,15 @@ class VncTunnelTest {
         }
     }
 }
+
+/**
+ * The frame the fake server paints, and the size the tests assert arrived. File scope, not the
+ * test class's companion, because the fake server is its own class in this file and paints in
+ * this size too - one constant keeps the server's ServerInit and the assertions honest about
+ * each other.
+ */
+private const val FRAME_WIDTH = 16
+private const val FRAME_HEIGHT = 8
 
 /**
  * A hand-written RFB 3.8 server: the protocol's half of the conversation, and nothing else.
