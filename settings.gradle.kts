@@ -17,6 +17,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // JitPack serves vernacular-vnc (com.github.maragung:vernacular-vnc), which has no
+        // Maven Central release. It is a build-time artifact host, not a plugin source, so
+        // it belongs here rather than in pluginManagement.
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

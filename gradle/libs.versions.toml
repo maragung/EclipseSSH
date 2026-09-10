@@ -12,6 +12,11 @@ hiltExt = "1.2.0"
 datastore = "1.1.4"
 coroutines = "1.10.1"
 sshd = "2.14.0"
+# Pinned to a JitPack commit, not a tag: vernacular-vnc has no release tags, and the
+# upstream repo's master has moved since the commit this version was verified against.
+# f39cbe2 is the revision whose RFB handshake, pixel format and thread model the
+# VNC engine in dev.eclipse.ssh.vnc was written and tested against.
+vernacular-vnc = "f39cbe28538a94ee70113ce0909a2e40b1bfe8f1"
 slf4j = "2.0.17"
 eddsa = "0.3.0"
 biometric = "1.1.0"
@@ -76,6 +81,7 @@ hilt-ext-compiler = { module = "androidx.hilt:hilt-compiler", version.ref = "hil
 sshd-core = { module = "org.apache.sshd:sshd-core", version.ref = "sshd" }
 sshd-common = { module = "org.apache.sshd:sshd-common", version.ref = "sshd" }
 sshd-sftp = { module = "org.apache.sshd:sshd-sftp", version.ref = "sshd" }
+vernacular-vnc = { module = "com.github.maragung:vernacular-vnc", version.ref = "vernacular-vnc" }
 eddsa = { module = "net.i2p.crypto:eddsa", version.ref = "eddsa" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }

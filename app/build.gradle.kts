@@ -370,6 +370,12 @@ dependencies {
     implementation(libs.slf4j.api)
     implementation(libs.slf4j.simple)
 
+    // The RFB (VNC) half of the remote-desktop viewer, spoken over a plain Socket that the
+    // VNC engine runs through an ad-hoc SSH local forward. Pinned to a JitPack commit SHA -
+    // see the version catalog note. Its only transitive dependency is Bouncy Castle's
+    // bcprov-jdk18on, which the VNC auth path uses and nothing else in the app pulls in.
+    implementation(libs.vernacular.vnc)
+
     testImplementation(libs.junit)
     testImplementation(libs.truth)
     testImplementation(libs.turbine)

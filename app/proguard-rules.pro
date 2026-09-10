@@ -20,6 +20,9 @@
 -dontwarn org.ietf.jgss.**
 -dontwarn org.apache.tomcat.**
 -dontwarn org.newsclub.net.unix.**
+# Bouncy Castle (pulled in by vernacular-vnc for VNC authentication) has optional
+# JDK-desktop/LDAP paths that reference classes Android does not ship.
+-dontwarn javax.naming.**
 
 # SSHD reads its own version info from a properties resource.
 -keepattributes Signature,InnerClasses,EnclosingMethod,*Annotation*
