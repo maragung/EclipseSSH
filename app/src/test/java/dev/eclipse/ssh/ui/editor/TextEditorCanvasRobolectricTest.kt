@@ -3,6 +3,7 @@ package dev.eclipse.ssh.ui.editor
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.luminance
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.fs.FsEntry
