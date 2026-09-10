@@ -68,6 +68,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -212,6 +213,7 @@ import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
 import dev.eclipse.ssh.presentation.transfersForDisplay
 import dev.eclipse.ssh.presentation.AuthFailurePrompt
+import dev.eclipse.ssh.presentation.ReconnectPrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.ui.editor.EditorRequest
@@ -1157,6 +1159,7 @@ private fun EclipseWorkspace(
                     onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
+                    onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1312,6 +1315,7 @@ private fun EclipseWorkspace(
                     onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
+                    onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1438,6 +1442,12 @@ private fun EclipseWorkspace(
                 onPasteSecret = viewModel::pasteSecret,
             )
         }
+    }
+    // Ask-first reconnect: the tab is already parked at Disconnected with the reason, and this is
+    // the question. Looked up like the auth-failure prompt above so a host deleted while the dialog
+    // was open simply takes its question with it.
+    state.reconnectPrompt?.let { prompt ->
+        ReconnectDialog(prompt = prompt, onReconnect = viewModel::answerReconnectPrompt)
     }
     if (showGlobalSearch) {
         GlobalSearchDialog(
@@ -1711,6 +1721,7 @@ private fun WorkspaceScaffold(
     onTerminalMinColumns: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
+    onReconnectAskFirst: (Boolean) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
@@ -1865,6 +1876,7 @@ private fun WorkspaceScaffold(
                     onReconnectBase = onReconnectBase,
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
+                    onReconnectAskFirst = onReconnectAskFirst,
                     onTerminalTheme = onTerminalTheme,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
@@ -3955,6 +3967,7 @@ private fun SettingsScreen(
     onReconnectBase: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit,
     onBlockScreenshots: (Boolean) -> Unit,
+    onReconnectAskFirst: (Boolean) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
@@ -4080,7 +4093,16 @@ private fun SettingsScreen(
     }
     Spacer(Modifier.height(14.dp))
     SettingsSection("Background processing") {
-        SettingRow(Icons.Default.SwapVert, "Session manager", "Foreground service ready for active SSH, SFTP and forwards") { Icon(Icons.Default.CheckCircle, "Ready", tint = EclipseSuccess) }
+        SettingRow(
+            Icons.Default.SwapVert,
+            "Session manager",
+            "Foreground service ready for active SSH, SFTP and forwards",
+        ) { Icon(Icons.Default.CheckCircle, "Ready", tint = EclipseSuccess) }
+        SettingRow(
+            Icons.Default.HelpOutline,
+            "Ask before reconnecting",
+            "Dropped sessions wait for your answer instead of reconnecting on their own",
+        ) { Switch(checked = state.settings.reconnectAskFirst, onCheckedChange = onReconnectAskFirst) }
         SettingRow(
             Icons.Default.Refresh,
             "Reconnect delay",
@@ -4775,6 +4797,24 @@ private fun AuthenticationDialog(
  * screen: the password again, a different private key, or both — plus the choice to update what is
  * stored on the host so the correction outlives this attempt.
  */
+/**
+ * The ask-first reconnect question: a session dropped, and the user said never to bring their
+ * sessions back without asking. "Reconnect" answers through the same dial the automatic ladder
+ * would have made; "Not now" leaves the tab parked at Disconnected, where its own Reconnect action
+ * still works whenever they change their mind.
+ */
+@Composable
+private fun ReconnectDialog(prompt: ReconnectPrompt, onReconnect: (Boolean) -> Unit) {
+    AlertDialog(
+        onDismissRequest = { onReconnect(false) },
+        icon = { Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.tertiary) },
+        title = { Text("Reconnect to ${prompt.hostName}?") },
+        text = { Text(prompt.reason, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+        confirmButton = { Button(onClick = { onReconnect(true) }) { Text("Reconnect") } },
+        dismissButton = { TextButton(onClick = { onReconnect(false) }) { Text("Not now") } },
+    )
+}
+
 @Composable
 private fun AuthFailureDialog(
     prompt: AuthFailurePrompt,

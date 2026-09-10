@@ -279,6 +279,17 @@ class MainViewModel @Inject constructor(
      * through the service, which has no dialog to show.
      */
     private val authFailure = MutableStateFlow<AuthFailurePrompt?>(null)
+    /**
+     * The dropped session a dialog should answer, or null.
+     *
+     * The whole of ask-first mode: instead of the reconnect ladder scheduling its own backoff after
+     * a fault, the tab parks at Disconnected with the reason and this prompt carries the question to
+     * the UI. Answering "reconnect" calls the same [connect] the ladder would have, so a recovered
+     * session is identical to an automatically recovered one - the property the ladder's KDoc
+     * promises. Raised only by the UI-side ladder because a dialog can only exist here; the
+     * background service honours ask-first by declining to redial unattended instead.
+     */
+    private val reconnectPrompt = MutableStateFlow<ReconnectPrompt?>(null)
     private val knownHostsState = MutableStateFlow<Map<String, String>>(emptyMap())
     /**
      * The live sessions, their shells and their scrollback — owned by [SshSessionStore], not by this
@@ -481,7 +492,8 @@ class MainViewModel @Inject constructor(
         },
         securityState,
         authFailure,
-    ) { base, security, refusedLogin ->
+        reconnectPrompt,
+    ) { base, security, refusedLogin, droppedSession ->
         base.state.copy(
             hostKeyChallenge = base.challenge,
             forwardings = base.forwards,
@@ -490,6 +502,7 @@ class MainViewModel @Inject constructor(
             knownHosts = security.knownHosts,
             savedCredentials = security.credentials,
             authFailure = refusedLogin,
+            reconnectPrompt = droppedSession,
         )
     }
 
@@ -660,6 +673,24 @@ class MainViewModel @Inject constructor(
     /** Clears the refused-login prompt once the UI has answered it. */
     fun consumeAuthFailure() {
         authFailure.value = null
+    }
+
+    /**
+     * Answers the reconnect prompt: reconnects on the same path the ladder would have used, or just
+     * clears the question.
+     *
+     * Consume-first on both branches — the dial writes its own tab state immediately, and a prompt
+     * left behind would sit over a session that is already coming back.
+     */
+    fun answerReconnectPrompt(reconnect: Boolean) {
+        val prompt = reconnectPrompt.value ?: return
+        reconnectPrompt.value = null
+        if (!reconnect) return
+        viewModelScope.launch {
+            val host = runCatching { hostRepository.hosts.first() }.getOrNull()
+                ?.firstOrNull { it.id == prompt.hostId } ?: return@launch
+            connect(host, resuming = true)
+        }
     }
 
     fun connect(
@@ -1571,9 +1602,38 @@ class MainViewModel @Inject constructor(
         // The rules this host was dialled with, or the app-wide ones for a session nothing dialled -
         // one the service restored, or one adopted from a previous process. See [reconnectPolicies].
         val policy = reconnectPolicies[hostId] ?: ReconnectPolicy.DEFAULT
+        val action = reconnectActionOnDrop(
+            // Read from the UI state's cached settings rather than a fresh DataStore read, because
+            // this is not a coroutine - the collector calls it directly - and a suspend read here
+            // would have to launch, which puts the tab's park state a frame behind the prompt. The
+            // cache is at most one emission stale, and the setting changes only from the Settings
+            // screen.
+            askFirst = uiState.value.settings.reconnectAskFirst,
+            attemptsSpent = reconnectAttempts[hostId] ?: 0,
+            maxAttempts = policy.maxAttempts,
+        )
+        // Ask-first mode: no ladder runs at all. The order is [reconnectActionOnDrop]'s - the mode
+        // spends no attempts, so an unspent allowance is part of the promise. The tab is rewritten
+        // here rather than in the collector because the ending-path cannot know the mode; the
+        // RECONNECTING it wrote first is replaced before any frame shows it.
+        if (action == ReconnectAction.PROMPT) {
+            updateTab(hostId) {
+                it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = "$endReason · waiting for your answer")
+            }
+            diagnostics.record(
+                hostId,
+                SessionEvent.RECONNECT_PROMPTED,
+                state = SessionConnectionState.DISCONNECTED,
+                detail = endReason,
+                network = networkMonitor.describe(),
+            )
+            val hostName = tabs.value.firstOrNull { it.hostId == hostId }?.name ?: hostId
+            reconnectPrompt.value = ReconnectPrompt(hostId = hostId, hostName = hostName, reason = endReason)
+            return
+        }
         val maxAttempts = policy.maxAttempts
-        val attempt = (reconnectAttempts[hostId] ?: 0) + 1
-        if (attempt > maxAttempts) {
+        if (action == ReconnectAction.GIVE_UP) {
+            val attempt = (reconnectAttempts[hostId] ?: 0) + 1
             updateTab(hostId) {
                 it?.copy(
                     state = SessionConnectionState.ERROR,
@@ -1595,6 +1655,7 @@ class MainViewModel @Inject constructor(
             )
             return
         }
+        val attempt = (reconnectAttempts[hostId] ?: 0) + 1
         reconnectAttempts[hostId] = attempt
         val job = viewModelScope.launch {
             val globalSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
@@ -3304,6 +3365,7 @@ class MainViewModel @Inject constructor(
             settingsRepository.setLegacyAlgorithms(settings.legacyAlgorithms)
             settingsRepository.setTerminalTheme(settings.terminalTheme)
             settingsRepository.setBlockScreenshots(settings.blockScreenshots)
+            settingsRepository.setReconnectAskFirst(settings.reconnectAskFirst)
             report("Imported ${hosts.size} host(s)")
         }
     }
@@ -3381,6 +3443,7 @@ class MainViewModel @Inject constructor(
 
     fun setBiometricUnlock(enabled: Boolean) = writeSetting("the unlock setting") { settingsRepository.setBiometricUnlock(enabled) }
     fun setBlockScreenshots(enabled: Boolean) = writeSetting("the screenshot setting") { settingsRepository.setBlockScreenshots(enabled) }
+    fun setReconnectAskFirst(enabled: Boolean) = writeSetting("the reconnect prompt setting") { settingsRepository.setReconnectAskFirst(enabled) }
     fun setDarkTheme(enabled: Boolean) = writeSetting("the theme setting") { settingsRepository.setDarkTheme(enabled) }
     fun setClipboardSeconds(seconds: Int) = writeSetting("the clipboard timeout") { settingsRepository.setClipboardSeconds(seconds) }
     fun setKeepAliveSeconds(seconds: Int) = writeSetting("the keep-alive interval") { settingsRepository.setKeepAliveSeconds(seconds) }
@@ -3675,6 +3738,18 @@ data class AuthFailurePrompt(
     val reason: String,
 )
 
+/**
+ * A dropped session waiting for the user's answer — ask-first reconnect mode, the UI half.
+ * Shaped after [AuthFailurePrompt] because it is the same kind of thing: a fault whose next step
+ * belongs to the user rather than to the app.
+ */
+data class ReconnectPrompt(
+    val hostId: String,
+    val hostName: String,
+    /** Why the session ended, as the terminal status line already says it. */
+    val reason: String,
+)
+
 data class MainUiState(
     val hosts: List<HostProfile> = emptyList(),
     val filteredHosts: List<HostProfile> = emptyList(),
@@ -3691,6 +3766,8 @@ data class MainUiState(
      * again. See [AuthFailurePrompt]. Null whenever no refusal is waiting to be answered.
      */
     val authFailure: AuthFailurePrompt? = null,
+    /** A dropped session asking whether to reconnect — non-null only in ask-first mode. */
+    val reconnectPrompt: ReconnectPrompt? = null,
     val knownHosts: Map<String, String> = emptyMap(),
     /**
      * Saved-credential metadata per host id — which hosts can connect without a prompt, and what key
@@ -3878,6 +3955,29 @@ internal fun retryPhase(phase: SessionConnectionState): SessionConnectionState =
         // Not AUTHENTICATING even when that is where it failed: the next attempt starts by dialling, so
         // the honest phase for the wait is the one it is about to be in.
         SessionConnectionState.CONNECTING
+    }
+
+/** What the ladder does with a drop: dial on its own, ask first, or stop. */
+internal enum class ReconnectAction { SCHEDULE, PROMPT, GIVE_UP }
+
+/**
+ * Which of the three things a drop leads to, as one decision with a stated order.
+ *
+ * The order is the behaviour: ask-first wins over an exhausted allowance, because the mode spends no
+ * attempts — the ladder never ran, so there is nothing to be out of. A user who answers *reconnect*
+ * gets a fresh ladder with every attempt it would have had, and a user who switches the mode on
+ * halfway through one host's ladder is prompted on its next drop rather than told the app has given
+ * up on a session it never tried to recover.
+ *
+ * Pure for the same reason [shouldAutoReconnect] is: the precedence is the part worth pinning down,
+ * and the states it has to get right — mode on with attempts spent, mode off at the top of the
+ * ladder — are exactly the ones a running app cannot be made to produce on demand.
+ */
+internal fun reconnectActionOnDrop(askFirst: Boolean, attemptsSpent: Int, maxAttempts: Int): ReconnectAction =
+    when {
+        askFirst -> ReconnectAction.PROMPT
+        attemptsSpent >= maxAttempts -> ReconnectAction.GIVE_UP
+        else -> ReconnectAction.SCHEDULE
     }
 
 /**

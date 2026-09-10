@@ -88,6 +88,7 @@ object VaultBackup {
             put("legacyAlgorithms", settings.legacyAlgorithms)
             put("terminalTheme", settings.terminalTheme)
             put("blockScreenshots", settings.blockScreenshots)
+            put("reconnectAskFirst", settings.reconnectAskFirst)
         })
         root.put("hosts", JSONArray().apply {
             hosts.forEach { host -> put(JSONObject().apply {
@@ -175,6 +176,7 @@ object VaultBackup {
             // Absent from backups written before this setting existed, which optBoolean resolves to
             // the default rather than to false-by-accident.
             blockScreenshots = settingsObj.optBoolean("blockScreenshots", defaults.blockScreenshots),
+            reconnectAskFirst = settingsObj.optBoolean("reconnectAskFirst", defaults.reconnectAskFirst),
         )
         val hostsArray = root.optJSONArray("hosts") ?: JSONArray()
         val hosts = ArrayList<HostProfile>(hostsArray.length())

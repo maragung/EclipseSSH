@@ -336,6 +336,9 @@ enum class SessionEvent {
     /** A reconnect was cancelled because the user took over. */
     RECONNECT_CANCELLED,
 
+    /** A reconnect was offered to the user instead of scheduled — ask-first mode. */
+    RECONNECT_PROMPTED,
+
     /** The default network changed under a live session. */
     NETWORK_CHANGED,
 

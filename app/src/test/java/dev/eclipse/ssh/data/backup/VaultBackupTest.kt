@@ -183,6 +183,7 @@ class VaultBackupTest {
             // Set to the opposite of its default on purpose. The assertion below compares whole
             // objects, so a field left at its default would match even if the backup dropped it.
             blockScreenshots = true,
+            reconnectAskFirst = true,
         )
         val knownHosts = mapOf("edge.example.com:2222" to EDGE_FINGERPRINT)
 
@@ -236,6 +237,7 @@ class VaultBackupTest {
         assertThat(settings.legacyAlgorithms).isEqualTo(defaults.legacyAlgorithms)
         assertThat(settings.terminalTheme).isEqualTo(defaults.terminalTheme)
         assertThat(settings.blockScreenshots).isEqualTo(defaults.blockScreenshots)
+        assertThat(settings.reconnectAskFirst).isEqualTo(defaults.reconnectAskFirst)
         assertThat(hosts).hasSize(1)
         assertThat(hosts.single().proxyType).isEqualTo(ProxyType.NONE)
         assertThat(hosts.single().socksPort).isEqualTo(1080)
