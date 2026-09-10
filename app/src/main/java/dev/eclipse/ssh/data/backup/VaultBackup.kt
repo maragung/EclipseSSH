@@ -27,7 +27,9 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.data.model.encodeForwardRules
+import dev.eclipse.ssh.data.model.encodeRemoteDesktop
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.security.SecureRandom
 import java.util.Base64
@@ -142,6 +144,9 @@ object VaultBackup {
                 // Re-encoded from the decoded rules rather than copied, so a column that arrived from a
                 // hand-edited file is normalised on its way out instead of being passed on.
                 put("savedForwards", encodeForwardRules(decodeForwardRules(host.savedForwards, host.id)))
+                // Same treatment for the remote-desktop column, and it travels in the clear by
+                // design: the line is a host, a port and flags - nothing to redact.
+                put("remoteDesktop", encodeRemoteDesktop(decodeRemoteDesktop(host.remoteDesktop)))
                 put("hostKeyPolicy", host.hostKeyPolicy.name)
             }) }
         })
@@ -265,6 +270,9 @@ object VaultBackup {
                 // rules the engine will act on: a line the app would not have let the user save does not
                 // survive the round trip, and the [MAX_SAVED_FORWARDS] cap is applied by the decoder.
                 savedForwards = encodeForwardRules(decodeForwardRules(h.optString("savedForwards"))),
+                // The remote-desktop column reads the same way: what decoding accepts is what is kept,
+                // and an absent key (a backup from before the column existed) is simply no endpoint.
+                remoteDesktop = encodeRemoteDesktop(decodeRemoteDesktop(h.optString("remoteDesktop"))),
                 hostKeyPolicy = HostKeyPolicy.entries.firstOrNull { it.name == h.optString("hostKeyPolicy") }
                     ?: HostKeyPolicy.ASK,
             )

@@ -56,7 +56,7 @@ object AppModule {
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): EclipseDatabase =
         Room.databaseBuilder(context, EclipseDatabase::class.java, "eclipse_ssh.db")
-            .addMigrations(Migrations.MIGRATION_2_3, Migrations.MIGRATION_3_4, Migrations.MIGRATION_4_5, Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8, Migrations.MIGRATION_8_9, Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11, Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13, Migrations.MIGRATION_13_14)
+            .addMigrations(Migrations.MIGRATION_2_3, Migrations.MIGRATION_3_4, Migrations.MIGRATION_4_5, Migrations.MIGRATION_5_6, Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8, Migrations.MIGRATION_8_9, Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11, Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13, Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15)
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .build()
 
