@@ -553,7 +553,7 @@ private fun EclipseWorkspace(
      * [rememberSaveable], so a rotation or a restore after process death comes back to the shell the
      * user was in rather than dropping them into the list.
      */
-    var openSessionHostId by rememberSaveable { mutableStateOf<String?>(null) }
+    var openSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     /**
      * Follows the sessions: a new one takes the screen, and the one being watched gives it back when it
      * ends.
@@ -561,7 +561,7 @@ private fun EclipseWorkspace(
      * Seeded from the sessions that already exist on the first composition rather than starting empty,
      * so returning to a process that still has sessions - a rotation, a restore after process death,
      * coming back from the background - does not count them as new and throw the user into a shell they
-     * did not just ask for. Connect sets [openSessionHostId] itself so the tap feels immediate; this is
+     * did not just ask for. Connect sets [openSessionId] itself so the tap feels immediate; this is
      * what gives every other route to a new session (the widget, a deep link, a reconnect from the list)
      * the same behaviour.
      *
@@ -571,19 +571,21 @@ private fun EclipseWorkspace(
     val seenSessions = remember { mutableSetOf<String>() }
     var sessionsSeeded by remember { mutableStateOf(false) }
     LaunchedEffect(state.tabs) {
-        val live = state.tabs.map { it.hostId }
+        // Tab ids, not host ids: with more than one shell on a host, each is its own session, and a
+        // duplicate opening must take the screen without disturbing the tab already on it.
+        val live = state.tabs.map { it.id }
         val appeared = if (sessionsSeeded) live.lastOrNull { it !in seenSessions } else null
         sessionsSeeded = true
         seenSessions.retainAll(live.toSet())
         seenSessions += live
         if (appeared != null) {
-            openSessionHostId = appeared
+            openSessionId = appeared
             destination = Destination.TERMINAL
-        } else if (openSessionHostId != null && openSessionHostId !in live) {
+        } else if (openSessionId != null && openSessionId !in live) {
             // The session being watched ended - closed from the strip, disconnected by the server, or
             // never restored into this process - so the terminal falls back to the list instead of
             // drawing a shell for a session that is not there.
-            openSessionHostId = null
+            openSessionId = null
         }
     }
     // The Files explorer keeps its own session list and its own listings, but it cannot see the
@@ -800,7 +802,13 @@ private fun EclipseWorkspace(
         }.onFailure { viewModel.reportUiFailure("Sessions will not survive minimising", it) }
         // Straight into the shell, full screen: the list of sessions is somewhere to come back to, not
         // somewhere to pass through on the way in.
-        openSessionHostId = host.id
+        //
+        // The tab this dial will speak for, resolved here the same way connect() resolves its session
+        // key: an existing tab of this host is the one a reconnect re-dials, and a host with no tab
+        // yet gets one filed under the host's own id (the multi-session rule that keeps a lone shell
+        // byte-identical with how it was keyed before). By the time the tab appears, the effect above
+        // would hand it the screen anyway - setting it here is what makes the tap feel immediate.
+        openSessionId = state.tabs.firstOrNull { it.hostId == host.id }?.id ?: host.id
         destination = Destination.TERMINAL
     }
     /**
@@ -973,11 +981,11 @@ private fun EclipseWorkspace(
      */
     val terminalImmersive = destination == Destination.TERMINAL &&
         !(state.settings.pinEnabled && !unlocked) &&
-        openSessionHostId?.let { id -> state.tabs.any { it.hostId == id } } == true
+        openSessionId?.let { id -> state.tabs.any { it.id == id } } == true
     // Back leaves the shell, not the app. A full-screen terminal has no navigation on screen, so
     // without this the only way out of a session is the gesture that closes the whole app - and the
     // session with it.
-    BackHandler(enabled = terminalImmersive) { openSessionHostId = null }
+    BackHandler(enabled = terminalImmersive) { openSessionId = null }
     /**
      * Hides the status and navigation bars while the shell is on screen, and puts them back afterwards.
      *
@@ -1066,8 +1074,8 @@ private fun EclipseWorkspace(
                     onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
                     onDisconnectAll = viewModel::disconnectAll,
-                    openSessionHostId = openSessionHostId,
-                    onOpenSession = { openSessionHostId = it },
+                    openSessionId = openSessionId,
+                    onOpenSession = { openSessionId = it },
                     immersive = terminalImmersive,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
@@ -1222,8 +1230,8 @@ private fun EclipseWorkspace(
                     onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
                     onDisconnectAll = viewModel::disconnectAll,
-                    openSessionHostId = openSessionHostId,
-                    onOpenSession = { openSessionHostId = it },
+                    openSessionId = openSessionId,
+                    onOpenSession = { openSessionId = it },
                     immersive = terminalImmersive,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
@@ -1665,7 +1673,7 @@ private fun WorkspaceScaffold(
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
     /** The session whose shell is on screen; null shows the list of sessions instead. */
-    openSessionHostId: String?,
+    openSessionId: String?,
     /** Opens a session's shell full-screen, or returns to the list with null. */
     onOpenSession: (String?) -> Unit,
     /** True when that shell owns the window, so this scaffold draws no chrome around it. */
@@ -1737,7 +1745,7 @@ private fun WorkspaceScaffold(
     // A shell owns the whole window, so it composes outside the Scaffold entirely: no top bar, no
     // Scaffold insets, nothing above the grid but the session strip. This is the branch the app enters
     // the moment a login succeeds, and what makes the terminal full screen rather than merely large.
-    val openSession = state.tabs.firstOrNull { it.hostId == openSessionHostId }
+    val openSession = state.tabs.firstOrNull { it.id == openSessionId }
     if (immersive && openSession != null) {
         TerminalScreen(
             state = state,
@@ -1767,7 +1775,7 @@ private fun WorkspaceScaffold(
             onFontSize = onTerminalFontSize,
             onKeyRowVisible = onTerminalKeyRow,
             activeTab = openSession,
-            onSelectSession = { onOpenSession(it.hostId) },
+            onSelectSession = { onOpenSession(it.id) },
             onLeaveSession = { onOpenSession(null) },
             modifier = modifier,
         )
@@ -1814,7 +1822,7 @@ private fun WorkspaceScaffold(
             Box(Modifier.padding(padding).fillMaxSize()) {
                 TerminalSessionsScreen(
                     state = state,
-                    onOpenSession = { onOpenSession(it.hostId) },
+                    onOpenSession = { onOpenSession(it.id) },
                     onCloseTab = onCloseTab,
                     onDisconnectAll = onDisconnectAll,
                     // The same authentication sheet the Hosts list opens, deliberately: a reconnect is
@@ -2093,7 +2101,7 @@ private fun TerminalScreen(
      *
      * Passed in rather than picked here because which shell is on screen decides whether the app has
      * any chrome at all, and that decision belongs where the chrome is - see
-     * [EclipseWorkspace]'s `openSessionHostId`. It also means this screen has no empty state: it is
+     * [EclipseWorkspace]'s `openSessionId`. It also means this screen has no empty state: it is
      * only ever composed for a session that exists, and the list is what handles having none.
      */
     activeTab: SessionTab,
@@ -2131,8 +2139,8 @@ private fun TerminalScreen(
     var snippetLabel by remember { mutableStateOf("") }
     var selection by remember { mutableStateOf<TerminalSelection?>(null) }
     // Dropped when the session changes: the coordinates are buffer lines, so keeping them would
-    // highlight an unrelated stretch of the other host's scrollback.
-    LaunchedEffect(activeTab.hostId) { selection = null }
+    // highlight an unrelated stretch of the other session's scrollback.
+    LaunchedEffect(activeTab.id) { selection = null }
     val theme = TerminalTheme.named(state.settings.terminalTheme)
     val termBg = Color(theme.background)
     val termFg = Color(theme.foreground)
@@ -2144,7 +2152,9 @@ private fun TerminalScreen(
             command = if (historyIndex < 0) "" else history[historyIndex]
         }
     }
-    val terminalText = state.terminalOutput[activeTab.hostId].orEmpty()
+    // This tab's own scrollback - keyed by the tab id, which is the session key: a host with two
+    // shells keeps two independent transcripts.
+    val terminalText = state.terminalOutput[activeTab.id].orEmpty()
     // The geometry this host has chosen, or zeroes for "match the screen". Looked up here rather than
     // carried on the tab because it is a stored setting: editing it and coming back has to take effect.
     val hostGeometry = remember(state.hosts, activeTab.hostId) {
@@ -2155,7 +2165,7 @@ private fun TerminalScreen(
     // when this screen leaves composition or the app stops, which is the signal the view model uses to
     // stop producing frames nobody can see.
     val currentFrames by frames.collectAsStateWithLifecycle()
-    val frame = currentFrames[activeTab.hostId] ?: TerminalFrame.EMPTY
+    val frame = currentFrames[activeTab.id] ?: TerminalFrame.EMPTY
     val latches = rememberTerminalLatches()
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -2291,8 +2301,8 @@ private fun TerminalScreen(
             onSaveText = { onSaveText(activeTab.hostId, terminalText) },
             onSaveScreen = { onSaveScreen(activeTab.hostId, terminalText) },
             onCopyAll = { onCopyText(terminalText) },
-            onPaste = { onPaste(activeTab.hostId) },
-            onScrollToBottom = { onScrollTo(activeTab.hostId, 0) },
+            onPaste = { onPaste(activeTab.id) },
+            onScrollToBottom = { onScrollTo(activeTab.id, 0) },
             keyRowVisible = state.settings.terminalKeyRowVisible,
             onToggleKeyRow = { onKeyRowVisible(!state.settings.terminalKeyRowVisible) },
             searchQuery = searchQuery,
@@ -2350,14 +2360,14 @@ private fun TerminalScreen(
                             selection = null
                             showKeyboard()
                         } else {
-                            onCopySelection(activeTab.hostId, finished)
+                            onCopySelection(activeTab.id, finished)
                         }
                     },
-                    onScroll = { delta -> onScroll(activeTab.hostId, delta) },
+                    onScroll = { delta -> onScroll(activeTab.id, delta) },
                     onTap = {
                         if (selection != null) selection = null else showKeyboard()
                     },
-                    onViewportChange = { columns, rows -> onResize(activeTab.hostId, columns, rows) },
+                    onViewportChange = { columns, rows -> onResize(activeTab.id, columns, rows) },
                     onZoom = { scale, ended ->
                         // The gesture reports a factor against its own start, so the start size has to
                         // be captured once: reading the current size every step would compound the
@@ -2374,13 +2384,13 @@ private fun TerminalScreen(
                         }
                     },
                     onLongPressCell = { line, column ->
-                        val text = state.terminalLine(activeTab.hostId, line)
+                        val text = state.terminalLine(activeTab.id, line)
                         selection = TerminalSelection.wordAt(line, column, text)
                             // The line's own length, not the grid's: scrollback printed at a wider
                             // terminal keeps every character, and a whole-line selection that stopped
                             // at the current width would copy a truncated line.
                             ?: TerminalSelection.wholeLine(line, maxOf(frame.columns, text.length))
-                        selection?.let { onCopySelection(activeTab.hostId, it) }
+                        selection?.let { onCopySelection(activeTab.id, it) }
                     },
                 )
                 if (frame.totalLines > 0 && frame.firstLine + frame.lines.size < frame.totalLines) {
@@ -2388,7 +2398,7 @@ private fun TerminalScreen(
                     // clue is that nothing moves, which reads as a hung session.
                     ScrollbackBadge(
                         lines = frame.totalLines - (frame.firstLine + frame.lines.size),
-                        onJump = { onScrollTo(activeTab.hostId, 0) },
+                        onJump = { onScrollTo(activeTab.id, 0) },
                         modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
                     )
                 }
@@ -2408,7 +2418,7 @@ private fun TerminalScreen(
             TerminalKeyRow(
                 latches = latches,
                 onKey = { key, ctrl, alt, shift ->
-                    onSendKey(activeTab.hostId, key, ctrl, alt, shift)
+                    onSendKey(activeTab.id, key, ctrl, alt, shift)
                     // Every cap is a clickable surface, and a clickable surface is focusable: a tap can
                     // leave the IME host unfocused, after which the software keyboard's characters and a
                     // hardware keyboard's keys both have nowhere to go while the row itself still works.
@@ -2424,7 +2434,7 @@ private fun TerminalScreen(
                 onCommand = { command = it; historyIndex = -1 },
                 onRecall = recall,
                 onSend = {
-                    onSendInput(activeTab.hostId, command + "\n")
+                    onSendInput(activeTab.id, command + "\n")
                     command = ""
                     historyIndex = -1
                 },
@@ -2441,9 +2451,9 @@ private fun TerminalScreen(
         TerminalInputBridge(
             focusRequester = focusRequester,
             latches = latches,
-            onText = { text -> onSendText(activeTab.hostId, text) },
-            onKey = { key, ctrl, alt, shift -> onSendKey(activeTab.hostId, key, ctrl, alt, shift) },
-            onChar = { char, ctrl, alt -> onSendChar(activeTab.hostId, char, ctrl, alt) },
+            onText = { text -> onSendText(activeTab.id, text) },
+            onKey = { key, ctrl, alt, shift -> onSendKey(activeTab.id, key, ctrl, alt, shift) },
+            onChar = { char, ctrl, alt -> onSendChar(activeTab.id, char, ctrl, alt) },
             onFocusChanged = { focused -> inputFocused = focused },
         )
     }
@@ -2455,7 +2465,7 @@ private fun TerminalScreen(
             // Typed into the remote shell rather than into a form, so the shell's own line editing
             // applies: the snippet arrives on the command line where it can be corrected before Enter,
             // which is what a snippet is for. Deliberately not sent with a newline.
-            onInsert = { snippet -> onSendText(activeTab.hostId, snippet.command); showSnippets = false; showKeyboard() },
+            onInsert = { snippet -> onSendText(activeTab.id, snippet.command); showSnippets = false; showKeyboard() },
             onSaveCurrent = { showSnippets = false; showSaveSnippet = true },
             onDelete = onDeleteSnippet,
         )
@@ -2568,7 +2578,7 @@ private fun TerminalSessionsScreen(
                     startedAt = remember(tab.startedAt, timeFormat) {
                         timeFormat.format(java.util.Date(tab.startedAt))
                     },
-                    lastOutput = state.terminalOutput[tab.hostId],
+                    lastOutput = state.terminalOutput[tab.id],
                     // This session's own lines only - see [sessionDiagnostics]. Computed per row and
                     // not remembered: the ring changes while a ladder runs, which is exactly when the
                     // sheet is open and reading it.
@@ -2807,8 +2817,8 @@ private fun SessionRow(
  * viewport. The transcript is the whole buffer in the same line order, so indexing it gives the line
  * even when the tap landed on scrollback. Out of range returns empty, which selects nothing.
  */
-private fun MainUiState.terminalLine(hostId: String, line: Int): String {
-    val text = terminalOutput[hostId] ?: return ""
+private fun MainUiState.terminalLine(sessionKey: String, line: Int): String {
+    val text = terminalOutput[sessionKey] ?: return ""
     return text.lineSequence().elementAtOrNull(line).orEmpty()
 }
 
@@ -4919,8 +4929,12 @@ private fun GlobalSearchDialog(state: MainUiState, onDismiss: () -> Unit, onSele
     val snippetResults = remember(state.snippets, query) {
         if (query.isBlank()) emptyList() else state.snippets.filter { it.label.contains(query, ignoreCase = true) || it.command.contains(query, ignoreCase = true) }
     }
-    val terminalMatches = remember(state.hosts, state.terminalOutput, query) {
-        if (query.isBlank()) emptyList() else state.hosts.filter { host -> state.terminalOutput[host.id].orEmpty().contains(query, ignoreCase = true) }
+    // Matched against every shell the host has, not just its first: a host with duplicated terminals
+    // keeps a transcript per tab, and text typed into the second one is no less findable.
+    val terminalMatches = remember(state.hosts, state.tabs, state.terminalOutput, query) {
+        if (query.isBlank()) emptyList() else state.hosts.filter { host ->
+            state.tabs.any { tab -> tab.hostId == host.id && state.terminalOutput[tab.id].orEmpty().contains(query, ignoreCase = true) }
+        }
     }
     AlertDialog(
         onDismissRequest = onDismiss,

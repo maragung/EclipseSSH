@@ -301,6 +301,28 @@ class SshSessionStore @Inject constructor() {
         sessions.keys.toList().filterTo(mutableSetOf()) { hostOf[it] == hostId }
 
     /**
+     * Each live session key with the host it is filed under, for the sweeps that visit every session.
+     *
+     * The liveness probe is the caller: a network change has to ask *each* session whether it survived,
+     * and the trace it writes while doing so is host-keyed. [liveHostIds] is not enough for that — two
+     * terminals on one host would collapse into one entry, and whichever session the probe picked, the
+     * other would never be asked.
+     */
+    fun liveKeysByHost(): List<Pair<String, String>> =
+        sessions.keys.toList().mapNotNull { key -> hostOf[key]?.takeIf { isLive(key) }?.let { key to it } }
+
+    /**
+     * The session host-scoped callers should reach [hostId] through, if the host has a live one.
+     *
+     * SFTP, transfers, saved forwards and the stats producer all belong to the *host* — they are one
+     * channel on one transport, not one per terminal — so they cannot know which of the host's session
+     * keys is the right one and should not have to. [primarySessionFor] picks the key (a session a
+     * terminal can adopt whole, else the first live one); this hands back the session itself, in the
+     * shape those callers already use.
+     */
+    fun primarySession(hostId: String): ClientSession? = primarySessionFor(hostId)?.let { liveSession(it) }
+
+    /**
      * The session key a UI attaching to [hostId] should use, if the host has anything to offer.
      *
      * Prefers a session a terminal can adopt whole — live *and* with its shell still open, scrollback

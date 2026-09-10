@@ -52,9 +52,11 @@ class SftpFileSystemProvider(
      * Every operation starts here rather than at connect time, because a provider instance outlives
      * the session it was made for: it sits in the explorer's state while the user reconnects, and
      * the next operation should find the new session through the store instead of holding a stale
-     * channel to a dead transport.
+     * channel to a dead transport. Asked host-wide rather than by key: SFTP is one channel on the
+     * host's primary session, not one per terminal, and the provider cannot know which of the host's
+     * session keys is holding it.
      */
-    private fun session() = sessionStore.liveSession(hostId)
+    private fun session() = sessionStore.primarySession(hostId)
         ?: throw IllegalStateException("$hostName is not connected")
 
     private suspend fun <T> channel(block: suspend (SftpClient) -> T): T =

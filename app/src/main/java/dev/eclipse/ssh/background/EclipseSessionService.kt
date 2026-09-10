@@ -229,7 +229,11 @@ class EclipseSessionService : LifecycleService() {
                     .mapNotNull { it.hostId }
                     .toSet()
             } else emptySet()
-            val pending = hostsNeedingRestore(hosts, activeIds, { sessionStore.isLive(it) }, askFirst) {
+            // Host-wide liveness, because a host's session may be filed under a terminal tab's key
+            // rather than the host's own: with more than one terminal per host the host-id slot is
+            // only one of several, and a pass that read it alone would redial a host whose shell is
+            // alive on screen.
+            val pending = hostsNeedingRestore(hosts, activeIds, { sessionStore.liveForHost(it).isNotEmpty() }, askFirst) {
                 it.id in transferHostIds
             }
             var connected = 0
@@ -253,8 +257,9 @@ class EclipseSessionService : LifecycleService() {
                 // finds for free.
                 val outcome = sessionStore.tryDialing(host.id) {
                     // The re-check is the point of the gate: whatever appeared while this host waited
-                    // its turn is a session to adopt, not one to duplicate.
-                    sessionStore.liveSession(host.id) ?: dial(host)
+                    // its turn is a session to adopt, not one to duplicate. Asked host-wide, because
+                    // what appeared may be the UI's session filed under a terminal tab's key.
+                    sessionStore.primarySession(host.id) ?: dial(host)
                 }
                 val session = when (outcome) {
                     DialAttempt.Busy -> {

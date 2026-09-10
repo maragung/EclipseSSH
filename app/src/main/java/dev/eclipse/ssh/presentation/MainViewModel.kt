@@ -618,12 +618,18 @@ class MainViewModel @Inject constructor(
         transportScope.launch {
             val hosts = runCatching { hostRepository.hosts.first() }.getOrDefault(emptyList())
             adoptable.forEach { hostId ->
-                val terminal = channels[hostId] ?: return@forEach
                 if (tabs.value.any { it.hostId == hostId }) return@forEach
                 val host = hosts.firstOrNull { it.id == hostId } ?: return@forEach
-                val buffer = terminalBuffers.getOrPut(hostId) { AnsiTerminalBuffer() }
-                updateTab(hostId) { existing ->
-                    (existing ?: SessionTab(hostId = hostId, title = host.name)).copy(
+                // The session's key travels with it: the tab takes the id the session is already filed
+                // under (the host's own id for a service restore, the previous tab's id for a process
+                // restart), so everything keyed by session - buffers, channels, the pty size the next
+                // reconnect will want - is already where the new tab will look for it. A fresh id would
+                // orphan all of it.
+                val sessionKey = sessionStore.primarySessionFor(hostId) ?: return@forEach
+                val terminal = channels[sessionKey] ?: return@forEach
+                val buffer = terminalBuffers.getOrPut(sessionKey) { AnsiTerminalBuffer() }
+                updateTab(sessionKey) { existing ->
+                    (existing ?: SessionTab(id = sessionKey, hostId = hostId, title = host.name)).copy(
                         state = SessionConnectionState.CONNECTED,
                         lastError = null,
                     )
@@ -637,9 +643,9 @@ class MainViewModel @Inject constructor(
                     channel = terminal.channelLabel,
                     idleForMs = terminal.idleForMs(),
                 )
-                terminalJobs.remove(hostId)?.cancelAndJoin()
-                terminalJobs[hostId] = launchTerminalCollector(hostId, terminal, buffer)
-                publishTerminalFrame(hostId, buffer)
+                terminalJobs.remove(sessionKey)?.cancelAndJoin()
+                terminalJobs[sessionKey] = launchTerminalCollector(sessionKey, hostId, terminal, buffer)
+                publishTerminalFrame(sessionKey, buffer)
             }
         }
     }
@@ -689,7 +695,7 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             val host = runCatching { hostRepository.hosts.first() }.getOrNull()
                 ?.firstOrNull { it.id == prompt.hostId } ?: return@launch
-            connect(host, resuming = true)
+            connect(host, resuming = true, sessionKey = prompt.sessionId)
         }
     }
 
@@ -700,25 +706,49 @@ class MainViewModel @Inject constructor(
         keyBytes: ByteArray? = null,
         keyPassphrase: String? = null,
         resuming: Boolean = false,
+        sessionKey: String? = null,
+        adopt: Boolean = true,
     ) {
-        // First, and synchronously: from here on this is the dial that speaks for this host, and every
-        // attempt still unwinding somewhere behind it is one whose report the user must not be shown.
-        val dial = dialGenerations.computeIfAbsent(host.id) { AtomicLong() }.incrementAndGet()
+        // Which session this dial speaks for. A session is owned by its *key* — the terminal tab's id —
+        // and this is the one place that decides it, before the tab exists:
+        //
+        //  - a caller that already knows (the reconnect ladder and the prompt answer, for a specific
+        //    tab) says so outright;
+        //  - a host with a tab open resolves to that tab, so tapping Connect on the host's card
+        //    reconnects the session the user is already watching rather than opening a twin;
+        //  - otherwise the host's own id, which is what the first tab of a host claims as its key — and
+        //    also the key the background service restores under, so a session a restore pass left there
+        //    is found by the adoption below instead of being dialled past.
+        //
+        // `adopt` is false only for a deliberate second terminal to the same host, which must not claim
+        // anything the host already has: that is the feature, not a race to be resolved.
+        val key = sessionKey
+            ?: tabs.value.firstOrNull { it.hostId == host.id }?.id
+            ?: host.id
+        // A session sitting in the service's host-id slot with no tab of its own — restored while the
+        // UI's own session was down — is this dial's to claim. Moving it under the key above (usually a
+        // no-op, because they are already the same string) is what lets [adoptStoredSession] find it
+        // and open a shell on it rather than logging in a second time. Refused when the key already
+        // holds anything, which is the tab's own live session saying so.
+        if (adopt) sessionStore.rekey(host.id, key)
+        // First, and synchronously: from here on this is the dial that speaks for this session, and
+        // every attempt still unwinding somewhere behind it is one whose report the user must not be shown.
+        val dial = dialGenerations.computeIfAbsent(key) { AtomicLong() }.incrementAndGet()
         selectedHostId.value = host.id
         pendingConnection = PendingConnection(host, password, keyPair, keyBytes, keyPassphrase, resuming)
         // Asking for this session by hand is a fresh start, whatever the last one did: the allowance
         // is only spent by the ladder's own attempts, and a user who has just tapped Connect (or
         // Reconnect on a tab that gave up) is entitled to all of it. The ladder's own attempt passes
         // `resuming` and must not reset anything - that is the whole point of counting.
-        if (!resuming) reconnectAttempts.remove(host.id)
+        if (!resuming) reconnectAttempts.remove(key)
         // A fresh manual dial retires any prompt a previous one raised: the user has already acted,
         // and a dialog about an attempt they replaced would sit on top of the one they are watching.
         if (!resuming) authFailure.value = null
         // A reconnect stays RECONNECTING for the whole attempt, keeping the sentence the ladder wrote
         // ("attempt 2 of 5"). Overwriting it with CONNECTING each time round would tell the user the
         // app had started something new, when what is happening is that it has not given up yet.
-        updateTab(host.id) { existing ->
-            (existing ?: SessionTab(hostId = host.id, title = host.name)).copy(
+        updateTab(key) { existing ->
+            (existing ?: SessionTab(id = key, hostId = host.id, title = host.name)).copy(
                 state = if (resuming) SessionConnectionState.RECONNECTING else SessionConnectionState.CONNECTING,
                 lastError = if (resuming) existing?.lastError else null,
             )
@@ -728,16 +758,16 @@ class MainViewModel @Inject constructor(
             if (resuming) SessionEvent.RECONNECT_ATTEMPT else SessionEvent.CONNECT_REQUESTED,
             state = if (resuming) SessionConnectionState.RECONNECTING else SessionConnectionState.CONNECTING,
             network = networkMonitor.describe(),
-            attempt = reconnectAttempts[host.id]?.takeIf { resuming },
+            attempt = reconnectAttempts[key]?.takeIf { resuming },
         )
-        // Replace any attempt still running for this host so a double tap cannot leave an
+        // Replace any attempt still running for this session so a double tap cannot leave an
         // orphaned session behind.
-        connectJobs.remove(host.id)?.cancel()
+        connectJobs.remove(key)?.cancel()
         // A user asking to connect now outranks a backoff waiting to do it later, and leaving the
         // waiter alive would let it fire a second connect on top of this one. Not when this *is* the
         // ladder's own attempt: cancelling the job that is running this code would kill the attempt.
         if (!resuming) {
-            reconnectJobs.remove(host.id)?.let { waiting ->
+            reconnectJobs.remove(key)?.let { waiting ->
                 waiting.cancel()
                 diagnostics.record(host.id, SessionEvent.RECONNECT_CANCELLED, detail = "connect requested")
             }
@@ -750,13 +780,15 @@ class MainViewModel @Inject constructor(
             val resolved = resolveCredentials(host, password, keyPair, keyBytes, keyPassphrase, resuming)
             // Recorded before the first attempt, so even a host that never gets a shell open has its
             // rules on file for the ladder that answers the failure.
-            reconnectPolicies[host.id] = reconnectPolicyOf(host)
-            // Everything from here to the shell being on screen happens under this host's dial gate,
-            // which is what stops two dials to the same account existing at once. The service's
-            // restore pass takes the same gate, so the pass that used to run concurrently with this
-            // one - tapping Connect is what starts the service - now waits, finds the session this
-            // attempt installed, and adopts it. See [SshSessionStore.dialing].
-            sessionStore.dialing(host.id) {
+            reconnectPolicies[key] = reconnectPolicyOf(host)
+            // Everything from here to the shell being on screen happens under this session's dial gate,
+            // which is what stops two dials behind the same key existing at once. The gate is per key
+            // rather than per host on purpose: a second terminal to the same host is a feature, and
+            // serialising it behind the first one's handshake would make it wait for no reason. The
+            // service's restore pass takes the host-id key's gate, so a pass that runs concurrently
+            // with a *duplicate* dial can still produce one extra live session — the accepted cost of
+            // never closing a session another key is using. See [SshSessionStore.dialing].
+            sessionStore.dialing(key) {
                 var lastError: Throwable? = null
                 for (attempt in 0 until MAX_CONNECT_ATTEMPTS) {
                     try {
@@ -764,23 +796,23 @@ class MainViewModel @Inject constructor(
                         // waited for it is one to use, not one to duplicate - and asked on every attempt,
                         // because a restore pass can install one between two of them. See
                         // [adoptStoredSession] for the two shapes that count.
-                        if (adoptStoredSession(host, dial, resolved, resuming)) return@dialing
+                        if (adoptStoredSession(host, key, dial, resolved, resuming)) return@dialing
                         val session = sshConnectionManager.connect(host, resolved.password, resolved.keyPair) { phase ->
-                            onConnectPhase(host.id, dial, phase, resuming, attempt)
+                            onConnectPhase(key, host.id, dial, phase, resuming, attempt)
                         }
                         // The tab may have been closed (or the host deleted) while the handshake
                         // was in flight. Honour that instead of resurrecting the tab — and tear
                         // the new session down so it does not leak. Dereferencing the missing tab
                         // here used to throw an NPE inside the coroutine and crash the app.
-                        if (tabs.value.none { it.hostId == host.id }) {
+                        if (tabs.value.none { it.id == key }) {
                             runCatching { session.close(false) }
                             return@dialing
                         }
-                        val size = ptySizes[host.id]
+                        val size = ptySizes[key]
                         // Authenticated. Everything from here is the channel and the pty, and it is worth
                         // saying so: a server that accepts the password and then cannot give out a pty
                         // used to spend that whole time claiming to be connecting.
-                        markOpeningShell(host.id, dial, resuming)
+                        markOpeningShell(key, dial, resuming)
                         // The session is authenticated but still unowned: [SshSessionStore.install] is
                         // what hands it to the app, and it runs only after the shell is open. A server
                         // that logs the user in and then refuses the channel - `MaxSessions 0`,
@@ -800,10 +832,10 @@ class MainViewModel @Inject constructor(
                             throw error
                         }
                         // Never replaces a live session with this one: if another dialler installed one
-                        // for this host while this handshake was in flight, that session is the one the
+                        // under this key while the handshake was in flight, that session is the one the
                         // app keeps and this one is the redundant half of a duplicate - the opposite of
                         // what `put` did, which closed the session the user was already typing into.
-                        val installed = sessionStore.install(host.id, session, host.id)
+                        val installed = sessionStore.install(key, session, host.id)
                         if (installed !== session) {
                             // Ours lost, so its pty goes with it. Marked first so its collector reports
                             // the app's decision rather than an outage the reconnect ladder would answer.
@@ -812,10 +844,10 @@ class MainViewModel @Inject constructor(
                             // The incumbent may have no shell on it - a restore pass installs
                             // transport-only sessions - so adopting has to be able to open one. Going
                             // round the loop instead would only lose the same race again, forever.
-                            if (adoptStoredSession(host, dial, resolved, resuming)) return@dialing
+                            if (adoptStoredSession(host, key, dial, resolved, resuming)) return@dialing
                             continue
                         }
-                        attachTerminal(host, terminal, resolved)
+                        attachTerminal(host, key, terminal, resolved)
                         return@dialing
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -836,11 +868,11 @@ class MainViewModel @Inject constructor(
                             // Named by the phase it failed in, read off the tab before it is overwritten.
                             // See [retryNotice] for why one message for all of them was actively
                             // misleading, and [retryPhase] for why this is no longer RECONNECTING.
-                            updateTab(host.id) { tab ->
-                                // Not this host's dial any more: a countdown belonging to an attempt the
+                            updateTab(key) { tab ->
+                                // Not this session's dial any more: a countdown belonging to an attempt the
                                 // user has already replaced would sit on top of the one they are waiting
                                 // for, counting attempts that are no longer being made.
-                                if (!isCurrentDial(host.id, dial)) return@updateTab tab
+                                if (!isCurrentDial(key, dial)) return@updateTab tab
                                 tab?.copy(
                                     state = retryPhase(tab.state),
                                     lastError = retryNotice(
@@ -861,11 +893,11 @@ class MainViewModel @Inject constructor(
                 // the credentials, the host, the network - has to change before trying again is worth
                 // anything, and the tab says so in red rather than in the amber of a finished session.
                 val reason = describeConnectFailure(lastError)
-                updateTab(host.id) { tab ->
+                updateTab(key) { tab ->
                     // See [dialGenerations]. This attempt did fail, and the trace below says so - but a
                     // failure is only news about the session the user is watching if it is still that
                     // session's failure.
-                    if (isCurrentDial(host.id, dial)) {
+                    if (isCurrentDial(key, dial)) {
                         tab?.copy(state = SessionConnectionState.ERROR, lastError = reason)
                     } else {
                         tab
@@ -874,7 +906,7 @@ class MainViewModel @Inject constructor(
                 // A refused login asks the user for the one thing that can change the outcome: the
                 // credential. Everything else stays a status line, because for those the answer is
                 // "wait" or "check the network", not a field to type into.
-                if (isCurrentDial(host.id, dial) && !resuming && isCredentialRejection(lastError)) {
+                if (isCurrentDial(key, dial) && !resuming && isCredentialRejection(lastError)) {
                     authFailure.value = AuthFailurePrompt(hostId = host.id, hostName = host.name, reason = reason)
                 }
                 diagnostics.record(
@@ -883,13 +915,13 @@ class MainViewModel @Inject constructor(
                     state = SessionConnectionState.ERROR,
                     // Marked in the trace rather than hidden from it: a CONNECT_FAILED followed by a
                     // session that came up is otherwise a contradiction a reader has to guess at.
-                    detail = if (isCurrentDial(host.id, dial)) reason else "$reason (superseded)",
+                    detail = if (isCurrentDial(key, dial)) reason else "$reason (superseded)",
                     network = networkMonitor.describe(),
                 )
             }
         }
-        connectJobs[host.id] = job
-        job.invokeOnCompletion { connectJobs.remove(host.id, job) }
+        connectJobs[key] = job
+        job.invokeOnCompletion { connectJobs.remove(key, job) }
     }
 
     /**
@@ -918,21 +950,22 @@ class MainViewModel @Inject constructor(
      */
     private suspend fun adoptStoredSession(
         host: HostProfile,
+        sessionKey: String,
         dial: Long,
         resolved: ResolvedCredentials,
         resuming: Boolean,
     ): Boolean {
-        sessionStore.adoptable(host.id)?.let { (_, existing) ->
+        sessionStore.adoptable(sessionKey)?.let { (_, existing) ->
             diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CONNECTED)
-            attachTerminal(host, existing, resolved)
+            attachTerminal(host, sessionKey, existing, resolved)
             return true
         }
-        val session = sessionStore.sessionAwaitingShell(host.id) ?: return false
+        val session = sessionStore.sessionAwaitingShell(sessionKey) ?: return false
         // Recorded before the shell is asked for, so a pty that never opens is attributable to the
         // session it was asked of rather than looking like a fresh handshake that stalled.
         diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
-        val size = ptySizes[host.id]
-        markOpeningShell(host.id, dial, resuming)
+        val size = ptySizes[sessionKey]
+        markOpeningShell(sessionKey, dial, resuming)
         val terminal = try {
             sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
         } catch (cancelled: CancellationException) {
@@ -943,7 +976,7 @@ class MainViewModel @Inject constructor(
             // whole ladder waiting on the same corpse. Dropped as found-dead - discard rather than
             // close, so nothing reports this as an ending the user asked for and the reconnect they
             // are waiting for is not suppressed.
-            sessionStore.discard(host.id)
+            sessionStore.discard(sessionKey)
             diagnostics.record(
                 host.id,
                 SessionEvent.ATTEMPT_FAILED,
@@ -954,7 +987,7 @@ class MainViewModel @Inject constructor(
             // dial in this attempt rather than one of the three attempts the user gets.
             return false
         }
-        attachTerminal(host, terminal, resolved)
+        attachTerminal(host, sessionKey, terminal, resolved)
         return true
     }
 
@@ -981,7 +1014,12 @@ class MainViewModel @Inject constructor(
      *    handover exclusive, and it is quick - every suspension point in the collector is cancellable
      *    and its teardown does no I/O.
      */
-    private suspend fun attachTerminal(host: HostProfile, terminal: TerminalChannel, resolved: ResolvedCredentials) {
+    private suspend fun attachTerminal(
+        host: HostProfile,
+        sessionKey: String,
+        terminal: TerminalChannel,
+        resolved: ResolvedCredentials,
+    ) {
         // First of everything here, and deliberately ahead of the collector below: the credential is
         // what the reconnect ladder answers an ending with, and the collector is what reports one. Left
         // where it used to be - after the tab was already CONNECTED - the two raced on every session
@@ -991,8 +1029,8 @@ class MainViewModel @Inject constructor(
         // here. Honoured now, before anything below runs: the rest of this function presents a session
         // to the user, and an attempt that has been replaced by another has none to present.
         currentCoroutineContext().ensureActive()
-        terminalJobs.remove(host.id)?.cancelAndJoin()
-        channels.put(host.id, terminal)?.let { previous ->
+        terminalJobs.remove(sessionKey)?.cancelAndJoin()
+        channels.put(sessionKey, terminal)?.let { previous ->
             // Never the channel just installed: adopting hands back the channel that is already in
             // the map, and closing it would end the session this call exists to present.
             if (previous !== terminal) {
@@ -1000,7 +1038,7 @@ class MainViewModel @Inject constructor(
                 runCatching { previous.close() }
             }
         }
-        val buffer = terminalBuffers.getOrPut(host.id) { AnsiTerminalBuffer() }
+        val buffer = terminalBuffers.getOrPut(sessionKey) { AnsiTerminalBuffer() }
         /*
          * The local half of the size the pty was just opened at.
          *
@@ -1022,14 +1060,14 @@ class MainViewModel @Inject constructor(
          * grid catching up with what the far end was already told, and recording it as a resize would
          * put a window-change in the trace that never went out on the wire.
          */
-        ptySizes[host.id]?.let { (columns, rows) -> buffer.resize(columns, rows) }
-        terminalJobs[host.id] = launchTerminalCollector(host.id, terminal, buffer)
+        ptySizes[sessionKey]?.let { (columns, rows) -> buffer.resize(columns, rows) }
+        terminalJobs[sessionKey] = launchTerminalCollector(sessionKey, host.id, terminal, buffer)
         // An adopted session may be sitting at a prompt with nothing to say, and the collector only
         // publishes when output arrives - so without this the scrollback the user already had would
         // stay off screen until they pressed a key.
-        publishTerminalFrame(host.id, buffer)
-        updateTab(host.id) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
-        connectedAt[host.id] = SystemClock.elapsedRealtime()
+        publishTerminalFrame(sessionKey, buffer)
+        updateTab(sessionKey) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
+        connectedAt[sessionKey] = SystemClock.elapsedRealtime()
         diagnostics.record(
             host.id,
             SessionEvent.SHELL_OPEN,
@@ -1060,7 +1098,7 @@ class MainViewModel @Inject constructor(
         if (host.autoLoginSftp) {
             loginSftp(host)
         } else {
-            updateTab(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
+            updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
         }
         // Last, and after the tab is already CONNECTED: the shell is the session, and the tunnels are a
         // convenience attached to it. See [startSavedForwards] for why a tunnel that cannot bind is not
@@ -1095,14 +1133,17 @@ class MainViewModel @Inject constructor(
         // nothing claimed on its tab.
         stopSavedForwards(host.id)
         val rules = decodeForwardRules(host.savedForwards, host.id)
-        updateTab(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size, forwardError = null) }
+        updateHostTabs(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size, forwardError = null) }
         if (rules.isEmpty()) return
         val job = transportScope.launch {
-            val session = sessions[host.id]
+            // Forwards belong to the host, not to whichever terminal came up last, so the session they
+            // ride is the host's primary one - with a single terminal that is the session that just
+            // attached; with several, the first live session the host has.
+            val session = sessionStore.primarySession(host.id)
             if (session == null) {
                 // Not an error worth a message: the only way to get here is a session that ended between
                 // the shell opening and this line, and whatever ended it is already on the tab.
-                updateTab(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size) }
+                updateHostTabs(host.id) { it?.copy(forwardsOpen = 0, forwardsTotal = rules.size) }
                 return@launch
             }
             var open = 0
@@ -1122,11 +1163,11 @@ class MainViewModel @Inject constructor(
                 }
                 // Written as each one lands rather than once at the end, so a rule that takes a while to
                 // bind does not hide the ones that already worked.
-                updateTab(host.id) { it?.copy(forwardsOpen = open, forwardsTotal = rules.size) }
+                updateHostTabs(host.id) { it?.copy(forwardsOpen = open, forwardsTotal = rules.size) }
             }
             if (failures.isEmpty()) return@launch
             val reason = failures.joinToString(" · ")
-            updateTab(host.id) { it?.copy(forwardError = reason) }
+            updateHostTabs(host.id) { it?.copy(forwardError = reason) }
             // One message for the whole set, and it names the host: this fires on a reconnect the user
             // may not have asked for, so a snackbar per failed rule on a flaky link would be a queue of
             // notifications about the same two ports.
@@ -1329,6 +1370,7 @@ class MainViewModel @Inject constructor(
      * [buffer] is confined to this coroutine, so the frame it renders is always a whole one.
      */
     private fun launchTerminalCollector(
+        sessionKey: String,
         hostId: String,
         terminal: TerminalChannel,
         buffer: AnsiTerminalBuffer,
@@ -1371,7 +1413,7 @@ class MainViewModel @Inject constructor(
         val transcript = launch {
             for (unused in transcriptDue) {
                 delay(TERMINAL_TEXT_MS)
-                publishTerminalText(hostId, buffer, force = true)
+                publishTerminalText(sessionKey, buffer, force = true)
             }
         }
         // Notices that the far end is gone, which nothing used to. [TerminalChannel.output] is a
@@ -1394,7 +1436,7 @@ class MainViewModel @Inject constructor(
             // where there is nothing left to protect and a session that never reported its end would
             // be the worse outcome.
             if (withTimeoutOrNull(TERMINAL_DRAIN_MS) { pump.join() } == null) incoming.close()
-            // Only if nothing newer has taken this host over. A reconnect cancels this coroutine
+            // Only if nothing newer has taken this session over. A reconnect cancels this coroutine
             // before it closes the channel it is replacing, so ordinarily it never sees that close -
             // but a cancel is a request, not a suspension of physics: this can already have been
             // resumed on another core, and reporting a replaced channel as a disconnection would
@@ -1406,9 +1448,9 @@ class MainViewModel @Inject constructor(
             // that sweep and this handler raced for the same entry, and when the sweep won, this
             // returned early and the tab that had just lost its connection was left saying CONNECTED,
             // with nothing scheduled to bring it back.
-            val current = channels[hostId]
+            val current = channels[sessionKey]
             if (current == null || current === terminal) {
-                channels.remove(hostId, terminal)
+                channels.remove(sessionKey, terminal)
                 // A close the app asked for is not an outage, and must not be described as one: the
                 // tab is already going wherever the caller is taking it - closed, replaced by a
                 // reconnect, or ended by Stop sessions - and overwriting it with "Disconnected from
@@ -1419,7 +1461,7 @@ class MainViewModel @Inject constructor(
                         SessionEvent.CLOSED_BY_USER,
                         channel = terminal.channelLabel,
                         idleForMs = terminal.idleForMs(),
-                        upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it },
+                        upForMs = connectedAt.remove(sessionKey)?.let { SystemClock.elapsedRealtime() - it },
                     )
                     return@launch
                 }
@@ -1434,16 +1476,16 @@ class MainViewModel @Inject constructor(
                 // again. Declines to touch a session that is still live, which is the ordinary case when
                 // a shell exits under a transport still carrying an SFTP transfer. See
                 // [SshSessionStore.reap].
-                val reaped = sessionStore.reap(hostId)
+                val reaped = sessionStore.reap(sessionKey)
                 // Read once, here, because two things now depend on it: the trace, and whether this
                 // ending starts a new ladder or continues the one already running.
-                val upForMs = connectedAt.remove(hostId)?.let { SystemClock.elapsedRealtime() - it }
+                val upForMs = connectedAt.remove(sessionKey)?.let { SystemClock.elapsedRealtime() - it }
                 // A session that stood up for a while and then dropped is a *new* outage and gets the
                 // full allowance back. One that died shortly after coming up is flapping, and its
                 // allowance carries over so that five of those in a row reach the end of the ladder and
                 // say what happened, instead of reconnecting for as long as the app is open. See
                 // [STABLE_SESSION_MS] for why the threshold is minutes rather than seconds.
-                if (upForMs != null && upForMs >= STABLE_SESSION_MS) reconnectAttempts.remove(hostId)
+                if (upForMs != null && upForMs >= STABLE_SESSION_MS) reconnectAttempts.remove(sessionKey)
                 // A shell the far end hung up on before it produced a single byte. Answering that with a
                 // ladder is the loop users report, so it is answered with the server's reason instead.
                 // See [endedBeforeItRan] for how narrow this is.
@@ -1456,9 +1498,9 @@ class MainViewModel @Inject constructor(
                 val refused = refusedBeforeOutput || refusedByServer
                 val willReconnect = !refused && shouldAutoReconnect(
                     end,
-                    tabIsOpen = tabs.value.any { it.hostId == hostId },
+                    tabIsOpen = tabs.value.any { it.id == sessionKey },
                     endedDeliberately = false,
-                    autoReconnectEnabled = reconnectPolicies[hostId]?.enabled ?: true,
+                    autoReconnectEnabled = reconnectPolicies[sessionKey]?.enabled ?: true,
                 )
                 // A fault the ladder is about to answer is a *reconnecting* tab, not an error one.
                 // Writing ERROR here and RECONNECTING a moment later - from inside the scheduling
@@ -1480,7 +1522,7 @@ class MainViewModel @Inject constructor(
                     refusedBeforeOutput -> "$endReason · closed before the shell produced any output, so it was not retried"
                     else -> endReason
                 }
-                updateTab(hostId) { it?.copy(state = ended, lastError = reason) }
+                updateTab(sessionKey) { it?.copy(state = ended, lastError = reason) }
                 diagnostics.record(
                     hostId,
                     SessionEvent.ENDED,
@@ -1499,12 +1541,15 @@ class MainViewModel @Inject constructor(
                     upForMs = upForMs,
                 )
                 if (willReconnect) {
-                    scheduleAutoReconnect(hostId, reason)
+                    scheduleAutoReconnect(sessionKey, hostId, reason)
                 } else {
                     // A shell that exited is finished with its session; nothing is going to use the
                     // transport again, and leaving it open would hold a socket and a heartbeat for a
-                    // tab showing a dead prompt.
-                    sessions.remove(hostId)?.let { session -> runCatching { session.close(false) } }
+                    // tab showing a dead prompt. Keyed by session, so this can only ever be closing
+                    // the transport under *this* terminal - a sibling terminal to the same host holds
+                    // its own session under its own key and is not touched. Through the store rather
+                    // than the raw map, so the host index entry goes with it.
+                    sessionStore.close(sessionKey)
                 }
             }
         }
@@ -1519,9 +1564,9 @@ class MainViewModel @Inject constructor(
                     buffer.feed(decoder.decode(chunk!!))
                     chunk = incoming.tryReceive().getOrNull()
                 } while (chunk != null)
-                pinScrollback(hostId, buffer, before)
-                publishTerminalFrame(hostId, buffer)
-                if (!publishTerminalText(hostId, buffer)) transcriptDue.trySend(Unit)
+                pinScrollback(sessionKey, buffer, before)
+                publishTerminalFrame(sessionKey, buffer)
+                if (!publishTerminalText(sessionKey, buffer)) transcriptDue.trySend(Unit)
                 // Said once per session, and only if it ever happens. A hole in the transcript is
                 // something the user has to be told about: the emulator's state depends on having seen
                 // every byte, so what is on screen after a drop may be wrong in ways that look like the
@@ -1557,8 +1602,8 @@ class MainViewModel @Inject constructor(
             // catch-up it still owed, and at the end of a session there is no next chunk to trigger
             // another one - so a shell whose last second was throttled ended with its farewell on
             // screen but missing from the transcript that Search, Save logs and Save text all read.
-            publishTerminalFrame(hostId, buffer)
-            publishTerminalText(hostId, buffer, force = true)
+            publishTerminalFrame(sessionKey, buffer)
+            publishTerminalText(sessionKey, buffer, force = true)
         }
     }
 
@@ -1598,10 +1643,10 @@ class MainViewModel @Inject constructor(
      * [connectFailureIsFinal] treats as final, so this cannot turn a missing password into a retry
      * loop.
      */
-    private fun scheduleAutoReconnect(hostId: String, endReason: String) {
-        // The rules this host was dialled with, or the app-wide ones for a session nothing dialled -
+    private fun scheduleAutoReconnect(sessionKey: String, hostId: String, endReason: String) {
+        // The rules this session was dialled with, or the app-wide ones for a session nothing dialled -
         // one the service restored, or one adopted from a previous process. See [reconnectPolicies].
-        val policy = reconnectPolicies[hostId] ?: ReconnectPolicy.DEFAULT
+        val policy = reconnectPolicies[sessionKey] ?: ReconnectPolicy.DEFAULT
         val action = reconnectActionOnDrop(
             // Read from the UI state's cached settings rather than a fresh DataStore read, because
             // this is not a coroutine - the collector calls it directly - and a suspend read here
@@ -1609,7 +1654,7 @@ class MainViewModel @Inject constructor(
             // cache is at most one emission stale, and the setting changes only from the Settings
             // screen.
             askFirst = uiState.value.settings.reconnectAskFirst,
-            attemptsSpent = reconnectAttempts[hostId] ?: 0,
+            attemptsSpent = reconnectAttempts[sessionKey] ?: 0,
             maxAttempts = policy.maxAttempts,
         )
         // Ask-first mode: no ladder runs at all. The order is [reconnectActionOnDrop]'s - the mode
@@ -1617,7 +1662,7 @@ class MainViewModel @Inject constructor(
         // here rather than in the collector because the ending-path cannot know the mode; the
         // RECONNECTING it wrote first is replaced before any frame shows it.
         if (action == ReconnectAction.PROMPT) {
-            updateTab(hostId) {
+            updateTab(sessionKey) {
                 it?.copy(state = SessionConnectionState.DISCONNECTED, lastError = "$endReason · waiting for your answer")
             }
             diagnostics.record(
@@ -1627,14 +1672,19 @@ class MainViewModel @Inject constructor(
                 detail = endReason,
                 network = networkMonitor.describe(),
             )
-            val hostName = tabs.value.firstOrNull { it.hostId == hostId }?.name ?: hostId
-            reconnectPrompt.value = ReconnectPrompt(hostId = hostId, hostName = hostName, reason = endReason)
+            val hostName = tabs.value.firstOrNull { it.id == sessionKey }?.title ?: hostId
+            reconnectPrompt.value = ReconnectPrompt(
+                sessionId = sessionKey,
+                hostId = hostId,
+                hostName = hostName,
+                reason = endReason,
+            )
             return
         }
         val maxAttempts = policy.maxAttempts
         if (action == ReconnectAction.GIVE_UP) {
-            val attempt = (reconnectAttempts[hostId] ?: 0) + 1
-            updateTab(hostId) {
+            val attempt = (reconnectAttempts[sessionKey] ?: 0) + 1
+            updateTab(sessionKey) {
                 it?.copy(
                     state = SessionConnectionState.ERROR,
                     // The reason first, because it is the only part of this sentence anybody can act
@@ -1655,15 +1705,15 @@ class MainViewModel @Inject constructor(
             )
             return
         }
-        val attempt = (reconnectAttempts[hostId] ?: 0) + 1
-        reconnectAttempts[hostId] = attempt
+        val attempt = (reconnectAttempts[sessionKey] ?: 0) + 1
+        reconnectAttempts[sessionKey] = attempt
         val job = viewModelScope.launch {
             val globalSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
                 .getOrDefault(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
             val window = backoffWindowMs(policy.backoffSeconds(globalSeconds), attempt)
             // Jitter on top of the deterministic window, matching the service's ladder.
             val waitMs = window + Random.nextLong(0, window / 2 + 1)
-            updateTab(hostId) {
+            updateTab(sessionKey) {
                 it?.copy(
                     state = SessionConnectionState.RECONNECTING,
                     // The reason stays on screen for the whole ladder. It used to be overwritten the
@@ -1690,14 +1740,14 @@ class MainViewModel @Inject constructor(
             // handed back before parking — otherwise a long outage would arrive with an exhausted
             // ladder the moment it ended.
             if (!networkMonitor.online.value) {
-                reconnectAttempts[hostId] = attempt - 1
-                updateTab(hostId) {
+                reconnectAttempts[sessionKey] = attempt - 1
+                updateTab(sessionKey) {
                     it?.copy(state = SessionConnectionState.RECONNECTING, lastError = "Waiting for a network…")
                 }
                 networkMonitor.online.first { it }
             }
-            if (tabs.value.none { it.hostId == hostId }) return@launch
-            // Somebody else brought this host back while the ladder waited - a manual Reconnect, a UI
+            if (tabs.value.none { it.id == sessionKey }) return@launch
+            // Somebody else brought this session back while the ladder waited - a manual Reconnect, a UI
             // that adopted the session, the service's restore pass - and there is nothing left to do.
             //
             // The test is the *shell*, not the session. `isLive` was true for a live transport with no
@@ -1706,23 +1756,23 @@ class MainViewModel @Inject constructor(
             // that only needed a shell opened on it - permanently, because nothing else was scheduled.
             // Falling through hands it to [connect], which adopts it under the dial gate and opens that
             // shell without a second login. See [adoptStoredSession].
-            if (sessionStore.adoptable(hostId) != null) return@launch
+            if (sessionStore.adoptable(sessionKey) != null) return@launch
             val host = runCatching { hostRepository.hosts.first() }.getOrNull()?.firstOrNull { it.id == hostId }
             if (host == null) {
                 // The profile was deleted while the ladder was waiting: nothing left to reconnect to.
-                reconnectAttempts.remove(hostId)
+                reconnectAttempts.remove(sessionKey)
                 return@launch
             }
-            updateTab(hostId) {
+            updateTab(sessionKey) {
                 it?.copy(
                     state = SessionConnectionState.RECONNECTING,
                     lastError = "Reconnecting · attempt $attempt of $maxAttempts · $endReason",
                 )
             }
-            connect(host, resuming = true)
+            connect(host, resuming = true, sessionKey = sessionKey)
         }
-        reconnectJobs.put(hostId, job)?.cancel()
-        job.invokeOnCompletion { reconnectJobs.remove(hostId, job) }
+        reconnectJobs.put(sessionKey, job)?.cancel()
+        job.invokeOnCompletion { reconnectJobs.remove(sessionKey, job) }
     }
 
     /**
@@ -1738,13 +1788,13 @@ class MainViewModel @Inject constructor(
      *
      * A view that is already live is left alone - it is *supposed* to move.
      */
-    private fun pinScrollback(hostId: String, buffer: AnsiTerminalBuffer, linesBefore: Int) {
-        val offset = scrollOffsets[hostId] ?: return
+    private fun pinScrollback(sessionKey: String, buffer: AnsiTerminalBuffer, linesBefore: Int) {
+        val offset = scrollOffsets[sessionKey] ?: return
         if (offset <= 0) return
         val growth = buffer.lineCount() - linesBefore
         if (growth <= 0) return
         val ceiling = buffer.maxScrollOffset(buffer.viewportRows)
-        scrollOffsets[hostId] = (offset + growth).coerceIn(0, ceiling)
+        scrollOffsets[sessionKey] = (offset + growth).coerceIn(0, ceiling)
     }
 
     /**
@@ -1763,17 +1813,17 @@ class MainViewModel @Inject constructor(
      * concurrently, so the read-modify-write on the map has to be a compare-and-set or two hosts
      * printing at once can lose one of the entries until the next frame.
      */
-    private fun publishTerminalFrame(hostId: String, buffer: AnsiTerminalBuffer) {
-        if (!isDisplaying(hostId, buffer)) return
+    private fun publishTerminalFrame(sessionKey: String, buffer: AnsiTerminalBuffer) {
+        if (!isDisplaying(sessionKey, buffer)) return
         if (terminalFrames.subscriptionCount.value == 0) return
-        val frame = buffer.frame(scrollOffsets[hostId] ?: 0)
+        val frame = buffer.frame(scrollOffsets[sessionKey] ?: 0)
         // Asked a second time, from inside the update: the check above only decides whether the frame
         // is worth building. See [isDisplaying] for why the write is where the question has to be
         // settled. [newerTerminalFrame] settles the other question the write has to answer: whether
         // this frame is still the newest one anybody built.
         terminalFrames.update { current ->
-            if (!isDisplaying(hostId, buffer)) current
-            else current + (hostId to newerTerminalFrame(current[hostId], frame))
+            if (!isDisplaying(sessionKey, buffer)) current
+            else current + (sessionKey to newerTerminalFrame(current[sessionKey], frame))
         }
     }
 
@@ -1792,10 +1842,10 @@ class MainViewModel @Inject constructor(
     private fun republishFrames() {
         if (terminalBuffers.isEmpty()) return
         terminalFrames.update { current ->
-            current + terminalBuffers.entries.associate { (hostId, buffer) ->
+            current + terminalBuffers.entries.associate { (sessionKey, buffer) ->
                 // Same guard as the collector's publish, for the same reason: this builds one snapshot
                 // per open session and a session that is printing can publish a newer one in between.
-                hostId to newerTerminalFrame(current[hostId], buffer.frame(scrollOffsets[hostId] ?: 0))
+                sessionKey to newerTerminalFrame(current[sessionKey], buffer.frame(scrollOffsets[sessionKey] ?: 0))
             }
         }
     }
@@ -1813,19 +1863,19 @@ class MainViewModel @Inject constructor(
      * [force] is for the end of a session, where "the last second of output" is not something the user
      * can wait for.
      */
-    private fun publishTerminalText(hostId: String, buffer: AnsiTerminalBuffer, force: Boolean = false): Boolean {
+    private fun publishTerminalText(sessionKey: String, buffer: AnsiTerminalBuffer, force: Boolean = false): Boolean {
         // Reported as published rather than as throttled: there is nothing to catch up to.
-        if (!isDisplaying(hostId, buffer)) return true
+        if (!isDisplaying(sessionKey, buffer)) return true
         val now = SystemClock.elapsedRealtime()
-        val last = textPublishedAt[hostId]
+        val last = textPublishedAt[sessionKey]
         if (!force && last != null && now - last < TERMINAL_TEXT_MS) return false
-        textPublishedAt[hostId] = now
+        textPublishedAt[sessionKey] = now
         val text = buffer.plainText().takeLast(MAX_TERMINAL_CHARS)
         // Inside the update, for the reason [isDisplaying] gives: a whole scrollback is the largest
         // thing a closed session can leave behind.
-        terminalOutput.update { if (isDisplaying(hostId, buffer)) it + (hostId to text) else it }
+        terminalOutput.update { if (isDisplaying(sessionKey, buffer)) it + (sessionKey to text) else it }
         // And the throttle stamp with it, which is written above before the answer is known.
-        if (!isDisplaying(hostId, buffer)) textPublishedAt.remove(hostId)
+        if (!isDisplaying(sessionKey, buffer)) textPublishedAt.remove(sessionKey)
         return true
     }
 
@@ -1856,18 +1906,18 @@ class MainViewModel @Inject constructor(
      * [MAX_TERMINAL_CHARS] of scrollback per closed tab, held for the life of the ViewModel, and it is
      * what `repeatedConnectAndDisconnectCyclesLeaveNothingBehind` caught.
      */
-    private fun isDisplaying(hostId: String, buffer: AnsiTerminalBuffer): Boolean =
-        terminalBuffers[hostId] === buffer
+    private fun isDisplaying(sessionKey: String, buffer: AnsiTerminalBuffer): Boolean =
+        terminalBuffers[sessionKey] === buffer
 
     /**
-     * Whether [generation] is still the dial [hostId] is on. See [dialGenerations].
+     * Whether [generation] is still the dial [sessionKey] is on. See [dialGenerations].
      *
-     * Absent means yes, deliberately: nothing removes a host's counter, so the only way to read null
+     * Absent means yes, deliberately: nothing removes a session's counter, so the only way to read null
      * here is for the counter to have gone with the whole map, and refusing to report at all would be
      * the worse of the two failures.
      */
-    private fun isCurrentDial(hostId: String, generation: Long): Boolean =
-        (dialGenerations[hostId]?.get() ?: generation) == generation
+    private fun isCurrentDial(sessionKey: String, generation: Long): Boolean =
+        (dialGenerations[sessionKey]?.get() ?: generation) == generation
 
     fun acceptHostKey() {
         val challenge = hostKeyChallenge.value ?: return
@@ -1916,7 +1966,10 @@ class MainViewModel @Inject constructor(
         hostKeyChallenge.value = null
         sshConnectionManager.challengeHandled()
         pendingConnection?.host?.id?.let { id ->
-            updateTab(id) { it?.copy(state = SessionConnectionState.ERROR, lastError = "Host key was rejected") }
+            // The tab this dial was speaking for - the host's existing one, or the fresh one it
+            // created - rather than the host id itself, which is only that tab's key by coincidence.
+            val sessionKey = tabs.value.firstOrNull { it.hostId == id }?.id ?: id
+            updateTab(sessionKey) { it?.copy(state = SessionConnectionState.ERROR, lastError = "Host key was rejected") }
             diagnostics.record(id, SessionEvent.CONNECT_FAILED, state = SessionConnectionState.ERROR, detail = "host key rejected")
         }
         pendingConnection = null
@@ -1930,11 +1983,11 @@ class MainViewModel @Inject constructor(
      * translates. Sending LF instead worked with `bash` and silently did nothing useful in a few
      * full-screen programs that read raw input.
      */
-    fun sendInput(hostId: String, value: String) {
+    fun sendInput(sessionKey: String, value: String) {
         if (value.endsWith("\n") || value.endsWith("\r")) {
-            recordCommand(hostId, value.trimEnd('\n', '\r'))
+            recordCommand(sessionKey, value.trimEnd('\n', '\r'))
         }
-        writeToTerminal(hostId, TerminalKeys.encode(TerminalKeys.normalizeNewlines(value)))
+        writeToTerminal(sessionKey, TerminalKeys.encode(TerminalKeys.normalizeNewlines(value)))
     }
 
     /**
@@ -1943,10 +1996,10 @@ class MainViewModel @Inject constructor(
      * This is the path the software keyboard uses, so it also has to feed the recent-commands list -
      * see [typedLines] for why that has to be reconstructed rather than observed.
      */
-    fun sendText(hostId: String, text: String) {
+    fun sendText(sessionKey: String, text: String) {
         if (text.isEmpty()) return
-        accumulateTyped(hostId, text)
-        writeToTerminal(hostId, TerminalKeys.encode(text))
+        accumulateTyped(sessionKey, text)
+        writeToTerminal(sessionKey, TerminalKeys.encode(text))
     }
 
     /**
@@ -1958,33 +2011,33 @@ class MainViewModel @Inject constructor(
      * the buffer rather than assuming.
      */
     fun sendKey(
-        hostId: String,
+        sessionKey: String,
         key: TerminalKey,
         ctrl: Boolean = false,
         alt: Boolean = false,
         shift: Boolean = false,
     ) {
-        val buffer = terminalBuffers[hostId]
+        val buffer = terminalBuffers[sessionKey]
         val applicationCursorKeys = buffer?.applicationCursorKeysEnabled() ?: false
         val modifiers = TerminalModifiers(ctrl = ctrl, alt = alt, shift = shift)
         when (key) {
-            TerminalKey.ENTER -> recordCommand(hostId, typedLines.remove(hostId)?.toString().orEmpty())
-            TerminalKey.BACKSPACE -> typedLines[hostId]?.let { line -> if (line.isNotEmpty()) line.setLength(line.length - 1) }
+            TerminalKey.ENTER -> recordCommand(sessionKey, typedLines.remove(sessionKey)?.toString().orEmpty())
+            TerminalKey.BACKSPACE -> typedLines[sessionKey]?.let { line -> if (line.isNotEmpty()) line.setLength(line.length - 1) }
             else -> Unit
         }
-        writeToTerminal(hostId, TerminalKeys.encode(key, modifiers, applicationCursorKeys))
+        writeToTerminal(sessionKey, TerminalKeys.encode(key, modifiers, applicationCursorKeys))
     }
 
     /** Sends a single character with its modifiers - the Ctrl row, and the IME's own key events. */
-    fun sendChar(hostId: String, char: Char, ctrl: Boolean = false, alt: Boolean = false) {
+    fun sendChar(sessionKey: String, char: Char, ctrl: Boolean = false, alt: Boolean = false) {
         if (!ctrl && !alt) {
-            accumulateTyped(hostId, char.toString())
+            accumulateTyped(sessionKey, char.toString())
         } else if (ctrl) {
             // Ctrl-C, Ctrl-U and friends all abandon the line one way or another. Keeping a partial
             // command after them would file text the user explicitly discarded.
-            typedLines.remove(hostId)
+            typedLines.remove(sessionKey)
         }
-        writeToTerminal(hostId, TerminalKeys.encode(char, TerminalModifiers(ctrl = ctrl, alt = alt)))
+        writeToTerminal(sessionKey, TerminalKeys.encode(char, TerminalModifiers(ctrl = ctrl, alt = alt)))
     }
 
     /**
@@ -2004,19 +2057,19 @@ class MainViewModel @Inject constructor(
      * empty clipboard is reported, because a Paste that appears to do nothing is indistinguishable
      * from a broken one.
      */
-    fun pasteFromClipboard(hostId: String) {
+    fun pasteFromClipboard(sessionKey: String) {
         val text = secureClipboard.paste()
         if (text.isNullOrEmpty()) {
             report("There is nothing on the clipboard to paste")
             return
         }
-        pasteIntoTerminal(hostId, text)
+        pasteIntoTerminal(sessionKey, text)
     }
 
-    fun pasteIntoTerminal(hostId: String, text: String) {
+    fun pasteIntoTerminal(sessionKey: String, text: String) {
         if (text.isEmpty()) return
-        val bracketed = terminalBuffers[hostId]?.bracketedPasteEnabled() ?: false
-        writeToTerminal(hostId, TerminalKeys.paste(text, bracketed))
+        val bracketed = terminalBuffers[sessionKey]?.bracketedPasteEnabled() ?: false
+        writeToTerminal(sessionKey, TerminalKeys.paste(text, bracketed))
     }
 
     /**
@@ -2043,27 +2096,27 @@ class MainViewModel @Inject constructor(
         return text
     }
 
-    /** Scrolls [hostId] to [offset] lines above the live bottom; 0 follows the output again. */
-    fun scrollTerminal(hostId: String, offset: Int) {
-        val buffer = terminalBuffers[hostId] ?: return
+    /** Scrolls [sessionKey]'s terminal to [offset] lines above the live bottom; 0 follows the output again. */
+    fun scrollTerminal(sessionKey: String, offset: Int) {
+        val buffer = terminalBuffers[sessionKey] ?: return
         val ceiling = buffer.maxScrollOffset(buffer.viewportRows)
         val clamped = offset.coerceIn(0, ceiling)
-        if (clamped == 0) scrollOffsets.remove(hostId) else scrollOffsets[hostId] = clamped
-        publishTerminalFrame(hostId, buffer)
+        if (clamped == 0) scrollOffsets.remove(sessionKey) else scrollOffsets[sessionKey] = clamped
+        publishTerminalFrame(sessionKey, buffer)
     }
 
     /** Scrolls by [delta] lines - positive is back into the history. */
-    fun scrollTerminalBy(hostId: String, delta: Int) {
-        scrollTerminal(hostId, (scrollOffsets[hostId] ?: 0) + delta)
+    fun scrollTerminalBy(sessionKey: String, delta: Int) {
+        scrollTerminal(sessionKey, (scrollOffsets[sessionKey] ?: 0) + delta)
     }
 
     /** The text of a selection, in absolute buffer coordinates, for copy. */
-    fun terminalSelectionText(hostId: String, fromLine: Int, fromColumn: Int, toLine: Int, toColumn: Int): String =
-        terminalBuffers[hostId]?.textIn(fromLine, fromColumn, toLine, toColumn).orEmpty()
+    fun terminalSelectionText(sessionKey: String, fromLine: Int, fromColumn: Int, toLine: Int, toColumn: Int): String =
+        terminalBuffers[sessionKey]?.textIn(fromLine, fromColumn, toLine, toColumn).orEmpty()
 
     /** One whole line of the buffer, for double-tap word selection and select-line. */
-    fun terminalLineText(hostId: String, line: Int): String =
-        terminalBuffers[hostId]?.textIn(line, 0, line, Int.MAX_VALUE).orEmpty()
+    fun terminalLineText(sessionKey: String, line: Int): String =
+        terminalBuffers[sessionKey]?.textIn(line, 0, line, Int.MAX_VALUE).orEmpty()
 
     /**
      * Hands [bytes] to the session's outbound queue, in the order the caller produced them.
@@ -2086,18 +2139,18 @@ class MainViewModel @Inject constructor(
      * A keystroke for a host that is no longer connected is dropped silently: the tab's own state
      * already says it is disconnected, and a report per keystroke would bury it.
      */
-    private fun writeToTerminal(hostId: String, bytes: ByteArray) {
+    private fun writeToTerminal(sessionKey: String, bytes: ByteArray) {
         if (bytes.isEmpty()) return
-        runCatching { channels[hostId]?.writeBytes(bytes) }
+        runCatching { channels[sessionKey]?.writeBytes(bytes) }
     }
 
     /** Appends printable text to the reconstructed command line. See [typedLines]. */
-    private fun accumulateTyped(hostId: String, text: String) {
-        val line = typedLines.getOrPut(hostId) { StringBuilder() }
+    private fun accumulateTyped(sessionKey: String, text: String) {
+        val line = typedLines.getOrPut(sessionKey) { StringBuilder() }
         for (char in text) {
             when {
                 char == '\n' || char == '\r' -> {
-                    recordCommand(hostId, line.toString())
+                    recordCommand(sessionKey, line.toString())
                     line.setLength(0)
                 }
                 // Control characters are commands to the shell, not part of what was typed.
@@ -2107,10 +2160,19 @@ class MainViewModel @Inject constructor(
         if (line.length > MAX_TYPED_LINE) line.delete(0, line.length - MAX_TYPED_LINE)
     }
 
-    private fun recordCommand(hostId: String, command: String) {
+    /**
+     * Files a finished command under the recent-commands list.
+     *
+     * The line being filed is session-scoped (each terminal reconstructs its own), but the history is
+     * host-scoped on purpose - it is the same shell account, and bash would share one history across
+     * two windows on the desktop too. The host is resolved from the tab rather than passed by the
+     * caller so the two keyings cannot drift apart at a call site.
+     */
+    private fun recordCommand(sessionKey: String, command: String) {
         val trimmed = command.trim()
-        typedLines.remove(hostId)
+        typedLines.remove(sessionKey)
         if (trimmed.isEmpty()) return
+        val hostId = tabs.value.firstOrNull { it.id == sessionKey }?.hostId ?: return
         val updated = (listOf(trimmed) + commandHistory.value[hostId].orEmpty()).distinct().take(MAX_HISTORY)
         commandHistory.value = commandHistory.value + (hostId to updated)
     }
@@ -2122,42 +2184,45 @@ class MainViewModel @Inject constructor(
      * would leave the parser wrapping text the shell had already fitted. This runs on rotation, on a
      * multi-window drag and when the software keyboard opens.
      */
-    fun resizeTerminal(hostId: String, columns: Int, rows: Int) {
-        val buffer = terminalBuffers[hostId]
+    fun resizeTerminal(sessionKey: String, columns: Int, rows: Int) {
+        val buffer = terminalBuffers[sessionKey]
         buffer?.resize(columns, rows)
         if (buffer != null) {
             // A taller viewport can leave the stored offset past the top of a short buffer.
-            scrollOffsets[hostId]?.let { offset ->
+            scrollOffsets[sessionKey]?.let { offset ->
                 // The buffer's own height, which is the requested one clamped to what a terminal may
                 // be; asking for 4 000 rows and then measuring the ceiling against 4 000 would clear
                 // an offset that is still perfectly valid.
                 val ceiling = buffer.maxScrollOffset(buffer.viewportRows)
                 if (offset > ceiling) {
-                    if (ceiling <= 0) scrollOffsets.remove(hostId) else scrollOffsets[hostId] = ceiling
+                    if (ceiling <= 0) scrollOffsets.remove(sessionKey) else scrollOffsets[sessionKey] = ceiling
                 }
             }
-            publishTerminalFrame(hostId, buffer)
+            publishTerminalFrame(sessionKey, buffer)
         }
-        // Remembered for the *next* pty this host opens. The composable only reports a size when the
+        // Remembered for the *next* pty this session opens. The composable only reports a size when the
         // size it measures changes, and a reconnect does not change the screen - so without this a new
         // channel kept the 120x40 default while the UI, having already reported the real size once,
         // never mentioned it again. Every full-screen program on a reconnected session was drawn for a
         // terminal twice the width of the phone.
-        val previous = ptySizes.put(hostId, columns to rows)
+        val previous = ptySizes.put(sessionKey, columns to rows)
         // Only when the geometry really moved. The composable reports on every measurement pass, and
         // an entry per pass would push the interesting history out of the ring within seconds of
-        // scrolling.
+        // scrolling. The trace is per *server*, so the host is resolved from the tab rather than
+        // assumed to be the key.
         if (previous != columns to rows) {
-            diagnostics.record(
-                hostId,
-                SessionEvent.PTY_RESIZED,
-                pty = "${columns}x$rows",
-                detail = previous?.let { "was ${it.first}x${it.second}" },
-            )
+            tabs.value.firstOrNull { it.id == sessionKey }?.hostId?.let { hostId ->
+                diagnostics.record(
+                    hostId,
+                    SessionEvent.PTY_RESIZED,
+                    pty = "${columns}x$rows",
+                    detail = previous?.let { "was ${it.first}x${it.second}" },
+                )
+            }
         }
         // sendWindowChange writes an SSH packet, which blocks when the transport is
         // congested; keep it off the main thread so a stalled link cannot cause an ANR.
-        transportScope.launch { runCatching { channels[hostId]?.resize(columns, rows) } }
+        transportScope.launch { runCatching { channels[sessionKey]?.resize(columns, rows) } }
     }
 
     /**
@@ -2178,7 +2243,7 @@ class MainViewModel @Inject constructor(
      */
     fun refreshFiles(host: HostProfile, path: String? = null, announce: Boolean = true) {
         transportScope.launch {
-            if (sessions[host.id] == null) {
+            if (sessionStore.primarySession(host.id) == null) {
                 if (announce) report("${host.name} is not connected")
                 return@launch
             }
@@ -2192,7 +2257,7 @@ class MainViewModel @Inject constructor(
                 // A listing that worked is the same proof the auto-login looks for, so a host whose
                 // SFTP failed earlier — or one that never tried, because the switch is off — stops
                 // claiming to be broken the moment the user gets a directory out of it.
-                updateTab(host.id) { tab ->
+                updateHostTabs(host.id) { tab ->
                     if (tab?.sftpState == SftpSessionState.READY) tab
                     else tab?.copy(sftpState = SftpSessionState.READY, sftpError = null)
                 }
@@ -2226,7 +2291,7 @@ class MainViewModel @Inject constructor(
      * the browser's own error on screen.
      */
     private suspend fun listRemote(host: HostProfile, path: String?) {
-        val session = sessions[host.id] ?: throw IllegalStateException("${host.name} is not connected")
+        val session = sessionStore.primarySession(host.id) ?: throw IllegalStateException("${host.name} is not connected")
         sshConnectionManager.withSftp(session) { sftp ->
             val target = path ?: homePaths[host.id] ?: sftpDirectoryService.homeDirectory(sftp, host.username)
                 .also { homePaths[host.id] = it }
@@ -2252,16 +2317,16 @@ class MainViewModel @Inject constructor(
      */
     fun loginSftp(host: HostProfile) {
         sftpJobs.remove(host.id)?.cancel()
-        updateTab(host.id) { it?.copy(sftpState = SftpSessionState.CONNECTING, sftpError = null) }
+        updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.CONNECTING, sftpError = null) }
         val job = transportScope.launch {
             try {
                 listRemote(host, null)
-                updateTab(host.id) { it?.copy(sftpState = SftpSessionState.READY, sftpError = null) }
+                updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.READY, sftpError = null) }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
                 val reason = describeSftpFailure(error)
-                updateTab(host.id) { it?.copy(sftpState = SftpSessionState.FAILED, sftpError = reason) }
+                updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.FAILED, sftpError = reason) }
                 report("SFTP on ${host.name}: $reason")
             }
         }
@@ -2355,7 +2420,7 @@ class MainViewModel @Inject constructor(
         }
         val remoteRoot = currentRemoteDir(host)
         transportScope.launch {
-            val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
+            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
             val rootDoc = DocumentFile.fromTreeUri(context, rootUri)
                 ?: return@launch report("The local folder is no longer accessible")
             try {
@@ -2411,7 +2476,7 @@ class MainViewModel @Inject constructor(
         }
         val remoteRoot = currentRemoteDir(host)
         transportScope.launch {
-            val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
+            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
             val rootDoc = DocumentFile.fromTreeUri(context, rootUri)
                 ?: return@launch report("The local folder is no longer accessible")
             try {
@@ -2482,12 +2547,12 @@ class MainViewModel @Inject constructor(
      */
     fun sendRemoteTo(sourceHost: HostProfile, file: RemoteFile, destHost: HostProfile, destPath: String) {
         transportScope.launch {
-            val source = sessions[sourceHost.id]
+            val source = sessionStore.primarySession(sourceHost.id)
                 ?: return@launch report("${sourceHost.name} is not connected")
             // Only a session opened *here* may be closed here. An already-open one belongs to its tab.
             var dialled: ClientSession? = null
             try {
-                val dest = sessions[destHost.id] ?: run {
+                val dest = sessionStore.primarySession(destHost.id) ?: run {
                     val password = sessionRegistry.credential(destHost.id)
                     val keyPair = sessionRegistry.keyBytes(destHost.id)?.let { bytes ->
                         runCatching { SshKeyLoader.load(bytes, "${destHost.username}-key", sessionRegistry.keyPassphrase(destHost.id)) }.getOrNull()
@@ -2666,7 +2731,7 @@ class MainViewModel @Inject constructor(
      * descriptor plus an SFTP channel per attempt.
      */
     private suspend fun startUploadJob(host: HostProfile, item: TransferItem, source: Uri, remotePath: String, totalBytes: Long?) {
-        val session = sessions[host.id] ?: return failTransfer(item, "${host.name} is not connected")
+        val session = sessionStore.primarySession(host.id) ?: return failTransfer(item, "${host.name} is not connected")
         val stream = runCatching { context.contentResolver.openInputStream(source) }.getOrNull()
             ?: return failTransfer(item, "Cannot read ${item.name}")
         val sftp = runCatching { sshConnectionManager.openSftp(session) }.getOrNull() ?: run {
@@ -2677,7 +2742,7 @@ class MainViewModel @Inject constructor(
     }
 
     private suspend fun startDownloadJob(host: HostProfile, item: TransferItem, destination: Uri, remotePath: String) {
-        val session = sessions[host.id] ?: return failTransfer(item, "${host.name} is not connected")
+        val session = sessionStore.primarySession(host.id) ?: return failTransfer(item, "${host.name} is not connected")
         val stream = runCatching { context.contentResolver.openOutputStream(destination, "w") }.getOrNull()
             ?: return failTransfer(item, "Cannot write ${item.name}")
         val sftp = runCatching { sshConnectionManager.openSftp(session) }.getOrNull() ?: run {
@@ -2717,7 +2782,7 @@ class MainViewModel @Inject constructor(
      */
     private fun fileOperation(host: HostProfile, what: String, path: String? = null, operation: suspend (SftpClient) -> Unit) {
         transportScope.launch {
-            val session = sessions[host.id]
+            val session = sessionStore.primarySession(host.id)
             if (session == null) {
                 // Reachable: the sheet and its dialogs stay up across a disconnect, so the button is
                 // still there to press after the session is gone.
@@ -2820,7 +2885,7 @@ class MainViewModel @Inject constructor(
     fun startLocalForward(host: HostProfile, localPort: Int, remoteHost: String, remotePort: Int) {
         val entry = ForwardEntry(type = ForwardType.LOCAL, localPort = localPort, remoteHost = remoteHost, remotePort = remotePort, hostId = host.id)
         transportScope.launch {
-            val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
+            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
             runCatching { portForwardingManager.startLocal(session, "127.0.0.1", localPort, remoteHost, remotePort) }
                 .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
                 .onFailure { reportForwardFailure("Local forward on port $localPort failed", it) }
@@ -2830,7 +2895,7 @@ class MainViewModel @Inject constructor(
     fun startRemoteForward(host: HostProfile, remotePort: Int, localPort: Int) {
         val entry = ForwardEntry(type = ForwardType.REMOTE, localPort = localPort, remoteHost = null, remotePort = remotePort, hostId = host.id)
         transportScope.launch {
-            val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
+            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
             // Bound on the server's loopback, not 0.0.0.0. The dialog only asks for two port numbers,
             // so nobody using it has chosen to publish anything; requesting all interfaces meant that
             // on any server configured `GatewayPorts yes` (or `clientspecified`) the phone's local
@@ -2847,7 +2912,7 @@ class MainViewModel @Inject constructor(
     fun startDynamicForward(host: HostProfile, localPort: Int) {
         val entry = ForwardEntry(type = ForwardType.DYNAMIC, localPort = localPort, hostId = host.id)
         transportScope.launch {
-            val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
+            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
             runCatching { portForwardingManager.startDynamic(session, "127.0.0.1", localPort) }
                 .onSuccess { handle -> forwardHandles[entry.id] = handle; forwardings.update { it + entry } }
                 .onFailure { reportForwardFailure("SOCKS proxy on port $localPort failed", it) }
@@ -2887,7 +2952,7 @@ class MainViewModel @Inject constructor(
      */
     fun refreshStats(host: HostProfile) {
         transportScope.launch {
-            val session = sessions[host.id] ?: return@launch report("${host.name} is not connected")
+            val session = sessionStore.primarySession(host.id) ?: return@launch report("${host.name} is not connected")
             val stats = try {
                 val hostname = sshConnectionManager.runCommand(session, "hostname")
                 val uptime = sshConnectionManager.runCommand(session, "uptime")
@@ -2998,10 +3063,14 @@ class MainViewModel @Inject constructor(
             var dialFailure: Throwable? = null
             // The same gate and the same install as [connect], for the same reason: this runs from a
             // notification action, so it can land in the middle of the UI's own dial to the host it
-            // wants. `sessions[hostId]` also did not prune - a session that had died was handed
-            // straight to `openSftp` - which is what [SshSessionStore.liveSession] is for.
-            val session = sessionStore.liveSession(host.id) ?: sessionStore.dialing(host.id) {
-                sessionStore.liveSession(host.id) ?: run {
+            // wants. A read straight out of the map also did not prune - a session that had died was
+            // handed straight to `openSftp` - which is what [SshSessionStore.primarySession] is for:
+            // any live session the host has, under whichever key it is filed, and nothing else.
+            val session = sessionStore.primarySession(host.id) ?: sessionStore.dialing(host.id) {
+                // Asked again inside the gate, and host-wide: whatever installed a session for this
+                // host while this coroutine waited for the gate is one to reuse, whatever key it is
+                // filed under.
+                sessionStore.primarySession(host.id) ?: run {
                     val password = sessionRegistry.credential(host.id)
                     val keyPair = sessionRegistry.keyBytes(host.id)?.let { bytes -> runCatching { SshKeyLoader.load(bytes, "${host.username}-key", sessionRegistry.keyPassphrase(host.id)) }.getOrNull() }
                     val reconnected = try {
@@ -3049,45 +3118,64 @@ class MainViewModel @Inject constructor(
     /**
      * Ends the session [tab] belongs to and drops everything it owned.
      *
-     * Identified by its host, not by the object handed in. The list used to be filtered with
+     * Identified by the tab, not by the object handed in. The list used to be filtered with
      * `tabs.value - tab`, which removes by *value*: every field of the caller's copy had to match the
      * live one, and the copy a caller has is the one it last read from [uiState] - a `StateFlow` that
      * conflates, so it can be one update behind [tabs] by design. A session that had just settled its
      * SFTP state a moment after connecting therefore had a tab in the list that no longer equalled the
      * one on screen, and closing it removed nothing at all: the tap did visibly nothing while the
      * socket, the pty and the collector were all torn down underneath it, leaving a tab pointing at a
-     * session that no longer existed. Keyed on `hostId` because that is the app's own identity for a
-     * session - every map below is keyed the same way, and [deleteHost] already filtered this way.
+     * session that no longer existed. Keyed on `tab.id` because that is the session key - the one
+     * identity that stays this terminal's alone when a host has more than one of them.
+     *
+     * Teardown comes in two scopes, and the split is what keeps a second terminal to the same host
+     * alive. The session-scoped half (job, collector, output, store entry) is dropped by the tab's own
+     * key and can only touch this terminal. The host-scoped half - SFTP, listings, history, forwards,
+     * the registry - belongs to the host as a whole and is only dropped when this was its *last*
+     * session: unregistering a host whose other terminal is still open would discard the resume
+     * credential and mark the host inactive while its shell is alive on screen.
      */
     fun closeTab(tab: SessionTab) {
         // Before the cancel below, not after: see [isDisplaying]. A collector that is still
         // finishing an iteration must not be able to publish a frame for a session being closed.
-        terminalBuffers.remove(tab.hostId)
-        terminalJobs.remove(tab.hostId)?.cancel()
-        connectJobs.remove(tab.hostId)?.cancel()
-        sftpJobs.remove(tab.hostId)?.cancel()
-        forwardJobs.remove(tab.hostId)?.cancel()
+        terminalBuffers.remove(tab.id)
+        terminalJobs.remove(tab.id)?.cancel()
+        connectJobs.remove(tab.id)?.cancel()
         // Closing a tab is the clearest possible statement that this session is not wanted, so it also
         // ends any reconnect waiting to bring it back.
-        reconnectJobs.remove(tab.hostId)?.let { waiting ->
+        reconnectJobs.remove(tab.id)?.let { waiting ->
             waiting.cancel()
             diagnostics.record(tab.hostId, SessionEvent.RECONNECT_CANCELLED, detail = "tab closed")
         }
-        reconnectAttempts.remove(tab.hostId)
-        reconnectPolicies.remove(tab.hostId)
-        sessionStore.forget(tab.hostId)
-        tabs.value = tabs.value.filterNot { it.hostId == tab.hostId }
-        terminalOutput.update { it - tab.hostId }
-        terminalFrames.update { it - tab.hostId }
-        scrollOffsets.remove(tab.hostId)
-        textPublishedAt.remove(tab.hostId)
-        typedLines.remove(tab.hostId)
+        reconnectAttempts.remove(tab.id)
+        reconnectPolicies.remove(tab.id)
+        sessionStore.forget(tab.id)
+        tabs.value = tabs.value.filterNot { it.id == tab.id }
+        terminalOutput.update { it - tab.id }
+        terminalFrames.update { it - tab.id }
+        scrollOffsets.remove(tab.id)
+        textPublishedAt.remove(tab.id)
+        typedLines.remove(tab.id)
+        ptySizes.remove(tab.id)
+        connectedAt.remove(tab.id)
+        // Asked *after* the store entry is gone, so the answer already reflects this session leaving.
+        // Keys that have died but not been reaped still count - a sibling terminal may come back for
+        // one - and the failure mode of getting this wrong in the eager direction is losing a live
+        // host's history and registry entry, which is the worse side to be wrong on.
+        val siblings = sessionStore.sessionKeysForHost(tab.hostId)
+        if (siblings.isNotEmpty()) {
+            // Another terminal of this host is still alive: its session keeps the host's SFTP
+            // channel, directory listing, command history and forwards, and the host stays
+            // registered. [loginSftp] and [startSavedForwards] are what rebind the host-scoped
+            // features to the surviving session when they next run.
+            return
+        }
+        sftpJobs.remove(tab.hostId)?.cancel()
+        forwardJobs.remove(tab.hostId)?.cancel()
         commandHistory.value = commandHistory.value - tab.hostId
         serverStats.update { it - tab.hostId }
         remoteListings.update { it - tab.hostId }
         homePaths.remove(tab.hostId)
-        ptySizes.remove(tab.hostId)
-        connectedAt.remove(tab.hostId)
         stopForwardingsFor(tab.hostId)
         // [releaseScope], not [viewModelScope], and for the reason [release] gives: this is teardown, and
         // teardown launched on a scope that dies with the screen is dropped exactly when it matters. The
@@ -3215,11 +3303,23 @@ class MainViewModel @Inject constructor(
 
     fun deleteHost(host: HostProfile) {
         launchGuarded("Could not delete ${host.name}") {
+            // Every session the host has, under every key - deleting the profile ends them all, not
+            // only the first terminal's. The keys come from the store's index rather than from the tab
+            // list so a session with no tab (a service restore) is closed too.
+            val keys = sessionStore.sessionKeysForHost(host.id)
             // Before the cancel below, not after: see [isDisplaying]. A collector that is still
             // finishing an iteration must not be able to publish a frame for a session being closed.
-            terminalBuffers.remove(host.id)
-            terminalJobs.remove(host.id)?.cancel()
-            connectJobs.remove(host.id)?.cancel()
+            keys.forEach { key -> terminalBuffers.remove(key) }
+            keys.forEach { key -> terminalJobs.remove(key)?.cancel() }
+            keys.forEach { key -> connectJobs.remove(key)?.cancel() }
+            keys.forEach { key ->
+                reconnectJobs.remove(key)?.cancel()
+                reconnectAttempts.remove(key)
+                reconnectPolicies.remove(key)
+                scrollOffsets.remove(key)
+                textPublishedAt.remove(key)
+                typedLines.remove(key)
+            }
             sftpJobs.remove(host.id)?.cancel()
             forwardJobs.remove(host.id)?.cancel()
             // Through the store, which marks the channel deliberate so its ending is not read as a
@@ -3227,13 +3327,10 @@ class MainViewModel @Inject constructor(
             // both here, on the caller's dispatcher — and `launchGuarded` is a `viewModelScope` body, so
             // that was `SSH_MSG_DISCONNECT` written from the UI thread. The buffer is already gone,
             // removed above for the reason recorded there, so this deliberately is not `forget`.
-            sessionStore.close(host.id)
+            keys.forEach { key -> sessionStore.close(key) }
             tabs.value = tabs.value.filterNot { it.hostId == host.id }
-            terminalOutput.update { it - host.id }
-            terminalFrames.update { it - host.id }
-            scrollOffsets.remove(host.id)
-            textPublishedAt.remove(host.id)
-            typedLines.remove(host.id)
+            terminalOutput.update { current -> current - keys.toSet() }
+            terminalFrames.update { current -> current - keys.toSet() }
             commandHistory.value = commandHistory.value - host.id
             serverStats.update { it - host.id }
             remoteListings.update { it - host.id }
@@ -3506,7 +3603,12 @@ class MainViewModel @Inject constructor(
     }
 
     /**
-     * Applies [transform] to the tab for [hostId], **in place**.
+     * Applies [transform] to the tab whose id is [sessionKey], **in place**.
+     *
+     * Keyed by the tab's id because that is the session key — with more than one terminal per host,
+     * a host id matches several tabs and "which one" would be decided by accident. The transform is
+     * handed `null` when no such tab exists, so a creator can put one there; a transform that answers
+     * `null` leaves the list alone.
      *
      * The index matters: this used to be `filterNot { it.hostId == hostId } + updated`, which moved a
      * tab to the end of the strip on every state change. Connecting two hosts at once was enough to
@@ -3514,7 +3616,7 @@ class MainViewModel @Inject constructor(
      * RECONNECTING, so the strip reshuffled under the user's finger while they were reaching for it.
      * A tab keeps the position it was opened in for as long as it is open.
      */
-    private fun updateTab(hostId: String, transform: (SessionTab?) -> SessionTab?) {
+    private fun updateTab(sessionKey: String, transform: (SessionTab?) -> SessionTab?) {
         // Atomic, because not every caller is on the main thread: the connect phase callback is
         // invoked from MINA's dial on Dispatchers.IO while the collector and the reconnect ladder are
         // writing the same list from the main dispatcher. Read-modify-write on `tabs.value` lost
@@ -3522,9 +3624,27 @@ class MainViewModel @Inject constructor(
         // `update` retries its transform on conflict, which is safe here: every transform is a pure
         // `copy` of the tab it was handed.
         tabs.update { current ->
-            val index = current.indexOfFirst { it.hostId == hostId }
+            val index = current.indexOfFirst { it.id == sessionKey }
             val updated = transform(current.getOrNull(index)) ?: return@update current
             if (index < 0) current + updated else current.toMutableList().also { it[index] = updated }
+        }
+    }
+
+    /**
+     * Applies [transform] to every tab of [hostId] — the writes that are about the *host* rather than
+     * about one of its terminals.
+     *
+     * SFTP state, saved-forward counts and their failures live on the tab because that is where the
+     * user reads them, but they describe a channel the whole host shares: one SFTP login, one set of
+     * tunnels. With a single terminal the two keyings coincide; with several, a state that only one
+     * tab carried would tell the user the file browser was broken in one terminal and working in
+     * another on the same host. Creates nothing — there is no session to speak of until [updateTab]
+     * has made its tab.
+     */
+    private fun updateHostTabs(hostId: String, transform: (SessionTab?) -> SessionTab?) {
+        tabs.update { current ->
+            if (current.none { it.hostId == hostId }) current
+            else current.map { if (it.hostId == hostId) transform(it) ?: it else it }
         }
     }
 
@@ -3537,10 +3657,10 @@ class MainViewModel @Inject constructor(
      * wait for when the shell is the one already on screen. And silent on behalf of a [dial] that has
      * been replaced, for the reason [onConnectPhase] gives.
      */
-    private fun markOpeningShell(hostId: String, dial: Long, resuming: Boolean) {
+    private fun markOpeningShell(sessionKey: String, dial: Long, resuming: Boolean) {
         if (resuming) return
-        val current = isCurrentDial(hostId, dial)
-        updateTab(hostId) { tab ->
+        val current = isCurrentDial(sessionKey, dial)
+        updateTab(sessionKey) { tab ->
             if (tab != null && phaseReportIsWritable(tab.state, current)) {
                 tab.copy(state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
             } else {
@@ -3575,14 +3695,21 @@ class MainViewModel @Inject constructor(
      * either way, marked as superseded - a diagnostic that hid the attempts actually being made would
      * be the harder bug to read. See [dialGenerations].
      */
-    private fun onConnectPhase(hostId: String, dial: Long, phase: SshConnectPhase, resuming: Boolean, attempt: Int) {
+    private fun onConnectPhase(
+        sessionKey: String,
+        hostId: String,
+        dial: Long,
+        phase: SshConnectPhase,
+        resuming: Boolean,
+        attempt: Int,
+    ) {
         val state = when {
             resuming -> SessionConnectionState.RECONNECTING
             phase == SshConnectPhase.HANDSHAKE -> SessionConnectionState.CONNECTING
             else -> SessionConnectionState.AUTHENTICATING
         }
-        val current = isCurrentDial(hostId, dial)
-        updateTab(hostId) { tab ->
+        val current = isCurrentDial(sessionKey, dial)
+        updateTab(sessionKey) { tab ->
             if (tab != null && phaseReportIsWritable(tab.state, current)) tab.copy(state = state) else tab
         }
         diagnostics.record(
@@ -3744,6 +3871,8 @@ data class AuthFailurePrompt(
  * belongs to the user rather than to the app.
  */
 data class ReconnectPrompt(
+    /** The session key (the tab's id) whose drop this question is about. */
+    val sessionId: String,
     val hostId: String,
     val hostName: String,
     /** Why the session ended, as the terminal status line already says it. */

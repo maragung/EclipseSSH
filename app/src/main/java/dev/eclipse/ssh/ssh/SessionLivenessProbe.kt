@@ -149,12 +149,12 @@ class SessionLivenessProbe @Inject constructor(
             sweep()
             return
         }
-        val hostIds = sessionStore.liveHostIds()
-        if (hostIds.isEmpty()) return
+        val live = sessionStore.liveKeysByHost()
+        if (live.isEmpty()) return
         val network = networkMonitor.describe()
         // No probe: every address the sockets could be bound to has been released, and twelve seconds of
         // deadlines cannot make that less true.
-        dropAll(hostIds, "network replaced · no local address survived · dropping the session", network)
+        dropAll(live, "network replaced · no local address survived · dropping the session", network)
     }
 
     /**
@@ -165,10 +165,10 @@ class SessionLivenessProbe @Inject constructor(
      * and its working directory and whatever was half-typed at the prompt.
      */
     private suspend fun holdThroughOutage() = holding.withLock {
-        val hostIds = sessionStore.liveHostIds()
-        if (hostIds.isEmpty()) return@withLock
+        val live = sessionStore.liveKeysByHost()
+        if (live.isEmpty()) return@withLock
         val before = lastAddresses.ifEmpty { networkMonitor.localAddresses() }
-        hostIds.forEach { hostId ->
+        live.forEach { (_, hostId) ->
             diagnostics.record(
                 hostId,
                 SessionEvent.NETWORK_CHANGED,
@@ -184,7 +184,7 @@ class SessionLivenessProbe @Inject constructor(
             val network = networkMonitor.describe()
             if (!returned) {
                 dropAll(
-                    sessionStore.liveHostIds(),
+                    sessionStore.liveKeysByHost(),
                     "no network for ${NETWORK_GRACE_MS / 1000}s · dropping the session",
                     network,
                 )
@@ -192,13 +192,13 @@ class SessionLivenessProbe @Inject constructor(
             }
             val after = networkMonitor.localAddresses()
             lastAddresses = after
-            val stillLive = sessionStore.liveHostIds()
+            val stillLive = sessionStore.liveKeysByHost()
             when (graceOutcome(before, after)) {
                 GraceOutcome.RESUME ->
                     // Silently, and that is the point: no probe, no redial, no reconnect, nothing sent.
                     // The addresses the sockets are bound to are still assigned, so as far as the session
                     // is concerned the outage did not happen.
-                    stillLive.forEach { hostId ->
+                    stillLive.forEach { (_, hostId) ->
                         diagnostics.record(
                             hostId,
                             SessionEvent.NETWORK_CHANGED,
@@ -211,7 +211,7 @@ class SessionLivenessProbe @Inject constructor(
                 GraceOutcome.UNKNOWN -> {
                     // The comparison did not run - no addresses on one side or the other. Ask the
                     // sessions themselves rather than guess, which is what a sweep is for.
-                    stillLive.forEach { hostId ->
+                    stillLive.forEach { (_, hostId) ->
                         diagnostics.record(
                             hostId,
                             SessionEvent.NETWORK_CHANGED,
@@ -236,10 +236,10 @@ class SessionLivenessProbe @Inject constructor(
      * `session.isOpen`, which is still true here - the app knows the transport is finished for a reason
      * MINA has no way to see, and a trace that says so is worth more than one that says `Released`.
      */
-    private fun dropAll(hostIds: Set<String>, detail: String, network: String) {
-        hostIds.forEach { hostId ->
+    private fun dropAll(live: List<Pair<String, String>>, detail: String, network: String) {
+        live.forEach { (sessionKey, hostId) ->
             diagnostics.record(hostId, SessionEvent.NETWORK_CHANGED, detail = detail, network = network)
-            sessionStore.discard(hostId, SessionEnd.NetworkLost)
+            sessionStore.discard(sessionKey, SessionEnd.NetworkLost)
         }
     }
 
@@ -251,16 +251,19 @@ class SessionLivenessProbe @Inject constructor(
      * have finished the job itself.
      */
     suspend fun sweep() = sweeping.withLock {
-        val hostIds = sessionStore.liveHostIds()
-        if (hostIds.isEmpty()) return@withLock
+        // Every live *session*, not every live host: with more than one terminal on a host each one is
+        // its own socket and has to be asked its own question. The trace stays host-keyed - one line
+        // per session is what a reader chasing a drop wants.
+        val live = sessionStore.liveKeysByHost()
+        if (live.isEmpty()) return@withLock
         val network = networkMonitor.describe()
-        hostIds.forEach { hostId ->
+        live.forEach { (_, hostId) ->
             diagnostics.record(hostId, SessionEvent.NETWORK_CHANGED, network = network)
         }
-        hostIds.map { hostId ->
+        live.map { (sessionKey, hostId) ->
             scope.async {
-                val session = sessionStore.liveSession(hostId) ?: return@async
-                val channel = sessionStore.channels[hostId]
+                val session = sessionStore.liveSession(sessionKey) ?: return@async
+                val channel = sessionStore.channels[sessionKey]
                 val probeStartedAt = System.currentTimeMillis()
                 var alive = false
                 for (attempt in 1..PROBE_ATTEMPTS) {
@@ -314,7 +317,7 @@ class SessionLivenessProbe @Inject constructor(
                 // named because it is known - a sweep only ever runs after the network changed - and
                 // `NetworkLost` tells the user something, where the channel's own guess would say
                 // `Released` and read as though the app had chosen this.
-                sessionStore.discard(hostId, SessionEnd.NetworkLost)
+                sessionStore.discard(sessionKey, SessionEnd.NetworkLost)
             }
         }.awaitAll()
     }
