@@ -583,6 +583,7 @@ class VaultBackupTest {
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nR:2222:22\nD:1080",
             remoteDesktop = "V:10.0.1.5:5900 view-only",
+            agentForwarding = true,
         )
 
         val restored = VaultBackup.fromJson(VaultBackup.toJson(listOf(tuned), AppSettings(), emptyMap())).first
@@ -625,6 +626,9 @@ class VaultBackupTest {
         assertThat(host.environment).isEmpty()
         assertThat(host.savedForwards).isEmpty()
         assertThat(host.remoteDesktop).isEmpty()
+        // The grant again: a backup written before the flag existed imports it off, so the
+        // administrator of that host gains nothing the user never gave them.
+        assertThat(host.agentForwarding).isFalse()
     }
 
     @Test

@@ -147,6 +147,7 @@ class HostMappingTest {
             // parsed line by line at connect time.
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nD:1080",
+            agentForwarding = true,
             hostKeyPolicy = HostKeyPolicy.STRICT,
         )
 
@@ -178,6 +179,8 @@ class HostMappingTest {
         assertThat(fresh.terminalColumns).isEqualTo(0)
         assertThat(fresh.terminalRows).isEqualTo(0)
         assertThat(fresh.keyboardInteractiveAuth).isTrue()
+        // The grant is opt-in: a host that never spoke about forwarding must not acquire it.
+        assertThat(fresh.agentForwarding).isFalse()
         assertThat(fresh.legacyAlgorithms).isNull()
         assertThat(fresh.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
         // Null, not empty. An empty algorithm list is a real instruction - propose nothing - and a

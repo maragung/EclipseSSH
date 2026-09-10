@@ -94,6 +94,7 @@ class AdvancedHostOptionsTest {
             startupCommand = "tmux attach || tmux new",
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nD:1080",
+            agentForwarding = true,
         )
 
         val edited = AdvancedHostOptions.from(tuned)
