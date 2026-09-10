@@ -36,6 +36,7 @@ class HostFormDraftTest {
         pickedKey: SshKeyProbe? = null,
         storedCredentials: StoredCredentials = StoredCredentials(),
         forgetKey: Boolean = false,
+        wakeOnLanMac: String = "",
     ) = HostFormDraft(
         host = host,
         username = username,
@@ -44,6 +45,7 @@ class HostFormDraftTest {
         keepAlive = keepAlive,
         fingerprint = fingerprint,
         storedFingerprint = storedFingerprint,
+        wakeOnLanMac = wakeOnLanMac,
         proxyType = proxyType,
         proxyJump = proxyJump,
         socksHost = socksHost,
@@ -193,6 +195,38 @@ class HostFormDraftTest {
         for (candidate in bad) {
             assertThat(valid(fingerprint = candidate).fingerprintValid).isFalse()
             assertThat(valid(fingerprint = candidate).canSave).isFalse()
+        }
+    }
+
+    // --- Wake-on-LAN ---
+
+    @Test
+    fun `no wake-on-lan address is the normal case and is always valid`() {
+        assertThat(valid(wakeOnLanMac = "").wakeOnLanMacValid).isTrue()
+        assertThat(valid(wakeOnLanMac = "").canSave).isTrue()
+    }
+
+    @Test
+    fun `every mac spelling the parser accepts is a saveable one`() {
+        for (mac in listOf("AA:BB:CC:DD:EE:01", "aa:bb:cc:dd:ee:01", "AA-BB-CC-DD-EE-01", "AABBCCDDEE01")) {
+            assertThat(valid(wakeOnLanMac = mac).wakeOnLanMacValid).isTrue()
+            assertThat(valid(wakeOnLanMac = mac).canSave).isTrue()
+        }
+    }
+
+    @Test
+    fun `a mac that is not a mac blocks saving`() {
+        // Each of these would be stored verbatim and handed to the wake menu, which would build a
+        // packet no card recognises - a host that looks wakable and is not.
+        for (mac in listOf(
+            "AA:BB:CC:DD:EE",               // a pair short
+            "AA:BB:CC:DD:EE:01:02",         // a pair long
+            "AA:BB:CC:DD:EE:ZZ",            // not hex
+            "AA:BB-CC:DD:EE:01",            // mixed separators
+            "wake the server",              // prose, not an address
+        )) {
+            assertThat(valid(wakeOnLanMac = mac).wakeOnLanMacValid).isFalse()
+            assertThat(valid(wakeOnLanMac = mac).canSave).isFalse()
         }
     }
 

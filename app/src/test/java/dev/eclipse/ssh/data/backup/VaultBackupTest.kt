@@ -583,6 +583,9 @@ class VaultBackupTest {
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nR:2222:22\nD:1080",
             remoteDesktop = "V:10.0.1.5:5900 view-only",
+            // The spelling as typed, dashes rather than colons: the round trip has to carry text,
+            // not a normalised form, or a host would silently change shape in its own backup.
+            wakeOnLanMac = "4C-2E-81-1A-02-F7",
         )
 
         val restored = VaultBackup.fromJson(VaultBackup.toJson(listOf(tuned), AppSettings(), emptyMap())).first
@@ -625,6 +628,7 @@ class VaultBackupTest {
         assertThat(host.environment).isEmpty()
         assertThat(host.savedForwards).isEmpty()
         assertThat(host.remoteDesktop).isEmpty()
+        assertThat(host.wakeOnLanMac).isEmpty()
     }
 
     @Test
@@ -643,7 +647,8 @@ class VaultBackupTest {
                        "startupCommand":"${"x".repeat(STARTUP_COMMAND_MAX_LENGTH + 200)}",
                        "environment":"${"E".repeat(ENVIRONMENT_MAX_LENGTH + 200)}",
                        "savedForwards":"L:8080\nX:1\nD:1080",
-                       "remoteDesktop":"V:not-a-target\nV:5900 view-only"}]}
+                       "remoteDesktop":"V:not-a-target\nV:5900 view-only",
+                       "wakeOnLanMac":"zz:zz:zz:zz:zz:zz"}]}
         """.trimIndent()
 
         val host = VaultBackup.fromJson(hostile).first.single()
@@ -673,6 +678,9 @@ class VaultBackupTest {
         // The remote-desktop column reads the same way: the first line that names a target the
         // engine could dial wins, and a line that names none falls out before it.
         assertThat(host.remoteDesktop).isEqualTo("V:5900 view-only")
+        // An address that is not a MAC in any accepted spelling is dropped rather than stored: it
+        // would otherwise give the wake menu a host it claims to be able to wake and cannot.
+        assertThat(host.wakeOnLanMac).isEmpty()
     }
 
     @Test

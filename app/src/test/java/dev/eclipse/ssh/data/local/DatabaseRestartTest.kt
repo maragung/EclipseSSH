@@ -77,6 +77,9 @@ class DatabaseRestartTest {
             // Off, which is not the column default: a default that overwrote the stored value would
             // silently turn this back on and the test would catch it here rather than a user later.
             autoLoginSftp = false,
+            // Dashes rather than colons, because the column stores the text as typed: a restart that
+            // normalised it would change what the form shows the next time it opens.
+            wakeOnLanMac = "4C-2E-81-1A-02-F7",
         )
 
         write(saved)
