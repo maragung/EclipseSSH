@@ -193,7 +193,7 @@ class SettingsAboutRobolectricTest {
         openAboutDialog()
 
         assertComposed("Apache MINA SSHD 2.14.0")
-        assertComposed("vernacular-vnc (pinned to commit f39cbe2 via JitPack)")
+        assertComposed("vernacular-vnc f39cbe2 (JitPack)")
         assertComposed("FreeRDP 3.31.1")
     }
 }

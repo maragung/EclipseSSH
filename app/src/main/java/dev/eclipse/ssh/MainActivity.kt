@@ -211,6 +211,7 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
+import dev.eclipse.ssh.feature.about.OPEN_SOURCE_LICENSES
 import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
@@ -4876,13 +4877,18 @@ private fun AboutDialog(onDismiss: () -> Unit) {
                     Text("Source code · github.com/maragung/EclipseSSH")
                 }
                 Text("Libraries", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // The one list the repo keeps: the dialog renders OPEN_SOURCE_LICENSES as-is, so
+                // what an About screen says and what the repo claims cannot drift apart.
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(ABOUT_LIBRARIES) { library ->
+                    items(OPEN_SOURCE_LICENSES) { library ->
                         Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
                             Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
-                                Text(library.name, style = MaterialTheme.typography.titleSmall)
+                                Text("${library.name} ${library.version}", style = MaterialTheme.typography.titleSmall)
                                 Text(
-                                    "${library.license} · ${library.purpose}",
+                                    // Bouncy Castle is the one entry with no purpose line - a
+                                    // transitive dependency nothing calls directly - so its row
+                                    // is the licence alone, not a sentence ending in a dangling dot.
+                                    library.purpose?.let { "${library.license} · $it" } ?: library.license,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -4895,31 +4901,6 @@ private fun AboutDialog(onDismiss: () -> Unit) {
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
-
-/**
- * One row of the About dialog's library list: what is bundled, under which license, and what it is
- * here for. A row is prose rather than a link — the licenses' full texts live in the repository, not
- * in the APK.
- */
-private data class AboutLibrary(val name: String, val license: String, val purpose: String)
-
-// These versions are mirrored by hand from gradle/libs.versions.toml (and, for FreeRDP, the pin in
-// freerdp/build.gradle.kts) — there is no runtime path from a version catalog to a dialog, so the
-// mirror and the pins must be updated together. Keep the licenses exactly as written: they were
-// verified against each project's own licensing file.
-private val ABOUT_LIBRARIES = listOf(
-    AboutLibrary("Apache MINA SSHD 2.14.0", "Apache-2.0", "SSH transport, SFTP and port forwarding"),
-    AboutLibrary("vernacular-vnc (pinned to commit f39cbe2 via JitPack)", "MIT", "VNC remote desktop client"),
-    AboutLibrary(
-        "FreeRDP 3.31.1",
-        "Apache-2.0",
-        "RDP remote desktop client; its Java JNI bridge file is MPL-2.0; the native build bundles OpenSSL (Apache-2.0), cJSON (MIT) and uriparser (BSD-3-Clause)",
-    ),
-    AboutLibrary("Android Jetpack — Compose (BOM 2025.04.01), Room 2.7.1, Hilt 2.56.1, WorkManager 2.10.0, DataStore 1.1.4, Biometric 1.1.0", "Apache-2.0", "UI, storage and background work"),
-    AboutLibrary("Kotlin 2.1.20 + coroutines 1.10.1", "Apache-2.0", "language and async runtime"),
-    AboutLibrary("eddsa 0.3.0", "CC0-1.0", "Ed25519 key support"),
-    AboutLibrary("SLF4J 2.0.17", "MIT", "logging facade"),
-)
 
 /** Where the source lives. Private repository — see the comment on the dialog's link. */
 private const val ABOUT_REPO_URL = "https://github.com/maragung/EclipseSSH"
