@@ -127,7 +127,20 @@ val fetchFreerdpSource =
         group = "freerdp"
         description =
             "Downloads, SHA256-verifies and extracts the pinned FreeRDP source tarball."
-        outputs.file(freerdpTarball)
+        // Every script-level pin and path the action reads is rebound as a local of this
+        // configuration block first. A top-level .kts `val` is a *field of the script
+        // class*, so a task action that reads one captures the script instance itself -
+        // which the configuration cache (org.gradle.configuration-cache=true) refuses to
+        // serialize, and a refused store fails the whole build, not just skips the cache.
+        // Locals captured by the action lambda are serialized as plain values instead.
+        // (Config-time uses such as `outputs` below may read either; the locals keep the
+        // action and its inputs visibly made of the same values.)
+        val version = freerdpVersion
+        val expectedSha256 = freerdpSha256
+        val tarball = freerdpTarball
+        val srcDir = freerdpSrcDir
+        val bridgeCMakeDir = freerdpBridgeCMakeDir
+        outputs.file(tarball)
         outputs.dir(freerdpSourceRoot)
         doLast {
             // The helpers below are local, not script-level `fun`s: a function
@@ -194,24 +207,24 @@ val fetchFreerdpSource =
             // only ever put there by a real extraction, and it is exactly the
             // input the build below needs, so a tree missing it is re-extracted
             // rather than trusted.
-            if (!freerdpBridgeCMakeDir.isDirectory) {
-                freerdpSrcDir.mkdirs()
-                if (!freerdpTarball.isFile) {
-                    logger.lifecycle("Downloading FreeRDP $freerdpVersion ...")
+            if (!bridgeCMakeDir.isDirectory) {
+                srcDir.mkdirs()
+                if (!tarball.isFile) {
+                    logger.lifecycle("Downloading FreeRDP $version ...")
                     download(
                         "https://github.com/FreeRDP/FreeRDP/releases/download/" +
-                            "$freerdpVersion/freerdp-$freerdpVersion.tar.gz",
-                        freerdpTarball,
+                            "$version/freerdp-$version.tar.gz",
+                        tarball,
                     )
                 }
-                verifySha256(freerdpTarball, freerdpSha256)
-                logger.lifecycle("Extracting FreeRDP $freerdpVersion ...")
+                verifySha256(tarball, expectedSha256)
+                logger.lifecycle("Extracting FreeRDP $version ...")
                 run(
                     "tar",
                     "xzf",
-                    freerdpTarball.absolutePath,
+                    tarball.absolutePath,
                     "-C",
-                    freerdpSrcDir.absolutePath,
+                    srcDir.absolutePath,
                 )
             }
         }
@@ -224,6 +237,17 @@ val buildFreerdpNative =
             "Cross-compiles the FreeRDP JNI bridge and dependencies for every ABI " +
                 "(the spike recipe) and collects the .so files into the jniLibs source set."
         dependsOn(fetchFreerdpSource)
+        // Same rebind-to-locals rule as fetchFreerdpSource: the action below reads only
+        // these locals, never the script's fields, so the configuration cache can store
+        // it (a script-object capture in a task action fails the build).
+        val sdkRoot = androidSdkRoot
+        val ndkVersion = freerdpNdkVersion
+        val bridgeCMakeDir = freerdpBridgeCMakeDir
+        val depsJniLibs = freerdpDepsJniLibs
+        val buildRoot = nativeBuildRoot
+        val jniLibsOut = nativeJniLibs
+        val abis = freerdpAbis
+        val runtimeLibraries = freerdpRuntimeLibraries
         // The pins are inputs so editing any of them reruns the task; the build
         // trees are deliberately NOT inputs - after a CI cache restore the task
         // reruns, CMake skips configure (build.ninja exists) and Ninja rebuilds
@@ -231,7 +255,7 @@ val buildFreerdpNative =
         inputs.property("freerdpVersion", freerdpVersion)
         inputs.property("freerdpSha256", freerdpSha256)
         inputs.property("abis", freerdpAbis.joinToString(","))
-        outputs.dir(nativeJniLibs)
+        outputs.dir(jniLibsOut)
         doLast {
             // Local for the same reason as fetchFreerdpSource's helpers: a
             // script-level `fun` would make this action hold the script object,
@@ -250,17 +274,17 @@ val buildFreerdpNative =
             }
 
             val toolchain =
-                File(File(androidSdkRoot, "ndk/$freerdpNdkVersion"), "build/cmake/android.toolchain.cmake")
+                File(File(sdkRoot, "ndk/$ndkVersion"), "build/cmake/android.toolchain.cmake")
             check(toolchain.isFile) {
-                "The NDK $freerdpNdkVersion toolchain is missing at $toolchain - install it " +
-                    "with: sdkmanager \"ndk;$freerdpNdkVersion\""
+                "The NDK $ndkVersion toolchain is missing at $toolchain - install it " +
+                    "with: sdkmanager \"ndk;$ndkVersion\""
             }
-            check(freerdpBridgeCMakeDir.isDirectory) {
-                "The extracted FreeRDP tree has no bridge project at $freerdpBridgeCMakeDir"
+            check(bridgeCMakeDir.isDirectory) {
+                "The extracted FreeRDP tree has no bridge project at $bridgeCMakeDir"
             }
 
-            for (abi in freerdpAbis) {
-                val cmakeDir = File(nativeBuildRoot, "cmake/$abi")
+            for (abi in abis) {
+                val cmakeDir = File(buildRoot, "cmake/$abi")
                 if (!File(cmakeDir, "build.ninja").isFile) {
                     // docs/README.android's standalone recipe with the lean
                     // feature set of upstream's `qa` build type: OpenSSL (the one
@@ -270,7 +294,7 @@ val buildFreerdpNative =
                     // minSdk, and must not promise more than it.
                     run(
                         "cmake",
-                        "-S", freerdpBridgeCMakeDir.absolutePath,
+                        "-S", bridgeCMakeDir.absolutePath,
                         "-B", cmakeDir.absolutePath,
                         "--toolchain", toolchain.absolutePath,
                         "-DANDROID_ABI=$abi",
@@ -289,15 +313,15 @@ val buildFreerdpNative =
                 }
                 run("cmake", "--build", cmakeDir.absolutePath)
 
-                val outDir = File(nativeJniLibs, abi)
+                val outDir = File(jniLibsOut, abi)
                 outDir.mkdirs()
 
                 val bridge = File(cmakeDir, "libfreerdp-android.so")
                 check(bridge.isFile) { "the bridge library was not built for $abi: $bridge" }
                 bridge.copyTo(File(outDir, bridge.name), overwrite = true)
 
-                for (lib in freerdpRuntimeLibraries) {
-                    val abiDir = File(freerdpDepsJniLibs, abi)
+                for (lib in runtimeLibraries) {
+                    val abiDir = File(depsJniLibs, abi)
                     val flattened = File(abiDir, "$lib.so")
                     val inLibDir = File(abiDir, "lib/$lib.so")
                     val installed = if (flattened.isFile) flattened else inLibDir
@@ -307,7 +331,7 @@ val buildFreerdpNative =
                     installed.copyTo(File(outDir, installed.name), overwrite = true)
                 }
                 logger.lifecycle(
-                    "packaged $abi: libfreerdp-android.so + ${freerdpRuntimeLibraries.size} dependencies",
+                    "packaged $abi: libfreerdp-android.so + ${runtimeLibraries.size} dependencies",
                 )
             }
         }
