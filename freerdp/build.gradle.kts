@@ -6,6 +6,15 @@
 //  2. a Gradle-driven native build that cross-compiles FreeRDP's own Android
 //     bridge and its dependency libraries for every ABI the app ships.
 //
+// Imports, not fully-qualified names: in a .kts script `java` at an expression
+// position resolves to the project's `java {}` extension accessor (the plugins
+// applied here bring the java base plugin), not the `java` package - the
+// fully-qualified form does not compile.
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.util.Locale
+
 // The native build deliberately does NOT use AGP's `externalNativeBuild`. AGP
 // would inject its own CMake discovery and flags - a different build from the
 // one the spike proved (branch spike/freerdp-android, runs 34515547889 and
@@ -249,7 +258,7 @@ fun runProcess(logger: org.gradle.api.logging.Logger, vararg command: String) {
 
 /** Downloads [url] to [target], following redirects (GitHub releases redirect to a CDN). */
 fun download(url: String, target: File) {
-    val connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+    val connection = URL(url).openConnection() as HttpURLConnection
     connection.connectTimeout = 30_000
     connection.readTimeout = 300_000
     connection.instanceFollowRedirects = true
@@ -266,7 +275,7 @@ fun download(url: String, target: File) {
 
 /** Verifies [file] against [expected] (lowercase hex) before anything is built from it. */
 fun verifySha256(file: File, expected: String) {
-    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    val digest = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
         val buffer = ByteArray(64 * 1024)
         while (true) {
@@ -276,7 +285,7 @@ fun verifySha256(file: File, expected: String) {
         }
     }
     val actual =
-        digest.digest().joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
+        digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
     check(actual == expected) {
         "sha256 mismatch for ${file.name}: expected $expected, got $actual"
     }
