@@ -36,12 +36,20 @@ env:
   COMPILE_SDK: 'android-35'
   MIN_SDK: '28'
   TARGET_SDK: 'android-35'
+  # The NDK and CMake the :freerdp module's native build is pinned to
+  # (freerdp/build.gradle.kts). Same pins the FreeRDP spike proved the build
+  # with. The SDK manager does not carry CMake 4.x, hence the PyPI install.
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
 
 jobs:
   verify:
     name: Lint, tests, APKs and AAB
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Generous because the first run after any freerdp/build.gradle.kts change
+    # pays a cold, uncached four-ABI native build (~30 min) on top of the
+    # usual suite; warm runs stay well inside the previous budget.
+    timeout-minutes: 120
 
     steps:
       - name: Check out
@@ -66,8 +74,35 @@ jobs:
             platform-tools
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
           cache-packages: true
           # ANDROID_HOME / ANDROID_SDK_ROOT are exported automatically.
+
+      - name: Install pinned CMake and Ninja
+        # The :freerdp native build drives CMake directly (see
+        # freerdp/build.gradle.kts for why it does not use AGP's
+        # externalNativeBuild). The SDK manager does not carry the CMake line
+        # that build needs; PyPI does. Same pin the spike verified with.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        # freerdp/build holds the extracted tarball, the per-ABI superbuild
+        # trees (OpenSSL + FreeRDP + friends) and the packaged jniLibs. A cold
+        # native build is roughly half an hour for four ABIs; a warm one is a
+        # CMake no-op. The key carries the module's build script because that
+        # is where the tarball, NDK and feature-set pins live - changing any of
+        # them must produce a different cache entry. Restored before any Gradle
+        # step: the first Gradle invocation (lint) already compiles :freerdp,
+        # which builds the native libraries.
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
@@ -142,6 +177,34 @@ jobs:
       - name: Stop the OpenSSH sandbox
         if: always()
         run: tools/local-sshd.sh clean
+
+      - name: Build and verify the :freerdp native module
+        # Every :freerdp compilation depends on the native build task, so the
+        # libraries exist by the time lint got here; this step still runs the
+        # module's own packaging and asserts the product: all eight .so files
+        # per ABI, and the bridge .so is an ELF binary for the architecture it
+        # is filed under. A wrong-ABI library is exactly the failure packaging
+        # would otherwise hide until install time - the same check the FreeRDP
+        # spike used.
+        run: |
+          set -euo pipefail
+          ./gradlew --stacktrace :freerdp:assembleDebug
+          declare -A ELF_SIGNATURE=(
+            [arm64-v8a]='ARM aarch64'
+            [armeabi-v7a]='ARM, EABI5'
+            [x86_64]='x86-64'
+            [x86]='Intel 80386'
+          )
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            for LIB in libfreerdp-android libfreerdp3 libfreerdp-client3 libwinpr3 \
+                       libcrypto libssl libcjson liburiparser; do
+              SO="freerdp/build/native/jniLibs/${ABI}/${LIB}.so"
+              test -f "${SO}" || { echo "missing ${SO}"; exit 1; }
+            done
+            file "freerdp/build/native/jniLibs/${ABI}/libfreerdp-android.so" \
+              | grep -F "${ELF_SIGNATURE[${ABI}]}"
+            echo "verified ${ABI}: ${ELF_SIGNATURE[${ABI}]}"
+          done
 
       - name: Compile instrumentation tests
         # The instrumentation sources cannot run here (the runner has no KVM

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A manifest file is optional for AGP 8 library modules; this one exists only
+     so lint has a stable main manifest to analyze instead of a generated
+     placeholder. The library declares no permissions and no components - it is
+     a JNI wrapper plus packaged .so files, nothing else. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

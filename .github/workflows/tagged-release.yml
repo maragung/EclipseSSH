@@ -32,12 +32,18 @@ env:
   BUILD_TOOLS: '35.0.0'
   COMPILE_SDK: 'android-35'
   TARGET_SDK: 'android-35'
+  # Same pins as ci.yml; the root-invoked assemble/bundle tasks compile the
+  # :freerdp module, whose native build needs them.
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
 
 jobs:
   tagged-release:
     name: Build, sign, and publish
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Room for one cold :freerdp native build if the cache entry is cold or
+    # was just re-keyed; a warm build fits the old budget.
+    timeout-minutes: 120
 
     steps:
       - name: Check out
@@ -60,7 +66,18 @@ jobs:
             platform-tools
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
           cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        # The :freerdp native build drives CMake directly; the SDK manager
+        # does not carry the 4.x line it needs. Same step as ci.yml.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
@@ -95,8 +112,24 @@ jobs:
           git describe --exact-match --tags HEAD
           echo "Building from tag: $(git describe --exact-match --tags HEAD)"
 
+      - name: Clean the build tree
+        # Run on its own, before the native cache restore below: the cache
+        # populates freerdp/build, which a root-invoked `clean` (as the old
+        # combined `clean assembleRelease bundleRelease` step ran it) would
+        # delete again, forcing a cold four-ABI native build into every
+        # tagged release.
+        run: ./gradlew --stacktrace clean
+
+      - name: Cache the FreeRDP native build tree
+        # Same entry ci.yml restores; placed after `clean` so the restored
+        # tree survives into the build.
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
       - name: Assemble release APK and AAB
-        run: ./gradlew --stacktrace clean assembleRelease bundleRelease
+        run: ./gradlew --stacktrace assembleRelease bundleRelease
 
       - name: Verify the release APK signatures
         run: |
@@ -206,7 +239,7 @@ jobs:
             echo
             echo "### Verification"
             echo
-            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 35, build-tools 35.0.0)"
+            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 35, build-tools 35.0.0, NDK 29.0.13113456)"
             echo "- All release APKs verified with \`apksigner verify\` (v2 + v3)"
             echo "- The AAB is verified and uploaded alongside the per-ABI APKs"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
