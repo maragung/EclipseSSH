@@ -87,6 +87,7 @@ object VaultBackup {
             put("terminalFontSize", settings.terminalFontSize)
             put("terminalMinColumns", settings.terminalMinColumns)
             put("pinEnabled", settings.pinEnabled)
+            put("vaultAutoLockMinutes", settings.vaultAutoLockMinutes)
             put("legacyAlgorithms", settings.legacyAlgorithms)
             put("terminalTheme", settings.terminalTheme)
             put("blockScreenshots", settings.blockScreenshots)
@@ -175,6 +176,13 @@ object VaultBackup {
                 settingsObj.optInt("terminalMinColumns", defaults.terminalMinColumns),
             ),
             pinEnabled = settingsObj.optBoolean("pinEnabled", defaults.pinEnabled),
+            // Normalized on the way in like every other imported number: a backup is untrusted
+            // input, and a hand-edited delay the dialog never offered would show as a value nobody
+            // chose. Absent from backups written before the setting existed, which resolves to the
+            // default rather than to zero (never re-lock) by accident.
+            vaultAutoLockMinutes = SettingsRepository.normalizeVaultAutoLockMinutes(
+                settingsObj.optInt("vaultAutoLockMinutes", defaults.vaultAutoLockMinutes),
+            ),
             legacyAlgorithms = settingsObj.optBoolean("legacyAlgorithms", defaults.legacyAlgorithms),
             terminalTheme = settingsObj.optString("terminalTheme", defaults.terminalTheme)
                 .takeIf { name -> TerminalTheme.entries.any { it.name == name } } ?: defaults.terminalTheme,
