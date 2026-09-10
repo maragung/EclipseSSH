@@ -1056,7 +1056,6 @@ private fun EclipseWorkspace(
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
                     onConnect = { host -> showAuthHost = host },
-                    onSelectHost = viewModel::selectHost,
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
@@ -1212,7 +1211,6 @@ private fun EclipseWorkspace(
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
                     onConnect = { host -> showAuthHost = host },
-                    onSelectHost = viewModel::selectHost,
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
@@ -1645,7 +1643,6 @@ private fun WorkspaceScaffold(
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
-    onSelectHost: (HostProfile) -> Unit,
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
@@ -1852,7 +1849,7 @@ private fun WorkspaceScaffold(
         Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
             when (destination) {
                 Destination.HOSTS -> HostsScreen(
-                    state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost,
+                    state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
                     onToggleFavoriteHost, onExportAccount, onDuplicateHost,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
@@ -1892,7 +1889,6 @@ private fun HostsScreen(
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
-    onSelectHost: (HostProfile) -> Unit,
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
@@ -1928,7 +1924,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost)
             }
         }
     }
@@ -1938,25 +1934,25 @@ private fun HostsScreen(
  * One saved host: who it is, how it authenticates, and a single overflow menu holding everything it
  * can do.
  *
- * There is deliberately no primary button on the card any more. A full-width Connect under every host
- * was the largest control on the screen repeated once per row — it added some 60dp to each card, so a
- * phone showed three hosts where it now shows six, and it spent all that emphasis on one of three
- * equally ordinary actions while Edit and Remove sat two taps deep inside the details sheet. Collapsing
- * the three into a kebab menu is what makes every row the same shape whatever the host, which is the
- * property a list needs and a per-row button cannot have.
+ * The card itself is the Connect control - one tap on the row opens the login, the same thing the
+ * menu's Connect item does. There is deliberately no primary button on the card for that: a
+ * full-width Connect under every host was the largest control on the screen repeated once per row —
+ * it added some 60dp to each card, so a phone showed three hosts where it now shows six, and it
+ * spent all that emphasis on one of three equally ordinary actions while Edit and Remove sat two
+ * taps deep inside the details sheet. The row carrying the connect keeps every card the same shape
+ * whatever the host, which is the property a list needs and a per-row button cannot have.
  *
  * One trailing control carries the host's name in its content description. With one card per host,
  * "More actions" alone is ambiguous to a screen reader and to a test: it names the control but not the
  * row it belongs to, and there are as many of them as there are hosts. The arrow that used to sit
  * beside it went away when everything it opened moved into this menu, so the menu is now the one way
- * into everything a host can do - which is also why it no longer needs a second control competing for
- * the row's trailing edge.
+ * into everything except connect - which is also why it no longer needs a second control competing
+ * for the row's trailing edge.
  */
 @Composable
 private fun HostCard(
     host: HostProfile,
     onConnect: (HostProfile) -> Unit,
-    onSelect: (HostProfile) -> Unit,
     onDetails: (HostProfile) -> Unit,
     onEdit: (HostProfile) -> Unit,
     onRemove: (HostProfile) -> Unit,
@@ -1968,7 +1964,10 @@ private fun HostCard(
     // leave the menu open over a different host than the one it was opened on.
     var menuOpen by remember(host.id) { mutableStateOf(false) }
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { onSelect(host) },
+        // The row is the connect: one tap opens the login, exactly what the menu's Connect item does.
+        // selectHost is not needed here because connect() selects the host itself, so the transfer
+        // target and dialog defaults follow the tap either way.
+        modifier = Modifier.fillMaxWidth().clickable { onConnect(host) },
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {

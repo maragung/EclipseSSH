@@ -178,7 +178,8 @@ class HostAndThemeUiRobolectricTest {
     fun theHostCardOffersConnectEditAndRemoveBehindTheKebabAndNoConnectButton() {
         val host = addHost("Kebab edge")
 
-        // Nothing on the card itself is a Connect control any more.
+        // Nothing on the card itself is a Connect control any more: the row itself connects (see the
+        // test below), and it carries no "Connect" text of its own.
         assertWithMessage("the oversized Connect button is back on the card")
             .that(compose.onAllNodesWithText("Connect").fetchSemanticsNodes()).isEmpty()
 
@@ -188,6 +189,27 @@ class HostAndThemeUiRobolectricTest {
         compose.onNodeWithText("Connect").assertIsDisplayed()
         compose.onNodeWithText("Edit").assertIsDisplayed()
         compose.onNodeWithText("Remove").assertIsDisplayed()
+    }
+
+    /**
+     * One tap on the card opens the login - the same thing the kebab's Connect item does.
+     *
+     * The dialog is confirmed at window level, the pattern the Remove test below uses: a Compose
+     * dialog never goes idle under Robolectric, so the honest signal that the login opened is the
+     * window itself, not the nodes inside it.
+     */
+    @Test
+    fun tappingTheCardItselfOpensTheLogin() {
+        val host = addHost("Tappable")
+        val before = ShadowDialog.getShownDialogs().size
+
+        // The host's name sits on the card, so clicking it clicks the card.
+        compose.onNodeWithText(host.name).performClick()
+        pump()
+
+        assertWithMessage("tapping the card did not open the login")
+            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
+        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
     }
 
     /**
