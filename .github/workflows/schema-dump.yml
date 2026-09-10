@@ -66,12 +66,19 @@ jobs:
       - name: Run ksp to write the schema JSONs
         run: ./gradlew :app:kspDebugKotlin
 
-      # Optionally regenerate the dependency lockfile in the same breath (the
-      # same run resolves configurations, so the written lockfile is exactly
-      # what CI's verify step re-computes). Enable the step when a dependency
-      # lands and hand-writing its lock lines is unappealing.
-      # - name: Write the dependency lockfile
-      #   run: ./gradlew :app:dependencies --configuration releaseRuntimeClasspath --write-locks
+      # The account's artifact storage quota is shared across its private repos, and when it is
+      # full the upload step fails the job even though the schema it was meant to carry sits right
+      # there in the workspace. So the files are ALSO printed to the log between markers — small,
+      # text, and the log API is not metered the way artifact storage is — and the upload is
+      # non-fatal (the same call ci.yml made when it hit this). Take the JSON from whichever
+      # channel works.
+      - name: Print the current schema JSON to the log
+        run: |
+          current=$(grep -o 'version = [0-9]*' app/src/main/java/dev/eclipse/ssh/data/local/HostDatabase.kt | grep -o '[0-9]*' | head -1)
+          echo "SCHEMA_DUMP_BEGIN_$current"
+          cat "app/schemas/dev.eclipse.ssh.data.local.EclipseDatabase/$current.json"
+          echo
+          echo "SCHEMA_DUMP_END_$current"
 
       - name: Upload schemas
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
@@ -79,3 +86,4 @@ jobs:
           name: room-schemas
           path: app/schemas/
           if-no-files-found: error
+        continue-on-error: true # storage quota is account-wide; the log above carries the JSON
