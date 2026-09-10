@@ -211,6 +211,7 @@ import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
 import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
+import dev.eclipse.ssh.feature.vault.shouldRelockVault
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
@@ -1013,21 +1014,46 @@ private fun EclipseWorkspace(
     }
     // Deliberately `remember`, NOT `rememberSaveable`: this is a security gate, so it has to fail
     // closed. rememberSaveable persists into the saved-instance-state Bundle, which survives
-    // system-initiated process death — and the ON_STOP re-lock below cannot clear it in time,
-    // because ProcessLifecycleOwner debounces ON_STOP by 700ms while onSaveInstanceState runs
-    // immediately after onStop on API 28+. The Bundle was therefore written with `true`, and
-    // returning to a background-killed process skipped the lock screen entirely. `remember` still
-    // survives rotation (MainActivity handles those configChanges itself, so it is never
-    // recreated); anything that does recreate the activity now re-locks, which is the safe default.
+    // system-initiated process death — and the ON_START re-lock below cannot undo that, because
+    // the timestamp it needs is exactly as ephemeral: restored to `unlocked = true` with no
+    // backgrounded-at to compare against, a background-killed process would come back unlocked.
+    // `remember` still survives rotation (MainActivity handles those configChanges itself, so it is
+    // never recreated); anything that does recreate the activity now re-locks, which is the safe
+    // default.
     var unlocked by remember { mutableStateOf(false) }
 
-    // Re-lock automatically when the app leaves the foreground, so an unlocked
-    // vault is never left exposed in the background. A file picker (SAF) briefly
-    // stops the activity too, so we skip re-locking while one is in flight.
+    // Re-lock the vault after the app has been in the background past the auto-lock delay, so a
+    // phone left on a desk is not an open vault while an unlocked one stays usable through the
+    // glance-away-and-back that a zero-tolerance rule would punish. The countdown starts at ON_STOP
+    // and the decision — pure, and unit-tested in [shouldRelockVault] — runs at ON_START, the first
+    // moment the elapsed time is known. Clearing `unlocked` here is what makes the re-lock real:
+    // the same `pinEnabled && !unlocked` branch below that gates a cold launch then composes the
+    // same LockScreen, biometric button and all, before anything else is reachable.
+    // A file picker (SAF) briefly stops the activity too, so one in flight suspends the countdown
+    // rather than starting it. With no PIN set there is no lock to re-arm and the setting is inert.
     val pinEnabled by rememberUpdatedState(state.settings.pinEnabled)
+    val vaultAutoLockMinutes by rememberUpdatedState(state.settings.vaultAutoLockMinutes)
+    var backgroundedAtMs by remember { mutableStateOf<Long?>(null) }
     DisposableEffect(Unit) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && pinEnabled && !pickerActive) unlocked = false
+            when (event) {
+                Lifecycle.Event.ON_STOP ->
+                    if (!pickerActive) backgroundedAtMs = System.currentTimeMillis()
+                Lifecycle.Event.ON_START -> {
+                    val wentAwayAtMs = backgroundedAtMs
+                    backgroundedAtMs = null
+                    if (
+                        wentAwayAtMs != null &&
+                        shouldRelockVault(
+                            autoLockMinutes = vaultAutoLockMinutes,
+                            lockConfigured = pinEnabled,
+                            backgroundedAtMs = wentAwayAtMs,
+                            nowMs = System.currentTimeMillis(),
+                        )
+                    ) unlocked = false
+                }
+                else -> Unit
+            }
         }
         ProcessLifecycleOwner.get().lifecycle.addObserver(observer)
         onDispose { ProcessLifecycleOwner.get().lifecycle.removeObserver(observer) }
@@ -1240,6 +1266,7 @@ private fun EclipseWorkspace(
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
+                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1399,6 +1426,7 @@ private fun EclipseWorkspace(
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
+                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1922,6 +1950,7 @@ private fun WorkspaceScaffold(
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
     onReconnectAskFirst: (Boolean) -> Unit = {},
+    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
@@ -2081,6 +2110,7 @@ private fun WorkspaceScaffold(
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
                     onReconnectAskFirst = onReconnectAskFirst,
+                    onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
@@ -4421,6 +4451,7 @@ private fun SettingsScreen(
     onLegacyAlgorithms: (Boolean) -> Unit,
     onBlockScreenshots: (Boolean) -> Unit,
     onReconnectAskFirst: (Boolean) -> Unit = {},
+    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
@@ -4441,6 +4472,7 @@ private fun SettingsScreen(
     var showFontDialog by remember { mutableStateOf(false) }
     var showWidthDialog by remember { mutableStateOf(false) }
     var showPinDialog by remember { mutableStateOf(false) }
+    var showVaultAutoLockDialog by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
@@ -4453,6 +4485,17 @@ private fun SettingsScreen(
         SettingRow(Icons.Default.Lock, "Biometric vault lock", "Protect passwords and private keys") { Switch(checked = state.settings.biometricUnlock, onCheckedChange = onBiometric) }
         SettingRow(Icons.Default.Key, "Generate SSH key pair", "RSA 2048/4096 or ECDSA P-256, exported as PEM") { TextButton(onClick = onGenerateKey) { Text("Generate") } }
         SettingRow(Icons.Default.Lock, "PIN lock", if (state.settings.pinEnabled) "Enabled · PIN fallback at launch" else "Set a PIN for quick unlock") { TextButton(onClick = { showPinDialog = true }) { Text(if (state.settings.pinEnabled) "Change" else "Set") } }
+        // The subtitle says so when there is no lock to re-arm: with no PIN set the vault has no
+        // lock screen at all, so the delay would be a setting over nothing.
+        SettingRow(
+            Icons.Default.Lock,
+            "Auto-lock vault",
+            when {
+                !state.settings.pinEnabled -> "No PIN is set, so there is no lock to re-arm"
+                state.settings.vaultAutoLockMinutes == 0 -> "Never re-locks while the app is in the background"
+                else -> "Re-locks after ${state.settings.vaultAutoLockMinutes} minutes in the background"
+            },
+        ) { TextButton(onClick = { showVaultAutoLockDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Encrypted vault", "AES-256-GCM · Android Keystore") { Text("Protected", color = EclipseSuccess, style = MaterialTheme.typography.labelMedium) }
         SettingRow(Icons.Default.Key, "Known hosts", "${state.knownHosts.size} trusted fingerprint(s)") { TextButton(onClick = { showKnownHosts = true }) { Text("Manage") } }
         SettingRow(
@@ -4616,6 +4659,13 @@ private fun SettingsScreen(
             options = listOf(0, 15, 30, 60, 120),
             onDismiss = { showClipboardDialog = false },
             onConfirm = { onClipboard(it); showClipboardDialog = false },
+        )
+    }
+    if (showVaultAutoLockDialog) {
+        VaultAutoLockDialog(
+            current = state.settings.vaultAutoLockMinutes,
+            onDismiss = { showVaultAutoLockDialog = false },
+            onConfirm = { onVaultAutoLock(it); showVaultAutoLockDialog = false },
         )
     }
     if (showFontDialog) {
@@ -4875,6 +4925,44 @@ private fun IntervalDialog(title: String, subtitle: String, current: Int, option
                             selected = selected == option,
                             onClick = { selected = option },
                             label = { Text(if (option == 0) "Off" else "$option s") },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Picks how long the app may sit in the background before the vault re-locks. See
+ * [dev.eclipse.ssh.data.model.AppSettings.vaultAutoLockMinutes].
+ *
+ * Its own dialog rather than an [IntervalDialog], only because that one labels every chip in
+ * seconds and this setting is in minutes, with a "Never" choice rather than an "Off" one. The
+ * choices come from the repository that clamps them, so a chip cannot offer a delay that would be
+ * stored as a different number.
+ */
+@Composable
+private fun VaultAutoLockDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+    var selected by remember { mutableIntStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Auto-lock vault") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "How long the app may sit in the background before the PIN is asked for again. " +
+                        "The countdown starts the moment you leave the app.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                    SettingsRepository.VAULT_AUTO_LOCK_CHOICES.forEach { option ->
+                        FilterChip(
+                            selected = selected == option,
+                            onClick = { selected = option },
+                            label = { Text(if (option == 0) "Never" else "$option min") },
                         )
                     }
                 }
