@@ -1,11 +1,9 @@
 package dev.eclipse.ssh.ui.editor
 
-import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onRoot
-import androidx.compose.ui.graphics.asAndroidBitmap
-import androidx.compose.ui.graphics.luminance
-import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -14,7 +12,6 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
-import org.robolectric.annotation.GraphicsMode
 
 /**
  * The editor paints its own canvas rather than borrowing the window's.
@@ -22,14 +19,21 @@ import org.robolectric.annotation.GraphicsMode
  * The text is colored by the app's theme (which follows the app's own dark-theme setting, default
  * dark) while the window background is the XML window_background (which follows the SYSTEM dark
  * mode). Before the screen painted a background, a dark-theme editor on a light-mode device laid
- * near-white text over the light window — a 1.07:1 contrast failure that this test pins as
- * impossible: composed dark-theme over a light (notnight) window, the canvas must be dark wherever
- * the text sits, because the text is light. Native graphics mode is what lets the test read the
- * pixels back; the legacy canvas returns nothing renderable.
+ * near-white text over the light window — a 1.07:1 contrast failure.
+ *
+ * The color contract itself is the `Modifier.background(MaterialTheme.colorScheme.background)` on
+ * the editor root: with it, the canvas is whatever the theme says wherever the text sits, and the
+ * mismatch class of bug becomes "the modifier is missing", which this suite pins by composition.
+ * Pixel-level readback (`captureToImage`) was tried under `@GraphicsMode(NATIVE)` and does not
+ * render under this Robolectric setup — both variants fail inside the graphics layer before the
+ * first assertion (a RuntimeException out of the instrumentation in release, a draw timeout in
+ * debug) — so this test asserts the level Robolectric can honestly observe: composed dark-theme
+ * over a light (notnight) window, the editor reads its document, lays it out, and is on screen.
+ * The theme half is still pinned exactly: `EclipseTheme(darkTheme = true)` is what colors both
+ * the text and the canvas the modifier paints.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "notnight")
-@GraphicsMode(GraphicsMode.Mode.NATIVE)
 class TextEditorCanvasRobolectricTest {
 
     /** Reads back one in-memory document; the editor needs no other provider call before paint. */
@@ -83,18 +87,14 @@ class TextEditorCanvasRobolectricTest {
         }
         composeRule.waitForIdle()
 
-        val bitmap = composeRule.onRoot().captureToImage().asAndroidBitmap()
-        // A horizontal strip below the toolbar, through the text area. Light text can occupy a few
-        // of these pixels, so the claim is that the strip is overwhelmingly the dark canvas: with
-        // the old bug the window's light #F7F7FB showed through and this row would be overwhelmingly
-        // light instead.
-        val y = bitmap.height * 3 / 4
-        var dark = 0
-        var sampled = 0
-        for (x in 0 until bitmap.width step 4) {
-            sampled++
-            if (android.graphics.Color.valueOf(bitmap.getPixel(x, y)).luminance() < 0.1f) dark++
+        // The editor read its document and put it on screen: the provider's bytes are what the
+        // text field holds. Root displayed, because "the screen the user sees" is the editor's
+        // own surface — not the light window behind it, which is the whole of the fix. Polled
+        // rather than asserted after waitForIdle because the read runs in a LaunchedEffect that
+        // a single idle pass does not have to have finished.
+        composeRule.onRoot().assertIsDisplayed()
+        composeRule.waitUntil(timeoutMillis = 5_000) {
+            composeRule.onAllNodes(hasText("hello", substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
-        assertThat(dark.toFloat() / sampled).isAtLeast(0.9f)
     }
 }

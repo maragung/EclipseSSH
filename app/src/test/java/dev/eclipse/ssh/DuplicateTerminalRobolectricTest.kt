@@ -107,9 +107,7 @@ class DuplicateTerminalRobolectricTest {
 
         val tabs = pumpUntilTabs(host.id, count = 2)
         assertThat(tabs.map(SessionTab::id).toSet()).hasSize(2)
-        pumpUntil(describe = { "the duplicate never connected: " + diagnose(host.id) }) {
-            tabsFor(host.id).all { it.state == SessionConnectionState.CONNECTED }
-        }
+        awaitAllConnected(host.id)
         awaitCount(authAttempts, 2, "passwords offered to the server")
         awaitCount(shellsStarted, 2, "shells the server started")
         // Both terminals have a frame of their own, keyed by their own session key: the duplicate
@@ -131,6 +129,11 @@ class DuplicateTerminalRobolectricTest {
         val host = connectOneShell()
         compose.runOnUiThread { viewModel().duplicateSession(checkNotNull(tabFor(host.id))) }
         val tabs = pumpUntilTabs(host.id, count = 2)
+        // The tab exists the moment duplicateSession runs, but its shell does not: the dial is
+        // still in flight, and sendText to a session whose channel is not installed yet is a
+        // silent no-op. Wait for the duplicate to be CONNECTED — the first tab already is — or
+        // the echoes this test exists to compare never leave the app at all.
+        awaitAllConnected(host.id)
         val first = tabs[0].id
         val second = tabs[1].id
 
@@ -168,6 +171,10 @@ class DuplicateTerminalRobolectricTest {
         val viewModel = viewModel()
         compose.runOnUiThread { viewModel.duplicateSession(checkNotNull(tabFor(host.id))) }
         val tabs = pumpUntilTabs(host.id, count = 2)
+        // As in the transcript test: the duplicate's tab exists before its shell does, and the
+        // CONNECTED assertion below is about the survivor's *session* surviving the close, not
+        // about a dial that was still in flight when its sibling went away.
+        awaitAllConnected(host.id)
         val survivor = tabs[1]
         val store = injected(viewModel, "sessionStore", SshSessionStore::class.java)
 
@@ -252,6 +259,18 @@ class DuplicateTerminalRobolectricTest {
             tabsFor(hostId).size >= count
         }
         return tabsFor(hostId)
+    }
+
+    /**
+     * Waits until every tab this host has is CONNECTED — the state the duplicate's dial reaches
+     * some time after its tab appears. [pumpUntilTabs] returns on tab *existence* because the tab
+     * is created synchronously; anything that types into, closes, or asserts the state of the
+     * duplicate needs this wait first or it is racing the dial.
+     */
+    private fun awaitAllConnected(hostId: String) {
+        pumpUntil(describe = { "the duplicate never connected: " + diagnose(hostId) }) {
+            tabsFor(hostId).all { it.state == SessionConnectionState.CONNECTED }
+        }
     }
 
     /** Waits for a server-side counter to reach [expected], then holds still to prove it stops there. */

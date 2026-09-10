@@ -1569,7 +1569,10 @@ class SessionStabilityTest {
      * died" bug the per-key rules exist to make impossible.
      */
     @Test
-    fun `rekey refuses a key that already holds a session and moves nothing`() = runBlocking {
+    // The explicit Unit is load-bearing: the body ends in a containsExactly, which returns Truth's
+    // Ordered, and a @Test that returns anything at all makes JUnit reject the whole class with
+    // InvalidTestClassError before a single test runs.
+    fun `rekey refuses a key that already holds a session and moves nothing`(): Unit = runBlocking {
         val manager = newManager()
         val store = SshSessionStore()
         try {
