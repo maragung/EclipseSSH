@@ -147,6 +147,12 @@ object VaultBackup {
                 // Same treatment for the remote-desktop column, and it travels in the clear by
                 // design: the line is a host, a port and flags - nothing to redact.
                 put("remoteDesktop", encodeRemoteDesktop(decodeRemoteDesktop(host.remoteDesktop)))
+                // Written unconditionally even though it is false by default, so a host whose
+                // forwarding was turned on and back off restores "off" rather than whatever the
+                // importing build ships as its default. Absent from every older backup, which
+                // optBoolean resolves to false - the grant stays opt-in on restore, the same way
+                // the Room migration keeps it off for upgraded rows.
+                put("agentForwarding", host.agentForwarding)
                 put("hostKeyPolicy", host.hostKeyPolicy.name)
             }) }
         })
@@ -273,6 +279,11 @@ object VaultBackup {
                 // The remote-desktop column reads the same way: what decoding accepts is what is kept,
                 // and an absent key (a backup from before the column existed) is simply no endpoint.
                 remoteDesktop = encodeRemoteDesktop(decodeRemoteDesktop(h.optString("remoteDesktop"))),
+                // The one boolean in this file where "absent means false" is a security property and
+                // not just a default: an older backup predating the flag must not restore it on, for
+                // the same reason the migration keeps it off - it is a grant, and only the user can
+                // make it on the host that carries it.
+                agentForwarding = h.optBoolean("agentForwarding", false),
                 hostKeyPolicy = HostKeyPolicy.entries.firstOrNull { it.name == h.optString("hostKeyPolicy") }
                     ?: HostKeyPolicy.ASK,
             )

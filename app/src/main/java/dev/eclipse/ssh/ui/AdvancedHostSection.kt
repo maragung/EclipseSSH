@@ -264,6 +264,19 @@ internal fun AdvancedHostSection(
                 "Only the key and the password are offered. An account that needs a code cannot log in."
             },
         )
+        OptionSwitch(
+            checked = options.agentForwarding,
+            onCheckedChange = { onChange(options.copy(agentForwarding = it)) },
+            title = "Allow SSH agent forwarding",
+            detail = if (options.agentForwarding) {
+                "Shells on this host may use the keys saved in this app to sign onward challenges. " +
+                    "The server's administrator can request signatures as you while a session with " +
+                    "forwarding is open. A remote ssh-add cannot load keys onto this phone."
+            } else {
+                "The server cannot ask this phone to sign anything on its behalf. Turn on only for " +
+                    "hosts you administer yourself."
+            },
+        )
         Text(
             "Unknown host key",
             style = MaterialTheme.typography.bodySmall,

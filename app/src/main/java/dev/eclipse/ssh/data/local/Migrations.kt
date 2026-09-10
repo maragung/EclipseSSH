@@ -188,4 +188,19 @@ object Migrations {
             db.execSQL("ALTER TABLE host_profiles ADD COLUMN remoteDesktop TEXT NOT NULL DEFAULT ''")
         }
     }
+
+    /**
+     * The per-host SSH agent forwarding switch.
+     *
+     * DEFAULT 0, not 1, for a stronger reason than most of the boolean columns before it: this
+     * column is not a preference about how to connect, it is a *grant* to the server's
+     * administrator while a session is open. Turning it on for every upgraded host would hand that
+     * grant to hosts whose users never made it, which is not a settings default - it is a
+     * permission change made on someone else's behalf. Off is also OpenSSH's own default.
+     */
+    val MIGRATION_15_16 = object : Migration(15, 16) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN agentForwarding INTEGER NOT NULL DEFAULT 0")
+        }
+    }
 }
