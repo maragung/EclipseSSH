@@ -92,7 +92,9 @@ class SessionLogTest {
         start.countDown()
         writers.forEach { it.join() }
         reader.join()
-        assertThat(failure.get()).isNull()
+        // A null would be the failure; spelled as a Boolean so the nullable reference never has to
+        // reach an assertion overload that may not accept it.
+        assertThat(failure.get() == null).isTrue()
         // Whatever the interleaving produced, the survivor is a valid, bounded, ordered string.
         val snapshot = log.snapshot()
         assertThat(snapshot.length).isAtMost(512 + SessionLog.LINE_BOUNDARY_SLACK)

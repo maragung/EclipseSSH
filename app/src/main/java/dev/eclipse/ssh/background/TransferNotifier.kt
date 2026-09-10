@@ -30,6 +30,18 @@ class TransferNotifier @Inject constructor(@ApplicationContext private val conte
                     NotificationManager.IMPORTANCE_LOW,
                 ),
             )
+            // A sibling channel rather than the transfers one: "your command finished" is a
+            // different kind of event from a transfer's progress, and a user who mutes transfers
+            // should not lose terminal notifications with them (or vice versa). Declared here the
+            // same way as the first, which is this class's established pattern for the channels it
+            // owns.
+            notificationManager.createNotificationChannel(
+                NotificationChannel(
+                    CHANNEL_TERMINAL,
+                    "Terminal commands",
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ),
+            )
         }
     }
 
@@ -39,6 +51,30 @@ class TransferNotifier @Inject constructor(@ApplicationContext private val conte
 
     fun notifyFailed(item: TransferItem) {
         notify(item, "Transfer failed", "${item.direction.label} failed: ${item.name}")
+    }
+
+    /**
+     * "Notify when done": the long command the user armed in a terminal's overflow menu has gone
+     * quiet. One notification per arming - the caller disarms the detector when it fires - and the
+     * tap intent is the app's own main activity, the same trampoline every notification here uses.
+     */
+    fun notifyTerminalDone(sessionKey: String, hostName: String) {
+        if (!canPostNotifications()) return
+        val openIntent = PendingIntent.getActivity(
+            context,
+            0,
+            Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = NotificationCompat.Builder(context, CHANNEL_TERMINAL)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle("Terminal: $hostName")
+            .setContentText("Command finished")
+            .setContentIntent(openIntent)
+            .setAutoCancel(true)
+            .build()
+        // Keyed by session so a second arming replaces the first rather than stacking.
+        runCatching { notificationManager.notify(("terminal-done:$sessionKey").hashCode() and Int.MAX_VALUE, notification) }
     }
 
     private fun notify(item: TransferItem, title: String, text: String) {
@@ -70,5 +106,6 @@ class TransferNotifier @Inject constructor(@ApplicationContext private val conte
 
     companion object {
         const val CHANNEL_TRANSFERS = "transfer_results"
+        const val CHANNEL_TERMINAL = "terminal_events"
     }
 }

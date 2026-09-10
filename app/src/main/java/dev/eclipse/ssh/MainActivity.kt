@@ -1185,6 +1185,7 @@ private fun EclipseWorkspace(
                             textExportPicker.launch("$hostName-session.log")
                         }
                     },
+                    onNotifyWhenDone = viewModel::notifyWhenDone,
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1358,6 +1359,7 @@ private fun EclipseWorkspace(
                             textExportPicker.launch("$hostName-session.log")
                         }
                     },
+                    onNotifyWhenDone = viewModel::notifyWhenDone,
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1914,6 +1916,8 @@ private fun WorkspaceScaffold(
     onSaveLogs: (String, String) -> Unit = { _, _ -> },
     /** Saves a session's raw output log - session key and the host name to name the file after. */
     onSaveSessionLog: (String, String) -> Unit = { _, _ -> },
+    /** Arms the finished-command notification for a session key. */
+    onNotifyWhenDone: (String) -> Unit = {},
     onSaveText: (String, String) -> Unit = { _, _ -> },
     onSaveScreen: (String, String) -> Unit = { _, _ -> },
     onClearCompleted: () -> Unit = {},
@@ -1991,6 +1995,7 @@ private fun WorkspaceScaffold(
             onDeleteSnippet = onDeleteSnippet,
             onSaveLogs = onSaveLogs,
             onSaveSessionLog = onSaveSessionLog,
+            onNotifyWhenDone = onNotifyWhenDone,
             onSaveText = onSaveText,
             onSaveScreen = onSaveScreen,
             fontSize = state.settings.terminalFontSize,
@@ -2345,6 +2350,8 @@ private fun TerminalScreen(
     onSaveLogs: (String, String) -> Unit,
     /** Saves the raw session log - see MainViewModel.sessionLogText. */
     onSaveSessionLog: (String, String) -> Unit,
+    /** Arms the finished-command notification - see MainViewModel.notifyWhenDone. */
+    onNotifyWhenDone: (String) -> Unit,
     onSaveText: (String, String) -> Unit,
     onSaveScreen: (String, String) -> Unit,
     /**
@@ -2555,6 +2562,7 @@ private fun TerminalScreen(
             // The session's own key, not the host: a host with two shells has two logs, and the
             // tab's title is the host name the file should be called after.
             onSaveSessionLog = { onSaveSessionLog(activeTab.id, activeTab.title) },
+            onNotifyWhenDone = { onNotifyWhenDone(activeTab.id) },
             onSaveText = { onSaveText(activeTab.hostId, terminalText) },
             onSaveScreen = { onSaveScreen(activeTab.hostId, terminalText) },
             onCopyAll = { onCopyText(terminalText) },
@@ -3210,6 +3218,8 @@ private fun TerminalTabStrip(
     onSaveLogs: () -> Unit,
     /** Saves the raw session log; the item is hidden until the session has output to save. */
     onSaveSessionLog: () -> Unit,
+    /** Arms the finished-command notification for the session on screen. */
+    onNotifyWhenDone: () -> Unit,
     onSaveText: () -> Unit,
     onSaveScreen: () -> Unit,
     onCopyAll: () -> Unit,
@@ -3293,6 +3303,15 @@ private fun TerminalTabStrip(
                     text = { Text("Duplicate terminal") },
                     onClick = { menuOpen = false; onDuplicate(activeTab) },
                 )
+                // Only on a live session: the wait is for a command to *finish*, and a session
+                // that has already ended cannot finish anything. The notification the arming
+                // eventually posts is one-shot - the detector disarms itself when it fires.
+                if (activeTab.state.isLive) {
+                    DropdownMenuItem(
+                        text = { Text("Notify when done") },
+                        onClick = { menuOpen = false; onNotifyWhenDone() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text(if (showCommandBar) "Hide command bar" else "Show command bar") },
                     onClick = { menuOpen = false; onToggleCommandBar() },
