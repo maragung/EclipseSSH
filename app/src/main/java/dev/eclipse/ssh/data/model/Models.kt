@@ -236,6 +236,17 @@ data class HostProfile(
      */
     val savedForwards: String = "",
     /**
+     * The remote-desktop endpoints saved on this host, one line per protocol - `V:5900` for VNC,
+     * with an `R:...` shape reserved for RDP. Encoded by [encodeRemoteDesktop] and read back by
+     * [decodeRemoteDesktop], which doubles as validation exactly like [savedForwards] above it:
+     * the column can arrive from a hand-edited backup file.
+     *
+     * Packed text rather than a table of its own for the same reasons [savedForwards] is: one
+     * endpoint per protocol is all a host ever has, so rows would be ceremony. The line carries
+     * no secrets - host, port and flags - so it travels in vault backups in the clear.
+     */
+    val remoteDesktop: String = "",
+    /**
      * What to do when this host presents a key that is not in known-hosts.
      *
      * A *changed* key is refused under every policy, which is the whole point of pinning: only the
@@ -271,7 +282,7 @@ data class HostProfile(
         // printed. Their *presence* is, because "the startup command did not run" is a real report and
         // an answer of `null` versus `***` is the first thing that narrows it.
         "startupCommand=${redacted(startupCommand)}, environment=${redacted(environment)}, " +
-        "savedForwards=$savedForwards, hostKeyPolicy=$hostKeyPolicy)"
+        "savedForwards=$savedForwards, remoteDesktop=$remoteDesktop, hostKeyPolicy=$hostKeyPolicy)"
 
     companion object {
         /**

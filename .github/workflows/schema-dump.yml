@@ -1,0 +1,89 @@
+# One-off generator for the Room schema JSON. Run it after adding a migration
+# (DB version bump), take the app/schemas artifact it uploads, and commit the
+# new version's JSON - the committed schemas are the record of what each shipped
+# version looked like, and the next migration's step test seeds from them.
+#
+# Same pinned toolchain as ci.yml, for the same reasons ci.yml pins it: the
+# schema JSON's identityHash is a hash of the compiled entity descriptors, so a
+# different compiler or Room version could mint a different hash and break the
+# committed chain. Nothing here is trusted with secrets; permissions stay read.
+name: Schema dump
+
+on:
+  workflow_dispatch:
+  # A PR that changes the database layer dumps its own schema: dispatch by API
+  # only works once the workflow exists on the default branch, so the pull_request
+  # trigger is how the very first migration after this workflow lands gets its
+  # JSON. Paths-filtered so ordinary PRs do not pay for it.
+  pull_request:
+    paths:
+      - 'app/src/main/java/dev/eclipse/ssh/data/local/**'
+      - 'app/src/main/java/dev/eclipse/ssh/data/model/Models.kt'
+      - '.github/workflows/schema-dump.yml'
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+
+jobs:
+  dump:
+    name: Generate app/schemas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+          cache-packages: true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
+
+      # ksp, not a full build: the schema JSON is written by Room's annotation
+      # processor at compile time (room.schemaLocation in app/build.gradle.kts),
+      # and ksp*Kotlin alone runs it. Debug variant is enough — the schema is
+      # variant-independent; only the entity set matters.
+      - name: Run ksp to write the schema JSONs
+        run: ./gradlew :app:kspDebugKotlin
+
+      # The account's artifact storage quota is shared across its private repos, and when it is
+      # full the upload step fails the job even though the schema it was meant to carry sits right
+      # there in the workspace. So the files are ALSO printed to the log between markers — small,
+      # text, and the log API is not metered the way artifact storage is — and the upload is
+      # non-fatal (the same call ci.yml made when it hit this). Take the JSON from whichever
+      # channel works.
+      - name: Print the current schema JSON to the log
+        run: |
+          current=$(grep -o 'version = [0-9]*' app/src/main/java/dev/eclipse/ssh/data/local/HostDatabase.kt | grep -o '[0-9]*' | head -1)
+          echo "SCHEMA_DUMP_BEGIN_$current"
+          cat "app/schemas/dev.eclipse.ssh.data.local.EclipseDatabase/$current.json"
+          echo
+          echo "SCHEMA_DUMP_END_$current"
+
+      - name: Upload schemas
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: room-schemas
+          path: app/schemas/
+          if-no-files-found: error
+        continue-on-error: true # storage quota is account-wide; the log above carries the JSON

@@ -174,4 +174,18 @@ object Migrations {
             db.execSQL("ALTER TABLE transfer_queue ADD COLUMN errorMessage TEXT")
         }
     }
+
+    /**
+     * The per-host remote-desktop endpoints (VNC now, RDP reserved) as one packed text column -
+     * the same shape [MIGRATION_11_12]'s advanced-settings columns and the savedForwards column
+     * before it use, and for the same reasons: one endpoint per protocol is all a host has.
+     *
+     * NOT NULL DEFAULT '' because empty already means "nothing configured", so an upgraded row
+     * needs no special case downstream.
+     */
+    val MIGRATION_14_15 = object : Migration(14, 15) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN remoteDesktop TEXT NOT NULL DEFAULT ''")
+        }
+    }
 }

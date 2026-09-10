@@ -17,7 +17,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
- * The database has grown from version 2 to 14 through hand-written `ALTER TABLE` migrations.
+ * The database has grown from version 2 to 15 through hand-written `ALTER TABLE` migrations.
  * Room validates the migrated schema against the entities when it opens, so a single missing
  * or mistyped column turns an app update into a crash on launch.
  *
@@ -42,7 +42,7 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 2 database migrates all the way to 14 with its rows intact`() = runTest {
+    fun `a version 2 database migrates all the way to 15 with its rows intact`() = runTest {
         seedVersion2()
 
         val db = openWithMigrations()
@@ -128,6 +128,9 @@ class MigrationTest {
         assertThat(host.startupCommand).isEmpty()
         assertThat(host.environment).isEmpty()
         assertThat(host.savedForwards).isEmpty()
+        // Version 15's remote-desktop column is NOT NULL and empty for the same reason: "" is the
+        // absence of an endpoint, so an upgraded host configures nothing until its user does.
+        assertThat(host.remoteDesktop).isEmpty()
 
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.hostId).isNull()
@@ -257,6 +260,9 @@ class MigrationTest {
             // Newline separated, which is the shape most likely to be mangled by a text column.
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nD:1080",
+            // The version-15 column through the same door: packed lines, flags set off by
+            // whitespace, exactly the text the form will put there.
+            remoteDesktop = "V:10.0.1.5:5900 view-only",
         )
         db.hostDao().upsert(configured)
 
@@ -264,7 +270,7 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 11 database - the oldest a device can hold - migrates to 14 with its row intact`() = runTest {
+    fun `a version 11 database - the oldest a device can hold - migrates to 15 with its row intact`() = runTest {
         // Eleven is the real floor. The first public release (1.0.0) shipped at exactly this version, so
         // it is the oldest schema any device in the field can be holding and the oldest upgrade a user
         // actually runs. `seedVersion2` walks the same 11->12->13 steps, but from a hand-written schema;
@@ -276,7 +282,7 @@ class MigrationTest {
         val db = openWithMigrations()
 
         val host = db.hostDao().observeAll().first().single()
-        // Every value set at version 11 survives to 14, none of it reverted to a column default.
+        // Every value set at version 11 survives to 15, none of it reverted to a column default.
         assertThat(host.id).isEqualTo("v11-host")
         assertThat(host.port).isEqualTo(2211)
         assertThat(host.authMethod).isEqualTo("KEY")
@@ -308,6 +314,7 @@ class MigrationTest {
         assertThat(host.startupCommand).isEmpty()
         assertThat(host.environment).isEmpty()
         assertThat(host.savedForwards).isEmpty()
+        assertThat(host.remoteDesktop).isEmpty()
 
         // The transfer row and its version-11 columns survive the climb too.
         val transfer = db.transferDao().observeAll().first().single()
@@ -317,6 +324,64 @@ class MigrationTest {
         assertThat(transfer.retryCount).isEqualTo(3)
         assertThat(transfer.scheduledAt).isEqualTo(1_750_000_000_001L)
         assertThat(transfer.repeatMinutes).isEqualTo(15L)
+    }
+
+    @Test
+    fun `a version 14 host keeps every configured value across the step to 15`() = runTest {
+        // This release's step, on its own, for the same reason the 12->13 step test exists: the
+        // v2 and v11 climbs above can only ever see the new column at its default, which cannot
+        // catch the one failure an ALTER TABLE can commit without failing - rebuilding the table
+        // instead of extending it, and losing everything the user configured. Seeded from the
+        // committed 14.json with a fully configured row, so what survives is what was chosen.
+        seedVersion14()
+
+        val host = openWithMigrations().hostDao().observeAll().first().single()
+
+        // Every version-14 column, read back after the step, none of them at its default.
+        assertThat(host.id).isEqualTo("v14-host")
+        assertThat(host.name).isEqualTo("V14 edge")
+        assertThat(host.host).isEqualTo("edge14.example.com")
+        assertThat(host.username).isEqualTo("ops")
+        assertThat(host.port).isEqualTo(2214)
+        assertThat(host.authMethod).isEqualTo("KEY")
+        assertThat(host.groupName).isEqualTo("Prod")
+        assertThat(host.toDomain().tags).containsExactly("eu", "edge")
+        assertThat(host.isFavorite).isTrue()
+        assertThat(host.lastConnectedAt).isEqualTo(1_750_000_000_002L)
+        assertThat(host.fingerprint).isEqualTo("SHA256:v14")
+        assertThat(host.proxyType).isEqualTo("SOCKS5")
+        assertThat(host.proxyJump).isEqualTo("bastion14.example.com")
+        assertThat(host.socksHost).isEqualTo("10.0.0.14")
+        assertThat(host.socksPort).isEqualTo(9052)
+        assertThat(host.socksUsername).isEqualTo("ops")
+        assertThat(host.accentColor).isEqualTo(0xFF2196F3)
+        assertThat(host.connectTimeoutSeconds).isEqualTo(21)
+        assertThat(host.keepAliveSeconds).isEqualTo(42)
+        assertThat(host.autoLoginSftp).isFalse()
+        assertThat(host.compression).isTrue()
+        assertThat(host.keepAliveEnabled).isFalse()
+        assertThat(host.serverAliveCountMax).isEqualTo(4)
+        assertThat(host.authTimeoutSeconds).isEqualTo(60)
+        assertThat(host.autoReconnect).isFalse()
+        assertThat(host.maxReconnectAttempts).isEqualTo(7)
+        assertThat(host.reconnectBackoffSeconds).isEqualTo(11)
+        assertThat(host.usePty).isFalse()
+        assertThat(host.terminalType).isEqualTo("screen-256color")
+        assertThat(host.terminalColumns).isEqualTo(120)
+        assertThat(host.terminalRows).isEqualTo(40)
+        assertThat(host.keyboardInteractiveAuth).isFalse()
+        assertThat(host.legacyAlgorithms).isTrue()
+        assertThat(host.hostKeyPolicy).isEqualTo("STRICT")
+        assertThat(host.ciphers).isEqualTo("aes256-gcm@openssh.com")
+        assertThat(host.kexAlgorithms).isEqualTo("curve25519-sha256")
+        assertThat(host.macs).isEqualTo("hmac-sha2-256-etm@openssh.com")
+        assertThat(host.hostKeyAlgorithms).isEqualTo("ssh-ed25519")
+        assertThat(host.startupCommand).isEqualTo("tmux attach || tmux new")
+        assertThat(host.environment).isEqualTo("LANG=en_US.UTF-8")
+        assertThat(host.savedForwards).isEqualTo("L:8080:intranet.example:80")
+
+        // And the one column this step adds arrives empty: no endpoint configured, nothing bound.
+        assertThat(host.remoteDesktop).isEmpty()
     }
 
     @Test
@@ -339,9 +404,9 @@ class MigrationTest {
         // The half the audit kept on purpose (AUDIT-REPORT.md sections 5 and 12.9): a downgrade - a file
         // left by a build one version ahead, e.g. after a Play Store rollback - has no migration path
         // back and never can, so refusing to open it would be a crash loop with no way out from inside
-        // the app. Resetting is the recoverable direction. user_version 15 is that newer build; the row
+        // the app. Resetting is the recoverable direction. user_version 16 is that newer build; the row
         // shape beneath it is irrelevant, because a destructive downgrade drops every table first.
-        seedVersion2(userVersion = 15)
+        seedVersion2(userVersion = 16)
 
         val db = openLikeProduction()
 
@@ -357,7 +422,7 @@ class MigrationTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
-                Migrations.MIGRATION_13_14,
+                Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()
@@ -377,7 +442,7 @@ class MigrationTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
-                Migrations.MIGRATION_13_14,
+                Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .allowMainThreadQueries()
@@ -494,6 +559,46 @@ class MigrationTest {
                 "NULL,4280391411,25,45,0,1,0,6,90,0,9,12,0,'screen-256color',132,50,0,1,'STRICT')",
         )
         db.execSQL("PRAGMA user_version = 12")
+        db.close()
+    }
+
+    /**
+     * Writes the version-14 schema from its committed file, with one fully configured host in it -
+     * the starting point of the 14->15 step test, and the last schema before the remote-desktop
+     * column.
+     *
+     * Reconstructed from `schemas/14.json` for the same reason [seedVersion12] is: the committed
+     * file is the definition the shipped release validated against, and a hand-copied CREATE
+     * TABLE would be a second one that keeps passing after the first is found to differ.
+     */
+    private fun seedVersion14() {
+        val schema = JSONObject(schemaFile(14).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
+            "INSERT INTO host_profiles (id, name, host, username, port, authMethod, groupName, tags, " +
+                "isFavorite, lastConnectedAt, fingerprint, proxyType, proxyJump, socksHost, socksPort, " +
+                "socksUsername, socksPassword, accentColor, connectTimeoutSeconds, keepAliveSeconds, " +
+                "autoLoginSftp, compression, keepAliveEnabled, serverAliveCountMax, authTimeoutSeconds, " +
+                "autoReconnect, maxReconnectAttempts, reconnectBackoffSeconds, usePty, terminalType, " +
+                "terminalColumns, terminalRows, keyboardInteractiveAuth, legacyAlgorithms, hostKeyPolicy, " +
+                "ciphers, kexAlgorithms, macs, hostKeyAlgorithms, startupCommand, environment, savedForwards) " +
+                "VALUES ('v14-host','V14 edge','edge14.example.com','ops',2214,'KEY','Prod'," +
+                "'eu' || char(31) || 'edge',1,1750000000002,'SHA256:v14','SOCKS5'," +
+                "'bastion14.example.com','10.0.0.14',9052,'ops'," +
+                // socksPassword stays NULL for the same reason as every other seed: no fixture in
+                // this repo carries anything shaped like a credential.
+                "NULL,4280391411,21,42,0,1,0,4,60,0,7,11,0,'screen-256color',120,40,0,1,'STRICT'," +
+                "'aes256-gcm@openssh.com','curve25519-sha256','hmac-sha2-256-etm@openssh.com'," +
+                "'ssh-ed25519','tmux attach || tmux new','LANG=en_US.UTF-8','L:8080:intranet.example:80')",
+        )
+        db.execSQL("PRAGMA user_version = 14")
         db.close()
     }
 

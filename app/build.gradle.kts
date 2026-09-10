@@ -124,6 +124,11 @@ android {
                 "META-INF/NOTICE*",
                 "META-INF/INDEX.LIST",
                 "META-INF/*.kotlin_module",
+                // bcprov-jdk18on (pulled in by vernacular-vnc) and jspecify both ship an OSGi
+                // container manifest at this multi-release-jar path. Android is not an OSGi
+                // runtime, so both copies are dead weight - but only this resource is dropped,
+                // not the whole `META-INF/versions/9` tree, whose classes D8 does consume.
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
             )
             // MINA SSHD resolves its security providers / factories through
             // META-INF/services, so those entries must survive packaging.
@@ -369,6 +374,12 @@ dependencies {
     implementation(libs.eddsa)
     implementation(libs.slf4j.api)
     implementation(libs.slf4j.simple)
+
+    // The RFB (VNC) half of the remote-desktop viewer, spoken over a plain Socket that the
+    // VNC engine runs through an ad-hoc SSH local forward. Pinned to a JitPack commit SHA -
+    // see the version catalog note. Its only transitive dependency is Bouncy Castle's
+    // bcprov-jdk18on, which the VNC auth path uses and nothing else in the app pulls in.
+    implementation(libs.vernacular.vnc)
 
     testImplementation(libs.junit)
     testImplementation(libs.truth)

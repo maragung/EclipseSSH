@@ -582,6 +582,7 @@ class VaultBackupTest {
             startupCommand = "tmux attach || tmux new",
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nR:2222:22\nD:1080",
+            remoteDesktop = "V:10.0.1.5:5900 view-only",
         )
 
         val restored = VaultBackup.fromJson(VaultBackup.toJson(listOf(tuned), AppSettings(), emptyMap())).first
@@ -623,6 +624,7 @@ class VaultBackupTest {
         assertThat(host.startupCommand).isEmpty()
         assertThat(host.environment).isEmpty()
         assertThat(host.savedForwards).isEmpty()
+        assertThat(host.remoteDesktop).isEmpty()
     }
 
     @Test
@@ -640,7 +642,8 @@ class VaultBackupTest {
                        "macs":"   ",
                        "startupCommand":"${"x".repeat(STARTUP_COMMAND_MAX_LENGTH + 200)}",
                        "environment":"${"E".repeat(ENVIRONMENT_MAX_LENGTH + 200)}",
-                       "savedForwards":"L:8080\nX:1\nD:1080"}]}
+                       "savedForwards":"L:8080\nX:1\nD:1080",
+                       "remoteDesktop":"V:not-a-target\nV:5900 view-only"}]}
         """.trimIndent()
 
         val host = VaultBackup.fromJson(hostile).first.single()
@@ -667,6 +670,9 @@ class VaultBackupTest {
         assertThat(host.environment).hasLength(ENVIRONMENT_MAX_LENGTH)
         // Only the rules the engine can act on survive: `L:8080` names no target and `X:1` no kind.
         assertThat(host.savedForwards).isEqualTo("D:1080")
+        // The remote-desktop column reads the same way: the first line that names a target the
+        // engine could dial wins, and a line that names none falls out before it.
+        assertThat(host.remoteDesktop).isEqualTo("V:5900 view-only")
     }
 
     @Test

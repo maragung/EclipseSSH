@@ -30,7 +30,11 @@ import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardRuntime
 import dev.eclipse.ssh.data.model.ForwardStatus
 import dev.eclipse.ssh.data.model.ForwardType
+import dev.eclipse.ssh.data.model.RemoteDesktopConfig
+import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.data.model.decodeRemoteDesktop
+import dev.eclipse.ssh.data.model.encodeRemoteDesktop
 import dev.eclipse.ssh.data.model.describe
 import dev.eclipse.ssh.data.model.deviceListenAddress
 import dev.eclipse.ssh.data.model.encodeForwardRules
@@ -3413,6 +3417,36 @@ class MainViewModel @Inject constructor(
             job.invokeOnCompletion { forwardJobs.remove(hostId, job) }
         }
     }
+
+    /**
+     * Persists [hostId]'s VNC endpoint. The encode/decode round trip is the validation - the
+     * dialog checks its own fields, but this is a public entry point, so the save re-derives what
+     * the packed-text column will actually read back and refuses an endpoint that does not
+     * survive the trip rather than writing a line the next open cannot parse.
+     *
+     * Nothing is started here: the viewer owns its tunnel and dials it when opened, which keeps
+     * "save an endpoint" and "look at a desktop" as separate actions with separate failures.
+     */
+    fun saveRemoteDesktopTarget(hostId: String, target: RemoteDesktopTarget) {
+        launchGuarded("Could not save the remote desktop target") {
+            val host = hostRepository.hosts.first().firstOrNull { it.id == hostId }
+                ?: return@launchGuarded report("The host for this target no longer exists")
+            val text = encodeRemoteDesktop(RemoteDesktopConfig(vnc = target))
+            if (decodeRemoteDesktop(text).vnc == null) {
+                return@launchGuarded report("That VNC endpoint could not be saved")
+            }
+            hostRepository.save(host.copy(remoteDesktop = text))
+        }
+    }
+
+    /**
+     * Where the viewer's tunnel gets its SSH session, asked fresh on every (re)connect. A provider
+     * and not a session because the viewer outlives the session it started with: SSH's own
+     * reconnect ladder may have replaced the transport in between, and the viewer's Reconnect
+     * wants whatever the host has *then*, not the object it was handed at open.
+     */
+    fun vncSessionProvider(hostId: String): () -> ClientSession? =
+        { sessionStore.primarySession(hostId) }
 
     /**
      * Reads uptime, load, memory and disk usage from [host] for the server card.
