@@ -909,7 +909,7 @@ class PortForwardingRobolectricTest {
                 userAuthFactories = listOf<UserAuthFactory>(UserAuthPasswordFactory.INSTANCE)
                 subsystemFactories = Collections.singletonList(SftpSubsystemFactory())
                 fileSystemFactory = VirtualFileSystemFactory(root.toAbsolutePath())
-                shellFactory = ShellFactory { CountingShell() }
+                shellFactory = ShellFactory { CountingShell(shellsStarted) }
                 // In front of MINA's own handler, so a test can make the server say no to a remote
                 // forward - the one refusal this suite cannot produce any other way.
                 globalRequestHandlers =
@@ -992,7 +992,8 @@ private class EchoServer : Closeable {
  * copy so the two classes stay free to diverge. The count exists because "the tab says CONNECTED" is
  * the app's opinion and the number of shells the server started is the fact.
  */
-private class CountingShell : Command {
+// Top-level, so it cannot reach the test class's companion: the counter is handed in instead.
+private class CountingShell(private val shellsStarted: AtomicInteger) : Command {
     private var input: InputStream? = null
     private var output: OutputStream? = null
     private var exit: ExitCallback? = null
