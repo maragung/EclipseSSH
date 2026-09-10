@@ -748,6 +748,19 @@ data class AppSettings(
      */
     val blockScreenshots: Boolean = false,
     /**
+     * Whether a dropped session waits for the user's answer before it reconnects.
+     *
+     * Off by default because automatic recovery is the behaviour the app has always had and the one
+     * a reconnecting SSH client is for: a train tunnel ends, the network returns, the session is
+     * back before the user has picked the phone up. On, it is a deliberate trade the user made -
+     * "never bring my sessions back without my tap" - and the reconnect ladder parks the tab at
+     * Disconnected with a prompt instead of counting attempts. The prompt can only exist in the
+     * activity, so the background service honours the same setting by declining unattended redials
+     * (it still dials for a host with a transfer the user scheduled, which is a standing
+     * instruction). Per-host `autoReconnect = false` remains the way to opt one host out entirely.
+     */
+    val reconnectAskFirst: Boolean = false,
+    /**
      * Number of scrollback lines the terminal buffer holds. The default
      * of 2 000 is the Bitvise/PuTTY/iTerm2 standard; the user can
      * raise it for long-running `tail -f` sessions and lower it for a

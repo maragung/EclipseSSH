@@ -49,7 +49,7 @@ class MainActivityLifecycleTest {
 
             scenario.onActivity { activity -> assertThat(activity.isFinishing).isFalse() }
             assertThat(scenario.state).isEqualTo(Lifecycle.State.RESUMED)
-            compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+            compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
         }
     }
 
@@ -87,7 +87,7 @@ class MainActivityLifecycleTest {
     fun aDeepLinkDeliveredWhileAlreadyRunningIsNotDropped() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             compose.waitForIdle()
-            compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+            compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
 
             // singleTask routes an explicit intent for the live instance through onNewIntent
             // rather than creating a second activity.
@@ -110,7 +110,7 @@ class MainActivityLifecycleTest {
 
                 scenario.onActivity { assertThat(it.isFinishing).isFalse() }
                 // No host to connect to, so the workspace opens as if launched normally.
-                compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+                compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
             }
         }
     }
@@ -126,7 +126,7 @@ class MainActivityLifecycleTest {
             compose.waitForIdle()
 
             scenario.onActivity { assertThat(it.isFinishing).isFalse() }
-            compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+            compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
         }
     }
 
@@ -139,7 +139,7 @@ class MainActivityLifecycleTest {
             compose.waitForIdle()
 
             assertThat(scenario.state).isEqualTo(Lifecycle.State.RESUMED)
-            compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+            compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
         }
     }
 }

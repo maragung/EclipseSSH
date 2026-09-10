@@ -178,16 +178,44 @@ class HostAndThemeUiRobolectricTest {
     fun theHostCardOffersConnectEditAndRemoveBehindTheKebabAndNoConnectButton() {
         val host = addHost("Kebab edge")
 
-        // Nothing on the card itself is a Connect control any more.
+        // Nothing on the card itself is a Connect control any more: the row itself connects (see the
+        // test below), and it carries no "Connect" text of its own.
         assertWithMessage("the oversized Connect button is back on the card")
             .that(compose.onAllNodesWithText("Connect").fetchSemanticsNodes()).isEmpty()
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        // The menu's items compose on a later frame, and the wait is what makes their existence
+        // the precondition of touching them: a fixed pump once lost that race on a loaded
+        // runner, and the click on "Remove" then found no node at all.
+        pumpUntil(describe = { "the kebab menu never offered Connect" }) {
+            compose.onAllNodesWithText("Connect").fetchSemanticsNodes().isNotEmpty()
+        }
         pump()
 
         compose.onNodeWithText("Connect").assertIsDisplayed()
         compose.onNodeWithText("Edit").assertIsDisplayed()
         compose.onNodeWithText("Remove").assertIsDisplayed()
+    }
+
+    /**
+     * One tap on the card opens the login - the same thing the kebab's Connect item does.
+     *
+     * The dialog is confirmed at window level, the pattern the Remove test below uses: a Compose
+     * dialog never goes idle under Robolectric, so the honest signal that the login opened is the
+     * window itself, not the nodes inside it.
+     */
+    @Test
+    fun tappingTheCardItselfOpensTheLogin() {
+        val host = addHost("Tappable")
+        val before = ShadowDialog.getShownDialogs().size
+
+        // The host's name sits on the card, so clicking it clicks the card.
+        compose.onNodeWithText(host.name).performClick()
+        pump()
+
+        assertWithMessage("tapping the card did not open the login")
+            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
+        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
     }
 
     /**
@@ -202,7 +230,11 @@ class HostAndThemeUiRobolectricTest {
         val before = ShadowDialog.getShownDialogs().size
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        // Waited rather than pumped: the click below is only honest against a menu that is on
+        // screen, and on a loaded runner the items can still be a frame away.
+        pumpUntil(describe = { "the kebab menu never offered Remove" }) {
+            compose.onAllNodesWithText("Remove").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Remove").performClick()
         pump()
 
@@ -224,7 +256,10 @@ class HostAndThemeUiRobolectricTest {
         val host = addHost("Editable", hostname = "edit.example.test", username = "editor", port = 2244)
 
         compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        // Same wait as the Remove test: the click must not race the menu's composition.
+        pumpUntil(describe = { "the kebab menu never offered Edit" }) {
+            compose.onAllNodesWithText("Edit").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Edit").performClick()
         pump()
 

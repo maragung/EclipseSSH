@@ -50,7 +50,7 @@ class NavigationRobolectricTest {
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
 
-    /** The tab, not the identically-titled top app bar; only the tab is clickable. */
+    /** The navigation tab. Since the top bar went actions-only, it is also the only place a destination's name renders. */
     private fun tab(label: String) = compose.onNode(hasText(label) and hasClickAction())
 
     /** The activity's [MainViewModel], for raising a message the way the UI's own flows do. */
@@ -237,9 +237,11 @@ class NavigationRobolectricTest {
     fun everyDestinationIsReachableAndRendersItsFirstRunContent() {
         compose.waitForIdle()
 
-        // Hosts is the start destination.
-        assertDisplayed("Your secure workspace")
+        // Hosts is the start destination. Its top bar is now actions-only (no title, no search
+        // icon), so the screen is identified by its filter field and its actions.
         assertDisplayed("Search hosts, tags, or usernames")
+        compose.onNodeWithContentDescription("Add host").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Import account").assertIsDisplayed()
 
         tab("Terminal").performClick()
         assertDisplayed("No active sessions")
@@ -276,7 +278,7 @@ class NavigationRobolectricTest {
 
         // And back, without the round trip having disturbed anything.
         tab("Hosts").performClick()
-        assertDisplayed("Your secure workspace")
+        assertDisplayed("Search hosts, tags, or usernames")
     }
 
     @Test
@@ -335,7 +337,6 @@ class NavigationRobolectricTest {
         // Icon-only buttons are unusable with TalkBack unless they carry a description.
         compose.onNodeWithContentDescription("Add host").assertIsDisplayed()
         compose.onNodeWithContentDescription("Import account").assertIsDisplayed()
-        compose.onNodeWithContentDescription("Global search").assertIsDisplayed()
     }
 
     /**
@@ -371,29 +372,5 @@ class NavigationRobolectricTest {
         // Dismissed, and the workspace underneath is intact.
         assertDisplayed("Search hosts, tags, or usernames")
         assertThat(ShadowDialog.getLatestDialog().isShowing).isFalse()
-    }
-
-    /**
-     * The global search overlay opens over a non-start destination and closes back to it.
-     *
-     * Window-level for the same reason as [theAddHostDialogOpensAsAWindowAndBackDismissesIt]; the
-     * overlay's own copy is asserted by the instrumentation test. The part that matters here and
-     * cannot be seen from inside the dialog is that dismissing it returns to *Settings* rather than
-     * resetting navigation to the start destination.
-     */
-    @Test
-    fun theGlobalSearchOverlayOpensAndClosesBackToTheDestinationItWasOpenedFrom() {
-        compose.waitForIdle()
-        tab("Settings").performClick()
-        assertSettingsSection("Security")
-
-        val dialog = openDialogVia("Global search")
-        assertThat(dialog.isShowing).isTrue()
-        dismissWithBack(dialog)
-        assertThat(dialog.isShowing).isFalse()
-
-        // Still on Settings: dismissing search must not pop navigation back to Hosts.
-        assertSettingsSection("Security")
-        compose.onNodeWithText("Your secure workspace").assertDoesNotExist()
     }
 }

@@ -204,7 +204,14 @@ jobs:
         # the build rather than letting it through.
         run: ./gradlew --stacktrace :app:dependencies --configuration releaseRuntimeClasspath --write-locks
 
+      # The artifact uploads are convenience copies, not verification: everything they
+      # carry was already built and checked by the assemble and signature steps above.
+      # They are continue-on-error because the account-level artifact storage quota
+      # runs out from ordinary CI traffic and is only recalculated every 6-12 hours —
+      # a full, correct build must not report red because a convenience copy could
+      # not be stored.
       - name: Upload debug APK
+        continue-on-error: true
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: eclipse-ssh-debug-apk
@@ -212,6 +219,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload release APKs
+        continue-on-error: true
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: eclipse-ssh-release-apk
@@ -219,6 +227,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload release AAB
+        continue-on-error: true
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: eclipse-ssh-release-aab
@@ -227,6 +236,7 @@ jobs:
 
       - name: Upload test and lint reports
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: reports

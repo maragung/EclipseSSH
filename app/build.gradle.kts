@@ -209,6 +209,19 @@ android {
                 listOf("BC", "EdDSA").forEach { provider ->
                     test.systemProperty("org.apache.sshd.security.provider.$provider.useNamed", "false")
                 }
+                // The default condensed format prints only the exception class and one frame —
+                // `IllegalStateException at SomeTest.kt:289` — which names the wait that timed out
+                // but not what it was waiting *for*: the describe() strings and assertion diffs
+                // that say what actually happened live in the message body. CI diagnoses from the
+                // job log alone (the reports artifact uploads are the first casualty of the
+                // account's artifact-storage quota), so a failing Robolectric suite has to be
+                // readable straight from the log.
+                test.testLogging {
+                    events(org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED)
+                    exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+                    showCauses = true
+                    showStackTraces = true
+                }
             }
         }
     }

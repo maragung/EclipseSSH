@@ -216,7 +216,26 @@ class EclipseSessionService : LifecycleService() {
             // account the user had just connected — every single time Connect was tapped, because
             // tapping Connect is also what starts this service. It prunes dead entries as it goes, so
             // a session that has since dropped is still restored here.
-            val pending = hostsNeedingRestore(hosts, activeIds) { sessionStore.isLive(it) }
+            //
+            // Ask-first mode applies here too, or it would not apply at all: the UI's ladder parks and
+            // prompts, and a pass that redialled anyway would install a live session no tab is
+            // attached to behind a prompt asking whether to reconnect. The one exception is a host
+            // with a transfer in flight - the user scheduled that work, and it is the standing answer
+            // this pass needs.
+            val askFirst = runCatching { settingsRepository.settings.first().reconnectAskFirst }.getOrDefault(false)
+            val transferHostIds = if (askFirst) {
+                transferRepository.transfers.first()
+                    .filter { it.status == TransferStatus.RUNNING || it.status == TransferStatus.QUEUED }
+                    .mapNotNull { it.hostId }
+                    .toSet()
+            } else emptySet()
+            // Host-wide liveness, because a host's session may be filed under a terminal tab's key
+            // rather than the host's own: with more than one terminal per host the host-id slot is
+            // only one of several, and a pass that read it alone would redial a host whose shell is
+            // alive on screen.
+            val pending = hostsNeedingRestore(hosts, activeIds, { sessionStore.liveForHost(it).isNotEmpty() }, askFirst) {
+                it.id in transferHostIds
+            }
             var connected = 0
             // Hosts skipped because another dialler already had them. Counted rather than ignored: they
             // are neither successes (nothing was restored) nor failures (nothing went wrong), and the
@@ -238,8 +257,9 @@ class EclipseSessionService : LifecycleService() {
                 // finds for free.
                 val outcome = sessionStore.tryDialing(host.id) {
                     // The re-check is the point of the gate: whatever appeared while this host waited
-                    // its turn is a session to adopt, not one to duplicate.
-                    sessionStore.liveSession(host.id) ?: dial(host)
+                    // its turn is a session to adopt, not one to duplicate. Asked host-wide, because
+                    // what appeared may be the UI's session filed under a terminal tab's key.
+                    sessionStore.primarySession(host.id) ?: dial(host)
                 }
                 val session = when (outcome) {
                     DialAttempt.Busy -> {
@@ -320,7 +340,7 @@ class EclipseSessionService : LifecycleService() {
             detail = "background restore",
             network = networkMonitor.describe(),
         )
-        sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)))
+        sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)), host.id)
     } catch (cancelled: CancellationException) {
         // The service is going away. Without this the cancellation was swallowed into a null session
         // and the loop went on to dial every remaining host on an already dead context — pointless
@@ -513,18 +533,26 @@ class EclipseSessionService : LifecycleService() {
  * @param activeIds the ids [dev.eclipse.ssh.background.SessionRegistry] has credentials registered
  *   for, which is the app's definition of "the user wants this session up".
  * @param isLive whether the app already holds a usable session for an id.
+ * @param askFirst the app-wide ask-first setting: when it is on, this pass - which runs from a
+ *   connectivity callback while the phone is in a pocket - must not bring a shell back on its own.
+ *   The dialog that asks lives in the activity; the service's half of the mode is declining.
+ * @param transferPending whether [askFirst] should still dial for this host: a transfer the user
+ *   scheduled is a standing instruction, and letting it die mid-copy because nobody was there to
+ *   answer a prompt is not what the user asked for.
  */
 internal fun hostsNeedingRestore(
     hosts: List<HostProfile>,
     activeIds: Set<String>,
     isLive: (String) -> Boolean,
+    askFirst: Boolean = false,
+    transferPending: (HostProfile) -> Boolean = { false },
 ): List<HostProfile> = hosts.filter {
     // A host that switched auto-reconnect off is never dialled by this pass. That switch exists for a
     // host which "must never be dialled unattended" - a bastion behind a one-time code, an audited
     // account, a metered link - and this pass is the most unattended dialler in the app: it runs from a
     // connectivity callback while the phone is in a pocket. Its session is still *kept* if one exists,
     // and Reconnect still works; nothing here brings it back on its own.
-    it.autoReconnect && it.id in activeIds && !isLive(it.id)
+    it.autoReconnect && it.id in activeIds && !isLive(it.id) && (!askFirst || transferPending(it))
 }
 
 /**

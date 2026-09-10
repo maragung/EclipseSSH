@@ -389,6 +389,43 @@ class AutoReconnectDecisionTest {
         assertThat(ReconnectPolicy.DEFAULT.backoffSeconds(globalSeconds = 45)).isEqualTo(45)
     }
 
+    @Test
+    fun `a drop on the default setting schedules the ladder`() {
+        // Today's behaviour, unchanged: reconnectBaseSeconds' default is false, so the first drop of
+        // a session climbs the ladder without asking.
+        assertThat(reconnectActionOnDrop(askFirst = false, attemptsSpent = 0, maxAttempts = 5))
+            .isEqualTo(ReconnectAction.SCHEDULE)
+    }
+
+    @Test
+    fun `ask first mode prompts on every drop`() {
+        // Whatever the allowance says. Ask-first spends no attempts, so there is nothing to be out of
+        // - a prompt on the sixth drop of a host whose ladder would have been spent is the mode
+        // working, not the mode forgetting the ceiling.
+        assertThat(reconnectActionOnDrop(askFirst = true, attemptsSpent = 0, maxAttempts = 5))
+            .isEqualTo(ReconnectAction.PROMPT)
+        assertThat(reconnectActionOnDrop(askFirst = true, attemptsSpent = 5, maxAttempts = 5))
+            .isEqualTo(ReconnectAction.PROMPT)
+    }
+
+    @Test
+    fun `the ladder gives up only once every attempt is spent`() {
+        assertThat(reconnectActionOnDrop(askFirst = false, attemptsSpent = 4, maxAttempts = 5))
+            .isEqualTo(ReconnectAction.SCHEDULE)
+        assertThat(reconnectActionOnDrop(askFirst = false, attemptsSpent = 5, maxAttempts = 5))
+            .isEqualTo(ReconnectAction.GIVE_UP)
+    }
+
+    /**
+     * A user who switches ask-first on halfway through a host's ladder is prompted on its next drop,
+     * not shown the exhaustion message for attempts that never ran.
+     */
+    @Test
+    fun `ask first wins over an exhausted allowance`() {
+        assertThat(reconnectActionOnDrop(askFirst = true, attemptsSpent = 5, maxAttempts = 5))
+            .isNotEqualTo(ReconnectAction.GIVE_UP)
+    }
+
     private fun hostProfile() = HostProfile(
         id = "policy-host",
         name = "Policy",

@@ -61,6 +61,7 @@ internal object Keys {
     val legacyAlgorithms = booleanPreferencesKey("legacy_algorithms")
     val terminalTheme = stringPreferencesKey("terminal_theme")
     val blockScreenshots = booleanPreferencesKey("block_screenshots")
+    val reconnectAskFirst = booleanPreferencesKey("reconnect_ask_first")
     val terminalScrollback = intPreferencesKey("terminal_scrollback")
     val terminalCursorStyle = stringPreferencesKey("terminal_cursor_style")
     val transferBytesPerSecond = androidx.datastore.preferences.core.longPreferencesKey("transfer_bytes_per_second")
@@ -94,6 +95,9 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     legacyAlgorithms = prefs[Keys.legacyAlgorithms] ?: false,
     terminalTheme = prefs[Keys.terminalTheme] ?: TerminalTheme.DARK.name,
     blockScreenshots = prefs[Keys.blockScreenshots] ?: false,
+    // Absent from every install that predates the setting, and the default here is the behaviour
+    // those installs already had - automatic reconnect - rather than false-by-accident.
+    reconnectAskFirst = prefs[Keys.reconnectAskFirst] ?: false,
     terminalScrollback = (prefs[Keys.terminalScrollback] ?: 2_000)
         .coerceIn(SettingsRepository.MIN_SCROLLBACK, SettingsRepository.MAX_SCROLLBACK),
     terminalCursorStyle = prefs[Keys.terminalCursorStyle] ?: "block",
@@ -137,6 +141,7 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setBiometricUnlock(enabled: Boolean) = editPrefs { it[Keys.biometricUnlock] = enabled }
     suspend fun setBlockScreenshots(enabled: Boolean) = editPrefs { it[Keys.blockScreenshots] = enabled }
+    suspend fun setReconnectAskFirst(enabled: Boolean) = editPrefs { it[Keys.reconnectAskFirst] = enabled }
     suspend fun setDarkTheme(enabled: Boolean) = editPrefs { it[Keys.darkTheme] = enabled }
     suspend fun setClipboardSeconds(seconds: Int) = editPrefs { it[Keys.clipboardSeconds] = seconds }
     suspend fun setKeepAliveSeconds(seconds: Int) = editPrefs { it[Keys.keepAliveSeconds] = seconds }

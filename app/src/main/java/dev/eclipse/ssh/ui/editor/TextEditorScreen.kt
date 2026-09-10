@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.ui.editor
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -472,7 +473,19 @@ private fun EditorBody(
     // inset paddings side by side takes the larger of them rather than summing, so an open IME
     // does not double-pad. The status bar is handled on the toolbar Row below, inside the Surface,
     // so the tonal-elevation toolbar keeps painting behind it.
-    Column(Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
+    //
+    // The background is painted rather than borrowed from the window: the window background is the
+    // XML window_background, which follows the SYSTEM dark mode, while the text below is colored by
+    // this theme, which follows the app's own dark-theme setting (default dark). On a light-mode
+    // device that mismatch put near-white text on a near-white window - a 1.07:1 contrast failure -
+    // so the canvas now agrees with the text by construction, the same way the workspace root does.
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .imePadding()
+            .navigationBarsPadding(),
+    ) {
         Surface(tonalElevation = 3.dp) {
             Row(
                 Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 4.dp),

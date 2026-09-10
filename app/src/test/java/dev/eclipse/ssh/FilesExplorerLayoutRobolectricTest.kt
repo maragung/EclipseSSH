@@ -14,6 +14,8 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.getOrNull
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.model.AuthMethod
@@ -190,11 +192,14 @@ class FilesExplorerLayoutRobolectricTest {
     }
 
     /**
-     * A long-press selects, and the batch bar that follows offers the actions the session can serve.
+     * A long-press opens the per-entry action sheet; its Select row starts a selection; and the batch
+     * bar that follows offers the actions the session can serve.
      *
      * The bar is what a touch file manager is judged by: it appears on the gesture, counts what the
      * gesture caught, and offers Download and Schedule on a remote listing - the two a server's rows
-     * can do - alongside the ones both backends share.
+     * can do - alongside the ones both backends share. The gesture itself changed - long-press used
+     * to select directly - so this also pins the new half: the sheet is what the gesture opens, and
+     * selection is what its Select row starts.
      */
     @Test
     fun aSelectionBringsTheBatchBarAndItsActions() {
@@ -206,15 +211,79 @@ class FilesExplorerLayoutRobolectricTest {
         }
 
         compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
+        // The sheet, not the batch bar: the gesture's first consequence is the menu of everything
+        // this entry can do.
+        awaitDisplayed("Edit as text")
+        clickSheetRow("Select")
         awaitDisplayed("1 selected")
         compose.onNode(hasText("Download") and hasClickAction()).assertIsDisplayed()
         compose.onNode(hasText("Schedule") and hasClickAction()).assertIsDisplayed()
         compose.onNode(hasText("Delete") and hasClickAction()).assertIsDisplayed()
     }
 
+    /**
+     * The sheet's Edit row opens the full-window editor for the file that was long-pressed.
+     *
+     * This is the reason the sheet exists: before it, the only way to edit a file was to open its
+     * preview and find the Edit button there - and only for the preview's text-ish kinds. The
+     * assertion is the editor activity starting, which is the whole of the promise; the editor's own
+     * behaviour has its own suites.
+     */
+    @Test
+    fun theActionsSheetsEditRowOpensTheEditor() {
+        connect()
+        openFiles()
+        openTheHostsListing()
+        pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
+            names().contains(bulkName(0))
+        }
+        val app = compose.activity.application
+        compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
+        // Drain whatever starts the setup made, so the peek below only ever reports this
+        // click's doing — peeking does not consume, so a stale intent would mask the editor's.
+        while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
+        clickSheetRow("Edit as text")
+
+        // Stage 1: the row's own first act is closing the sheet it lives in, so the sheet
+        // leaving the tree is the observable proof that the click ran the app's code rather
+        // than stalling in the harness.
+        pumpUntil(describe = { "the sheet never closed after its Edit row was tapped: " + diagnose() }) {
+            compose.onAllNodes(hasText("Edit as text") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+        }
+        // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it,
+        // which fires on a later frame. Robolectric records every startActivity
+        // unconditionally, so a timeout here means the request never reached the effect —
+        // and the peeked intent is the honest witness of what did start instead.
+        pumpUntil(describe = {
+            "the editor activity never started (last start: " +
+                runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull() + "). " + diagnose()
+        }) {
+            runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull()
+                ?.component?.className == "dev.eclipse.ssh.ui.editor.TextEditorActivity"
+        }
+    }
+
     // ---------------------------------------------------------------- driving the app
 
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
+
+    /**
+     * Clicks a bottom-sheet row by invoking its own OnClick semantics action.
+     *
+     * A Material3 ModalBottomSheet lives in a Dialog window, and `performClick` delivers a real
+     * touch through the window's input dispatcher — which under Robolectric never reaches content
+     * inside a dialog window: the node is found, the call returns, and the row's lambda has not run.
+     * (The same gesture on the main window — a tab, a file row — arrives fine, which is why only
+     * the sheet-driven tests fail.) Invoking the action the touch would have dispatched runs the
+     * row's own code with nothing to deliver, so what the test asserts afterwards is about the app
+     * rather than about the harness.
+     */
+    private fun clickSheetRow(label: String) {
+        val row = compose.onNode(hasText(label) and hasClickAction()).fetchSemanticsNode()
+        val click = row.config.getOrNull(SemanticsActions.OnClick)?.action
+        checkNotNull(click) { "the \"$label\" sheet row has no OnClick action" }
+        compose.runOnUiThread { click() }
+    }
 
     private fun names(): List<String> = viewModel().filesExplorer.state.value.entries.map { it.name }
 

@@ -26,16 +26,24 @@ import org.apache.sshd.client.session.ClientSession
  * limit answered the second dial with a refusal the user then saw as an error on a session that was
  * working, and the UI never adopted the extra session, so it stayed open until the process died.
  *
- * Ownership rules, so that "one session per host" is a property of the app rather than a coincidence:
+ * Ownership rules, so that sessions are a property of the app rather than a coincidence:
  *
- *  - whoever is about to dial holds that host's [dialing] gate for the whole attempt, so there is
- *    never a second dial in flight to the same account;
- *  - whoever dials [install]s the result, which keeps a live incumbent and closes the newcomer
- *    instead of the other way round;
- *  - whoever is about to dial asks [isLive] first and adopts what it finds instead;
+ *  - whoever is about to dial holds that session key's [dialing] gate for the whole attempt, so there
+ *    is never a second dial in flight behind the same key;
+ *  - whoever dials [install]s the result under a session key, which keeps a live incumbent *under
+ *    that key* and closes the newcomer instead of the other way round. A key never closes another
+ *    key's session — see [install] for why that property is the one the multi-terminal feature
+ *    stands on;
+ *  - a session key is one of two things: a host id, while only the background service knows about
+ *    the session (its restore slot), or a terminal tab's session id, once the UI owns it. [rekey] is
+ *    the only way a slot moves between them;
  *  - a session is closed when the user closes the tab or stops sessions from the notification, not
  *    when a component that happened to open it goes away. An `Activity` being finished is not a
  *    reason to drop a shell the user asked to keep, and the service being recycled is not either.
+ *
+ * The host-scoped questions — which hosts have anything live, which of a host's sessions a UI should
+ * attach to, whether this was a host's last session — are answered through [hostOf] rather than by
+ * assuming the key *is* the host id, because with more than one terminal per host it no longer is.
  *
  * The terminal channels and their scrollback buffers live here for the same reason and with the same
  * lifetime: adopting a session without its pty would mean reconnecting the shell, and adopting a pty
@@ -52,25 +60,39 @@ import org.apache.sshd.client.session.ClientSession
 @Singleton
 class SshSessionStore @Inject constructor() {
 
-    /** Authenticated sessions, keyed by [dev.eclipse.ssh.data.model.HostProfile.id]. */
+    /**
+     * Authenticated sessions, keyed by session key — a host id for a session only the service knows
+     * about, or a terminal tab's session id once the UI owns it. See the class doc for how a key
+     * moves between the two.
+     */
     val sessions = ConcurrentHashMap<String, ClientSession>()
 
     /** The interactive shell open on each session, where one has been opened. */
     val channels = ConcurrentHashMap<String, TerminalChannel>()
 
-    /** Terminal state per host, kept across a reconnect so scrollback survives it. */
+    /** Terminal state per session, kept across a reconnect so scrollback survives it. */
     val buffers = ConcurrentHashMap<String, AnsiTerminalBuffer>()
 
     /**
-     * One dial at a time per host. See [dialing].
+     * Which host each session key belongs to, so host-scoped questions can be answered without
+     * assuming the key is the host id.
      *
-     * Never removed. A [Mutex] with nothing waiting on it is two fields and no thread, hosts are
+     * Written by [install], moved by [rekey], dropped by [close], [discard] and [reap] alongside the
+     * entry it describes. Exposed like the other maps — the callers that need it read it under the
+     * same atomicity rules, and a wrapper per shape would buy nothing.
+     */
+    val hostOf = ConcurrentHashMap<String, String>()
+
+    /**
+     * One dial at a time per session key. See [dialing].
+     *
+     * Never removed. A [Mutex] with nothing waiting on it is two fields and no thread, keys are
      * counted in tens, and pruning one would need the very lock it is pruning to stay correct.
      */
     private val dialGates = ConcurrentHashMap<String, Mutex>()
 
     /**
-     * Runs [attempt] as the only dial in flight for [hostId].
+     * Runs [attempt] as the only dial in flight for [sessionKey].
      *
      * This is the fix for the app's most visible connection bug: a tab that said *Reconnecting…* a
      * few seconds after a successful login, with two authentications in the server's log for one tap.
@@ -84,18 +106,20 @@ class SshSessionStore @Inject constructor() {
      * close, reported it as a drop, and the reconnect ladder started; the reconnect dialled again,
      * and the loop sustained itself.
      *
-     * Serialising per host closes the window: the second dialler waits, and by the time it holds the
-     * gate the first has installed its session, so its own [isLive] check inside the gate answers
-     * truthfully and it adopts instead of dialling. Per host rather than global so connecting to one
-     * server is never delayed by a handshake with another. Cancellation-safe - a cancelled attempt
-     * releases the gate - and re-entrancy is not required: no dial path takes this gate twice.
+     * Serialising closes the window: the second dialler waits, and by the time it holds the gate the
+     * first has installed its session, so its own [isLive] check inside the gate answers truthfully
+     * and it adopts instead of dialling. Per session key rather than global so connecting to one
+     * server is never delayed by a handshake with another - and so that a second terminal to the
+     * same host, which is a *feature* and not a race, is not queued behind the first one's gate.
+     * Cancellation-safe - a cancelled attempt releases the gate - and re-entrancy is not required:
+     * no dial path takes this gate twice.
      */
-    suspend fun <T> dialing(hostId: String, attempt: suspend () -> T): T =
-        dialGates.computeIfAbsent(hostId) { Mutex() }.withLock { attempt() }
+    suspend fun <T> dialing(sessionKey: String, attempt: suspend () -> T): T =
+        dialGates.computeIfAbsent(sessionKey) { Mutex() }.withLock { attempt() }
 
     /**
      * Like [dialing], but reports [DialAttempt.Busy] instead of waiting when another dialler already
-     * holds [hostId]'s gate.
+     * holds [sessionKey]'s gate.
      *
      * For callers that walk a list of hosts, where waiting is both pointless and harmful. Pointless
      * because whatever the current dialler installs is found by the next pass anyway; harmful because
@@ -107,8 +131,8 @@ class SshSessionStore @Inject constructor() {
      * itself nullable, and "nobody could connect" and "somebody else is connecting" call for opposite
      * responses - a backoff in the first case, patience in the second.
      */
-    suspend fun <T> tryDialing(hostId: String, attempt: suspend () -> T): DialAttempt<T> {
-        val gate = dialGates.computeIfAbsent(hostId) { Mutex() }
+    suspend fun <T> tryDialing(sessionKey: String, attempt: suspend () -> T): DialAttempt<T> {
+        val gate = dialGates.computeIfAbsent(sessionKey) { Mutex() }
         if (!gate.tryLock()) return DialAttempt.Busy
         return try {
             DialAttempt.Ran(attempt())
@@ -118,49 +142,61 @@ class SshSessionStore @Inject constructor() {
     }
 
     /**
-     * Publishes [session] as the session for [hostId] without ever closing a live one.
+     * Publishes [session] as the session for [sessionKey] without ever closing a live one.
      *
      * Returns the session the app is now using, which is *not* always the one passed in: if a live
-     * session is already installed, the newcomer is the redundant one and it is closed. `put` did the
-     * opposite - it closed whatever it replaced, which on the duplicate-dial path above meant closing
-     * the session the user was typing into.
+     * session is already installed under this key, the newcomer is the redundant one and it is
+     * closed. `put` did the opposite - it closed whatever it replaced, which on the duplicate-dial
+     * path above meant closing the session the user was typing into.
+     *
+     * **The incumbent test is per key, and that is load-bearing.** With more than one terminal per
+     * host, two keys can hold two live sessions to the same account; a check that looked at the
+     * *host's* sessions instead of this key's would close one of the user's terminals on the
+     * grounds that another one exists. The race this used to have - two diallers, the survivor
+     * killing the user's shell - becomes, under a fresh key, one extra live session nobody claims,
+     * which is the failure mode the multi-terminal feature can tolerate and clean up in [reap].
      *
      * A dead incumbent is replaced, along with its channel: the shell on a closed transport cannot be
      * reused, and leaving it in the map would let [adoptableHostIds] offer it to the next UI.
+     *
+     * [hostId] is explicit rather than derived from the key because the two stop being the same
+     * string the moment a terminal tab owns the session: the key is then the tab's session id and
+     * the host is what [hostOf] needs filed under it.
      */
-    fun install(hostId: String, session: ClientSession): ClientSession {
-        val incumbent = liveSession(hostId)
+    fun install(sessionKey: String, session: ClientSession, hostId: String): ClientSession {
+        val incumbent = liveSession(sessionKey)
         if (incumbent != null && incumbent !== session) {
             runCatching { session.close(false) }
             return incumbent
         }
-        sessions.put(hostId, session)?.let { previous ->
+        sessions.put(sessionKey, session)?.let { previous ->
             if (previous !== session) {
-                channels.remove(hostId)?.let { channel ->
+                channels.remove(sessionKey)?.let { channel ->
                     channel.markDeliberate()
                     runCatching { channel.close() }
                 }
                 runCatching { previous.close(false) }
             }
         }
+        hostOf[sessionKey] = hostId
         return session
     }
 
     /**
-     * The live session and open shell for [hostId], for a caller that would otherwise dial one.
+     * The live session and open shell for [sessionKey], for a caller that would otherwise dial one.
      *
      * Both halves or nothing: a session whose pty has gone has nothing to attach a terminal to, and
      * answering with it would produce a tab that shows CONNECTED and never prints anything.
      */
-    fun adoptable(hostId: String): Pair<ClientSession, TerminalChannel>? {
-        val session = liveSession(hostId) ?: return null
-        val channel = channels[hostId] ?: return null
+    fun adoptable(sessionKey: String): Pair<ClientSession, TerminalChannel>? {
+        val session = liveSession(sessionKey) ?: return null
+        val channel = channels[sessionKey] ?: return null
         if (!channel.isOpen) return null
         return session to channel
     }
 
     /**
-     * The live session for [hostId] that has no shell on it, if there is one.
+     * The live session for [sessionKey] that has no shell on it, if there is one.
      *
      * Not every session in the store carries a pty. The background service dials transport-only
      * sessions when it restores a host (a transfer to resume, a tracked host after process death),
@@ -174,19 +210,19 @@ class SshSessionStore @Inject constructor() {
      * of the answer — the caller opens a shell on the session that is already there instead of
      * dialling a second one.
      *
-     * A stale closed channel is dropped on the way out, so a host whose shell died but whose
+     * A stale closed channel is dropped on the way out, so a session whose shell died but whose
      * transport survived is offered here rather than being stuck behind a channel nobody can use.
      */
-    fun sessionAwaitingShell(hostId: String): ClientSession? {
-        val session = liveSession(hostId) ?: return null
-        val channel = channels[hostId]
+    fun sessionAwaitingShell(sessionKey: String): ClientSession? {
+        val session = liveSession(sessionKey) ?: return null
+        val channel = channels[sessionKey]
         if (channel != null) {
             if (channel.isOpen) return null
             // Dead, so it is bookkeeping and not a decision: the channel's own close future has
             // already published why it ended, and [TerminalChannel.finish] is first-completion-wins, so
             // discarding here reports nothing. `close` would be a claim - that the app meant this - on
             // an ending the app had no part in.
-            channels.remove(hostId, channel)
+            channels.remove(sessionKey, channel)
             runCatching { channel.discard() }
         }
         return session
@@ -216,13 +252,20 @@ class SshSessionStore @Inject constructor() {
      * removing a corpse is whoever proved it was one, through [discard]. A dead entry left in the map
      * costs nothing: it reads as not-live, so the restore pass dials, and [install] replaces it.
      */
-    fun liveSession(hostId: String): ClientSession? =
-        sessions[hostId]?.takeIf { it.isOpen && it.isAuthenticated }
+    fun liveSession(sessionKey: String): ClientSession? =
+        sessions[sessionKey]?.takeIf { it.isOpen && it.isAuthenticated }
 
-    fun isLive(hostId: String): Boolean = liveSession(hostId) != null
+    fun isLive(sessionKey: String): Boolean = liveSession(sessionKey) != null
 
-    /** Host ids with a usable session. Reads only; the dead are removed by [reap] and [discard]. */
-    fun liveHostIds(): Set<String> = sessions.keys.toList().filterTo(mutableSetOf()) { isLive(it) }
+    /**
+     * Host ids with a usable session. Reads only; the dead are removed by [reap] and [discard].
+     *
+     * The answer is [hostOf] rather than the keys, because a session owned by a terminal tab is filed
+     * under the tab's session id and not under the host's — the key set stopped being the host id set
+     * the moment one host could hold more than one terminal.
+     */
+    fun liveHostIds(): Set<String> =
+        sessions.keys.toList().filter { isLive(it) }.mapNotNullTo(mutableSetOf()) { hostOf[it] }
 
     /**
      * Hosts whose session *and* shell are both still alive, so a UI arriving after a rotation or a
@@ -231,29 +274,120 @@ class SshSessionStore @Inject constructor() {
      * terminal: there is nothing to attach a collector to.
      */
     fun adoptableHostIds(): Set<String> =
-        liveHostIds().filterTo(mutableSetOf()) { channels[it]?.isOpen == true }
+        sessions.keys.toList()
+            .filter { isLive(it) && channels[it]?.isOpen == true }
+            .mapNotNullTo(mutableSetOf()) { hostOf[it] }
 
     /**
-     * Closes the session and shell for [hostId], keeping its scrollback.
+     * The session keys [hostId] still has a live session under.
+     *
+     * The host-scoped half of [isLive]: the service's restore pass and the SFTP client both ask about
+     * a *host*, and with more than one terminal per host the answer has to consider every key filed
+     * under it, not just the one that happens to be named after it.
+     */
+    fun liveForHost(hostId: String): Set<String> =
+        sessions.keys.toList().filterTo(mutableSetOf()) { hostOf[it] == hostId && isLive(it) }
+
+    /**
+     * Every key still filed under [hostId], live or not.
+     *
+     * Live-ness is the wrong question for the caller that needs this: closing a tab wants to know
+     * whether it is taking the host's *last* session with it, and a sibling entry that has died but
+     * not yet been reaped still means another terminal may come back for it — err towards keeping
+     * the host-scoped state, because the reverse (dropping a live host's registry entry and
+     * command history) is the one that loses the user something.
+     */
+    fun sessionKeysForHost(hostId: String): Set<String> =
+        sessions.keys.toList().filterTo(mutableSetOf()) { hostOf[it] == hostId }
+
+    /**
+     * Each live session key with the host it is filed under, for the sweeps that visit every session.
+     *
+     * The liveness probe is the caller: a network change has to ask *each* session whether it survived,
+     * and the trace it writes while doing so is host-keyed. [liveHostIds] is not enough for that — two
+     * terminals on one host would collapse into one entry, and whichever session the probe picked, the
+     * other would never be asked.
+     */
+    fun liveKeysByHost(): List<Pair<String, String>> =
+        sessions.keys.toList().mapNotNull { key -> hostOf[key]?.takeIf { isLive(key) }?.let { key to it } }
+
+    /**
+     * The session host-scoped callers should reach [hostId] through, if the host has a live one.
+     *
+     * SFTP, transfers, saved forwards and the stats producer all belong to the *host* — they are one
+     * channel on one transport, not one per terminal — so they cannot know which of the host's session
+     * keys is the right one and should not have to. [primarySessionFor] picks the key (a session a
+     * terminal can adopt whole, else the first live one); this hands back the session itself, in the
+     * shape those callers already use.
+     */
+    fun primarySession(hostId: String): ClientSession? = primarySessionFor(hostId)?.let { liveSession(it) }
+
+    /**
+     * The session key a UI attaching to [hostId] should use, if the host has anything to offer.
+     *
+     * Prefers a session a terminal can adopt whole — live *and* with its shell still open, scrollback
+     * and all — because that is the case where attaching costs nothing. Falls back to the first live
+     * session, which is a transport the caller can open a shell on ([sessionAwaitingShell]); a host
+     * with only dead entries answers `null`, and the caller dials.
+     */
+    fun primarySessionFor(hostId: String): String? {
+        val keys = sessionKeysForHost(hostId)
+        return keys.firstOrNull { adoptable(it) != null } ?: keys.firstOrNull { isLive(it) }
+    }
+
+    /**
+     * Moves everything filed under [oldKey] to [newKey]: the session, its channel, its buffer, and
+     * the host the index says it belongs to.
+     *
+     * This is how a session the background service restored under its host-id slot becomes a
+     * terminal tab's session: the UI arrives, finds a live session with no tab, and re-keys it rather
+     * than dialling a twin. The one non-negotiable rule is that [newKey] must be **fresh** — a key
+     * that already holds anything is refused, because moving an established session out from under
+     * its own tab is exactly the "shell died" bug the per-key rules exist to prevent.
+     *
+     * Synchronous and on the calling thread, deliberately: the caller is about to file the session's
+     * first channel or buffer under the new key, and a re-key that completed on another thread would
+     * let that write land under a key that had not moved yet.
+     *
+     * Returns whether anything moved. `false` covers both an empty [oldKey] and an occupied
+     * [newKey]; the caller treats them the same — dial or adopt under whichever key it already has.
+     */
+    fun rekey(oldKey: String, newKey: String): Boolean {
+        if (sessions.containsKey(newKey) || channels.containsKey(newKey) || buffers.containsKey(newKey)) return false
+        val host = hostOf.remove(oldKey) ?: return false
+        val session = sessions.remove(oldKey)
+        val channel = channels.remove(oldKey)
+        val buffer = buffers.remove(oldKey)
+        if (session == null && channel == null && buffer == null) return false
+        if (session != null) sessions[newKey] = session
+        if (channel != null) channels[newKey] = channel
+        if (buffer != null) buffers[newKey] = buffer
+        hostOf[newKey] = host
+        return true
+    }
+
+    /**
+     * Closes the session and shell for [sessionKey], keeping its scrollback.
      *
      * Order matters: the channel first, so the shell gets its EOF and the remote side sees a closed
      * pty rather than a vanished transport, then the session. `close(false)` is a graceful close —
      * MINA sends `SSH_MSG_DISCONNECT` and lets the server tidy up.
      */
-    fun close(hostId: String) {
-        val channel = channels.remove(hostId)?.also {
+    fun close(sessionKey: String) {
+        val channel = channels.remove(sessionKey)?.also {
             // Marked before either close, so the shell's own close listener - which may run on a MINA
             // thread while this call is still in flight - reports the app's decision rather than an
             // outage, and nothing schedules a reconnect to a session the user asked to end.
             it.markDeliberate()
         }
-        val session = sessions.remove(hostId)
+        val session = sessions.remove(sessionKey)
+        hostOf.remove(sessionKey)
         release(channel, session) { runCatching { it.close(false) } }
     }
 
     /**
-     * Drops the session for [hostId] because it has been *found dead*, without claiming the app meant
-     * it to end.
+     * Drops the session for [sessionKey] because it has been *found dead*, without claiming the app
+     * meant it to end.
      *
      * The difference from [close] is one line of consequence: [close] marks the channel deliberate,
      * which tells the collector "the app did this" and suppresses the reconnect. Here the opposite is
@@ -268,9 +402,10 @@ class SshSessionStore @Inject constructor() {
      * a lost network, say. Passed to [TerminalChannel.discard], which records it only if the transport
      * has not already reported something first-hand.
      */
-    fun discard(hostId: String, reason: SessionEnd? = null) {
-        val channel = channels.remove(hostId)
-        val session = sessions.remove(hostId)
+    fun discard(sessionKey: String, reason: SessionEnd? = null) {
+        val channel = channels.remove(sessionKey)
+        val session = sessions.remove(sessionKey)
+        hostOf.remove(sessionKey)
         release(channel, session, releaseChannel = { runCatching { it.discard(reason) } }) { runCatching { it.close(true) } }
     }
 
@@ -300,13 +435,14 @@ class SshSessionStore @Inject constructor() {
      * Returns whether anything was removed, which the caller uses only for the trace: reaping nothing is
      * the ordinary outcome and not a failure.
      */
-    fun reap(hostId: String): Boolean {
-        val session = sessions[hostId] ?: return false
+    fun reap(sessionKey: String): Boolean {
+        val session = sessions[sessionKey] ?: return false
         if (session.isOpen && session.isAuthenticated) return false
-        val channel = channels[hostId]
+        val channel = channels[sessionKey]
         if (channel != null && !channel.hasEnded) return false
-        if (channel != null && channels.remove(hostId, channel)) runCatching { channel.discard() }
-        if (!sessions.remove(hostId, session)) return false
+        if (channel != null && channels.remove(sessionKey, channel)) runCatching { channel.discard() }
+        if (!sessions.remove(sessionKey, session)) return false
+        hostOf.remove(sessionKey)
         // Immediate: a graceful close writes SSH_MSG_DISCONNECT and waits for it, and this session has
         // already gone. Ordinarily a no-op, since MINA closed it itself; kept because "not live" also
         // covers a session that is open and unauthenticated, which nothing else will ever close.
@@ -315,9 +451,9 @@ class SshSessionStore @Inject constructor() {
     }
 
     /** [close], and forget the terminal state too. For a tab the user has closed. */
-    fun forget(hostId: String) {
-        close(hostId)
-        buffers.remove(hostId)
+    fun forget(sessionKey: String) {
+        close(sessionKey)
+        buffers.remove(sessionKey)
     }
 
     /** Closes every session. For "Stop sessions", and for the app being torn down deliberately. */

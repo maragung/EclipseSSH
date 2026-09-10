@@ -11,6 +11,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.documentfile.provider.DocumentFile
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
@@ -19,6 +20,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -68,6 +71,7 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -182,7 +186,6 @@ import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
-import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
@@ -197,6 +200,7 @@ import dev.eclipse.ssh.data.MAX_TRANSFER_RETRIES
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.data.fs.SingleDocumentProvider
 import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
@@ -212,6 +216,7 @@ import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
 import dev.eclipse.ssh.presentation.transfersForDisplay
 import dev.eclipse.ssh.presentation.AuthFailurePrompt
+import dev.eclipse.ssh.presentation.ReconnectPrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.ui.editor.EditorRequest
@@ -551,7 +556,7 @@ private fun EclipseWorkspace(
      * [rememberSaveable], so a rotation or a restore after process death comes back to the shell the
      * user was in rather than dropping them into the list.
      */
-    var openSessionHostId by rememberSaveable { mutableStateOf<String?>(null) }
+    var openSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     /**
      * Follows the sessions: a new one takes the screen, and the one being watched gives it back when it
      * ends.
@@ -559,7 +564,7 @@ private fun EclipseWorkspace(
      * Seeded from the sessions that already exist on the first composition rather than starting empty,
      * so returning to a process that still has sessions - a rotation, a restore after process death,
      * coming back from the background - does not count them as new and throw the user into a shell they
-     * did not just ask for. Connect sets [openSessionHostId] itself so the tap feels immediate; this is
+     * did not just ask for. Connect sets [openSessionId] itself so the tap feels immediate; this is
      * what gives every other route to a new session (the widget, a deep link, a reconnect from the list)
      * the same behaviour.
      *
@@ -569,19 +574,21 @@ private fun EclipseWorkspace(
     val seenSessions = remember { mutableSetOf<String>() }
     var sessionsSeeded by remember { mutableStateOf(false) }
     LaunchedEffect(state.tabs) {
-        val live = state.tabs.map { it.hostId }
+        // Tab ids, not host ids: with more than one shell on a host, each is its own session, and a
+        // duplicate opening must take the screen without disturbing the tab already on it.
+        val live = state.tabs.map { it.id }
         val appeared = if (sessionsSeeded) live.lastOrNull { it !in seenSessions } else null
         sessionsSeeded = true
         seenSessions.retainAll(live.toSet())
         seenSessions += live
         if (appeared != null) {
-            openSessionHostId = appeared
+            openSessionId = appeared
             destination = Destination.TERMINAL
-        } else if (openSessionHostId != null && openSessionHostId !in live) {
+        } else if (openSessionId != null && openSessionId !in live) {
             // The session being watched ended - closed from the strip, disconnected by the server, or
             // never restored into this process - so the terminal falls back to the list instead of
             // drawing a shell for a session that is not there.
-            openSessionHostId = null
+            openSessionId = null
         }
     }
     // The Files explorer keeps its own session list and its own listings, but it cannot see the
@@ -684,6 +691,10 @@ private fun EclipseWorkspace(
     // deserves a window of its own rather than a layer over whatever the workspace was showing.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
     var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
+    // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
+    // reason the preview target is: its file actions resolve against this workspace's context,
+    // clipboard and overlays, none of which the screen should know about.
+    var transferActionsFor by remember { mutableStateOf<TransferItem?>(null) }
     var pendingExportPassphrase by remember { mutableStateOf<String?>(null) }
     var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
     var showExportDialog by remember { mutableStateOf(false) }
@@ -798,7 +809,13 @@ private fun EclipseWorkspace(
         }.onFailure { viewModel.reportUiFailure("Sessions will not survive minimising", it) }
         // Straight into the shell, full screen: the list of sessions is somewhere to come back to, not
         // somewhere to pass through on the way in.
-        openSessionHostId = host.id
+        //
+        // The tab this dial will speak for, resolved here the same way connect() resolves its session
+        // key: an existing tab of this host is the one a reconnect re-dials, and a host with no tab
+        // yet gets one filed under the host's own id (the multi-session rule that keeps a lone shell
+        // byte-identical with how it was keyed before). By the time the tab appears, the effect above
+        // would hand it the screen anyway - setting it here is what makes the tap feel immediate.
+        openSessionId = state.tabs.firstOrNull { it.hostId == host.id }?.id ?: host.id
         destination = Destination.TERMINAL
     }
     /**
@@ -931,7 +948,6 @@ private fun EclipseWorkspace(
             viewModel.consumeQuickConnect()
         }
     }
-    var showGlobalSearch by remember { mutableStateOf(false) }
     // Deliberately `remember`, NOT `rememberSaveable`: this is a security gate, so it has to fail
     // closed. rememberSaveable persists into the saved-instance-state Bundle, which survives
     // system-initiated process death — and the ON_STOP re-lock below cannot clear it in time,
@@ -971,11 +987,11 @@ private fun EclipseWorkspace(
      */
     val terminalImmersive = destination == Destination.TERMINAL &&
         !(state.settings.pinEnabled && !unlocked) &&
-        openSessionHostId?.let { id -> state.tabs.any { it.hostId == id } } == true
+        openSessionId?.let { id -> state.tabs.any { it.id == id } } == true
     // Back leaves the shell, not the app. A full-screen terminal has no navigation on screen, so
     // without this the only way out of a session is the gesture that closes the whole app - and the
     // session with it.
-    BackHandler(enabled = terminalImmersive) { openSessionHostId = null }
+    BackHandler(enabled = terminalImmersive) { openSessionId = null }
     /**
      * Hides the status and navigation bars while the shell is on screen, and puts them back afterwards.
      *
@@ -1056,7 +1072,6 @@ private fun EclipseWorkspace(
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
                     onConnect = { host -> showAuthHost = host },
-                    onSelectHost = viewModel::selectHost,
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
@@ -1064,9 +1079,10 @@ private fun EclipseWorkspace(
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
+                    onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
-                    openSessionHostId = openSessionHostId,
-                    onOpenSession = { openSessionHostId = it },
+                    openSessionId = openSessionId,
+                    onOpenSession = { openSessionId = it },
                     immersive = terminalImmersive,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
@@ -1132,6 +1148,7 @@ private fun EclipseWorkspace(
                     onResumeAllTransfers = viewModel::resumeAllTransfers,
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
+                    onOpenTransferActions = { transferActionsFor = it },
                     onAddForward = { type, localPort, remoteHost, remotePort ->
                         activeHost?.let { host ->
                             when (type) {
@@ -1142,7 +1159,6 @@ private fun EclipseWorkspace(
                         }
                     },
                     onStopForward = viewModel::stopForwarding,
-                    onGlobalSearch = { showGlobalSearch = true },
                     onExportVault = { showExportDialog = true },
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
@@ -1158,6 +1174,7 @@ private fun EclipseWorkspace(
                     onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
+                    onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1212,7 +1229,6 @@ private fun EclipseWorkspace(
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
                     onConnect = { host -> showAuthHost = host },
-                    onSelectHost = viewModel::selectHost,
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
@@ -1220,9 +1236,10 @@ private fun EclipseWorkspace(
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
+                    onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
-                    openSessionHostId = openSessionHostId,
-                    onOpenSession = { openSessionHostId = it },
+                    openSessionId = openSessionId,
+                    onOpenSession = { openSessionId = it },
                     immersive = terminalImmersive,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
@@ -1288,6 +1305,7 @@ private fun EclipseWorkspace(
                     onResumeAllTransfers = viewModel::resumeAllTransfers,
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
+                    onOpenTransferActions = { transferActionsFor = it },
                     onAddForward = { type, localPort, remoteHost, remotePort ->
                         activeHost?.let { host ->
                             when (type) {
@@ -1298,7 +1316,6 @@ private fun EclipseWorkspace(
                         }
                     },
                     onStopForward = viewModel::stopForwarding,
-                    onGlobalSearch = { showGlobalSearch = true },
                     onExportVault = { showExportDialog = true },
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
@@ -1314,6 +1331,7 @@ private fun EclipseWorkspace(
                     onTerminalMinColumns = viewModel::setTerminalMinColumns,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
+                    onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1441,13 +1459,11 @@ private fun EclipseWorkspace(
             )
         }
     }
-    if (showGlobalSearch) {
-        GlobalSearchDialog(
-            state = state,
-            onDismiss = { showGlobalSearch = false },
-            onSelectHost = { host -> viewModel.selectHost(host); destination = Destination.HOSTS; showGlobalSearch = false },
-            onCopySnippet = { command -> viewModel.copyToClipboard(command); showGlobalSearch = false },
-        )
+    // Ask-first reconnect: the tab is already parked at Disconnected with the reason, and this is
+    // the question. Looked up like the auth-failure prompt above so a host deleted while the dialog
+    // was open simply takes its question with it.
+    state.reconnectPrompt?.let { prompt ->
+        ReconnectDialog(prompt = prompt, onReconnect = viewModel::answerReconnectPrompt)
     }
     if (showExportDialog) {
         PassphraseDialog(
@@ -1552,6 +1568,41 @@ private fun EclipseWorkspace(
             },
         )
     }
+    // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
+    // preview and the editor that some rows open are their own windows, and none of them should
+    // have to fight this sheet for the bottom of the screen.
+    transferActionsFor?.let { item ->
+        TransferActionsSheet(
+            item = item,
+            onDismiss = { transferActionsFor = null },
+            onPause = { id -> transferActionsFor = null; viewModel.pauseTransfer(id) },
+            onResume = { id -> transferActionsFor = null; viewModel.resumeTransfer(id) },
+            onCancel = { id -> transferActionsFor = null; viewModel.cancelTransfer(id) },
+            onRunNow = { id -> transferActionsFor = null; viewModel.runTransferNow(id) },
+            onViewFile = { transfer ->
+                transferActionsFor = null
+                transferLocalTarget(context, transfer)?.let { previewTarget = it }
+                    ?: viewModel.reportUiMessage("${transfer.name} has no local file to view")
+            },
+            onEditFile = { transfer ->
+                transferActionsFor = null
+                transferLocalTarget(context, transfer)?.let { editorRequest = EditorRequest(it.entry, it.provider) }
+                    ?: viewModel.reportUiMessage("${transfer.name} has no local file to edit")
+            },
+            onOpenFile = { transfer ->
+                transferActionsFor = null
+                openTransferFileExternally(context, transfer, choose = false, onNoApp = viewModel::reportUiMessage)
+            },
+            onOpenFileWith = { transfer ->
+                transferActionsFor = null
+                openTransferFileExternally(context, transfer, choose = true, onNoApp = viewModel::reportUiMessage)
+            },
+            onCopyDetails = { transfer ->
+                transferActionsFor = null
+                viewModel.copyToClipboard(transferDetails(transfer))
+            },
+        )
+    }
     }
     }
 }
@@ -1645,7 +1696,6 @@ private fun WorkspaceScaffold(
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
-    onSelectHost: (HostProfile) -> Unit,
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
@@ -1656,9 +1706,11 @@ private fun WorkspaceScaffold(
     /** Saves a copy of one host under a new id - the card menu's Duplicate item. */
     onDuplicateHost: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
+    /** Long-press on a terminal tab: opens a second shell on the same host. */
+    onDuplicateSession: (SessionTab) -> Unit = {},
     onDisconnectAll: () -> Unit,
     /** The session whose shell is on screen; null shows the list of sessions instead. */
-    openSessionHostId: String?,
+    openSessionId: String?,
     /** Opens a session's shell full-screen, or returns to the list with null. */
     onOpenSession: (String?) -> Unit,
     /** True when that shell owns the window, so this scaffold draws no chrome around it. */
@@ -1697,6 +1749,8 @@ private fun WorkspaceScaffold(
     onResumeAllTransfers: () -> Unit = {},
     onCancelAllTransfers: () -> Unit = {},
     onRunTransferNow: (String) -> Unit = {},
+    /** Long-press on a transfer card: opens the per-item action sheet held above this scaffold. */
+    onOpenTransferActions: (TransferItem) -> Unit = {},
     onAddForward: (ForwardType, Int, String?, Int?) -> Unit = { _, _, _, _ -> },
     onStopForward: (String) -> Unit = {},
     onExportVault: () -> Unit = {},
@@ -1714,11 +1768,11 @@ private fun WorkspaceScaffold(
     onTerminalMinColumns: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
+    onReconnectAskFirst: (Boolean) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
     verifyPin: suspend (String) -> Boolean = { false },
-    onGlobalSearch: () -> Unit = {},
     onForgetKnownHost: (String) -> Unit = {},
     onClearKnownHosts: () -> Unit = {},
     onForgetAllCredentials: () -> Unit = {},
@@ -1729,7 +1783,7 @@ private fun WorkspaceScaffold(
     // A shell owns the whole window, so it composes outside the Scaffold entirely: no top bar, no
     // Scaffold insets, nothing above the grid but the session strip. This is the branch the app enters
     // the moment a login succeeds, and what makes the terminal full screen rather than merely large.
-    val openSession = state.tabs.firstOrNull { it.hostId == openSessionHostId }
+    val openSession = state.tabs.firstOrNull { it.id == openSessionId }
     if (immersive && openSession != null) {
         TerminalScreen(
             state = state,
@@ -1759,7 +1813,8 @@ private fun WorkspaceScaffold(
             onFontSize = onTerminalFontSize,
             onKeyRowVisible = onTerminalKeyRow,
             activeTab = openSession,
-            onSelectSession = { onOpenSession(it.hostId) },
+            onSelectSession = { onOpenSession(it.id) },
+            onDuplicateSession = onDuplicateSession,
             onLeaveSession = { onOpenSession(null) },
             modifier = modifier,
         )
@@ -1767,23 +1822,22 @@ private fun WorkspaceScaffold(
     }
     Scaffold(
         modifier = modifier,
+        // No top bar at all except on Hosts — and no title even there. Every destination already
+        // names itself in the navigation bar at the bottom, so the bar above repeated that name (and
+        // the global-search icon beside it) in vertical space the document on screen could use; the
+        // screens felt noticeably tighter for it. Hosts is the one destination with actions that
+        // belong to no row on it (Add, Import account), and those stay, actions-only.
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(destination.label)
-                        if (destination == Destination.HOSTS) Text("Your secure workspace", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                },
-                actions = {
-                    if (destination == Destination.HOSTS) {
+            if (destination == Destination.HOSTS) {
+                TopAppBar(
+                    title = {},
+                    actions = {
                         IconButton(onClick = onImportAccount) { Icon(Icons.Default.CloudDownload, "Import account") }
                         IconButton(onClick = onAddHost) { Icon(Icons.Default.Add, "Add host") }
-                    }
-                    IconButton(onClick = onGlobalSearch) { Icon(Icons.Default.Search, "Global search") }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
-            )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+                )
+            }
         },
         containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
@@ -1806,7 +1860,7 @@ private fun WorkspaceScaffold(
             Box(Modifier.padding(padding).fillMaxSize()) {
                 TerminalSessionsScreen(
                     state = state,
-                    onOpenSession = { onOpenSession(it.hostId) },
+                    onOpenSession = { onOpenSession(it.id) },
                     onCloseTab = onCloseTab,
                     onDisconnectAll = onDisconnectAll,
                     // The same authentication sheet the Hosts list opens, deliberately: a reconnect is
@@ -1852,7 +1906,7 @@ private fun WorkspaceScaffold(
         Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
             when (destination) {
                 Destination.HOSTS -> HostsScreen(
-                    state, onSearch, onAddHost, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost,
+                    state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
                     onToggleFavoriteHost, onExportAccount, onDuplicateHost,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
@@ -1860,6 +1914,7 @@ private fun WorkspaceScaffold(
                 Destination.TRANSFERS -> TransfersScreen(
                     state.transfers, onClearCompleted, onPauseTransfer, onResumeTransfer, onCancelTransfer,
                     onPauseAllTransfers, onResumeAllTransfers, onCancelAllTransfers, onRunTransferNow,
+                    onOpenTransferActions,
                 )
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
@@ -1868,6 +1923,7 @@ private fun WorkspaceScaffold(
                     onReconnectBase = onReconnectBase,
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
+                    onReconnectAskFirst = onReconnectAskFirst,
                     onTerminalTheme = onTerminalTheme,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
@@ -1892,7 +1948,6 @@ private fun HostsScreen(
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
-    onSelectHost: (HostProfile) -> Unit,
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
@@ -1928,7 +1983,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onSelectHost, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost)
             }
         }
     }
@@ -1938,25 +1993,25 @@ private fun HostsScreen(
  * One saved host: who it is, how it authenticates, and a single overflow menu holding everything it
  * can do.
  *
- * There is deliberately no primary button on the card any more. A full-width Connect under every host
- * was the largest control on the screen repeated once per row — it added some 60dp to each card, so a
- * phone showed three hosts where it now shows six, and it spent all that emphasis on one of three
- * equally ordinary actions while Edit and Remove sat two taps deep inside the details sheet. Collapsing
- * the three into a kebab menu is what makes every row the same shape whatever the host, which is the
- * property a list needs and a per-row button cannot have.
+ * The card itself is the Connect control - one tap on the row opens the login, the same thing the
+ * menu's Connect item does. There is deliberately no primary button on the card for that: a
+ * full-width Connect under every host was the largest control on the screen repeated once per row —
+ * it added some 60dp to each card, so a phone showed three hosts where it now shows six, and it
+ * spent all that emphasis on one of three equally ordinary actions while Edit and Remove sat two
+ * taps deep inside the details sheet. The row carrying the connect keeps every card the same shape
+ * whatever the host, which is the property a list needs and a per-row button cannot have.
  *
  * One trailing control carries the host's name in its content description. With one card per host,
  * "More actions" alone is ambiguous to a screen reader and to a test: it names the control but not the
  * row it belongs to, and there are as many of them as there are hosts. The arrow that used to sit
  * beside it went away when everything it opened moved into this menu, so the menu is now the one way
- * into everything a host can do - which is also why it no longer needs a second control competing for
- * the row's trailing edge.
+ * into everything except connect - which is also why it no longer needs a second control competing
+ * for the row's trailing edge.
  */
 @Composable
 private fun HostCard(
     host: HostProfile,
     onConnect: (HostProfile) -> Unit,
-    onSelect: (HostProfile) -> Unit,
     onDetails: (HostProfile) -> Unit,
     onEdit: (HostProfile) -> Unit,
     onRemove: (HostProfile) -> Unit,
@@ -1968,7 +2023,10 @@ private fun HostCard(
     // leave the menu open over a different host than the one it was opened on.
     var menuOpen by remember(host.id) { mutableStateOf(false) }
     Card(
-        modifier = Modifier.fillMaxWidth().clickable { onSelect(host) },
+        // The row is the connect: one tap opens the login, exactly what the menu's Connect item does.
+        // selectHost is not needed here because connect() selects the host itself, so the transfer
+        // target and dialog defaults follow the tap either way.
+        modifier = Modifier.fillMaxWidth().clickable { onConnect(host) },
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
     ) {
@@ -2082,11 +2140,13 @@ private fun TerminalScreen(
      *
      * Passed in rather than picked here because which shell is on screen decides whether the app has
      * any chrome at all, and that decision belongs where the chrome is - see
-     * [EclipseWorkspace]'s `openSessionHostId`. It also means this screen has no empty state: it is
+     * [EclipseWorkspace]'s `openSessionId`. It also means this screen has no empty state: it is
      * only ever composed for a session that exists, and the list is what handles having none.
      */
     activeTab: SessionTab,
     onSelectSession: (SessionTab) -> Unit,
+    /** Long-press on the strip's tab: opens a second shell on the same host. */
+    onDuplicateSession: (SessionTab) -> Unit,
     onLeaveSession: () -> Unit,
     modifier: Modifier = Modifier,
     fontSize: Int = 13,
@@ -2120,8 +2180,8 @@ private fun TerminalScreen(
     var snippetLabel by remember { mutableStateOf("") }
     var selection by remember { mutableStateOf<TerminalSelection?>(null) }
     // Dropped when the session changes: the coordinates are buffer lines, so keeping them would
-    // highlight an unrelated stretch of the other host's scrollback.
-    LaunchedEffect(activeTab.hostId) { selection = null }
+    // highlight an unrelated stretch of the other session's scrollback.
+    LaunchedEffect(activeTab.id) { selection = null }
     val theme = TerminalTheme.named(state.settings.terminalTheme)
     val termBg = Color(theme.background)
     val termFg = Color(theme.foreground)
@@ -2133,7 +2193,9 @@ private fun TerminalScreen(
             command = if (historyIndex < 0) "" else history[historyIndex]
         }
     }
-    val terminalText = state.terminalOutput[activeTab.hostId].orEmpty()
+    // This tab's own scrollback - keyed by the tab id, which is the session key: a host with two
+    // shells keeps two independent transcripts.
+    val terminalText = state.terminalOutput[activeTab.id].orEmpty()
     // The geometry this host has chosen, or zeroes for "match the screen". Looked up here rather than
     // carried on the tab because it is a stored setting: editing it and coming back has to take effect.
     val hostGeometry = remember(state.hosts, activeTab.hostId) {
@@ -2144,7 +2206,7 @@ private fun TerminalScreen(
     // when this screen leaves composition or the app stops, which is the signal the view model uses to
     // stop producing frames nobody can see.
     val currentFrames by frames.collectAsStateWithLifecycle()
-    val frame = currentFrames[activeTab.hostId] ?: TerminalFrame.EMPTY
+    val frame = currentFrames[activeTab.id] ?: TerminalFrame.EMPTY
     val latches = rememberTerminalLatches()
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -2268,6 +2330,7 @@ private fun TerminalScreen(
             activeTab = activeTab,
             frame = frame,
             onSelect = onSelectSession,
+            onDuplicate = onDuplicateSession,
             onLeaveSession = onLeaveSession,
             onCloseTab = onCloseTab,
             onDisconnectAll = onDisconnectAll,
@@ -2280,8 +2343,8 @@ private fun TerminalScreen(
             onSaveText = { onSaveText(activeTab.hostId, terminalText) },
             onSaveScreen = { onSaveScreen(activeTab.hostId, terminalText) },
             onCopyAll = { onCopyText(terminalText) },
-            onPaste = { onPaste(activeTab.hostId) },
-            onScrollToBottom = { onScrollTo(activeTab.hostId, 0) },
+            onPaste = { onPaste(activeTab.id) },
+            onScrollToBottom = { onScrollTo(activeTab.id, 0) },
             keyRowVisible = state.settings.terminalKeyRowVisible,
             onToggleKeyRow = { onKeyRowVisible(!state.settings.terminalKeyRowVisible) },
             searchQuery = searchQuery,
@@ -2339,14 +2402,14 @@ private fun TerminalScreen(
                             selection = null
                             showKeyboard()
                         } else {
-                            onCopySelection(activeTab.hostId, finished)
+                            onCopySelection(activeTab.id, finished)
                         }
                     },
-                    onScroll = { delta -> onScroll(activeTab.hostId, delta) },
+                    onScroll = { delta -> onScroll(activeTab.id, delta) },
                     onTap = {
                         if (selection != null) selection = null else showKeyboard()
                     },
-                    onViewportChange = { columns, rows -> onResize(activeTab.hostId, columns, rows) },
+                    onViewportChange = { columns, rows -> onResize(activeTab.id, columns, rows) },
                     onZoom = { scale, ended ->
                         // The gesture reports a factor against its own start, so the start size has to
                         // be captured once: reading the current size every step would compound the
@@ -2363,13 +2426,13 @@ private fun TerminalScreen(
                         }
                     },
                     onLongPressCell = { line, column ->
-                        val text = state.terminalLine(activeTab.hostId, line)
+                        val text = state.terminalLine(activeTab.id, line)
                         selection = TerminalSelection.wordAt(line, column, text)
                             // The line's own length, not the grid's: scrollback printed at a wider
                             // terminal keeps every character, and a whole-line selection that stopped
                             // at the current width would copy a truncated line.
                             ?: TerminalSelection.wholeLine(line, maxOf(frame.columns, text.length))
-                        selection?.let { onCopySelection(activeTab.hostId, it) }
+                        selection?.let { onCopySelection(activeTab.id, it) }
                     },
                 )
                 if (frame.totalLines > 0 && frame.firstLine + frame.lines.size < frame.totalLines) {
@@ -2377,7 +2440,7 @@ private fun TerminalScreen(
                     // clue is that nothing moves, which reads as a hung session.
                     ScrollbackBadge(
                         lines = frame.totalLines - (frame.firstLine + frame.lines.size),
-                        onJump = { onScrollTo(activeTab.hostId, 0) },
+                        onJump = { onScrollTo(activeTab.id, 0) },
                         modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
                     )
                 }
@@ -2397,7 +2460,7 @@ private fun TerminalScreen(
             TerminalKeyRow(
                 latches = latches,
                 onKey = { key, ctrl, alt, shift ->
-                    onSendKey(activeTab.hostId, key, ctrl, alt, shift)
+                    onSendKey(activeTab.id, key, ctrl, alt, shift)
                     // Every cap is a clickable surface, and a clickable surface is focusable: a tap can
                     // leave the IME host unfocused, after which the software keyboard's characters and a
                     // hardware keyboard's keys both have nowhere to go while the row itself still works.
@@ -2413,7 +2476,7 @@ private fun TerminalScreen(
                 onCommand = { command = it; historyIndex = -1 },
                 onRecall = recall,
                 onSend = {
-                    onSendInput(activeTab.hostId, command + "\n")
+                    onSendInput(activeTab.id, command + "\n")
                     command = ""
                     historyIndex = -1
                 },
@@ -2430,9 +2493,9 @@ private fun TerminalScreen(
         TerminalInputBridge(
             focusRequester = focusRequester,
             latches = latches,
-            onText = { text -> onSendText(activeTab.hostId, text) },
-            onKey = { key, ctrl, alt, shift -> onSendKey(activeTab.hostId, key, ctrl, alt, shift) },
-            onChar = { char, ctrl, alt -> onSendChar(activeTab.hostId, char, ctrl, alt) },
+            onText = { text -> onSendText(activeTab.id, text) },
+            onKey = { key, ctrl, alt, shift -> onSendKey(activeTab.id, key, ctrl, alt, shift) },
+            onChar = { char, ctrl, alt -> onSendChar(activeTab.id, char, ctrl, alt) },
             onFocusChanged = { focused -> inputFocused = focused },
         )
     }
@@ -2444,7 +2507,7 @@ private fun TerminalScreen(
             // Typed into the remote shell rather than into a form, so the shell's own line editing
             // applies: the snippet arrives on the command line where it can be corrected before Enter,
             // which is what a snippet is for. Deliberately not sent with a newline.
-            onInsert = { snippet -> onSendText(activeTab.hostId, snippet.command); showSnippets = false; showKeyboard() },
+            onInsert = { snippet -> onSendText(activeTab.id, snippet.command); showSnippets = false; showKeyboard() },
             onSaveCurrent = { showSnippets = false; showSaveSnippet = true },
             onDelete = onDeleteSnippet,
         )
@@ -2557,7 +2620,7 @@ private fun TerminalSessionsScreen(
                     startedAt = remember(tab.startedAt, timeFormat) {
                         timeFormat.format(java.util.Date(tab.startedAt))
                     },
-                    lastOutput = state.terminalOutput[tab.hostId],
+                    lastOutput = state.terminalOutput[tab.id],
                     // This session's own lines only - see [sessionDiagnostics]. Computed per row and
                     // not remembered: the ring changes while a ladder runs, which is exactly when the
                     // sheet is open and reading it.
@@ -2796,8 +2859,8 @@ private fun SessionRow(
  * viewport. The transcript is the whole buffer in the same line order, so indexing it gives the line
  * even when the tap landed on scrollback. Out of range returns empty, which selects nothing.
  */
-private fun MainUiState.terminalLine(hostId: String, line: Int): String {
-    val text = terminalOutput[hostId] ?: return ""
+private fun MainUiState.terminalLine(sessionKey: String, line: Int): String {
+    val text = terminalOutput[sessionKey] ?: return ""
     return text.lineSequence().elementAtOrNull(line).orEmpty()
 }
 
@@ -2870,11 +2933,14 @@ private fun TerminalKeyRowHandle(expanded: Boolean, onToggle: () -> Unit, modifi
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun TerminalTabStrip(
     tabs: List<SessionTab>,
     activeTab: SessionTab,
     frame: TerminalFrame,
     onSelect: (SessionTab) -> Unit,
+    /** Long-press on a tab (or its menu item): a second, independent shell on the same host. */
+    onDuplicate: (SessionTab) -> Unit,
     onLeaveSession: () -> Unit,
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
@@ -2918,7 +2984,14 @@ private fun TerminalTabStrip(
         ) {
             tabs.forEach { tab ->
                 Surface(
-                    modifier = Modifier.clickable { onSelect(tab) },
+                    // Long-press duplicates: a second shell on the same host, in its own tab, with its
+                    // own session. Same gesture as the Files list uses to reach an item's actions, and
+                    // the strip's overflow menu carries the same command for anyone who finds gestures
+                    // easier to hit than to remember.
+                    modifier = Modifier.combinedClickable(
+                        onClick = { onSelect(tab) },
+                        onLongClick = { onDuplicate(tab) },
+                    ),
                     shape = RoundedCornerShape(12.dp),
                     color = if (tab == activeTab) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                 ) {
@@ -2956,6 +3029,10 @@ private fun TerminalTabStrip(
         Box {
             IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Terminal actions") }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Duplicate terminal") },
+                    onClick = { menuOpen = false; onDuplicate(activeTab) },
+                )
                 DropdownMenuItem(
                     text = { Text(if (showCommandBar) "Hide command bar" else "Show command bar") },
                     onClick = { menuOpen = false; onToggleCommandBar() },
@@ -3349,6 +3426,7 @@ private fun ColumnScope.FilesScreen(
                 if (entry.isDirectory) filesExplorer.navigate(entry.path, entry.name) else provider?.let { onPreviewFile(entry, it) }
             },
             onToggleSelect = filesExplorer::toggleSelected,
+            onOpenActions = { actionEntry = it },
         )
     }
 
@@ -3378,6 +3456,9 @@ private fun ColumnScope.FilesScreen(
             isLocal = explorer.isLocal,
             supportsPermissions = explorer.supportsPermissions,
             onDismiss = { actionEntry = null },
+            // The sheet closes so the batch bar it summons is visible; the entry joins whatever
+            // selection is already active, which is the old long-press behaviour one tap deeper.
+            onSelect = { actionEntry = null; filesExplorer.toggleSelected(entry.path) },
             onPreview = { actionEntry = null; provider?.let { onPreviewFile(entry, it) } },
             onEdit = { actionEntry = null; provider?.let { onEditFile(entry, it) } },
             onRename = { actionEntry = null; renameEntry = entry },
@@ -3517,6 +3598,65 @@ private data class PreviewTarget(
     val entry: FsEntry,
     val provider: FileSystemProvider,
 )
+
+/**
+ * A transfer's local file as the preview overlay's subject (and, through [PreviewTarget.entry],
+ * the editor's). Built at tap time rather than when the sheet opened, and resolved through SAF
+ * rather than from anything cached: a grant revoked in between reads as a failure inside the
+ * preview, which is where a person can see it, instead of a crash here.
+ *
+ * The document's own answers are preferred but every one has a fallback, because providers vary
+ * in what they will report for a single document — the transfer's name and size are facts the row
+ * already knows.
+ */
+private fun transferLocalTarget(context: Context, item: TransferItem): PreviewTarget? {
+    val uri = item.localUri?.let(Uri::parse) ?: return null
+    val document = runCatching { DocumentFile.fromSingleUri(context, uri) }.getOrNull()
+    return PreviewTarget(
+        entry = FsEntry(
+            name = document?.name ?: item.name,
+            path = uri.toString(),
+            isDirectory = false,
+            size = document?.length()?.takeIf { it >= 0 } ?: item.totalBytes,
+            modifiedEpochMillis = document?.lastModified()?.takeIf { it > 0 },
+            permissions = null,
+            mimeType = document?.type,
+        ),
+        provider = SingleDocumentProvider(context, uri),
+    )
+}
+
+/**
+ * Offers the transfer's local file to another app — straight to the handler the resolver picks,
+ * or through the chooser when [choose] is set. The read grant rides the intent, the same way the
+ * preview sheet's own open-with does; a device where nothing handles the type is a message, not a
+ * crash.
+ */
+private fun openTransferFileExternally(
+    context: Context,
+    item: TransferItem,
+    choose: Boolean,
+    onNoApp: (String) -> Unit,
+) {
+    val uri = item.localUri?.let(Uri::parse) ?: return onNoApp("${item.name} has no local file")
+    val mime = runCatching { DocumentFile.fromSingleUri(context, uri)?.type }.getOrNull() ?: "*/*"
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mime)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    val target = if (choose) Intent.createChooser(intent, "Open ${item.name} with") else intent
+    runCatching { context.startActivity(target) }
+        .onFailure { onNoApp("No app on this device can open ${item.name}") }
+}
+
+/** The transfer's facts as text, for the clipboard: what it is, where it sits, how far it got. */
+private fun transferDetails(item: TransferItem): String = listOfNotNull(
+    item.name,
+    "${item.direction.label} · ${item.hostName}",
+    "Status: ${item.status.name.lowercase()} (${(item.progress * 100).toInt()}%)",
+    item.remotePath?.let { "Remote: $it" },
+    item.localUri?.let { "Local: $it" },
+).joinToString("\n")
 
 /** A copy or move waiting on the user to browse to its destination — see [FilesScreen]. */
 private data class PendingRelocate(
@@ -3763,6 +3903,7 @@ private fun TransfersScreen(
     onResumeAll: () -> Unit,
     onCancelAll: () -> Unit,
     onRunNow: (String) -> Unit,
+    onOpenActions: (TransferItem) -> Unit,
 ) {
     Spacer(Modifier.height(8.dp))
     val running = transfers.count { it.status == TransferStatus.RUNNING }
@@ -3824,7 +3965,7 @@ private fun TransfersScreen(
         EmptyState(filter.emptyTitle, "Nothing in this state right now.", null)
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            visible.forEach { TransferCard(it, onPause, onResume, onCancel, onRunNow) }
+            visible.forEach { TransferCard(it, onPause, onResume, onCancel, onRunNow, onOpenActions) }
             TruncatedListingNotice(
                 transfers.size,
                 "transfers",
@@ -3854,9 +3995,24 @@ private fun TransferItem.matches(filter: TransferFilter): Boolean = when (filter
     TransferFilter.DONE -> status == TransferStatus.COMPLETE
 }
 
+/**
+ * One transfer as a card.
+ *
+ * The card's own buttons stay (pause, resume, cancel) because they are the one-tap answers to the
+ * states a watched transfer cycles through; the long-press sheet is everything else — the file the
+ * transfer is about, copied details, removal — which is why the gesture is on the whole card and
+ * not just its chrome. Tap stays inert: unlike a file row there is nothing a transfer "opens".
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume: (String) -> Unit, onCancel: (String) -> Unit, onRunNow: (String) -> Unit) {
-    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume: (String) -> Unit, onCancel: (String) -> Unit, onRunNow: (String) -> Unit, onOpenActions: (TransferItem) -> Unit) {
+    Card(
+        Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = {}, onLongClick = { onOpenActions(item) }),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.size(40.dp)) { Box(contentAlignment = Alignment.Center) { Icon(if (item.direction == TransferDirection.DOWNLOAD) Icons.Default.CloudDownload else Icons.Default.CloudUpload, null, tint = MaterialTheme.colorScheme.primary) } }
@@ -3934,6 +4090,96 @@ private fun formatTransferBytes(bytes: Long): String {
     return if (unit == "B") "$bytes B" else "${"%.1f".format(value)} $unit"
 }
 
+/**
+ * The per-transfer action sheet: everything one transfer can do, opened by long-pressing its card.
+ *
+ * The card's own buttons remain the one-tap answers to the states a watched transfer cycles
+ * through; this is the complete list, and like the Files explorer's action sheet it offers only
+ * what the item's own state can serve — a control action for its current status, and the file
+ * actions only when the local file actually exists in full.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TransferActionsSheet(
+    item: TransferItem,
+    onDismiss: () -> Unit,
+    onPause: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onCancel: (String) -> Unit,
+    onRunNow: (String) -> Unit,
+    onViewFile: (TransferItem) -> Unit,
+    onEditFile: (TransferItem) -> Unit,
+    onOpenFile: (TransferItem) -> Unit,
+    onOpenFileWith: (TransferItem) -> Unit,
+    onCopyDetails: (TransferItem) -> Unit,
+) {
+    // The local file exists in full once a download completes, and from the very start for an
+    // upload — it is the source the bytes come from. A download in any other state has only a
+    // prefix on disk, and previewing or editing a prefix would show content the user would take
+    // for the whole file.
+    val hasLocalFile = item.localUri != null &&
+        (item.status == TransferStatus.COMPLETE || item.direction == TransferDirection.UPLOAD)
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(horizontal = 22.dp).padding(bottom = 18.dp)) {
+            Text(item.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                "${item.direction.label} · ${item.hostName} · ${item.status.name.lowercase()}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            // The control the status asks for, in the card's own vocabulary: a retry is a resume
+            // the user chose to name differently, exactly as the card's icon does.
+            when (item.status) {
+                TransferStatus.RUNNING -> TransferActionRow("Pause") { onPause(item.id) }
+                TransferStatus.PAUSED -> TransferActionRow("Resume") { onResume(item.id) }
+                TransferStatus.FAILED -> TransferActionRow("Retry") { onResume(item.id) }
+                TransferStatus.QUEUED -> if (item.scheduledAt != null) {
+                    TransferActionRow("Run now") { onRunNow(item.id) }
+                } else {
+                    TransferActionRow("Resume") { onResume(item.id) }
+                }
+                TransferStatus.COMPLETE -> Unit
+            }
+            if (item.status != TransferStatus.COMPLETE) {
+                TransferActionRow("Cancel transfer", destructive = true) { onCancel(item.id) }
+            }
+            if (hasLocalFile) {
+                TransferActionRow("View file") { onViewFile(item) }
+                // Editing only a finished file: overwriting the source of a running upload, or a
+                // half-written download target, races the transfer that is still writing it.
+                if (item.status == TransferStatus.COMPLETE) {
+                    TransferActionRow("Edit as text") { onEditFile(item) }
+                }
+                TransferActionRow("Open") { onOpenFile(item) }
+                TransferActionRow("Open with") { onOpenFileWith(item) }
+            }
+            TransferActionRow("Copy details") { onCopyDetails(item) }
+            if (item.status == TransferStatus.COMPLETE) {
+                // Cancel for a finished transfer stops nothing — it only drops the row, so the
+                // sheet names it for what it does here.
+                TransferActionRow("Remove from list", destructive = true) { onCancel(item.id) }
+            }
+        }
+    }
+}
+
+/** One row of the transfer action sheet, red where the action removes something. */
+// The click goes last so every row reads as `TransferActionRow(label) { ... }` — with a trailing
+// Boolean the trailing lambda would have nothing to bind to.
+@Composable
+private fun TransferActionRow(label: String, destructive: Boolean = false, onClick: () -> Unit) {
+    Text(
+        label,
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 14.dp),
+        style = MaterialTheme.typography.bodyLarge,
+        color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+    )
+}
+
 @Composable
 private fun SettingsScreen(
     state: MainUiState,
@@ -3952,6 +4198,7 @@ private fun SettingsScreen(
     onReconnectBase: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit,
     onBlockScreenshots: (Boolean) -> Unit,
+    onReconnectAskFirst: (Boolean) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
@@ -4077,7 +4324,16 @@ private fun SettingsScreen(
     }
     Spacer(Modifier.height(14.dp))
     SettingsSection("Background processing") {
-        SettingRow(Icons.Default.SwapVert, "Session manager", "Foreground service ready for active SSH, SFTP and forwards") { Icon(Icons.Default.CheckCircle, "Ready", tint = EclipseSuccess) }
+        SettingRow(
+            Icons.Default.SwapVert,
+            "Session manager",
+            "Foreground service ready for active SSH, SFTP and forwards",
+        ) { Icon(Icons.Default.CheckCircle, "Ready", tint = EclipseSuccess) }
+        SettingRow(
+            Icons.Default.HelpOutline,
+            "Ask before reconnecting",
+            "Dropped sessions wait for your answer instead of reconnecting on their own",
+        ) { Switch(checked = state.settings.reconnectAskFirst, onCheckedChange = onReconnectAskFirst) }
         SettingRow(
             Icons.Default.Refresh,
             "Reconnect delay",
@@ -4772,6 +5028,24 @@ private fun AuthenticationDialog(
  * screen: the password again, a different private key, or both — plus the choice to update what is
  * stored on the host so the correction outlives this attempt.
  */
+/**
+ * The ask-first reconnect question: a session dropped, and the user said never to bring their
+ * sessions back without asking. "Reconnect" answers through the same dial the automatic ladder
+ * would have made; "Not now" leaves the tab parked at Disconnected, where its own Reconnect action
+ * still works whenever they change their mind.
+ */
+@Composable
+private fun ReconnectDialog(prompt: ReconnectPrompt, onReconnect: (Boolean) -> Unit) {
+    AlertDialog(
+        onDismissRequest = { onReconnect(false) },
+        icon = { Icon(Icons.Default.Refresh, null, tint = MaterialTheme.colorScheme.tertiary) },
+        title = { Text("Reconnect to ${prompt.hostName}?") },
+        text = { Text(prompt.reason, color = MaterialTheme.colorScheme.onSurfaceVariant) },
+        confirmButton = { Button(onClick = { onReconnect(true) }) { Text("Reconnect") } },
+        dismissButton = { TextButton(onClick = { onReconnect(false) }) { Text("Not now") } },
+    )
+}
+
 @Composable
 private fun AuthFailureDialog(
     prompt: AuthFailurePrompt,
@@ -4860,69 +5134,6 @@ private fun HostKeyDialog(challenge: HostKeyChallenge, onAccept: () -> Unit, onR
         },
         confirmButton = { Button(onClick = onAccept) { Text("Trust and connect") } },
         dismissButton = { TextButton(onClick = onReject) { Text("Reject") } },
-    )
-}
-
-@Composable
-private fun GlobalSearchDialog(state: MainUiState, onDismiss: () -> Unit, onSelectHost: (HostProfile) -> Unit, onCopySnippet: (String) -> Unit) {
-    var query by remember { mutableStateOf("") }
-    // Remembered rather than recomputed on every recomposition. Terminal scrollback runs to
-    // MAX_TERMINAL_CHARS per host, so the last of these is a case-insensitive scan of a few hundred
-    // kilobytes; a live session repaints this dialog while the user is still typing, and re-scanning
-    // on each of those frames made the field itself feel slow.
-    val hostResults = remember(state.hosts, query) {
-        if (query.isBlank()) emptyList() else state.hosts.filter { it.matchesQuery(query) }
-    }
-    val snippetResults = remember(state.snippets, query) {
-        if (query.isBlank()) emptyList() else state.snippets.filter { it.label.contains(query, ignoreCase = true) || it.command.contains(query, ignoreCase = true) }
-    }
-    val terminalMatches = remember(state.hosts, state.terminalOutput, query) {
-        if (query.isBlank()) emptyList() else state.hosts.filter { host -> state.terminalOutput[host.id].orEmpty().contains(query, ignoreCase = true) }
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Global search") },
-        text = {
-            Column {
-                OutlinedTextField(query, { query = it }, modifier = Modifier.fillMaxWidth(), placeholder = { Text("Search hosts, snippets, terminal output") }, singleLine = true, leadingIcon = { Icon(Icons.Default.Search, null) })
-                Spacer(Modifier.height(12.dp))
-                Column(Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f)).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (query.isBlank()) {
-                        Text("Type to search across your workspace.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    } else {
-                        if (hostResults.isNotEmpty()) {
-                            Text("Hosts", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            hostResults.forEach { host ->
-                                Row(Modifier.fillMaxWidth().clickable { onSelectHost(host) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Computer, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Text("${host.name} · ${host.username}@${host.host}", style = MaterialTheme.typography.bodyMedium)
-                                }
-                            }
-                        }
-                        if (snippetResults.isNotEmpty()) {
-                            Spacer(Modifier.height(6.dp))
-                            Text("Snippets", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            snippetResults.forEach { snippet ->
-                                Row(Modifier.fillMaxWidth().clickable { onCopySnippet(snippet.command) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Terminal, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Column { Text(snippet.label, style = MaterialTheme.typography.bodyMedium); Text(snippet.command, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontFamily = FontFamily.Monospace) }
-                                }
-                            }
-                        }
-                        if (terminalMatches.isNotEmpty()) {
-                            Spacer(Modifier.height(6.dp))
-                            Text("Terminal output", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            terminalMatches.forEach { host ->
-                                Row(Modifier.fillMaxWidth().clickable { onSelectHost(host) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Terminal, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Text(host.name, style = MaterialTheme.typography.bodyMedium) }
-                            }
-                        }
-                        if (hostResults.isEmpty() && snippetResults.isEmpty() && terminalMatches.isEmpty()) {
-                            Text("No matches for \"$query\".", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
 

@@ -64,6 +64,7 @@ class SettingsRepositoryTest {
             repo.setLegacyAlgorithms(false)
             repo.setTerminalTheme(TerminalTheme.DARK.name)
             repo.setBlockScreenshots(false)
+            repo.setReconnectAskFirst(false)
             repo.setTerminalScrollback(2_000)
             repo.setTerminalCursorStyle("block")
             repo.setTransferBytesPerSecond(0L)
@@ -89,6 +90,8 @@ class SettingsRepositoryTest {
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.DARK.name)
         // Off unless asked for: FLAG_SECURE blocks the user's own screenshots too.
         assertThat(settings.blockScreenshots).isFalse()
+        // Off unless asked for: the default is today's behaviour, a drop redials on its own.
+        assertThat(settings.reconnectAskFirst).isFalse()
         assertThat(settings.terminalScrollback).isEqualTo(2_000)
         assertThat(settings.terminalCursorStyle).isEqualTo("block")
         assertThat(settings.transferBytesPerSecond).isEqualTo(0L)
@@ -107,6 +110,7 @@ class SettingsRepositoryTest {
         repo.setLegacyAlgorithms(true)
         repo.setTerminalTheme(TerminalTheme.entries.last().name)
         repo.setBlockScreenshots(true)
+        repo.setReconnectAskFirst(true)
         repo.setTerminalScrollback(20_000)
         repo.setTerminalCursorStyle("bar")
         repo.setTransferBytesPerSecond(5L * 1024 * 1024)
@@ -123,6 +127,7 @@ class SettingsRepositoryTest {
         assertThat(settings.legacyAlgorithms).isTrue()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
         assertThat(settings.blockScreenshots).isTrue()
+        assertThat(settings.reconnectAskFirst).isTrue()
         assertThat(settings.terminalScrollback).isEqualTo(20_000)
         assertThat(settings.terminalCursorStyle).isEqualTo("bar")
         assertThat(settings.transferBytesPerSecond).isEqualTo(5L * 1024 * 1024)
