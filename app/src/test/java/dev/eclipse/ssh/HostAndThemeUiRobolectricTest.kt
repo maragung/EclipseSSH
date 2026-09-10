@@ -523,6 +523,62 @@ class HostAndThemeUiRobolectricTest {
         assertThat(copies.map { it.name }).containsExactly("Original", "Original (copy)")
     }
 
+    /**
+     * Port forwarding lives on the host, and the kebab is the host's one way into everything besides
+     * connect - so the manager opens from there, on the host it was opened for, and not from Settings.
+     */
+    @Test
+    fun portForwardingInTheKebabOpensThePerHostManagerSheet() {
+        val host = addHost("Forwarder", hostname = "fwd.example.test", username = "forwarder")
+
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pumpUntil(describe = { "the kebab never offered Port forwarding" }) {
+            compose.onAllNodesWithText("Port forwarding").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Port forwarding").performClick()
+        // Anchored on "Add rule" rather than the sheet's own "Port forwarding" title: the kebab item
+        // and the title are the same string, and this way the assertion is about the manager being
+        // up, not about text that could survive from the menu that just closed. A bottom sheet
+        // composes into the same window, so it can be waited on where a dialog cannot.
+        pumpUntil(describe = { "the forwarding manager never opened" }) {
+            compose.onAllNodesWithText("Add rule").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Add rule").assertIsDisplayed()
+    }
+
+    /**
+     * Duplicating a host with forwarding rules is a question, not a command: "same box, different
+     * purpose" usually wants the tunnels too, but the copy that does not want them must not inherit
+     * them silently. A rules-free host duplicates straight away - that is the test above - so this
+     * one gives the host rules and asserts the ask happens before any copy exists.
+     *
+     * Asserted at window level, like the removal ask: an AlertDialog never settles `waitForIdle`.
+     */
+    @Test
+    fun duplicatingAHostWithForwardingRulesAsksBeforeCopyingThem() {
+        val host = addHost("Tunnelled", hostname = "tun.example.test", username = "tunneller")
+        val before = ShadowDialog.getShownDialogs().size
+        compose.runOnUiThread {
+            viewModel().saveHost(host.copy(savedForwards = "L:8080:intranet.example:80\nD:1080"))
+        }
+        pumpUntil(describe = { "the rules never reached the host" }) {
+            viewModel().uiState.value.hosts.any { it.id == host.id && it.savedForwards.isNotBlank() }
+        }
+
+        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
+        pumpUntil(describe = { "the kebab never offered Duplicate" }) {
+            compose.onAllNodesWithText("Duplicate").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Duplicate").performClick()
+        pump()
+
+        assertWithMessage("Duplicate copied the host's rules without asking")
+            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
+        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
+        // No copy yet: the question is still open, and the profile list behind it is unchanged.
+        assertThat(viewModel().uiState.value.hosts.filter { it.host == "tun.example.test" }).hasSize(1)
+    }
+
     // ---------------------------------------------------------------- driving the app
 
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]

@@ -447,6 +447,24 @@ enum class ForwardType(val label: String) {
     DYNAMIC("Dynamic (SOCKS5)"),
 }
 
+/** The interface every forward binds unless the rule says otherwise. */
+const val DEFAULT_FORWARD_LISTEN_HOST = "127.0.0.1"
+
+/**
+ * One saved port-forward rule, or one forward opened by hand: the same shape serves both, because
+ * a running forward is only a rule with a handle behind it.
+ *
+ * Ports are named by *side*, not by direction, so a rule reads the same whichever way it tunnels:
+ * [localPort] is a port on this device, [remotePort] a port on the server's side. For a local or
+ * dynamic rule the device port is the one listened on; for a remote rule it is the destination the
+ * phone dials when the server's side is connected to.
+ *
+ * [listenHost] is the interface the rule *listens* on, on whichever side it lands: the phone for
+ * local and dynamic, the server for remote. It defaults to loopback, and the codec only writes it
+ * when it differs - so every rule ever saved before this field existed still round-trips byte for
+ * byte. [localHost] is the remote rule's phone-side destination, null meaning this device's own
+ * loopback.
+ */
 data class ForwardEntry(
     val id: String = UUID.randomUUID().toString(),
     val type: ForwardType,
@@ -454,7 +472,35 @@ data class ForwardEntry(
     val remoteHost: String? = null,
     val remotePort: Int? = null,
     val hostId: String? = null,
+    val listenHost: String = DEFAULT_FORWARD_LISTEN_HOST,
+    val localHost: String? = null,
+    /** Off: stored, shown, and never started - not by a connect, not by hand. */
+    val enabled: Boolean = true,
+    /**
+     * Off: started by hand from the forwarding sheet only. A connect or a reconnect brings up the
+     * auto-start rules and deliberately leaves the manual ones alone.
+     */
+    val autoStart: Boolean = true,
+    /** An optional label, for telling three rules over port 3000 apart at a glance. */
+    val name: String? = null,
 )
+
+/**
+ * What one rule is doing right now, independent of every other rule and of the session's own
+ * state - a tunnel that cannot bind is not a connection failure, it is one row's bad day.
+ */
+enum class ForwardRuntime(val label: String) {
+    DISABLED("Disabled"),
+    STARTING("Starting"),
+    RUNNING("Running"),
+    STOPPED("Stopped"),
+    FAILED("Failed"),
+    /** Was running; the session it rode dropped and the reconnect will bring it back. */
+    RECONNECTING("Reconnecting"),
+}
+
+/** One rule paired with what it is doing, for the forwarding sheet. */
+data class ForwardStatus(val entry: ForwardEntry, val state: ForwardRuntime, val error: String? = null)
 
 data class Snippet(
     val id: String = UUID.randomUUID().toString(),
