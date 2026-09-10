@@ -6,6 +6,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
+import dev.eclipse.ssh.data.credentials.HostCredentialStore
 import dev.eclipse.ssh.data.credentials.HostCredentialUpdate
 import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.model.AuthMethod
@@ -24,6 +25,7 @@ import java.time.Duration
 import java.util.Base64
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.runBlocking
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
@@ -224,6 +226,16 @@ class DuplicateTerminalRobolectricTest {
             viewModel.uiState.value.hosts.any { it.id == profile.id }
         }
         val saved = viewModel.uiState.value.hosts.first { it.id == profile.id }
+        // saveHost writes the host row first and the credentials after it, in the same guarded
+        // launch — the wait above only proves the row landed. Connecting with password = null
+        // reads the credential store, and reading it before the write offers the server no auth
+        // method at all ("No more authentication methods available", authAttempts = 0), which is
+        // a race in this test rather than anything about the app. So the password itself is what
+        // the connect waits for.
+        val credentials = injected(viewModel, "credentialStore", HostCredentialStore::class.java)
+        pumpUntil(describe = { "the saved password never reached the credential store" }) {
+            runBlocking { credentials.password(profile.id) != null }
+        }
         compose.runOnUiThread { viewModel.connect(saved, password = null) }
         var trusted = false
         pumpUntil(describe = { "the first session never connected: " + diagnose(profile.id) }) {

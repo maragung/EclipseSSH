@@ -2,8 +2,10 @@ package dev.eclipse.ssh.ui.editor
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasText
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onRoot
+import dev.eclipse.ssh.EclipseApp
+import dev.eclipse.ssh.MainActivity
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -31,9 +33,15 @@ import org.robolectric.annotation.Config
  * over a light (notnight) window, the editor reads its document, lays it out, and is on screen.
  * The theme half is still pinned exactly: `EclipseTheme(darkTheme = true)` is what colors both
  * the text and the canvas the modifier paints.
+ *
+ * The rule is the app's own MainActivity, not `createComposeRule()`'s bare ComponentActivity:
+ * the release variant's unit tests resolve their activity against the release manifest, and the
+ * ui-test-manifest AAR that registers ComponentActivity lands there for no configuration —
+ * declaring it testImplementation was tried and the release suite still died on "Unable to
+ * resolve activity". MainActivity is declared in the real manifest, so both variants resolve it.
  */
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], qualifiers = "notnight")
+@Config(application = EclipseApp::class, sdk = [35], qualifiers = "notnight")
 class TextEditorCanvasRobolectricTest {
 
     /** Reads back one in-memory document; the editor needs no other provider call before paint. */
@@ -74,13 +82,14 @@ class TextEditorCanvasRobolectricTest {
     )
 
     @get:Rule
-    val composeRule = createComposeRule()
+    val composeRule = createAndroidComposeRule<MainActivity>()
 
     @Test
     fun aDarkThemeEditorPaintsADarkCanvasEvenOnALightWindow() {
         composeRule.setContent {
             // darkTheme = true is the app setting's default; notnight above is the system half of
-            // the mismatch that used to leave the text unreadable.
+            // the mismatch that used to leave the text unreadable. The editor replaces the
+            // activity's content wholesale — the app's own screens are never composed here.
             EclipseTheme(darkTheme = true) {
                 TextEditorScreen(request()) { }
             }

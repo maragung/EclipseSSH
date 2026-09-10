@@ -1469,20 +1469,29 @@ class RealOpenSshInteropRobolectricTest {
         val program = command.substringAfterLast('/').substringBefore(' ')
         compose.runOnUiThread { viewModel.sendText(hostId, command) }
         compose.runOnUiThread { viewModel.sendKey(hostId, TerminalKey.ENTER) }
-        pumpUntil(describe = { "`$command` never painted \"$paints\". " + diagnose(hostId) }) {
+        // The wait includes the wide rows, not just the marker: a full-screen program paints
+        // itself a piece at a time, and vi — resized twice on its way up — can have its marker
+        // and its screen mode on screen while its file rows are still unpainted. A widest-row
+        // check fired at that moment reads as "nothing wide enough to prove anything about
+        // wrapping" when all that happened is the paint had not finished. The frame that
+        // satisfies the wait is the frame asserted below, so the two cannot race a repaint.
+        var painted = frame(hostId)
+        pumpUntil(
+            describe = {
+                "`$command` never finished painting a screen wider than the $NARROW_COLUMNS-column " +
+                    "view, so this proves nothing about wrapping. " + diagnose(hostId)
+            },
+        ) {
             val frame = frame(hostId)
-            drawn(hostId).contains(paints) &&
+            val widest = visualRows(frame, frame.columns).maxOfOrNull { it.trimEnd().length } ?: 0
+            val complete = drawn(hostId).contains(paints) &&
                 frame.alternateScreen == alternateScreen &&
-                (frame.alternateScreen || frame.positionalScreen)
+                (frame.alternateScreen || frame.positionalScreen) &&
+                widest > NARROW_COLUMNS
+            if (complete) painted = frame
+            complete
         }
-
-        val painted = frame(hostId)
         assertThat(painted.alternateScreen).isEqualTo(alternateScreen)
-        val widest = visualRows(painted, painted.columns).maxOf { it.trimEnd().length }
-        check(widest > NARROW_COLUMNS) {
-            "$program painted nothing wider than the $NARROW_COLUMNS-column view, so this proves " +
-                "nothing about wrapping: widest row is $widest columns. " + diagnose(hostId)
-        }
         // Whichever way the program took the screen, the display leaves it alone: one visual row per grid
         // row, every one of them starting at column zero, in a view narrower than the pty. Not gated on
         // the alternate screen, because `top` never asks for one - it homes the cursor and repaints the
