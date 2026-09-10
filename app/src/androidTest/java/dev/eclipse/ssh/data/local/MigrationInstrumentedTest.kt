@@ -13,7 +13,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * The same version-2-to-13 upgrade the unit tests cover, run against the device's own SQLite.
+ * The same version-2-to-16 upgrade the unit tests cover, run against the device's own SQLite.
  * Robolectric substitutes a host build of SQLite, so a migration can pass there and still fail
  * on a real Android version — and this one runs on every user's first launch after an update.
  */
@@ -84,10 +84,10 @@ class MigrationInstrumentedTest {
     @Test
     fun aDatabaseFromANewerBuildIsResetRatherThanRefused() = runTest {
         // The production fallback is now downgrade-only (see AppModule.provideDatabase). On real SQLite
-        // as on the JVM, a file left by a build one version ahead - user_version 15 here - has no path
+        // as on the JVM, a file left by a build one version ahead - user_version 17 here - has no path
         // back, so it is destructively recreated at the current version rather than refused. A missing
         // *upgrade* migration is left to throw, which is the loud half the unit suite pins.
-        seedVersion2(userVersion = 15)
+        seedVersion2(userVersion = 17)
 
         val db = openLikeProduction()
 
@@ -103,7 +103,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
-                Migrations.MIGRATION_13_14,
+                Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15, Migrations.MIGRATION_15_16,
             )
             // Deliberately no destructive fallback: a broken migration must fail, not wipe data.
             .build()
@@ -118,7 +118,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_8_9,
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
-                Migrations.MIGRATION_13_14,
+                Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15, Migrations.MIGRATION_15_16,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .build()

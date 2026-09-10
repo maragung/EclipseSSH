@@ -39,6 +39,11 @@ class TransferRestorer @Inject constructor(
             item.hostId == hostId &&
                 item.status in RESUMABLE_STATUSES &&
                 (item.scheduledAt == null || item.scheduledAt <= System.currentTimeMillis()) &&
+                // Cross-host rows are filtered out beside the blank-localUri ones rather than left
+                // to the `when` below, because the restore pass must never touch them: there is no
+                // local document to reopen, and "resuming" one would at best redial a host for
+                // nothing and at worst mark a healthy transfer FAILED through the retry ladder.
+                item.direction != TransferDirection.CROSS_HOST &&
                 !item.remotePath.isNullOrBlank() &&
                 !item.localUri.isNullOrBlank()
         }
@@ -91,6 +96,11 @@ class TransferRestorer @Inject constructor(
                             }
                             repository.save(latest.copy(progress = 1f, status = TransferStatus.COMPLETE, errorMessage = null))
                         }
+                        // Unreachable: the filter above excludes cross-host rows, and the compiler
+                        // is what keeps that true for every direction added from now on. error()
+                        // rather than a quiet skip, so a filter regression is a loud failure in QA
+                        // instead of a restore that silently did nothing for a transfer.
+                        TransferDirection.CROSS_HOST -> error("Cross-host transfers are filtered out above and cannot be restored")
                     }
                     resumed++
                 } catch (cancelled: CancellationException) {
