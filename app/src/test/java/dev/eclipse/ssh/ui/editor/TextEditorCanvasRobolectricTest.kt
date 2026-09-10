@@ -1,14 +1,15 @@
 package dev.eclipse.ssh.ui.editor
 
+import android.content.Intent
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasText
-import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.junit4.AndroidComposeTestRule
 import androidx.compose.ui.test.onRoot
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.rules.ActivityScenarioRule
 import dev.eclipse.ssh.EclipseApp
-import dev.eclipse.ssh.MainActivity
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
-import dev.eclipse.ssh.ui.EclipseTheme
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -29,16 +30,18 @@ import org.robolectric.annotation.Config
  * Pixel-level readback (`captureToImage`) was tried under `@GraphicsMode(NATIVE)` and does not
  * render under this Robolectric setup — both variants fail inside the graphics layer before the
  * first assertion (a RuntimeException out of the instrumentation in release, a draw timeout in
- * debug) — so this test asserts the level Robolectric can honestly observe: composed dark-theme
- * over a light (notnight) window, the editor reads its document, lays it out, and is on screen.
- * The theme half is still pinned exactly: `EclipseTheme(darkTheme = true)` is what colors both
- * the text and the canvas the modifier paints.
+ * debug) — so this test asserts the level Robolectric can honestly observe: a dark-theme editor
+ * (the app setting's default) on a light (notnight) window reads its document, lays it out, and
+ * is on screen.
  *
- * The rule is the app's own MainActivity, not `createComposeRule()`'s bare ComponentActivity:
- * the release variant's unit tests resolve their activity against the release manifest, and the
- * ui-test-manifest AAR that registers ComponentActivity lands there for no configuration —
- * declaring it testImplementation was tried and the release suite still died on "Unable to
- * resolve activity". MainActivity is declared in the real manifest, so both variants resolve it.
+ * The host is the editor's own activity, launched with a live request the way the Files and
+ * Transfers sheets launch it. Not `createComposeRule()`'s bare ComponentActivity: the release
+ * variant's unit tests resolve their activity against the release manifest, and ComponentActivity
+ * is registered in none of them — declaring the ui-test-manifest AAR testImplementation was tried
+ * and lands in no unit-test manifest either. An activity that composes its own content is a shape
+ * the compose rule supports for exactly this case: the rule asserts against what the activity
+ * set, and `rule.setContent` is never called — on an activity that has already set its own
+ * content it throws.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = EclipseApp::class, sdk = [35], qualifiers = "notnight")
@@ -60,7 +63,7 @@ class TextEditorCanvasRobolectricTest {
         override suspend fun rename(path: String, newName: String) = error("unused by the editor launch")
         override suspend fun copy(sourcePath: String, targetDirectoryPath: String) =
             error("unused by the editor launch")
-        override suspend fun move(sourcePath: String, targetDirectoryPath: String) =
+        override suspend fun move(path: String, targetDirectoryPath: String) =
             error("unused by the editor launch")
         override suspend fun delete(path: String) = error("unused by the editor launch")
         override suspend fun setPermissions(path: String, mode: Int) = error("unused by the editor launch")
@@ -81,29 +84,37 @@ class TextEditorCanvasRobolectricTest {
         provider = SingleFileProvider("hello".toByteArray()),
     )
 
+    /**
+     * The rule around the real [TextEditorActivity], with a live request behind its token — the
+     * same launch the sheets produce. The provider is the extraction `createAndroidComposeRule`
+     * itself uses for an `ActivityScenarioRule`; copied rather than reused because it is private
+     * in the compose test library.
+     */
     @get:Rule
-    val composeRule = createAndroidComposeRule<MainActivity>()
+    val compose = AndroidComposeTestRule(
+        ActivityScenarioRule<TextEditorActivity>(
+            Intent(ApplicationProvider.getApplicationContext(), TextEditorActivity::class.java)
+                .putExtra(TextEditorActivity.EXTRA_REQUEST_TOKEN, EditorRequests.put(request())),
+        ),
+    ) { rule ->
+        var activity: TextEditorActivity? = null
+        rule.scenario.onActivity { activity = it }
+        checkNotNull(activity)
+    }
 
     @Test
     fun aDarkThemeEditorPaintsADarkCanvasEvenOnALightWindow() {
-        composeRule.setContent {
-            // darkTheme = true is the app setting's default; notnight above is the system half of
-            // the mismatch that used to leave the text unreadable. The editor replaces the
-            // activity's content wholesale — the app's own screens are never composed here.
-            EclipseTheme(darkTheme = true) {
-                TextEditorScreen(request()) { }
-            }
+        // The composition under test is the activity's own onCreate: it reads darkTheme from the
+        // settings repository — the app setting's default, dark, on a clean install — wraps the
+        // editor in EclipseTheme, and it is that screen which must be showing over the light
+        // (notnight) window. The wait comes first because it is what drives the frames: the
+        // document read runs in a coroutine a single idle pass does not have to have finished,
+        // and waitUntil advances the clock until the text it produced is on screen — after
+        // which the root being displayed is an assertion about a composed screen, not a race
+        // with the first one.
+        compose.waitUntil(timeoutMillis = 5_000) {
+            compose.onAllNodes(hasText("hello", substring = true)).fetchSemanticsNodes().isNotEmpty()
         }
-        composeRule.waitForIdle()
-
-        // The editor read its document and put it on screen: the provider's bytes are what the
-        // text field holds. Root displayed, because "the screen the user sees" is the editor's
-        // own surface — not the light window behind it, which is the whole of the fix. Polled
-        // rather than asserted after waitForIdle because the read runs in a LaunchedEffect that
-        // a single idle pass does not have to have finished.
-        composeRule.onRoot().assertIsDisplayed()
-        composeRule.waitUntil(timeoutMillis = 5_000) {
-            composeRule.onAllNodes(hasText("hello", substring = true)).fetchSemanticsNodes().isNotEmpty()
-        }
+        compose.onRoot().assertIsDisplayed()
     }
 }
