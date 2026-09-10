@@ -45,6 +45,7 @@ import org.apache.sshd.server.auth.password.PasswordAuthenticator
 import org.apache.sshd.server.auth.password.UserAuthPasswordFactory
 import org.apache.sshd.server.channel.ChannelSession
 import org.apache.sshd.server.command.Command
+import org.apache.sshd.server.forward.AcceptAllForwardingFilter
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider
 import org.apache.sshd.server.shell.ShellFactory
 import org.apache.sshd.sftp.server.SftpSubsystemFactory
@@ -907,6 +908,13 @@ class PortForwardingRobolectricTest {
                 }
                 // Password only, so `authAttempts` is an exact count - see the connection matrix.
                 userAuthFactories = listOf<UserAuthFactory>(UserAuthPasswordFactory.INSTANCE)
+                // The builder's default filter rejects every forward - direct-tcpip with
+                // SSH_OPEN_ADMINISTRATIVELY_PROHIBITED and tcpip-forward with a plain refusal - and a
+                // suite whose subject is tunnels would then measure only the client's bind succeeding
+                // while every byte never left the phone. Accept-all here: the one refusal this suite
+                // needs is produced on purpose by [forwardGate], which sits in front of MINA's own
+                // handler and can deny a single request without touching anything else.
+                forwardingFilter = AcceptAllForwardingFilter.INSTANCE
                 subsystemFactories = Collections.singletonList(SftpSubsystemFactory())
                 fileSystemFactory = VirtualFileSystemFactory(root.toAbsolutePath())
                 shellFactory = ShellFactory { CountingShell(shellsStarted) }

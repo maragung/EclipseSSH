@@ -243,21 +243,27 @@ class MainViewModel @Inject constructor(
      * two states a rule cannot record for itself. A rule has no way to notice that the transport under
      * its tracker died — MINA closes the listening socket from the session's own teardown and nothing
      * calls back into this class — so RECONNECTING and this-session-gone STOPPED are derived where the
-     * statuses are produced rather than tracked live, from the session key in [forwardSessionKeys].
+     * statuses are produced rather than tracked live, from the ride in [forwardRides].
      */
     private val forwardStates = MutableStateFlow<Map<String, ForwardStatus>>(emptyMap())
 
+    /** The transport one forward rides: the session key it was opened under, and the session itself. */
+    private data class ForwardRide(val sessionKey: String, val session: ClientSession)
+
     /**
-     * The session key each forward was opened against, by entry id.
+     * The transport each forward rides, by entry id.
      *
      * Forwards always ride the host's primary session, but *which* key that is changes: a second
      * terminal can hold the primary while the first one's transport dies, and "the host still has a
-     * live session" is then true while this particular tracker is dead. Without this map a hand-opened
-     * forward whose session died under a surviving sibling would show RUNNING for as long as the app
-     * stayed open — the one display state that is not merely wrong but unrecoverable, because nothing
-     * ever rewrites it. Cleared beside its handle in [releaseForwards].
+     * live session" is then true while this particular tracker is dead. The instance is carried beside
+     * the key because a key is not a transport: the reconnect ladder dials a *new* session under the
+     * old tab's key, so liveness of the key alone would call the new session "the forward's session"
+     * and resurrect a tunnel that died with the old one the moment the reconnect lands. Without this
+     * map a hand-opened forward whose session died under a surviving sibling would show RUNNING for as
+     * long as the app stayed open — the one display state that is not merely wrong but unrecoverable,
+     * because nothing ever rewrites it. Cleared beside its handle in [releaseForwards].
      */
-    private val forwardSessionKeys = ConcurrentHashMap<String, String>()
+    private val forwardRides = ConcurrentHashMap<String, ForwardRide>()
 
     /**
      * Where every coroutine that can reach an SSH transport runs. Not the main thread, ever.
@@ -1193,8 +1199,10 @@ class MainViewModel @Inject constructor(
         forwardJobs.remove(host.id)?.cancel()
         // Unconditional, including for a host with no rules: this also clears the previous transport's
         // trackers, and a host whose last rule was just deleted has to end up with nothing bound and
-        // nothing claimed on its tab.
+        // nothing claimed on its tab. [releaseDeadRides] beside it takes the hand-opened tunnels the
+        // dead transport took with it - forwards no rule will ever rebind, so no later pass would.
         stopSavedForwards(host.id)
+        releaseDeadRides(host.id)
         val rules = decodeForwardRules(host.savedForwards, host.id)
         // Every rule gets a row before anything is started, so the sheet can say "Disabled" about a
         // rule that will never bind and "Stopped" about one that only a hand can start - a rule that is
@@ -1302,7 +1310,7 @@ class MainViewModel @Inject constructor(
         val claimed = forwardings.value
             .filter { candidate ->
                 forwardHandles.containsKey(candidate.id) &&
-                    forwardSessionKeys[candidate.id]?.let { sessionStore.isLive(it) } == true
+                    forwardRideIsLive(candidate.id)
             }
             .mapNotNull { it.deviceListenAddress() }
             .toMutableSet()
@@ -1333,7 +1341,7 @@ class MainViewModel @Inject constructor(
                     return@forEach
                 }
                 forwardHandles[entry.id] = handle
-                if (sessionKey != null) forwardSessionKeys[entry.id] = sessionKey
+                if (sessionKey != null) forwardRides[entry.id] = ForwardRide(sessionKey, session)
                 forwardings.update { it + entry }
                 setForwardState(entry, ForwardRuntime.RUNNING)
             } catch (cancelled: CancellationException) {
@@ -1377,8 +1385,22 @@ class MainViewModel @Inject constructor(
     private fun displayedForwardState(status: ForwardStatus, openTabs: List<SessionTab>): ForwardRuntime {
         val recorded = status.state
         if (recorded != ForwardRuntime.RUNNING && recorded != ForwardRuntime.STARTING) return recorded
-        val sessionKey = forwardSessionKeys[status.entry.id] ?: return recorded
-        if (sessionStore.isLive(sessionKey)) return recorded
+        if (!forwardRideIsLive(status.entry.id)) return deriveDeadRideState(status, openTabs)
+        return recorded
+    }
+
+    /**
+     * Whether the transport [id]'s forward rides is still the live session under its key.
+     *
+     * The comparison is on the session *instance*, not the key's liveness, because a reconnect dials a
+     * fresh session under the old tab's key: the key comes back alive while the tunnel that rode the
+     * old transport stays dead.
+     */
+    private fun forwardRideIsLive(id: String): Boolean =
+        forwardRides[id]?.let { ride -> sessionStore.liveSession(ride.sessionKey) === ride.session } == true
+
+    /** What a row whose transport is gone should show while it waits to be rebound or released. */
+    private fun deriveDeadRideState(status: ForwardStatus, openTabs: List<SessionTab>): ForwardRuntime {
         val hostId = status.entry.hostId
         val comesBackWithTheLadder = hostId != null &&
             status.entry.enabled &&
@@ -1425,6 +1447,30 @@ class MainViewModel @Inject constructor(
     }
 
     /**
+     * Releases the host's forwards whose transport is gone - the hand-opened tunnels a dead session
+     * took with it, which nothing else tears down: [stopSavedForwards] handles the rule-derived ones,
+     * and the reconnect's own [startSavedForwards] call is the one moment the app knows for sure that
+     * the old transport's trackers will never work again and a new session has come to replace them.
+     *
+     * A dead ride left standing is not inert, either: the moment a new session lands under the old
+     * tab's key, key-liveness would flip the row back to RUNNING - a tunnel that is not there,
+     * counted open on the tab forever.
+     */
+    private fun releaseDeadRides(hostId: String) {
+        // Only entries with a *dead* ride, not every entry without a live one: a forward still mid-bind
+        // has no ride yet, and releasing it here would close a tunnel this very batch is about to own.
+        val dead = forwardings.value
+            .filter { it.hostId == hostId }
+            .filter { entry ->
+                forwardRides[entry.id]?.let { ride ->
+                    sessionStore.liveSession(ride.sessionKey) !== ride.session
+                } == true
+            }
+            .map { it.id }
+        releaseForwards(dead)
+    }
+
+    /**
      * Drops the forward trackers for [ids], closing them off the main thread.
      *
      * Split in two on purpose. The bookkeeping - the entries leaving [forwardHandles] and
@@ -1447,7 +1493,7 @@ class MainViewModel @Inject constructor(
         if (ids.isEmpty()) return
         val dropped = ids.toSet()
         val handles = dropped.mapNotNull { forwardHandles.remove(it) }
-        dropped.forEach { forwardSessionKeys.remove(it) }
+        dropped.forEach { forwardRides.remove(it) }
         forwardings.update { entries -> entries.filterNot { it.id in dropped } }
         // The status rows go with the handles: a released forward is not "stopped", it is gone - the
         // rebind path that calls this re-lists every rule a moment later, and the stop paths that want
@@ -3163,7 +3209,7 @@ class MainViewModel @Inject constructor(
         try {
             val handle = openForward(session, entry)
             forwardHandles[entry.id] = handle
-            if (sessionKey != null) forwardSessionKeys[entry.id] = sessionKey
+            if (sessionKey != null) forwardRides[entry.id] = ForwardRide(sessionKey, session)
             forwardings.update { it + entry }
             setForwardState(entry, ForwardRuntime.RUNNING)
         } catch (cancelled: CancellationException) {
@@ -3309,8 +3355,7 @@ class MainViewModel @Inject constructor(
                     // A handle on a live session is a tunnel that is up right now, whatever the row
                     // said a moment ago - including a row a just-cancelled rebind never finished
                     // writing. An id that survived the edit with its tunnel intact keeps both.
-                    val running = forwardHandles.containsKey(entry.id) &&
-                        forwardSessionKeys[entry.id]?.let { sessionStore.isLive(it) } == true
+                    val running = forwardHandles.containsKey(entry.id) && forwardRideIsLive(entry.id)
                     next[entry.id] = when {
                         !entry.enabled -> ForwardStatus(entry, ForwardRuntime.DISABLED)
                         running -> ForwardStatus(entry, ForwardRuntime.RUNNING)
@@ -4021,7 +4066,7 @@ class MainViewModel @Inject constructor(
         // And the rows that had no handle to close go with them: the view model is gone, and a status
         // map that outlived its handles would be a claim about tunnels nobody can start or stop.
         forwardStates.value = emptyMap()
-        forwardSessionKeys.clear()
+        forwardRides.clear()
         reconnectWake.close()
         // Sessions, shells and scrollback deliberately survive: they belong to [SshSessionStore] and
         // the foreground service is running to keep them. Closing them here is what used to kill every
