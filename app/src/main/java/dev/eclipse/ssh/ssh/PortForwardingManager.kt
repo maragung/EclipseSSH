@@ -45,5 +45,13 @@ class PortForwardingManager @Inject constructor() {
 }
 
 class ForwardingHandle(private val tracker: PortForwardingTracker) : Closeable {
+    /**
+     * The port this forward's listener actually landed on.
+     *
+     * A bind asked for port 0 gets an OS-assigned ephemeral port here, which is how an ad-hoc
+     * forward (the VNC tunnel) claims a port without predicting one - a predicted port is a race
+     * another bind can win, and the saved rules already carry the scars of that family.
+     */
+    val boundPort: Int get() = tracker.boundAddress.port
     override fun close() { tracker.close() }
 }
