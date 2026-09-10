@@ -87,6 +87,7 @@ import dev.eclipse.ssh.ssh.ForwardingHandle
 import dev.eclipse.ssh.background.SessionRegistry
 import dev.eclipse.ssh.security.SecureClipboard
 import dev.eclipse.ssh.security.normalizePastedSecret
+import dev.eclipse.ssh.feature.terminallog.SessionLog
 import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
@@ -198,6 +199,18 @@ class MainViewModel @Inject constructor(
 
     /** When each host's searchable plain text was last rebuilt - see [publishTerminalText]. */
     private val textPublishedAt = ConcurrentHashMap<String, Long>()
+
+    /**
+     * The raw transcript each session keeps for "Save session log", keyed by session key.
+     *
+     * Beside [scrollOffsets] and [textPublishedAt] rather than inside the UI state because it is
+     * written from the collector at output rate and read only when the user exports it - putting a
+     * quarter megabyte of text through [uiState] would rebuild every screen in the app per chunk.
+     * Created by the collector alongside the session's buffer, so a reconnect (which keeps the
+     * same key and the same scrollback) keeps its log too; dropped in the same teardown that
+     * drops [terminalOutput] - [closeTab] and [deleteHost].
+     */
+    private val sessionLogs = ConcurrentHashMap<String, SessionLog>()
 
     /**
      * The command line each host appears to be typing, for the recent-commands list.
@@ -1683,6 +1696,10 @@ class MainViewModel @Inject constructor(
     ): Job = viewModelScope.launch(Dispatchers.Default) {
         val incoming = Channel<ByteArray>(Channel.UNLIMITED)
         val decoder = Utf8StreamDecoder()
+        // Created here rather than beside the buffer in `connect` so every path that starts a
+        // collector - a fresh connect, an adopted session, a reconnect - gets one, and so a
+        // reconnect (same session key, same scrollback) keeps the log it already had.
+        val sessionLog = sessionLogs.getOrPut(sessionKey) { SessionLog() }
         // Answers to the queries the remote side sends: a cursor-position report, a device-attributes
         // reply. The buffer produces them while parsing and cannot write them itself; without this a
         // program that asks where the cursor is - anything using readline for a multi-line prompt -
@@ -1878,7 +1895,15 @@ class MainViewModel @Inject constructor(
                     // Decoded here rather than in the channel because the state that matters - the
                     // two or three bytes of a codepoint that straddled a network read - lives between
                     // chunks. See [Utf8StreamDecoder].
-                    buffer.feed(decoder.decode(chunk!!))
+                    val decoded = decoder.decode(chunk!!)
+                    buffer.feed(decoded)
+                    // The tee point for everything a session showed: every decoded chunk passes
+                    // through here on its way to the buffer, so the session log records exactly
+                    // what the terminal saw. Typed input needs no second plumbing - there is no
+                    // local echo; a keystroke is written to the channel and comes back through
+                    // `terminal.output` like any other output, so it reaches this tee when the
+                    // shell echoes it.
+                    sessionLog.append(decoded)
                     chunk = incoming.tryReceive().getOrNull()
                 } while (chunk != null)
                 pinScrollback(sessionKey, buffer, before)
@@ -1915,6 +1940,10 @@ class MainViewModel @Inject constructor(
             // instead of vanishing, so a session cut mid-character still ends with what arrived.
             val tail = decoder.flush()
             if (tail.isNotEmpty()) buffer.feed(tail)
+            // The same tail goes into the session log - it is real output, the last thing the
+            // session ever said, and a log that stops one character short of the farewell it was
+            // built to keep would be a strange one.
+            if (tail.isNotEmpty()) sessionLog.append(tail)
             // Unconditionally, and past the throttle. Cancelling `transcript` above cancels whatever
             // catch-up it still owed, and at the end of a session there is no next chunk to trigger
             // another one - so a shell whose last second was throttled ended with its farewell on
@@ -2434,6 +2463,15 @@ class MainViewModel @Inject constructor(
     /** One whole line of the buffer, for double-tap word selection and select-line. */
     fun terminalLineText(sessionKey: String, line: Int): String =
         terminalBuffers[sessionKey]?.textIn(line, 0, line, Int.MAX_VALUE).orEmpty()
+
+    /**
+     * The raw transcript of one session, for "Save session log".
+     *
+     * Read on demand rather than pushed through [uiState] because it is only ever wanted at the
+     * moment the user taps export - see [sessionLogs]. Null for a session that never produced
+     * output or whose tab has been closed; the menu item that calls this is hidden in both cases.
+     */
+    fun sessionLogText(sessionKey: String): String? = sessionLogs[sessionKey]?.snapshot()
 
     /**
      * Hands [bytes] to the session's outbound queue, in the order the caller produced them.
@@ -3688,6 +3726,7 @@ class MainViewModel @Inject constructor(
         tabs.value = tabs.value.filterNot { it.id == tab.id }
         terminalOutput.update { it - tab.id }
         terminalFrames.update { it - tab.id }
+        sessionLogs.remove(tab.id)
         scrollOffsets.remove(tab.id)
         textPublishedAt.remove(tab.id)
         typedLines.remove(tab.id)
@@ -3877,6 +3916,7 @@ class MainViewModel @Inject constructor(
             tabs.value = tabs.value.filterNot { it.hostId == host.id }
             terminalOutput.update { current -> current - keys.toSet() }
             terminalFrames.update { current -> current - keys.toSet() }
+            keys.forEach { key -> sessionLogs.remove(key) }
             commandHistory.value = commandHistory.value - host.id
             serverStats.update { it - host.id }
             remoteListings.update { it - host.id }

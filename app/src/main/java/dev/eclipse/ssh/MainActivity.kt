@@ -1171,6 +1171,20 @@ private fun EclipseWorkspace(
                         pickerActive = true
                         textExportPicker.launch("eclipse-$hostId.log")
                     },
+                    // The raw log comes straight from the view model's per-session transcript -
+                    // keyed by session, so the shell on screen is the one saved - and rides the
+                    // same SAF launcher and pending-bytes slot the diagnostics save uses. Nothing
+                    // is written unless a log exists, which the menu item already ensured.
+                    onSaveSessionLog = { sessionKey, hostName ->
+                        val text = viewModel.sessionLogText(sessionKey)
+                        if (text.isNullOrEmpty()) {
+                            viewModel.reportUiMessage("This session has no output to save yet")
+                        } else {
+                            pendingTextExport = text.toByteArray()
+                            pickerActive = true
+                            textExportPicker.launch("$hostName-session.log")
+                        }
+                    },
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1329,6 +1343,20 @@ private fun EclipseWorkspace(
                         pendingTextExport = ("Eclipse SSH session log\nHost: $hostId\nSaved: ${System.currentTimeMillis()}\n\n$text").toByteArray()
                         pickerActive = true
                         textExportPicker.launch("eclipse-$hostId.log")
+                    },
+                    // The raw log comes straight from the view model's per-session transcript -
+                    // keyed by session, so the shell on screen is the one saved - and rides the
+                    // same SAF launcher and pending-bytes slot the diagnostics save uses. Nothing
+                    // is written unless a log exists, which the menu item already ensured.
+                    onSaveSessionLog = { sessionKey, hostName ->
+                        val text = viewModel.sessionLogText(sessionKey)
+                        if (text.isNullOrEmpty()) {
+                            viewModel.reportUiMessage("This session has no output to save yet")
+                        } else {
+                            pendingTextExport = text.toByteArray()
+                            pickerActive = true
+                            textExportPicker.launch("$hostName-session.log")
+                        }
                     },
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
@@ -1884,6 +1912,8 @@ private fun WorkspaceScaffold(
     onSaveSnippet: (String, String) -> Unit = { _, _ -> },
     onDeleteSnippet: (String) -> Unit = {},
     onSaveLogs: (String, String) -> Unit = { _, _ -> },
+    /** Saves a session's raw output log - session key and the host name to name the file after. */
+    onSaveSessionLog: (String, String) -> Unit = { _, _ -> },
     onSaveText: (String, String) -> Unit = { _, _ -> },
     onSaveScreen: (String, String) -> Unit = { _, _ -> },
     onClearCompleted: () -> Unit = {},
@@ -1960,6 +1990,7 @@ private fun WorkspaceScaffold(
             onSaveSnippet = onSaveSnippet,
             onDeleteSnippet = onDeleteSnippet,
             onSaveLogs = onSaveLogs,
+            onSaveSessionLog = onSaveSessionLog,
             onSaveText = onSaveText,
             onSaveScreen = onSaveScreen,
             fontSize = state.settings.terminalFontSize,
@@ -2312,6 +2343,8 @@ private fun TerminalScreen(
     onSaveSnippet: (String, String) -> Unit,
     onDeleteSnippet: (String) -> Unit,
     onSaveLogs: (String, String) -> Unit,
+    /** Saves the raw session log - see MainViewModel.sessionLogText. */
+    onSaveSessionLog: (String, String) -> Unit,
     onSaveText: (String, String) -> Unit,
     onSaveScreen: (String, String) -> Unit,
     /**
@@ -2519,6 +2552,9 @@ private fun TerminalScreen(
             onToggleHistory = { showHistory = !showHistory },
             onSnippets = { showSnippets = true },
             onSaveLogs = { onSaveLogs(activeTab.hostId, terminalText) },
+            // The session's own key, not the host: a host with two shells has two logs, and the
+            // tab's title is the host name the file should be called after.
+            onSaveSessionLog = { onSaveSessionLog(activeTab.id, activeTab.title) },
             onSaveText = { onSaveText(activeTab.hostId, terminalText) },
             onSaveScreen = { onSaveScreen(activeTab.hostId, terminalText) },
             onCopyAll = { onCopyText(terminalText) },
@@ -3172,6 +3208,8 @@ private fun TerminalTabStrip(
     onToggleHistory: () -> Unit,
     onSnippets: () -> Unit,
     onSaveLogs: () -> Unit,
+    /** Saves the raw session log; the item is hidden until the session has output to save. */
+    onSaveSessionLog: () -> Unit,
     onSaveText: () -> Unit,
     onSaveScreen: () -> Unit,
     onCopyAll: () -> Unit,
@@ -3272,6 +3310,13 @@ private fun TerminalTabStrip(
                 DropdownMenuItem(text = { Text("Copy all output") }, onClick = { menuOpen = false; onCopyAll() })
                 DropdownMenuItem(text = { Text("Jump to live output") }, onClick = { menuOpen = false; onScrollToBottom() })
                 DropdownMenuItem(text = { Text("Save logs") }, onClick = { menuOpen = false; onSaveLogs() })
+                // Only once there is something to save: the session log is created with the
+                // session, so on a shell that has not spoken yet the item would offer an empty
+                // file. `terminalText` is the observable proxy for "this session has output" -
+                // it is what the transcript view and the other saves read.
+                if (terminalText.isNotBlank()) {
+                    DropdownMenuItem(text = { Text("Save session log") }, onClick = { menuOpen = false; onSaveSessionLog() })
+                }
                 DropdownMenuItem(text = { Text("Save text") }, onClick = { menuOpen = false; onSaveText() })
                 DropdownMenuItem(text = { Text("Save screen") }, onClick = { menuOpen = false; onSaveScreen() })
                 DropdownMenuItem(text = { Text("Disconnect all") }, onClick = { menuOpen = false; onDisconnectAll() })
