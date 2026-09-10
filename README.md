@@ -34,7 +34,10 @@ them — Ed25519 keys generated elsewhere are read too — manage
 known-hosts entries, lock the app with a PIN or biometrics, toggle `FLAG_SECURE`, and let a copied
 password clear itself from the clipboard — a wipe that survives the process being killed. Passwords,
 passphrases and private keys are encrypted with a hardware-backed key and are kept out of logs,
-exceptions, backups and `adb backup`.
+exceptions, vault backups and `adb backup`. A single-account export is the one deliberate exception:
+it may carry the account's saved password and key passphrase inside its own passphrase-encrypted
+envelope, so importing it on another device connects without re-entering them; private keys never
+travel in an export.
 
 **Extras.** Local, remote and dynamic (SOCKS) port forwarding; server stats; a quick-connect home-screen
 widget; vault export/import.

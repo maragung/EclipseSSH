@@ -10,6 +10,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.eclipse.ssh.data.HostRepository
 import dev.eclipse.ssh.data.TransferRepository
+import dev.eclipse.ssh.data.backup.AccountCredentials
 import dev.eclipse.ssh.data.backup.BackupFormatException
 import dev.eclipse.ssh.data.backup.VaultBackup
 import dev.eclipse.ssh.data.credentials.HostCredentialStore
@@ -3239,16 +3240,50 @@ class MainViewModel @Inject constructor(
 
     fun exportAccount(host: HostProfile, passphrase: String, uri: Uri) = viewModelScope.launch(Dispatchers.IO) {
         guardBackup("Export failed") {
-            writeDocument(uri, VaultBackup.encrypt(VaultBackup.toAccountJson(host), passphrase))
+            // The saved password and key passphrase ride along so the account is complete on the
+            // other device - the point of an account export. Read via the same plaintext accessors
+            // duplicateHost uses, guarded on what stored() says exists so an account with nothing
+            // saved exports without the credentials block at all. The private key is deliberately
+            // not included: it has its own export path, and the key is the credential whose
+            // compromise is catastrophic.
+            val stored = runCatching { credentialStore.stored(host.id) }.getOrDefault(StoredCredentials())
+            val credentials = AccountCredentials(
+                password = if (stored.hasPassword) credentialStore.password(host.id) else null,
+                passphrase = if (stored.hasPassphrase) credentialStore.passphrase(host.id) else null,
+            ).takeIf { it.password != null || it.passphrase != null }
+            writeDocument(uri, VaultBackup.encrypt(VaultBackup.toAccountJson(host, credentials), passphrase))
+            // Generic on purpose: the snackbar is readable over a shoulder and in a screenshot,
+            // and whether this file carries a password is not its business.
             report("Exported ${host.name}")
         }
     }
 
     fun importAccount(passphrase: String, uri: Uri) = viewModelScope.launch(Dispatchers.IO) {
         guardBackup("Import failed") {
-            val host = VaultBackup.fromAccountJson(VaultBackup.decrypt(readDocument(uri), passphrase))
-            hostRepository.save(host)
-            report("Imported ${host.name}")
+            val imported = VaultBackup.fromAccountJson(VaultBackup.decrypt(readDocument(uri), passphrase))
+            hostRepository.save(imported.host)
+            // The same decrypt-then-apply dance duplicateHost does. A password is applied as-is;
+            // a passphrase only when the host already has a key on this device, because the
+            // credential store drops a passphrase with no key to attach it to - the key itself
+            // never travels in the account file, so the passphrase waits for it here.
+            val stored = runCatching { credentialStore.stored(imported.host.id) }.getOrDefault(StoredCredentials())
+            val update = imported.credentials?.let { credentials ->
+                HostCredentialUpdate(
+                    password = credentials.password?.let { SecretEdit.Replace(it) } ?: SecretEdit.Keep,
+                    passphrase = if (stored.hasKey) {
+                        credentials.passphrase?.let { SecretEdit.Replace(it) } ?: SecretEdit.Keep
+                    } else SecretEdit.Keep,
+                )
+            } ?: HostCredentialUpdate()
+            if (!update.isNoop) {
+                runCatching { credentialStore.apply(imported.host.id, update) }
+                    .onFailure { error -> report("Imported ${imported.host.name}, but its credentials could not be saved", error) }
+            }
+            // One message, so the qualification is not spoken over by the plain confirmation.
+            val keyNote = if (imported.credentials?.passphrase != null && !stored.hasKey) {
+                " — import its private key to use the saved passphrase"
+            } else ""
+            report("Imported ${imported.host.name}$keyNote")
         }
     }
 

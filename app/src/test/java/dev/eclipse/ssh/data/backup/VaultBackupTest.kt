@@ -29,6 +29,7 @@ import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.ssh.cipherFactoriesFor
+import org.json.JSONObject
 import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -196,7 +197,7 @@ class VaultBackupTest {
     }
 
     @Test
-    fun `credentials are never written into a backup`() {
+    fun `credentials are never written into a vault backup`() {
         val host = HostProfile(
             name = "Edge",
             host = "edge.example.com",
@@ -209,6 +210,7 @@ class VaultBackupTest {
 
         assertThat(json).doesNotContain("super-secret-proxy-password")
         assertThat(json).doesNotContain("socksPassword")
+        assertThat(json).doesNotContain("credentials")
         assertThat(VaultBackup.fromJson(json).first.single().socksPassword).isNull()
     }
 
@@ -384,7 +386,55 @@ class VaultBackupTest {
 
         val restored = VaultBackup.fromAccountJson(VaultBackup.toAccountJson(host))
 
-        assertThat(restored).isEqualTo(host)
+        assertThat(restored.host).isEqualTo(host)
+        assertThat(restored.credentials).isNull()
+    }
+
+    /**
+     * The reason the credentials block exists: an account export lands on another device as a
+     * complete account, password included, so first connect there does not ask for the one thing the
+     * export already knew. The passphrase travels too — only meaningful beside a key, but the key
+     * never travels in this file, so the passphrase waits on the new device for the key's own import.
+     */
+    @Test
+    fun `an account export carries the saved password and passphrase round trip`() {
+        val host = HostProfile(id = "acct-2", name = "Keyed box", host = "box.example.com", username = "ci")
+
+        val restored = VaultBackup.fromAccountJson(
+            VaultBackup.toAccountJson(host, AccountCredentials(password = "hunter2", passphrase = "open sesame")),
+        )
+
+        assertThat(restored.host).isEqualTo(host)
+        assertThat(restored.credentials).isEqualTo(AccountCredentials(password = "hunter2", passphrase = "open sesame"))
+    }
+
+    /** Exports written before the block existed, and accounts with nothing stored: same read. */
+    @Test
+    fun `an account export with a blank credentials block imports as one without`() {
+        val host = HostProfile(id = "acct-3", name = "Old box", host = "old.example.com", username = "u")
+        val legacy = VaultBackup.toAccountJson(host)
+        assertThat(legacy).doesNotContain("credentials")
+
+        val blankBlock = JSONObject(legacy).apply {
+            put("credentials", JSONObject().put("password", "  ").put("passphrase", ""))
+        }.toString()
+
+        val restored = VaultBackup.fromAccountJson(blankBlock)
+        assertThat(restored.host).isEqualTo(host)
+        assertThat(restored.credentials).isNull()
+    }
+
+    /** The block is untrusted input like every other field: bounded, never fatal. */
+    @Test
+    fun `an absurdly long account credential is truncated rather than rejected`() {
+        val host = HostProfile(id = "acct-4", name = "Stuffed box", host = "box.example.com", username = "u")
+        val oversized = "x".repeat(10_000)
+
+        val restored = VaultBackup.fromAccountJson(
+            VaultBackup.toAccountJson(host, AccountCredentials(password = oversized)),
+        )
+
+        assertThat(restored.credentials?.password).hasLength(4096)
     }
 
     @Test

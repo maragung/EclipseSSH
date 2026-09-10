@@ -42,11 +42,20 @@ import org.json.JSONObject
 
 /**
  * Passphrase-encrypted backup of the workspace configuration (host profiles and
- * settings). Credentials are intentionally excluded and remain device-local inside the
+ * settings). A full vault excludes credentials on purpose and they remain device-local inside the
  * Android Keystore vault: SSH passwords, private keys, the unlock PIN hash, and the SOCKS
- * proxy password are never written to a backup, because the Keystore key that protects
- * them cannot be exported. Every other host and settings field round-trips losslessly, so
- * restoring a vault reproduces the workspace apart from those secrets.
+ * proxy password are never written to a vault backup. Every other host and settings field
+ * round-trips losslessly, so restoring a vault reproduces the workspace apart from those secrets.
+ *
+ * A single-account export is the one deliberate exception, because its purpose is different: it
+ * moves *one account* to another device, and an account that arrives without its password asks
+ * the user for the one thing the export already knew. [toAccountJson] may therefore carry the
+ * account's saved SSH password and key passphrase in an opt-in `credentials` block, inside the
+ * same AES-GCM/PBKDF2 envelope as the rest of the payload — a block no vault backup ever writes
+ * and no older build ever reads. Private keys stay out of both formats: the key is the credential
+ * whose compromise is catastrophic, it already has its own export path from the Keys screen, and
+ * the account file plus that separately exported key is a complete account without duplicating
+ * key material.
  *
  * Older payloads still import, and this is the property the format is built around rather than a
  * concession: every key is read with an `opt…(key, default)` whose default is the field's own shipped
@@ -290,14 +299,37 @@ object VaultBackup {
         if (isNull(key)) null else optString(key).trim().take(ALGORITHM_LIST_MAX_LENGTH).takeIf(String::isNotBlank)
 
     /** Exports one connection profile using the same passphrase-encrypted format as a vault. */
-    fun toAccountJson(host: HostProfile): String = toJson(listOf(host), AppSettings(), emptyMap())
+    fun toAccountJson(host: HostProfile, credentials: AccountCredentials? = null): String {
+        // Built on top of toJson rather than threaded through it, so the vault path cannot start
+        // carrying credentials by accident: the only writer of the block is this function.
+        val root = JSONObject(toJson(listOf(host), AppSettings(), emptyMap()))
+        if (credentials != null) {
+            val block = JSONObject()
+            credentials.password?.let { block.put("password", it) }
+            credentials.passphrase?.let { block.put("passphrase", it) }
+            // Absent by default, so exports from before the block existed and exports of accounts
+            // with nothing stored read the same way on import - and no version bump is needed.
+            if (block.length() > 0) root.put("credentials", block)
+        }
+        return root.toString()
+    }
 
-    /** Reads one connection profile from an account export and rejects empty/multi-purpose payloads. */
-    fun fromAccountJson(json: String): HostProfile {
+    /** Reads one account export and rejects empty/multi-purpose payloads. */
+    fun fromAccountJson(json: String): ImportedAccount {
         val hosts = fromJson(json).first
         if (hosts.size != 1) throw BackupFormatException("Account export must contain exactly one host")
-        return hosts.single()
+        val block = runCatching { JSONObject(json) }.getOrNull()?.optJSONObject("credentials")
+        // Shape-checked like every other imported value: the block is untrusted input, so an
+        // over-long or blank field is dropped rather than stored or fatal.
+        val credentials = block?.let {
+            AccountCredentials(password = it.readAccountSecret("password"), passphrase = it.readAccountSecret("passphrase"))
+        }?.takeIf { it.password != null || it.passphrase != null }
+        return ImportedAccount(host = hosts.single(), credentials = credentials)
     }
+
+    /** One credential field as imported: bounded, trimmed, and null when there is nothing usable. */
+    private fun JSONObject.readAccountSecret(key: String): String? =
+        if (isNull(key)) null else optString(key).trim().take(MAX_ACCOUNT_CREDENTIAL_LENGTH).takeIf(String::isNotBlank)
 
     fun encrypt(plaintext: String, passphrase: String): String {
         val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
@@ -353,7 +385,29 @@ object VaultBackup {
     private const val TAG_LENGTH_BITS = 128
     private const val ITERATIONS = 100_000
     private const val DELIMITER = "."
+
+    /**
+     * Bound on an imported account credential's length. Generous against any real password - longer
+     * than every passphrase policy - and bounded against a hand-edited file, because the value goes
+     * from the file straight into the credential store.
+     */
+    private const val MAX_ACCOUNT_CREDENTIAL_LENGTH = 4096
 }
 
 /** Raised when a backup payload cannot be read: wrong passphrase, truncation, or bad JSON. */
 class BackupFormatException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * The credentials an account export may carry: the saved SSH password and the saved key passphrase,
+ * nothing else. Private keys are deliberately absent - see [VaultBackup].
+ *
+ * `toString` is redacted because this type travels through ViewModels where anything can end up in
+ * a log; the values themselves are the entire point of the type, so the redaction has to be spelled
+ * out rather than inherited from a generic data-class rendering.
+ */
+data class AccountCredentials(val password: String? = null, val passphrase: String? = null) {
+    override fun toString(): String = "AccountCredentials(password=${if (password != null) "***" else "null"}, passphrase=${if (passphrase != null) "***" else "null"})"
+}
+
+/** One account export as imported: the profile, plus the credentials the file carried, if any. */
+data class ImportedAccount(val host: HostProfile, val credentials: AccountCredentials?)
