@@ -636,9 +636,13 @@ class PortForwardingRobolectricTest {
             // The primary's transport dies the way a network fault looks: abruptly, and without
             // anything telling the app it was on purpose.
             checkNotNull(store.liveSession(host.id)) { "the primary session never reached the store" }.close(true)
+            // During the rebind window the local port briefly refuses connections — the dead
+            // transport's listener is gone and the sibling's is not up yet — so the probe must read
+            // as "not yet" here, not throw. The state assertions outside this loop still fail
+            // loudly on a connection that stays refused.
             pumpUntil(describe = { "the forwards were never rebound to the sibling: " + diagnose(host.id) }) {
                 statusesOf(host.id)[ruleId]?.state == ForwardRuntime.RUNNING &&
-                    echoThrough(port, "probe") == "probe"
+                    runCatching { echoThrough(port, "probe") }.getOrDefault("") == "probe"
             }
             // Exactly one handle for the rule: the dead transport's tracker must not linger beside
             // the survivor's.

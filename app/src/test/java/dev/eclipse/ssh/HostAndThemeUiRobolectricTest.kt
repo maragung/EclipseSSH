@@ -147,8 +147,15 @@ class HostAndThemeUiRobolectricTest {
         runBlocking { repository.setTerminalTheme(TerminalTheme.SOLARIZED_LIGHT.name) }
         openThemeRow()
 
+        // The chip with the freshly-written label composes a frame or two after the row does —
+        // under CI load a fixed pump can land before its layout pass, so wait for the display
+        // assertion to hold instead of asserting it once.
+        pumpUntil(describe = { "the theme chip never appeared on its row" }) {
+            runCatching {
+                compose.onNodeWithContentDescription("Terminal theme, Solarized light").assertIsDisplayed()
+            }.isSuccess
+        }
         val trigger = compose.onNodeWithContentDescription("Terminal theme, Solarized light")
-        trigger.assertIsDisplayed()
         val bounds = trigger.getUnclippedBoundsInRoot()
         val root = compose.onNodeWithText("Terminal theme").getUnclippedBoundsInRoot()
 
