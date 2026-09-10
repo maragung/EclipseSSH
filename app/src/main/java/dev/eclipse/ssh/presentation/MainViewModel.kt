@@ -4009,6 +4009,7 @@ class MainViewModel @Inject constructor(
             settingsRepository.setTerminalTheme(settings.terminalTheme)
             settingsRepository.setBlockScreenshots(settings.blockScreenshots)
             settingsRepository.setReconnectAskFirst(settings.reconnectAskFirst)
+            settingsRepository.setVaultAutoLockMinutes(settings.vaultAutoLockMinutes)
             report("Imported ${hosts.size} host(s)")
         }
     }
@@ -4087,6 +4088,7 @@ class MainViewModel @Inject constructor(
     fun setBiometricUnlock(enabled: Boolean) = writeSetting("the unlock setting") { settingsRepository.setBiometricUnlock(enabled) }
     fun setBlockScreenshots(enabled: Boolean) = writeSetting("the screenshot setting") { settingsRepository.setBlockScreenshots(enabled) }
     fun setReconnectAskFirst(enabled: Boolean) = writeSetting("the reconnect prompt setting") { settingsRepository.setReconnectAskFirst(enabled) }
+    fun setVaultAutoLockMinutes(minutes: Int) = writeSetting("the vault auto-lock delay") { settingsRepository.setVaultAutoLockMinutes(minutes) }
     fun setDarkTheme(enabled: Boolean) = writeSetting("the theme setting") { settingsRepository.setDarkTheme(enabled) }
     fun setClipboardSeconds(seconds: Int) = writeSetting("the clipboard timeout") { settingsRepository.setClipboardSeconds(seconds) }
     fun setKeepAliveSeconds(seconds: Int) = writeSetting("the keep-alive interval") { settingsRepository.setKeepAliveSeconds(seconds) }

@@ -790,6 +790,19 @@ data class AppSettings(
      */
     val terminalMinColumns: Int = 80,
     val pinEnabled: Boolean = false,
+    /**
+     * How long the app may sit in the background before the vault asks for the PIN (or biometric)
+     * again, in minutes. 0 means never re-lock.
+     *
+     * The countdown starts the moment the app leaves the foreground and the lock is applied when it
+     * next comes back — see [dev.eclipse.ssh.feature.vault.shouldRelockVault] and the ON_START
+     * observer in `MainActivity`. 5 by default: long enough that glancing at a password manager or
+     * answering a message and coming straight back does not ask again, short enough that a phone
+     * left on a desk for a few minutes is not an open vault. Only meaningful while a lock is
+     * actually configured: with no PIN set there is no lock screen to return to, and the setting is
+     * inert (the row's subtitle says so).
+     */
+    val vaultAutoLockMinutes: Int = 5,
     val legacyAlgorithms: Boolean = false,
     val terminalTheme: String = TerminalTheme.DARK.name,
     /**
