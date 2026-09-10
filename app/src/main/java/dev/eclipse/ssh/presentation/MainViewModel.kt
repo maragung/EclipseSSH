@@ -266,6 +266,18 @@ class MainViewModel @Inject constructor(
     private val forwardRides = ConcurrentHashMap<String, ForwardRide>()
 
     /**
+     * Handle closes that are still running, by forward id.
+     *
+     * MINA releases a listening port synchronously *inside* `close()`, but the close is itself a
+     * coroutine on [releaseScope] - so a bind issued right after a release (a reconnect rebinding its
+     * rules, an edited rule re-claiming the port of the rule it replaced, or Stop followed by Start on
+     * the same one) can reach the port first and lose it to the close that is still on its way:
+     * "Address already in use", reported against no one. [openForward] joins whatever it finds here
+     * before claiming anything, which is every bind there is; entries leave with the close they name.
+     */
+    private val pendingReleases = ConcurrentHashMap<String, Job>()
+
+    /**
      * Where every coroutine that can reach an SSH transport runs. Not the main thread, ever.
      *
      * [viewModelScope] dispatches on `Dispatchers.Main.immediate`, and that is the wrong place for
@@ -1262,22 +1274,28 @@ class MainViewModel @Inject constructor(
      * The REMOTE destination is [ForwardEntry.localHost] - the address the *phone* dials when the
      * server's side is connected to - and null means this device's own loopback, `ssh -R`'s default.
      */
-    private suspend fun openForward(session: ClientSession, entry: ForwardEntry): ForwardingHandle = when (entry.type) {
-        ForwardType.LOCAL -> portForwardingManager.startLocal(
-            session,
-            entry.listenHost,
-            entry.localPort,
-            entry.remoteHost.orEmpty(),
-            entry.remotePort ?: 0,
-        )
-        ForwardType.REMOTE -> portForwardingManager.startRemote(
-            session,
-            entry.listenHost,
-            entry.remotePort ?: 0,
-            entry.localHost ?: DEFAULT_FORWARD_LISTEN_HOST,
-            entry.localPort,
-        )
-        ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort)
+    private suspend fun openForward(session: ClientSession, entry: ForwardEntry): ForwardingHandle {
+        // The one bind path, so the one place a port is claimed: any release still in flight may be
+        // holding it - see [pendingReleases]. Joined as a set because one close serves several ids, and
+        // joining another host's moment-long close is cheaper than being wrong about whose port it was.
+        pendingReleases.values.toSet().forEach { it.join() }
+        return when (entry.type) {
+            ForwardType.LOCAL -> portForwardingManager.startLocal(
+                session,
+                entry.listenHost,
+                entry.localPort,
+                entry.remoteHost.orEmpty(),
+                entry.remotePort ?: 0,
+            )
+            ForwardType.REMOTE -> portForwardingManager.startRemote(
+                session,
+                entry.listenHost,
+                entry.remotePort ?: 0,
+                entry.localHost ?: DEFAULT_FORWARD_LISTEN_HOST,
+                entry.localPort,
+            )
+            ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort)
+        }
     }
 
     /**
@@ -1336,7 +1354,12 @@ class MainViewModel @Inject constructor(
                 // rewritten underneath it. Closed by hand because it never reached [forwardHandles],
                 // so no other path knows it exists.
                 if (forwardStates.value[entry.id]?.state == ForwardRuntime.STOPPED) {
-                    releaseScope.launch { runCatching { handle.close() } }
+                    // Registered in [pendingReleases] like every other close, because the port this
+                    // handle just claimed is being given back and a Start on the same rule would race
+                    // it exactly like a rebind races a release.
+                    val close = releaseScope.launch { runCatching { handle.close() } }
+                    pendingReleases[entry.id] = close
+                    close.invokeOnCompletion { pendingReleases.remove(entry.id, close) }
                     refreshForwardCounters(host.id)
                     return@forEach
                 }
@@ -1488,6 +1511,12 @@ class MainViewModel @Inject constructor(
      *
      * [releaseScope] rather than [transportScope] because a cancelled close leaks a listening socket,
      * and because [onCleared] runs after [viewModelScope] has been cancelled.
+     *
+     * The close is registered in [pendingReleases] for as long as it runs: a bind that happens to
+     * want a port this close is still releasing would lose the race to it - MINA's unbind is
+     * synchronous *inside* `close()`, but the close itself is a coroutine launched here, so without
+     * this handoff the rebind's bind lands first, the port is still held, and the rule reports
+     * "Address already in use" against nobody. [openForward] joins whatever it finds there.
      */
     private fun releaseForwards(ids: Collection<String>) {
         if (ids.isEmpty()) return
@@ -1501,7 +1530,9 @@ class MainViewModel @Inject constructor(
         // row left behind here would claim a tunnel nothing is holding.
         forwardStates.update { states -> states.filterNot { it.key in dropped } }
         if (handles.isEmpty()) return
-        releaseScope.launch { handles.forEach { handle -> runCatching { handle.close() } } }
+        val close = releaseScope.launch { handles.forEach { handle -> runCatching { handle.close() } } }
+        dropped.forEach { pendingReleases[it] = close }
+        close.invokeOnCompletion { dropped.forEach { pendingReleases.remove(it, close) } }
     }
 
     /**

@@ -60,6 +60,7 @@ import org.apache.sshd.common.kex.KeyExchangeFactory
 import org.apache.sshd.common.mac.BuiltinMacs
 import org.apache.sshd.common.mac.Mac
 import org.apache.sshd.common.session.helpers.CurrentService
+import org.apache.sshd.server.forward.AcceptAllForwardingFilter
 import org.apache.sshd.common.signature.BuiltinSignatures
 import org.apache.sshd.common.signature.Signature
 import org.apache.sshd.client.keyverifier.ServerKeyVerifier
@@ -105,6 +106,15 @@ class SshConnectionManager @Inject constructor(
         // Every session this client creates is a [LivenessClientSession], which is the only way the
         // host's own keep-alive interval can reach the heartbeat at all: see [armHeartbeat].
         sessionFactory = LivenessSessionFactory(this)
+        // The client's role in a remote (-R) forward: the *server* accepts on the remote port and
+        // opens a "forwarded-tcpip" channel back at us, which lands in TcpipServerChannel.doInit
+        // demanding forwardingFilter.canConnect(...). The builder's default is
+        // RejectAllForwardingFilter, so every such channel is refused with
+        // SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, the server closes the accepted socket, and the
+        // rule shows RUNNING while carrying no traffic at all. Local (-L) and dynamic (-D) rules
+        // never consult this filter on the client, so only -R is affected. We already gate rule
+        // creation and binding ourselves; MINA's blanket default adds nothing but breakage here.
+        forwardingFilter = AcceptAllForwardingFilter.INSTANCE
         // The fallback for a session that reaches construction without a liveness attribute, and the
         // value the client-level resolver hands to any session that asks. [connect] keeps it in step
         // with the global setting.
