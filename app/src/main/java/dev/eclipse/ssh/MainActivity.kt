@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -210,6 +211,7 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
+import dev.eclipse.ssh.feature.about.OPEN_SOURCE_LICENSES
 import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
@@ -4444,6 +4446,7 @@ private fun SettingsScreen(
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var showAbout by remember { mutableStateOf(false) }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -4570,6 +4573,22 @@ private fun SettingsScreen(
                 "${state.diagnostics.size} event(s) recorded · no secrets"
             },
         ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
+    }
+    Spacer(Modifier.height(14.dp))
+    SettingsSection("About") {
+        SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
+            // Two "View" buttons sit on this screen once diagnostics is counted, and a screen reader
+            // hears both of them as just "View" — so the button carries the row it belongs to, the
+            // same "setting, action" shape the theme picker's content description uses.
+            TextButton(
+                onClick = { showAbout = true },
+                modifier = Modifier.semantics { contentDescription = "About EclipseSSH" },
+            ) { Text("View") }
+        }
+    }
+
+    if (showAbout) {
+        AboutDialog(onDismiss = { showAbout = false })
     }
 
     if (showDiagnostics) {
@@ -4819,6 +4838,72 @@ private fun DiagnosticsDialog(
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
+
+/**
+ * Version, credits and the library list — the screen a licence question or a "what is this app"
+ * question is answered from.
+ *
+ * The version is read from the PackageManager rather than from a generated `BuildConfig` field: the
+ * app builds with no buildConfig fields at all, and this answer is the one Android itself shows in
+ * system settings, so the dialog cannot disagree with it.
+ */
+@Composable
+private fun AboutDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("About EclipseSSH") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.70f))) {
+                Text("EclipseSSH", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Version ${packageInfo.versionName} (${packageInfo.longVersionCode})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "An SSH and SFTP client for Android: a full-screen VT/ANSI terminal, concurrent " +
+                        "sessions in tabs, a two-pane SFTP browser with resumable transfers, port " +
+                        "forwarding and remote desktop, with credentials kept in an Android " +
+                        "Keystore-backed vault.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("Created by Maragung", style = MaterialTheme.typography.titleSmall)
+                // The repo is private, so this link serves the owner and contributors rather than the
+                // public — anyone else lands on GitHub's sign-in, which is still the honest
+                // destination for "where is the source".
+                TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ABOUT_REPO_URL))) }) {
+                    Text("Source code · github.com/maragung/EclipseSSH")
+                }
+                Text("Libraries", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // The one list the repo keeps: the dialog renders OPEN_SOURCE_LICENSES as-is, so
+                // what an About screen says and what the repo claims cannot drift apart.
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(OPEN_SOURCE_LICENSES) { library ->
+                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text("${library.name} ${library.version}", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    // Bouncy Castle is the one entry with no purpose line - a
+                                    // transitive dependency nothing calls directly - so its row
+                                    // is the licence alone, not a sentence ending in a dangling dot.
+                                    library.purpose?.let { "${library.license} · $it" } ?: library.license,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+/** Where the source lives. Private repository — see the comment on the dialog's link. */
+private const val ABOUT_REPO_URL = "https://github.com/maragung/EclipseSSH"
 
 @Composable
 private fun KnownHostsDialog(
