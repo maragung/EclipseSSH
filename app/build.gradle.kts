@@ -124,6 +124,11 @@ android {
                 "META-INF/NOTICE*",
                 "META-INF/INDEX.LIST",
                 "META-INF/*.kotlin_module",
+                // bcprov-jdk18on (pulled in by vernacular-vnc) and jspecify both ship an OSGi
+                // container manifest at this multi-release-jar path. Android is not an OSGi
+                // runtime, so both copies are dead weight - but only this resource is dropped,
+                // not the whole `META-INF/versions/9` tree, whose classes D8 does consume.
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
             )
             // MINA SSHD resolves its security providers / factories through
             // META-INF/services, so those entries must survive packaging.
