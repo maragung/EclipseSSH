@@ -11,6 +11,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.documentfile.provider.DocumentFile
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
@@ -199,6 +200,7 @@ import dev.eclipse.ssh.data.MAX_TRANSFER_RETRIES
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.data.fs.SingleDocumentProvider
 import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
@@ -689,6 +691,10 @@ private fun EclipseWorkspace(
     // deserves a window of its own rather than a layer over whatever the workspace was showing.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
     var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
+    // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
+    // reason the preview target is: its file actions resolve against this workspace's context,
+    // clipboard and overlays, none of which the screen should know about.
+    var transferActionsFor by remember { mutableStateOf<TransferItem?>(null) }
     var pendingExportPassphrase by remember { mutableStateOf<String?>(null) }
     var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
     var showExportDialog by remember { mutableStateOf(false) }
@@ -1142,6 +1148,7 @@ private fun EclipseWorkspace(
                     onResumeAllTransfers = viewModel::resumeAllTransfers,
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
+                    onOpenTransferActions = { transferActionsFor = it },
                     onAddForward = { type, localPort, remoteHost, remotePort ->
                         activeHost?.let { host ->
                             when (type) {
@@ -1298,6 +1305,7 @@ private fun EclipseWorkspace(
                     onResumeAllTransfers = viewModel::resumeAllTransfers,
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
+                    onOpenTransferActions = { transferActionsFor = it },
                     onAddForward = { type, localPort, remoteHost, remotePort ->
                         activeHost?.let { host ->
                             when (type) {
@@ -1560,6 +1568,41 @@ private fun EclipseWorkspace(
             },
         )
     }
+    // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
+    // preview and the editor that some rows open are their own windows, and none of them should
+    // have to fight this sheet for the bottom of the screen.
+    transferActionsFor?.let { item ->
+        TransferActionsSheet(
+            item = item,
+            onDismiss = { transferActionsFor = null },
+            onPause = { id -> transferActionsFor = null; viewModel.pauseTransfer(id) },
+            onResume = { id -> transferActionsFor = null; viewModel.resumeTransfer(id) },
+            onCancel = { id -> transferActionsFor = null; viewModel.cancelTransfer(id) },
+            onRunNow = { id -> transferActionsFor = null; viewModel.runTransferNow(id) },
+            onViewFile = { transfer ->
+                transferActionsFor = null
+                transferLocalTarget(context, transfer)?.let { previewTarget = it }
+                    ?: viewModel.reportUiMessage("${transfer.name} has no local file to view")
+            },
+            onEditFile = { transfer ->
+                transferActionsFor = null
+                transferLocalTarget(context, transfer)?.let { editorRequest = EditorRequest(it.entry, it.provider) }
+                    ?: viewModel.reportUiMessage("${transfer.name} has no local file to edit")
+            },
+            onOpenFile = { transfer ->
+                transferActionsFor = null
+                openTransferFileExternally(context, transfer, choose = false, onNoApp = viewModel::reportUiMessage)
+            },
+            onOpenFileWith = { transfer ->
+                transferActionsFor = null
+                openTransferFileExternally(context, transfer, choose = true, onNoApp = viewModel::reportUiMessage)
+            },
+            onCopyDetails = { transfer ->
+                transferActionsFor = null
+                viewModel.copyToClipboard(transferDetails(transfer))
+            },
+        )
+    }
     }
     }
 }
@@ -1706,6 +1749,8 @@ private fun WorkspaceScaffold(
     onResumeAllTransfers: () -> Unit = {},
     onCancelAllTransfers: () -> Unit = {},
     onRunTransferNow: (String) -> Unit = {},
+    /** Long-press on a transfer card: opens the per-item action sheet held above this scaffold. */
+    onOpenTransferActions: (TransferItem) -> Unit = {},
     onAddForward: (ForwardType, Int, String?, Int?) -> Unit = { _, _, _, _ -> },
     onStopForward: (String) -> Unit = {},
     onExportVault: () -> Unit = {},
@@ -1869,6 +1914,7 @@ private fun WorkspaceScaffold(
                 Destination.TRANSFERS -> TransfersScreen(
                     state.transfers, onClearCompleted, onPauseTransfer, onResumeTransfer, onCancelTransfer,
                     onPauseAllTransfers, onResumeAllTransfers, onCancelAllTransfers, onRunTransferNow,
+                    onOpenTransferActions,
                 )
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
@@ -3553,6 +3599,65 @@ private data class PreviewTarget(
     val provider: FileSystemProvider,
 )
 
+/**
+ * A transfer's local file as the preview overlay's subject (and, through [PreviewTarget.entry],
+ * the editor's). Built at tap time rather than when the sheet opened, and resolved through SAF
+ * rather than from anything cached: a grant revoked in between reads as a failure inside the
+ * preview, which is where a person can see it, instead of a crash here.
+ *
+ * The document's own answers are preferred but every one has a fallback, because providers vary
+ * in what they will report for a single document — the transfer's name and size are facts the row
+ * already knows.
+ */
+private fun transferLocalTarget(context: Context, item: TransferItem): PreviewTarget? {
+    val uri = item.localUri?.let(Uri::parse) ?: return null
+    val document = runCatching { DocumentFile.fromSingleUri(context, uri) }.getOrNull()
+    return PreviewTarget(
+        entry = FsEntry(
+            name = document?.name ?: item.name,
+            path = uri.toString(),
+            isDirectory = false,
+            size = document?.length()?.takeIf { it >= 0 } ?: item.totalBytes,
+            modifiedEpochMillis = document?.lastModified()?.takeIf { it > 0 },
+            permissions = null,
+            mimeType = document?.type,
+        ),
+        provider = SingleDocumentProvider(context, uri),
+    )
+}
+
+/**
+ * Offers the transfer's local file to another app — straight to the handler the resolver picks,
+ * or through the chooser when [choose] is set. The read grant rides the intent, the same way the
+ * preview sheet's own open-with does; a device where nothing handles the type is a message, not a
+ * crash.
+ */
+private fun openTransferFileExternally(
+    context: Context,
+    item: TransferItem,
+    choose: Boolean,
+    onNoApp: (String) -> Unit,
+) {
+    val uri = item.localUri?.let(Uri::parse) ?: return onNoApp("${item.name} has no local file")
+    val mime = runCatching { DocumentFile.fromSingleUri(context, uri)?.type }.getOrNull() ?: "*/*"
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mime)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    val target = if (choose) Intent.createChooser(intent, "Open ${item.name} with") else intent
+    runCatching { context.startActivity(target) }
+        .onFailure { onNoApp("No app on this device can open ${item.name}") }
+}
+
+/** The transfer's facts as text, for the clipboard: what it is, where it sits, how far it got. */
+private fun transferDetails(item: TransferItem): String = listOfNotNull(
+    item.name,
+    "${item.direction.label} · ${item.hostName}",
+    "Status: ${item.status.name.lowercase()} (${(item.progress * 100).toInt()}%)",
+    item.remotePath?.let { "Remote: $it" },
+    item.localUri?.let { "Local: $it" },
+).joinToString("\n")
+
 /** A copy or move waiting on the user to browse to its destination — see [FilesScreen]. */
 private data class PendingRelocate(
     val copy: Boolean,
@@ -3798,6 +3903,7 @@ private fun TransfersScreen(
     onResumeAll: () -> Unit,
     onCancelAll: () -> Unit,
     onRunNow: (String) -> Unit,
+    onOpenActions: (TransferItem) -> Unit,
 ) {
     Spacer(Modifier.height(8.dp))
     val running = transfers.count { it.status == TransferStatus.RUNNING }
@@ -3859,7 +3965,7 @@ private fun TransfersScreen(
         EmptyState(filter.emptyTitle, "Nothing in this state right now.", null)
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            visible.forEach { TransferCard(it, onPause, onResume, onCancel, onRunNow) }
+            visible.forEach { TransferCard(it, onPause, onResume, onCancel, onRunNow, onOpenActions) }
             TruncatedListingNotice(
                 transfers.size,
                 "transfers",
@@ -3889,9 +3995,24 @@ private fun TransferItem.matches(filter: TransferFilter): Boolean = when (filter
     TransferFilter.DONE -> status == TransferStatus.COMPLETE
 }
 
+/**
+ * One transfer as a card.
+ *
+ * The card's own buttons stay (pause, resume, cancel) because they are the one-tap answers to the
+ * states a watched transfer cycles through; the long-press sheet is everything else — the file the
+ * transfer is about, copied details, removal — which is why the gesture is on the whole card and
+ * not just its chrome. Tap stays inert: unlike a file row there is nothing a transfer "opens".
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume: (String) -> Unit, onCancel: (String) -> Unit, onRunNow: (String) -> Unit) {
-    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+private fun TransferCard(item: TransferItem, onPause: (String) -> Unit, onResume: (String) -> Unit, onCancel: (String) -> Unit, onRunNow: (String) -> Unit, onOpenActions: (TransferItem) -> Unit) {
+    Card(
+        Modifier
+            .fillMaxWidth()
+            .combinedClickable(onClick = {}, onLongClick = { onOpenActions(item) }),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.size(40.dp)) { Box(contentAlignment = Alignment.Center) { Icon(if (item.direction == TransferDirection.DOWNLOAD) Icons.Default.CloudDownload else Icons.Default.CloudUpload, null, tint = MaterialTheme.colorScheme.primary) } }
@@ -3967,6 +4088,94 @@ private fun formatTransferBytes(bytes: Long): String {
         unit = next
     }
     return if (unit == "B") "$bytes B" else "${"%.1f".format(value)} $unit"
+}
+
+/**
+ * The per-transfer action sheet: everything one transfer can do, opened by long-pressing its card.
+ *
+ * The card's own buttons remain the one-tap answers to the states a watched transfer cycles
+ * through; this is the complete list, and like the Files explorer's action sheet it offers only
+ * what the item's own state can serve — a control action for its current status, and the file
+ * actions only when the local file actually exists in full.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TransferActionsSheet(
+    item: TransferItem,
+    onDismiss: () -> Unit,
+    onPause: (String) -> Unit,
+    onResume: (String) -> Unit,
+    onCancel: (String) -> Unit,
+    onRunNow: (String) -> Unit,
+    onViewFile: (TransferItem) -> Unit,
+    onEditFile: (TransferItem) -> Unit,
+    onOpenFile: (TransferItem) -> Unit,
+    onOpenFileWith: (TransferItem) -> Unit,
+    onCopyDetails: (TransferItem) -> Unit,
+) {
+    // The local file exists in full once a download completes, and from the very start for an
+    // upload — it is the source the bytes come from. A download in any other state has only a
+    // prefix on disk, and previewing or editing a prefix would show content the user would take
+    // for the whole file.
+    val hasLocalFile = item.localUri != null &&
+        (item.status == TransferStatus.COMPLETE || item.direction == TransferDirection.UPLOAD)
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(Modifier.padding(horizontal = 22.dp).padding(bottom = 18.dp)) {
+            Text(item.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                "${item.direction.label} · ${item.hostName} · ${item.status.name.lowercase()}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            // The control the status asks for, in the card's own vocabulary: a retry is a resume
+            // the user chose to name differently, exactly as the card's icon does.
+            when (item.status) {
+                TransferStatus.RUNNING -> TransferActionRow("Pause") { onPause(item.id) }
+                TransferStatus.PAUSED -> TransferActionRow("Resume") { onResume(item.id) }
+                TransferStatus.FAILED -> TransferActionRow("Retry") { onResume(item.id) }
+                TransferStatus.QUEUED -> if (item.scheduledAt != null) {
+                    TransferActionRow("Run now") { onRunNow(item.id) }
+                } else {
+                    TransferActionRow("Resume") { onResume(item.id) }
+                }
+                TransferStatus.COMPLETE -> Unit
+            }
+            if (item.status != TransferStatus.COMPLETE) {
+                TransferActionRow("Cancel transfer", destructive = true) { onCancel(item.id) }
+            }
+            if (hasLocalFile) {
+                TransferActionRow("View file") { onViewFile(item) }
+                // Editing only a finished file: overwriting the source of a running upload, or a
+                // half-written download target, races the transfer that is still writing it.
+                if (item.status == TransferStatus.COMPLETE) {
+                    TransferActionRow("Edit as text") { onEditFile(item) }
+                }
+                TransferActionRow("Open") { onOpenFile(item) }
+                TransferActionRow("Open with") { onOpenFileWith(item) }
+            }
+            TransferActionRow("Copy details") { onCopyDetails(item) }
+            if (item.status == TransferStatus.COMPLETE) {
+                // Cancel for a finished transfer stops nothing — it only drops the row, so the
+                // sheet names it for what it does here.
+                TransferActionRow("Remove from list", destructive = true) { onCancel(item.id) }
+            }
+        }
+    }
+}
+
+/** One row of the transfer action sheet, red where the action removes something. */
+@Composable
+private fun TransferActionRow(label: String, onClick: () -> Unit, destructive: Boolean = false) {
+    Text(
+        label,
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 14.dp),
+        style = MaterialTheme.typography.bodyLarge,
+        color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+    )
 }
 
 @Composable
