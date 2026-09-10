@@ -36,6 +36,10 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import org.apache.sshd.agent.SshAgent
+import org.apache.sshd.agent.SshAgentFactory
+import org.apache.sshd.agent.SshAgentServer
+import org.apache.sshd.agent.local.LocalAgentFactory
 import org.apache.sshd.client.ClientBuilder
 import org.apache.sshd.client.ClientFactoryManager
 import org.apache.sshd.client.SshClient
@@ -44,6 +48,9 @@ import org.apache.sshd.common.AttributeRepository
 import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.SshException
 import org.apache.sshd.common.PropertyResolver
+import org.apache.sshd.common.channel.ChannelFactory
+import org.apache.sshd.common.session.ConnectionService
+import org.apache.sshd.common.session.Session
 import org.apache.sshd.common.util.net.SshdSocketAddress
 import org.apache.sshd.common.NamedFactory
 import org.apache.sshd.common.NamedResource
@@ -75,6 +82,9 @@ import org.apache.sshd.sftp.client.SftpClientFactory
 class SshConnectionManager @Inject constructor(
     @ApplicationContext context: Context,
     private val settingsRepository: SettingsRepository,
+    // Defaulted so the plain (context, settings) construction every non-forwarding test uses still
+    // compiles; Hilt ignores Kotlin defaults and injects the bound StoredKeyVaultSource in the app.
+    private val agentKeySource: VaultKeySource = VaultKeySource.NONE,
 ) : Closeable {
     private val knownHosts = KnownHostsStore(context)
     /**
@@ -115,6 +125,14 @@ class SshConnectionManager @Inject constructor(
         // never consult this filter on the client, so only -R is affected. We already gate rule
         // creation and binding ourselves; MINA's blanket default adds nothing but breakage here.
         forwardingFilter = AcceptAllForwardingFilter.INSTANCE
+        // The agent-forwarding half of the same story. Setting an agent factory is what makes
+        // SshClient.checkConfig() register the auth-agent channel factories, so the *client* can
+        // accept an `auth-agent@openssh.com` channel opened back at it; the factory itself is
+        // session-aware (see ForwardingAwareAgentFactory) and answers null for every session that
+        // was not dialled with forwarding on - which is also what keeps the side effect MINA
+        // otherwise has (offering agent identities during publickey auth for *every* session) off
+        // the hosts that never asked for it.
+        agentFactory = ForwardingAwareAgentFactory()
         // The fallback for a session that reaches construction without a liveness attribute, and the
         // value the client-level resolver hands to any session that asks. [connect] keeps it in step
         // with the global setting.
@@ -307,15 +325,31 @@ class SshConnectionManager @Inject constructor(
         // every value written is a valid interval and it is only ever a fallback.
         armHeartbeat(client, globalKeepAlive)
         /*
+         * The identities this session's agent will serve, resolved before the dial for the reason on
+         * [StoreBackedAgent]: once the session exists, every agent call runs on MINA's I/O threads,
+         * where a suspend read of the credential vault cannot go. Loaded only for a host that asked
+         * for forwarding - the attribute is the factory's entire decision, and its absence for every
+         * other host is what keeps those sessions agent-less. A vault that cannot be read serves an
+         * empty agent rather than failing a login the credentials were only decorating: forwarding is
+         * an opt-in feature of the session, never a dependency of it.
+         */
+        val agentIdentities = if (profile.agentForwarding) {
+            runCatching { agentKeySource.loadIdentities() }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+        /*
          * The connection context, which is how per-host configuration reaches session construction.
          *
          * MINA attaches this repository to the [IoSession] before handing it to the session factory,
          * so it is readable from [LivenessClientSession] at the one moment the heartbeat can still be
-         * armed. The proxy configurations travel the same way and are read by [ProxyAwareConnector].
+         * armed. The proxy configurations travel the same way and are read by [ProxyAwareConnector],
+         * and the agent identities are read by [ForwardingAwareAgentFactory].
          */
         val context = AttributeRepository.ofAttributesMap(
             buildMap<AttributeRepository.AttributeKey<*>, Any> {
                 put(TUNING_KEY, tuning)
+                if (agentIdentities.isNotEmpty()) put(AGENT_IDENTITIES_KEY, agentIdentities)
                 when (profile.proxyType) {
                     ProxyType.SOCKS5 -> put(SocksProxyConfig.KEY, socksProxyConfig(profile, timeout))
                     ProxyType.HTTP_CONNECT -> put(HttpProxyConfig.KEY, httpProxyConfig(profile, timeout))
@@ -439,6 +473,12 @@ class SshConnectionManager @Inject constructor(
             usePty = pty.enabled,
             terminalType = pty.terminalType,
             environment = parseEnvironment(profile?.environment),
+            // Per-session because the request is made on the channel: it is what tells the far end
+            // it may open an agent channel back, and a session that never asked is a session whose
+            // administrator never gets the invitation. SFTP channels never carry it - forwarding is
+            // a property of the interactive shell the user typed into, not of every channel the
+            // session happens to open.
+            agentForwarding = profile?.agentForwarding == true,
         )
         // After the channel is open, because there is nowhere to write before it. A startup command is
         // typed into the shell exactly as if the user had typed it - see [startupCommandBytes] for why
@@ -1044,6 +1084,54 @@ internal class SessionAlgorithms(
 
 /** [SessionTuning] as carried on the connection context. */
 private val TUNING_KEY = AttributeRepository.AttributeKey<SessionTuning>()
+
+/** The agent identities a forwarding-enabled session was dialled with, on the same context. */
+internal val AGENT_IDENTITIES_KEY = AttributeRepository.AttributeKey<List<AgentIdentity>>()
+
+/**
+ * The agent to serve on [context], or null when the session behind it never asked for forwarding.
+ *
+ * Split out of the factory as a pure function of the context so the decision itself is testable
+ * without a [Session]: the null half is load-bearing. MINA asks the agent factory for identities
+ * during publickey authentication of *every* session (`UserAuthPublicKeyIterator`), so a factory
+ * that answered for all of them would offer the whole vault to every host on every login, and the
+ * one observable that distinguishes "forwarding host" from "ordinary host" is this attribute.
+ */
+internal fun agentFor(context: AttributeRepository?): StoreBackedAgent? {
+    val identities = context?.getAttribute(AGENT_IDENTITIES_KEY) ?: return null
+    if (identities.isEmpty()) return null
+    return StoreBackedAgent(identities)
+}
+
+/**
+ * The session-aware half of agent forwarding.
+ *
+ * `createClient` is called from two places, and only one of them is the feature: the interesting
+ * call is [org.apache.sshd.agent.local.ChannelAgentForwarding.doInit], when a host we asked for
+ * forwarding opens `auth-agent@openssh.com` back. The other caller is
+ * `UserAuthPublicKeyIterator.initializeAgentIdentities`, which runs for every session's publickey
+ * auth and expects null to mean "no agent here" - answered for any session, this would turn every
+ * login into an offer of the vault's keys.
+ *
+ * A fresh [StoreBackedAgent] per call is deliberate: MINA closes the agent it asked for once auth
+ * is over, and a shared instance would be closed under the forwarding channel that still needs it
+ * (the agent itself is stateless, so the copies cost nothing).
+ */
+private class ForwardingAwareAgentFactory : SshAgentFactory {
+
+    override fun getChannelForwardingFactories(manager: FactoryManager): List<ChannelFactory> =
+        LocalAgentFactory.DEFAULT_FORWARDING_CHANNELS
+
+    override fun createClient(session: Session, manager: FactoryManager): SshAgent? {
+        // Read off the IoSession rather than the session's own accessor, for the same reason
+        // [sessionTuning] does: the repository reaches the socket before the session is built, and
+        // publickey auth can start in between.
+        val context = session.getIoSession().getAttribute(AttributeRepository::class.java) as? AttributeRepository
+        return agentFor(context)
+    }
+
+    override fun createServer(service: ConnectionService): SshAgentServer? = null
+}
 
 /**
  * The keep-alive interval to use for [profile], in seconds, or `0` for "no keep-alive at all".

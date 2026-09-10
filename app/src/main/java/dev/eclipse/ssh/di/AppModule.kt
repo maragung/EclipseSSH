@@ -24,6 +24,8 @@ import dev.eclipse.ssh.data.local.Migrations
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.security.SecretCipher
 import dev.eclipse.ssh.security.SecureVault
+import dev.eclipse.ssh.ssh.StoredKeyVaultSource
+import dev.eclipse.ssh.ssh.VaultKeySource
 import javax.inject.Singleton
 
 @Module
@@ -87,6 +89,15 @@ object AppModule {
     @Provides
     @Singleton
     fun provideSecretCipher(vault: SecureVault): SecretCipher = vault
+
+    /**
+     * The agent-forwarding key source, bound beside the cipher it reads through for the same reason:
+     * the one place a reader looks for the app's wiring should name both halves. [SshConnectionManager]
+     * takes the interface so a test can serve fixtures without a credential store.
+     */
+    @Provides
+    @Singleton
+    fun provideVaultKeySource(source: StoredKeyVaultSource): VaultKeySource = source
 
     /**
      * The credential file.
