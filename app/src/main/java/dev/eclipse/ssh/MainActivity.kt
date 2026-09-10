@@ -184,6 +184,7 @@ import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
 import dev.eclipse.ssh.data.model.PORT_RANGE
 import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardType
+import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
@@ -232,6 +233,7 @@ import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
+import dev.eclipse.ssh.ui.PortForwardManagerSheet
 import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
 import dev.eclipse.ssh.ssh.GeneratedKeyPair
 import dev.eclipse.ssh.ssh.PERMISSION_PRESETS
@@ -925,7 +927,17 @@ private fun EclipseWorkspace(
     var showAddHost by remember { mutableStateOf(false) }
     var showEditHost by remember { mutableStateOf<HostProfile?>(null) }
     var showHostDetails by remember { mutableStateOf<HostProfile?>(null) }
+    // The host whose port-forwarding manager sheet is open, by id rather than by profile: the sheet
+    // edits the host's saved rules, so it must read the *current* profile from the hosts flow every
+    // recomposition - a snapshot taken at open time would keep showing the pre-save rules after its
+    // own Save button, and would keep showing a host the user has since removed.
+    var forwardManagerHostId by remember { mutableStateOf<String?>(null) }
     var pendingDeleteHost by remember { mutableStateOf<HostProfile?>(null) }
+    // The host whose duplication is waiting on the "also copy the forwarding rules?" answer. Null
+    // when nothing is pending; a host with no rules never lands here at all, so the only dialog a
+    // rules-free Duplicate can raise is one some other action opened.
+    var duplicateAskHost by remember { mutableStateOf<HostProfile?>(null) }
+    var duplicateForwards by remember { mutableStateOf(true) }
     var showAuthHost by remember { mutableStateOf<HostProfile?>(deepLinkHost) }
     // A deep link arriving while the app is already running updates deepLinkHost, so open
     // the auth prompt for it and let the activity clear the pending value.
@@ -933,6 +945,17 @@ private fun EclipseWorkspace(
         deepLinkHost?.let {
             showAuthHost = it
             onDeepLinkConsumed()
+        }
+    }
+    // A duplicate with rules is a question, not a command: "same box, different purpose" usually
+    // wants the tunnels too, but the copy that does not want them must not have to delete them one
+    // by one afterwards. A rules-free host has nothing to ask about and duplicates straight away.
+    val requestDuplicateHost: (HostProfile) -> Unit = { host ->
+        if (host.savedForwards.isBlank()) {
+            viewModel.duplicateHost(host)
+        } else {
+            duplicateForwards = true
+            duplicateAskHost = host
         }
     }
     // A Quick Settings tile or home-screen widget tap resolves, on the view model, to the
@@ -1077,7 +1100,8 @@ private fun EclipseWorkspace(
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
-                    onDuplicateHost = viewModel::duplicateHost,
+                    onDuplicateHost = requestDuplicateHost,
+                    onManageForwards = { forwardManagerHostId = it.id },
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1234,7 +1258,8 @@ private fun EclipseWorkspace(
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
-                    onDuplicateHost = viewModel::duplicateHost,
+                    onDuplicateHost = requestDuplicateHost,
+                    onManageForwards = { forwardManagerHostId = it.id },
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1386,6 +1411,22 @@ private fun EclipseWorkspace(
             onRefreshStats = { viewModel.refreshStats(host) },
         )
     }
+    forwardManagerHostId?.let { hostId ->
+        // Resolved from the live hosts flow rather than a snapshot taken when the sheet opened: the
+        // sheet's own saves rewrite the host's rules, and a host removed while its manager was open
+        // closes the sheet rather than editing a profile that no longer exists.
+        state.hosts.firstOrNull { it.id == hostId }?.let { host ->
+            PortForwardManagerSheet(
+                host = host,
+                statuses = state.forwardStatuses,
+                runningForwards = state.forwardings,
+                onDismiss = { forwardManagerHostId = null },
+                onStartRule = { viewModel.startForwardRule(hostId, it) },
+                onStopRule = viewModel::stopForwardRule,
+                onSaveRules = { viewModel.saveForwardRules(hostId, it) },
+            )
+        }
+    }
     showEditHost?.let { host ->
         AddHostDialog(
             initialHost = host,
@@ -1413,6 +1454,47 @@ private fun EclipseWorkspace(
                 }
             },
             dismissButton = { TextButton(onClick = { pendingDeleteHost = null }) { Text("Cancel") } },
+        )
+    }
+    duplicateAskHost?.let { host ->
+        // Counted here rather than carried in from the kebab click: the count in the sentence has to
+        // match the rules this dialog will actually copy, and decoding the same column twice is what
+        // the engine itself does to keep its ids honest.
+        val ruleCount = remember(host) { decodeForwardRules(host.savedForwards, host.id).size }
+        AlertDialog(
+            onDismissRequest = { duplicateAskHost = null },
+            title = { Text("Duplicate ${host.name}?") },
+            text = {
+                Column {
+                    Text("A copy with the same settings and saved credentials, under a name of its own.")
+                    // A row-wide toggle, not just the checkbox: the label is the sentence the user is
+                    // agreeing to, so tapping it anywhere is agreeing to it.
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 12.dp)
+                            .toggleable(
+                                value = duplicateForwards,
+                                role = Role.Checkbox,
+                                onValueChange = { duplicateForwards = it },
+                            ),
+                    ) {
+                        Checkbox(checked = duplicateForwards, onCheckedChange = null)
+                        Text(
+                            if (ruleCount == 1) "Also duplicate its 1 port forwarding rule"
+                            else "Also duplicate its $ruleCount port forwarding rules",
+                            modifier = Modifier.padding(start = 8.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { viewModel.duplicateHost(host, duplicateForwards); duplicateAskHost = null }) {
+                    Text("Duplicate")
+                }
+            },
+            dismissButton = { TextButton(onClick = { duplicateAskHost = null }) { Text("Cancel") } },
         )
     }
     showAuthHost?.let { host ->
@@ -1705,6 +1787,12 @@ private fun WorkspaceScaffold(
     onExportAccount: (HostProfile) -> Unit = {},
     /** Saves a copy of one host under a new id - the card menu's Duplicate item. */
     onDuplicateHost: (HostProfile) -> Unit = {},
+    /**
+     * Opens one host's port-forwarding manager sheet - the card menu's Port forwarding item, and the
+     * session row's forward note. The manager lives above this scaffold with the other sheets, so it
+     * survives the destination changing underneath it and keeps its state through a rule edit.
+     */
+    onManageForwards: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
     /** Long-press on a terminal tab: opens a second shell on the same host. */
     onDuplicateSession: (SessionTab) -> Unit = {},
@@ -1866,6 +1954,9 @@ private fun WorkspaceScaffold(
                     // The same authentication sheet the Hosts list opens, deliberately: a reconnect is
                     // a connection, and it should ask for whatever a connection asks for.
                     onReconnect = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onConnect) },
+                    // The session row knows its host's id; the manager above this scaffold wants the
+                    // profile, which only the hosts flow can answer for.
+                    onManageForwards = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onManageForwards) },
                     onCopyTrace = onCopyTrace,
                     onGoToHosts = { onDestination(Destination.HOSTS) },
                 )
@@ -1907,7 +1998,7 @@ private fun WorkspaceScaffold(
             when (destination) {
                 Destination.HOSTS -> HostsScreen(
                     state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
-                    onToggleFavoriteHost, onExportAccount, onDuplicateHost,
+                    onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
@@ -1954,6 +2045,7 @@ private fun HostsScreen(
     onToggleFavoriteHost: (HostProfile) -> Unit,
     onExportAccount: (HostProfile) -> Unit,
     onDuplicateHost: (HostProfile) -> Unit,
+    onManageForwards: (HostProfile) -> Unit,
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
@@ -1983,7 +2075,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards)
             }
         }
     }
@@ -2018,6 +2110,7 @@ private fun HostCard(
     onToggleFavorite: (HostProfile) -> Unit,
     onExportAccount: (HostProfile) -> Unit,
     onDuplicate: (HostProfile) -> Unit,
+    onPortForwarding: (HostProfile) -> Unit,
 ) {
     // Keyed on the host id so a list that reorders (a favourite toggled, a search narrowed) cannot
     // leave the menu open over a different host than the one it was opened on.
@@ -2054,9 +2147,17 @@ private fun HostCard(
                             leadingIcon = { Icon(Icons.Default.Wifi, null) },
                             onClick = { menuOpen = false; onConnect(host) },
                         )
+                        // Directly under Connect because it is the other thing a connected host is
+                        // opened for: the manager works whether or not the session is up, but it is
+                        // the running tunnels a user comes here hunting.
+                        DropdownMenuItem(
+                            text = { Text("Port forwarding") },
+                            leadingIcon = { Icon(Icons.Default.SwapVert, null) },
+                            onClick = { menuOpen = false; onPortForwarding(host) },
+                        )
                         // The arrow this item replaced used to sit beside the kebab as a second way
-                        // into the details sheet; now this is the way in, so it sits directly under
-                        // Connect, where the eye lands first.
+                        // into the details sheet; now this is the way in, so it sits high in the
+                        // menu, where the eye lands first.
                         DropdownMenuItem(
                             text = { Text("Details") },
                             leadingIcon = { Icon(Icons.AutoMirrored.Filled.ArrowForward, null) },
@@ -2574,6 +2675,8 @@ private fun TerminalSessionsScreen(
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
     onReconnect: (String) -> Unit,
+    /** Opens this session's host's port-forwarding manager - the forward note on its row. */
+    onManageForwards: (String) -> Unit,
     onCopyTrace: (String) -> Unit,
     onGoToHosts: () -> Unit,
 ) {
@@ -2627,6 +2730,7 @@ private fun TerminalSessionsScreen(
                     trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[tab.hostId]),
                     onOpen = { onOpenSession(tab) },
                     onReconnect = { onReconnect(tab.hostId) },
+                    onManageForwards = { onManageForwards(tab.hostId) },
                     onCopyTrace = onCopyTrace,
                     onClose = { onCloseTab(tab) },
                 )
@@ -2733,6 +2837,8 @@ private fun SessionRow(
     trace: List<SessionDiagnosticEvent>,
     onOpen: () -> Unit,
     onReconnect: () -> Unit,
+    /** Opens the host's port-forwarding manager; the forward note is the smaller target inside the row. */
+    onManageForwards: () -> Unit,
     onCopyTrace: (String) -> Unit,
     onClose: () -> Unit,
 ) {
@@ -2798,6 +2904,44 @@ private fun SessionRow(
                         style = MaterialTheme.typography.labelMedium,
                         color = if (isProblem) MaterialTheme.colorScheme.error
                         else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                // The tunnels this host's rules have up, beside the SFTP note and for the same
+                // reason: both are a fact about the session that is not the session's own state, so
+                // neither belongs on the status line. Only shown when the host has rules at all -
+                // "0 Forwardings Active" on every plain shell is noise wearing an indicator.
+                if (tab.forwardsTotal > 0) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        // A smaller target inside a row that is itself the open-the-shell target:
+                        // tapping the note wants the tunnels, not the terminal.
+                        modifier = Modifier.clickable(onClick = onManageForwards),
+                    ) {
+                        // Green while any tunnel is up, amber when none are: the ratio against the
+                        // total is the manager's first screen, this only has to say "worth a look".
+                        Box(
+                            Modifier
+                                .size(8.dp)
+                                .clip(RoundedCornerShape(50))
+                                .background(if (tab.forwardsOpen > 0) EclipseSuccess else EclipseWarning),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "${tab.forwardsOpen} Forwardings Active",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                // Why a tunnel is not up, in the same styling the SFTP note uses for its problems -
+                // see [SessionTab.forwardError] for why this is deliberately not [SessionTab.lastError].
+                tab.forwardError?.let { error ->
+                    Text(
+                        error,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -5630,11 +5774,12 @@ private fun HostDetailsSheet(
             // the answer to the question this line exists to answer, and leaving the row out when the
             // answer is "nothing" makes its absence indistinguishable from the app not tracking it.
             DetailLine("Credentials", credentials.describe())
-            // Only what the card's own menu does not already offer. Connect, Details, Favorite,
-            // Export account, Edit and Remove are all one tap away on every row through the kebab, so
-            // repeating them here meant two paths to each act. What is left is the one action only
-            // this sheet can do: dropping the saved secrets, which lives here because it belongs with
-            // the Credentials line above it rather than in a menu the user opens for other reasons.
+            // Only what the card's own menu does not already offer. Connect, Details, Port
+            // forwarding, Favorite, Export account, Edit and Remove are all one tap away on every
+            // row through the kebab, so repeating them here meant two paths to each act. What is
+            // left is the one action only this sheet can do: dropping the saved secrets, which
+            // lives here because it belongs with the Credentials line above it rather than in a menu
+            // the user opens for other reasons.
             if (!credentials.isEmpty) {
                 OutlinedButton(onClick = onForgetCredentials) { Text("Forget credentials") }
             }
