@@ -19,6 +19,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -1073,6 +1075,7 @@ private fun EclipseWorkspace(
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
+                    onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionId = openSessionId,
                     onOpenSession = { openSessionId = it },
@@ -1229,6 +1232,7 @@ private fun EclipseWorkspace(
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = viewModel::duplicateHost,
                     onCloseTab = viewModel::closeTab,
+                    onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionId = openSessionId,
                     onOpenSession = { openSessionId = it },
@@ -1671,6 +1675,8 @@ private fun WorkspaceScaffold(
     /** Saves a copy of one host under a new id - the card menu's Duplicate item. */
     onDuplicateHost: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
+    /** Long-press on a terminal tab: opens a second shell on the same host. */
+    onDuplicateSession: (SessionTab) -> Unit = {},
     onDisconnectAll: () -> Unit,
     /** The session whose shell is on screen; null shows the list of sessions instead. */
     openSessionId: String?,
@@ -1776,6 +1782,7 @@ private fun WorkspaceScaffold(
             onKeyRowVisible = onTerminalKeyRow,
             activeTab = openSession,
             onSelectSession = { onOpenSession(it.id) },
+            onDuplicateSession = onDuplicateSession,
             onLeaveSession = { onOpenSession(null) },
             modifier = modifier,
         )
@@ -2106,6 +2113,8 @@ private fun TerminalScreen(
      */
     activeTab: SessionTab,
     onSelectSession: (SessionTab) -> Unit,
+    /** Long-press on the strip's tab: opens a second shell on the same host. */
+    onDuplicateSession: (SessionTab) -> Unit,
     onLeaveSession: () -> Unit,
     modifier: Modifier = Modifier,
     fontSize: Int = 13,
@@ -2289,6 +2298,7 @@ private fun TerminalScreen(
             activeTab = activeTab,
             frame = frame,
             onSelect = onSelectSession,
+            onDuplicate = onDuplicateSession,
             onLeaveSession = onLeaveSession,
             onCloseTab = onCloseTab,
             onDisconnectAll = onDisconnectAll,
@@ -2891,11 +2901,14 @@ private fun TerminalKeyRowHandle(expanded: Boolean, onToggle: () -> Unit, modifi
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun TerminalTabStrip(
     tabs: List<SessionTab>,
     activeTab: SessionTab,
     frame: TerminalFrame,
     onSelect: (SessionTab) -> Unit,
+    /** Long-press on a tab (or its menu item): a second, independent shell on the same host. */
+    onDuplicate: (SessionTab) -> Unit,
     onLeaveSession: () -> Unit,
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
@@ -2939,7 +2952,14 @@ private fun TerminalTabStrip(
         ) {
             tabs.forEach { tab ->
                 Surface(
-                    modifier = Modifier.clickable { onSelect(tab) },
+                    // Long-press duplicates: a second shell on the same host, in its own tab, with its
+                    // own session. Same gesture as the Files list uses to reach an item's actions, and
+                    // the strip's overflow menu carries the same command for anyone who finds gestures
+                    // easier to hit than to remember.
+                    modifier = Modifier.combinedClickable(
+                        onClick = { onSelect(tab) },
+                        onLongClick = { onDuplicate(tab) },
+                    ),
                     shape = RoundedCornerShape(12.dp),
                     color = if (tab == activeTab) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                 ) {
@@ -2977,6 +2997,10 @@ private fun TerminalTabStrip(
         Box {
             IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Terminal actions") }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Duplicate terminal") },
+                    onClick = { menuOpen = false; onDuplicate(activeTab) },
+                )
                 DropdownMenuItem(
                     text = { Text(if (showCommandBar) "Hide command bar" else "Show command bar") },
                     onClick = { menuOpen = false; onToggleCommandBar() },

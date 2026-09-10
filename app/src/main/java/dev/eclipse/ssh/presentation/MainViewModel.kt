@@ -1095,10 +1095,17 @@ class MainViewModel @Inject constructor(
         // user asks for a listing — which is the point of the switch: an account with a shell and no
         // sftp-server subsystem otherwise greets every successful login with a failure about a feature
         // the user never asked for.
-        if (host.autoLoginSftp) {
-            loginSftp(host)
-        } else {
-            updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
+        //
+        // A host that already has a working SFTP channel — a duplicate terminal attaching under a
+        // sibling's session, or a reconnect while the channel survived — keeps it: SFTP is host-scoped
+        // (one channel on the host's primary session, see [loginSftp]), so a second login would close
+        // and reopen a channel the host is already using. The READY write below mirrors the state onto
+        // the new tab, whose copy still says it never tried.
+        val sftpReady = tabs.value.any { it.hostId == host.id && it.sftpState == SftpSessionState.READY }
+        when {
+            sftpReady -> updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.READY, sftpError = null) }
+            host.autoLoginSftp -> loginSftp(host)
+            else -> updateHostTabs(host.id) { it?.copy(sftpState = SftpSessionState.DISABLED, sftpError = null) }
         }
         // Last, and after the tab is already CONNECTED: the shell is the session, and the tunnels are a
         // convenience attached to it. See [startSavedForwards] for why a tunnel that cannot bind is not
@@ -1550,6 +1557,17 @@ class MainViewModel @Inject constructor(
                     // its own session under its own key and is not touched. Through the store rather
                     // than the raw map, so the host index entry goes with it.
                     sessionStore.close(sessionKey)
+                }
+                // The host's saved tunnels ride its primary session, and this ending may have just
+                // taken that transport with it. A sibling terminal still holds a live session, so the
+                // forwards can be rebound to the survivor now; on a host whose last session this was,
+                // nothing runs - the ladder's own attach brings the tunnels back with the session it
+                // dials. [startSavedForwards] stops the old handles first, so a host with no saved
+                // rules is a no-op.
+                if (sessionStore.sessionKeysForHost(hostId).any { it != sessionKey && sessionStore.isLive(it) }) {
+                    runCatching { hostRepository.hosts.first() }.getOrNull()
+                        ?.firstOrNull { it.id == hostId }
+                        ?.let(startSavedForwards)
                 }
             }
         }
@@ -3113,6 +3131,35 @@ class MainViewModel @Inject constructor(
                 TransferDirection.UPLOAD -> transferCoordinator.resumeUpload(item, sftp, stream as InputStream)
             }
         }
+    }
+
+    /**
+     * Opens a second shell on [tab]'s host: a new tab, a new session, nothing shared with the shell
+     * that is already running except the account.
+     *
+     * The dial goes out under a *fresh* key with `adopt = false`, which is the whole of the feature:
+     * [connect] resolves an ordinary dial to the host's existing tab so that Connect reconnects what
+     * the user is watching, and a duplicate must not be resolved - it claims nothing, adopts nothing,
+     * and cannot land on the session the first terminal is typing into. The cost of that is the one
+     * race the design accepts: a restore pass installing a session under the host-id slot at the same
+     * moment leaves one extra live session nobody claims, which [SshSessionStore.reap] tidies.
+     *
+     * `resuming = true` not because anything is being resumed but because it is the dial that may
+     * take its credential from the session registry - the shell the user duplicated is authenticated
+     * right now, so its credential is there, and a duplicate that prompted for a password the host
+     * already knows would be an interrogation, not a feature.
+     *
+     * The tab is created here rather than by [connect] so it can carry its own title: the host's name
+     * plus its ordinal, so two shells on one host are told apart by something a person can read.
+     */
+    fun duplicateSession(tab: SessionTab) {
+        val host = uiState.value.hosts.firstOrNull { it.id == tab.hostId } ?: return
+        val key = java.util.UUID.randomUUID().toString()
+        val ordinal = tabs.value.count { it.hostId == host.id } + 1
+        updateTab(key) { existing ->
+            existing ?: SessionTab(id = key, hostId = host.id, title = "${host.name} $ordinal")
+        }
+        connect(host, resuming = true, sessionKey = key, adopt = false)
     }
 
     /**
