@@ -383,6 +383,15 @@ dependencies {
     // instrumentation copy in androidTest stays as the real-device signal.
     testImplementation(platform(libs.androidx.compose.bom))
     testImplementation(libs.androidx.compose.ui.test.junit4)
+    // `createComposeRule()` launches a bare ComponentActivity, which this AAR's manifest is what
+    // registers. It is debugImplementation above because instrumented tests only run on debug — but
+    // Robolectric unit tests run on the release variant too, and a release unit test resolves its
+    // activity against the variant's manifest, where debugImplementation never lands: the whole
+    // editor-canvas suite died on release with "Unable to resolve activity for Intent { …
+    // androidx.activity.ComponentActivity }" while passing on debug. testImplementation puts the
+    // registration into both variants' unit-test manifests; the duplicate on debug merges as the
+    // same declaration it already carries.
+    testImplementation(libs.androidx.compose.ui.test.manifest)
     testImplementation(libs.androidx.test.junit)
     // Stripped copies of sshd-common + sshd-sftp for unit tests (see above).
     testImplementation(files(tasks.named("stripSshdServices")))

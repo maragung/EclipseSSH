@@ -9,6 +9,8 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.getOrNull
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.TransferRepository
@@ -92,7 +94,7 @@ class TransfersActionsRobolectricTest {
                 totalBytes = 943_718_400,
             ),
         )
-        openTransfers()
+        openTransfers(rowName = "nightly-dump.sql")
         longPress("nightly-dump.sql")
 
         awaitRow("Resume")
@@ -124,7 +126,7 @@ class TransfersActionsRobolectricTest {
                 totalBytes = 2_254_856_192,
             ),
         )
-        openTransfers()
+        openTransfers(rowName = "site-backup.tar")
         longPress("site-backup.tar")
 
         awaitRow("View file")
@@ -164,10 +166,10 @@ class TransfersActionsRobolectricTest {
                 totalBytes = 3_072,
             ),
         )
-        openTransfers()
+        openTransfers(rowName = "release-notes.md")
         longPress("release-notes.md")
 
-        compose.onNode(hasText("Edit as text") and hasClickAction()).performClick()
+        clickSheetRow("Edit as text")
         val app = compose.activity.application
         pumpUntil(describe = { "the editor activity never started" }) {
             runCatching { shadowOf(app).nextStartedActivity }.getOrNull()
@@ -198,18 +200,43 @@ class TransfersActionsRobolectricTest {
         }
     }
 
-    private fun openTransfers() {
+    /**
+     * Opens the Transfers tab and waits for one row, by the name the caller knows will be in it.
+     *
+     * The row is named rather than hard-coded to the clean install's seeds, because the seeds are
+     * conditional: `seedIfEmpty` runs in the view model's init and only writes its demo rows while
+     * the queue is still empty, so a test that injects its own row through the repository first
+     * races that check — the injected row suppresses the seeds, and a wait for the seeded
+     * "release-bundle.tar.gz" then times out on a screen that is showing exactly what the test
+     * wrote. Each test waits for the row it put there (or, on the clean-install test, the seed it
+     * knows arrives because nothing was injected).
+     */
+    private fun openTransfers(rowName: String = "release-bundle.tar.gz") {
         compose.waitForIdle()
         compose.onNode(hasText("Transfers") and hasClickAction()).performClick()
-        pumpUntil(describe = { "the seeded queue never arrived" }) {
-            compose.onAllNodes(hasText("release-bundle.tar.gz") and hasClickAction())
-                .fetchSemanticsNodes().isNotEmpty()
+        pumpUntil(describe = { "the \"$rowName\" row never arrived" }) {
+            compose.onAllNodes(hasText(rowName) and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
         }
     }
 
     /** Long-presses one transfer's card, by the name the card shows. */
     private fun longPress(name: String) {
         compose.onNode(hasText(name) and hasClickAction()).performTouchInput { longClick() }
+    }
+
+    /**
+     * Clicks a sheet row by invoking its own OnClick semantics action.
+     *
+     * A Material3 ModalBottomSheet lives in a Dialog window, and `performClick`'s injected touch
+     * never reaches content inside a dialog window under Robolectric — the node is found, the call
+     * returns, the lambda never runs. See `FilesExplorerLayoutRobolectricTest.clickSheetRow` for
+     * the full reasoning; the shape is copied so both suites fail in equally readable ways.
+     */
+    private fun clickSheetRow(label: String) {
+        val row = compose.onNode(hasText(label) and hasClickAction()).fetchSemanticsNode()
+        val click = row.config.getOrNull(SemanticsActions.OnClick)?.action
+        checkNotNull(click) { "the \"$label\" sheet row has no OnClick action" }
+        compose.runOnUiThread { click() }
     }
 
     /** A row of the sheet that must be there, and on screen. */

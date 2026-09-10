@@ -12,6 +12,7 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ssh.SshSessionStore
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalLayout
@@ -1064,20 +1065,32 @@ class RealOpenSshInteropRobolectricTest {
         // rest of the line.
         //
         // The window is a shared log, not this session's: a connection any other test's session opens
-        // while this one is logging in lands its own kex lines in the same bytes. So the verdict below
-        // carries the raw lines and the window's login count - with those two, the next failure names
-        // its own cause (one login that negotiated none, against a foreign login's lines interleaved)
-        // instead of a bare list that cannot distinguish them.
+        // while this one is logging in lands its own kex lines in the same bytes, and sshd's kex lines
+        // name no port. So the lines are attributed to their connections by the client port sshd *does*
+        // name - the same join key `loginsByPort` uses - and this session's own socket supplies the
+        // port, which nothing else can be using while this session holds it open. The raw-lines
+        // assertion this replaces failed exactly that way in CI: a foreign login with `none`
+        // negotiated landed inside the window and read as "this session compressed nothing".
         val kexLines = appendedLog(log, logOffset).lineSequence()
             .filter { it.contains("kex:") && it.contains("compression: ") }
             .toList()
-        val negotiated = kexLines
-            .map { it.substringAfter("compression: ").trim().substringBefore(' ') }
-            .toList()
         val windowLogins = loginsByPort(log, logOffset)
         val window = "logins in this window: $windowLogins; kex lines:\n${kexLines.joinToString("\n")}"
+        val store = injected(viewModel(), "sessionStore", SshSessionStore::class.java)
+        val sessionKey = tabFor(saved.id)?.id
+        val session = sessionKey?.let(store::liveSession)
+        val localPort = runCatching {
+            (session?.ioSession?.localAddress as? InetSocketAddress)?.port
+        }.getOrNull()
+        assertWithMessage("this session has no live socket the log could name. $window")
+            .that(localPort)
+            .isNotNull()
+        val negotiated = compressionByClientPort(log, logOffset)[localPort!!]
         assertWithMessage("the server logged no negotiated compression for this session. $window")
-            .that(negotiated.size)
+            .that(negotiated)
+            .isNotNull()
+        assertWithMessage("the server logged fewer kex lines than one per direction. $window")
+            .that(negotiated!!.size)
             .isAtLeast(2)
         if (compression) {
             assertWithMessage("compression was on for this host and the server compressed nothing. $window")
@@ -1255,6 +1268,35 @@ class RealOpenSshInteropRobolectricTest {
     private fun logins(log: File, offset: Long, port: Int): Int = loginsByPort(log, offset)[port] ?: 0
 
     /**
+     * The compression sshd negotiated per connection since [offset], keyed by the client port that
+     * connection arrived on.
+     *
+     * sshd's kex lines name no port, so a shared log cannot tell one connection's kex from another's
+     * by the line alone - and this class shares one log with every host any earlier test left
+     * behind. But the log is written per connection and in order: a `Connection from …` line opens
+     * the block that connection's kex lines land in, and the port it names is the same join key
+     * [loginsByPort] uses. The compression assertions read their connection's block, so a foreign
+     * login landing inside the window changes nothing about this session's verdict.
+     */
+    private fun compressionByClientPort(log: File, offset: Long): Map<Int, List<String>> {
+        val negotiated = mutableMapOf<Int, MutableList<String>>()
+        var clientPort = -1
+        appendedLog(log, offset).lineSequence().forEach { line ->
+            ARRIVED.find(line)?.let { match ->
+                clientPort = match.groupValues[1].toInt()
+                return@forEach
+            }
+            // -1 until the first arrival line, so kex lines a connection opened *before* the window
+            // are not charged to whatever connection happens to be next.
+            if (clientPort > 0 && line.contains("kex:") && line.contains("compression: ")) {
+                val compression = line.substringAfter("compression: ").trim().substringBefore(' ')
+                negotiated.getOrPut(clientPort) { mutableListOf() }.add(compression)
+            }
+        }
+        return negotiated
+    }
+
+    /**
      * Every login since [offset], counted per listening port, as the evidence for [logins].
      *
      * Key 0 collects the logins whose own arrival predates [offset] - a connection this window did not
@@ -1301,6 +1343,12 @@ class RealOpenSshInteropRobolectricTest {
 
     private fun viewModel(): MainViewModel =
         ViewModelProvider(compose.activity)[MainViewModel::class.java]
+
+    /** Reads one of the view model's injected singletons. See `ConnectionMatrixRobolectricTest`. */
+    private fun <T> injected(viewModel: MainViewModel, name: String, type: Class<T>): T =
+        type.cast(
+            MainViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(viewModel),
+        )!!
 
     private fun tabFor(hostId: String) = viewModel().uiState.value.tabs.firstOrNull { it.hostId == hostId }
 

@@ -14,6 +14,8 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.getOrNull
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.model.AuthMethod
@@ -212,7 +214,7 @@ class FilesExplorerLayoutRobolectricTest {
         // The sheet, not the batch bar: the gesture's first consequence is the menu of everything
         // this entry can do.
         awaitDisplayed("Edit as text")
-        compose.onNode(hasText("Select") and hasClickAction()).performClick()
+        clickSheetRow("Select")
         awaitDisplayed("1 selected")
         compose.onNode(hasText("Download") and hasClickAction()).assertIsDisplayed()
         compose.onNode(hasText("Schedule") and hasClickAction()).assertIsDisplayed()
@@ -238,7 +240,7 @@ class FilesExplorerLayoutRobolectricTest {
         val app = compose.activity.application
 
         compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
-        compose.onNode(hasText("Edit as text") and hasClickAction()).performClick()
+        clickSheetRow("Edit as text")
         pumpUntil(describe = { "the editor activity never started: " + diagnose() }) {
             runCatching { shadowOf(app).nextStartedActivity }.getOrNull()
                 ?.component?.className == "dev.eclipse.ssh.ui.editor.TextEditorActivity"
@@ -248,6 +250,24 @@ class FilesExplorerLayoutRobolectricTest {
     // ---------------------------------------------------------------- driving the app
 
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
+
+    /**
+     * Clicks a bottom-sheet row by invoking its own OnClick semantics action.
+     *
+     * A Material3 ModalBottomSheet lives in a Dialog window, and `performClick` delivers a real
+     * touch through the window's input dispatcher — which under Robolectric never reaches content
+     * inside a dialog window: the node is found, the call returns, and the row's lambda has not run.
+     * (The same gesture on the main window — a tab, a file row — arrives fine, which is why only
+     * the sheet-driven tests fail.) Invoking the action the touch would have dispatched runs the
+     * row's own code with nothing to deliver, so what the test asserts afterwards is about the app
+     * rather than about the harness.
+     */
+    private fun clickSheetRow(label: String) {
+        val row = compose.onNode(hasText(label) and hasClickAction()).fetchSemanticsNode()
+        val click = row.config.getOrNull(SemanticsActions.OnClick)?.action
+        checkNotNull(click) { "the \"$label\" sheet row has no OnClick action" }
+        compose.runOnUiThread { click() }
+    }
 
     private fun names(): List<String> = viewModel().filesExplorer.state.value.entries.map { it.name }
 

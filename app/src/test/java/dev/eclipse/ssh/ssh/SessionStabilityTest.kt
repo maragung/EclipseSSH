@@ -604,7 +604,12 @@ class SessionStabilityTest {
             val started = shells.size
             val terminal = manager.openTerminal(session)
             awaitShell(started)
-            store.sessions[profile.id] = session
+            // install() rather than raw map writes: the sweep and every host-scoped question reach
+            // sessions through the hostOf index install() writes, so a session filed straight into
+            // the maps is invisible to the probe — the liveness half of this test would pass with
+            // the probe never having run, and the liveHostIds() assertion below would never have
+            // had a live host to stop offering.
+            store.install(profile.id, session, profile.id)
             store.channels[profile.id] = terminal
             assertThat(store.isLive(profile.id)).isTrue()
 
@@ -675,7 +680,9 @@ class SessionStabilityTest {
             val started = shells.size
             val terminal = manager.openTerminal(session)
             val shell = awaitShell(started)
-            store.sessions[profile.id] = session
+            // install() for the same reason as the keep-alive test above: a session the probe cannot
+            // see is a session this test can never prove was spared rather than overlooked.
+            store.install(profile.id, session, profile.id)
             store.channels[profile.id] = terminal
             assertThat(store.isLive(profile.id)).isTrue()
 
@@ -725,7 +732,9 @@ class SessionStabilityTest {
             val started = shells.size
             val terminal = manager.openTerminal(session)
             awaitShell(started)
-            store.sessions[profile.id] = session
+            // install(), or the sweep below is a no-op and the session "survives" because nobody
+            // asked it anything - the exact vacuous pass the elapsed-time assertion exists to rule out.
+            store.install(profile.id, session, profile.id)
             store.channels[profile.id] = terminal
 
             // The handover: both sockets stay open, nothing crosses them again.
@@ -1548,7 +1557,10 @@ class SessionStabilityTest {
             } finally {
                 collector.cancel()
             }
-            assertThat(logins.get()).isEqualTo(loginsBefore)
+            // Exactly the one login this test's own connect made - a re-key that worked is free, and
+            // a re-key that quietly redialled is a second one. [loginsBefore] is read before that
+            // connect, so the difference is counted rather than the total.
+            assertThat(logins.get() - loginsBefore).isEqualTo(1)
 
             // Teardown by the new key reaches the session; by the old key there is nothing to reach.
             store.forget(tabKey)
