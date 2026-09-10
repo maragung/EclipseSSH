@@ -36,7 +36,7 @@ class AppNavigationTest {
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
 
-    /** The tab, not the identically-titled top app bar; only the tab is clickable. */
+    /** The navigation tab. Since the top bar went actions-only, it is also the only place a destination's name renders. */
     private fun tab(label: String) = compose.onNode(hasText(label) and hasClickAction())
 
     /**
@@ -60,8 +60,8 @@ class AppNavigationTest {
     fun everyDestinationIsReachableAndRendersItsFirstRunContent() {
         compose.waitForIdle()
 
-        // Hosts is the start destination.
-        compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+        // Hosts is the start destination. Its top bar is actions-only (no title, no search icon),
+        // so the screen is identified by its filter field.
         compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
 
         tab("Terminal").performClick()
@@ -95,7 +95,7 @@ class AppNavigationTest {
 
         // And back, without the round trip having disturbed anything.
         tab("Hosts").performClick()
-        compose.onNodeWithText("Your secure workspace").assertIsDisplayed()
+        compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
     }
 
     @Test
@@ -119,7 +119,6 @@ class AppNavigationTest {
         // Icon-only buttons are unusable with TalkBack unless they carry a description.
         compose.onNodeWithContentDescription("Add host").assertIsDisplayed()
         compose.onNodeWithContentDescription("Import account").assertIsDisplayed()
-        compose.onNodeWithContentDescription("Global search").assertIsDisplayed()
     }
 
     @Test
@@ -155,24 +154,6 @@ class AppNavigationTest {
 
         compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
         compose.waitForIdle()
-    }
-
-    @Test
-    fun theGlobalSearchOverlayOpensAndClosesFromAnyDestination() {
-        compose.waitForIdle()
-        tab("Settings").performClick()
-
-        compose.onNodeWithContentDescription("Global search").performClick()
-        compose.waitForIdle()
-
-        compose.onNodeWithText("Search hosts, snippets, terminal output").assertIsDisplayed()
-        compose.onNodeWithText("Type to search across your workspace.").assertIsDisplayed()
-
-        compose.onNode(hasText("Close") and hasClickAction()).performClick()
-        compose.waitForIdle()
-
-        // Dismissing search returns to the destination it was opened from.
-        assertSettingsSection("Security")
     }
 
     // ------------------------------------------------------------------ on a device only

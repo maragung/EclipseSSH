@@ -185,7 +185,6 @@ import dev.eclipse.ssh.data.model.ForwardEntry
 import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
-import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
@@ -943,7 +942,6 @@ private fun EclipseWorkspace(
             viewModel.consumeQuickConnect()
         }
     }
-    var showGlobalSearch by remember { mutableStateOf(false) }
     // Deliberately `remember`, NOT `rememberSaveable`: this is a security gate, so it has to fail
     // closed. rememberSaveable persists into the saved-instance-state Bundle, which survives
     // system-initiated process death — and the ON_STOP re-lock below cannot clear it in time,
@@ -1154,7 +1152,6 @@ private fun EclipseWorkspace(
                         }
                     },
                     onStopForward = viewModel::stopForwarding,
-                    onGlobalSearch = { showGlobalSearch = true },
                     onExportVault = { showExportDialog = true },
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
@@ -1311,7 +1308,6 @@ private fun EclipseWorkspace(
                         }
                     },
                     onStopForward = viewModel::stopForwarding,
-                    onGlobalSearch = { showGlobalSearch = true },
                     onExportVault = { showExportDialog = true },
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
@@ -1460,14 +1456,6 @@ private fun EclipseWorkspace(
     // was open simply takes its question with it.
     state.reconnectPrompt?.let { prompt ->
         ReconnectDialog(prompt = prompt, onReconnect = viewModel::answerReconnectPrompt)
-    }
-    if (showGlobalSearch) {
-        GlobalSearchDialog(
-            state = state,
-            onDismiss = { showGlobalSearch = false },
-            onSelectHost = { host -> viewModel.selectHost(host); destination = Destination.HOSTS; showGlobalSearch = false },
-            onCopySnippet = { command -> viewModel.copyToClipboard(command); showGlobalSearch = false },
-        )
     }
     if (showExportDialog) {
         PassphraseDialog(
@@ -1740,7 +1728,6 @@ private fun WorkspaceScaffold(
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
     verifyPin: suspend (String) -> Boolean = { false },
-    onGlobalSearch: () -> Unit = {},
     onForgetKnownHost: (String) -> Unit = {},
     onClearKnownHosts: () -> Unit = {},
     onForgetAllCredentials: () -> Unit = {},
@@ -1790,23 +1777,22 @@ private fun WorkspaceScaffold(
     }
     Scaffold(
         modifier = modifier,
+        // No top bar at all except on Hosts — and no title even there. Every destination already
+        // names itself in the navigation bar at the bottom, so the bar above repeated that name (and
+        // the global-search icon beside it) in vertical space the document on screen could use; the
+        // screens felt noticeably tighter for it. Hosts is the one destination with actions that
+        // belong to no row on it (Add, Import account), and those stay, actions-only.
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(destination.label)
-                        if (destination == Destination.HOSTS) Text("Your secure workspace", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                },
-                actions = {
-                    if (destination == Destination.HOSTS) {
+            if (destination == Destination.HOSTS) {
+                TopAppBar(
+                    title = {},
+                    actions = {
                         IconButton(onClick = onImportAccount) { Icon(Icons.Default.CloudDownload, "Import account") }
                         IconButton(onClick = onAddHost) { Icon(Icons.Default.Add, "Add host") }
-                    }
-                    IconButton(onClick = onGlobalSearch) { Icon(Icons.Default.Search, "Global search") }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
-            )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+                )
+            }
         },
         containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
@@ -4937,73 +4923,6 @@ private fun HostKeyDialog(challenge: HostKeyChallenge, onAccept: () -> Unit, onR
         },
         confirmButton = { Button(onClick = onAccept) { Text("Trust and connect") } },
         dismissButton = { TextButton(onClick = onReject) { Text("Reject") } },
-    )
-}
-
-@Composable
-private fun GlobalSearchDialog(state: MainUiState, onDismiss: () -> Unit, onSelectHost: (HostProfile) -> Unit, onCopySnippet: (String) -> Unit) {
-    var query by remember { mutableStateOf("") }
-    // Remembered rather than recomputed on every recomposition. Terminal scrollback runs to
-    // MAX_TERMINAL_CHARS per host, so the last of these is a case-insensitive scan of a few hundred
-    // kilobytes; a live session repaints this dialog while the user is still typing, and re-scanning
-    // on each of those frames made the field itself feel slow.
-    val hostResults = remember(state.hosts, query) {
-        if (query.isBlank()) emptyList() else state.hosts.filter { it.matchesQuery(query) }
-    }
-    val snippetResults = remember(state.snippets, query) {
-        if (query.isBlank()) emptyList() else state.snippets.filter { it.label.contains(query, ignoreCase = true) || it.command.contains(query, ignoreCase = true) }
-    }
-    // Matched against every shell the host has, not just its first: a host with duplicated terminals
-    // keeps a transcript per tab, and text typed into the second one is no less findable.
-    val terminalMatches = remember(state.hosts, state.tabs, state.terminalOutput, query) {
-        if (query.isBlank()) emptyList() else state.hosts.filter { host ->
-            state.tabs.any { tab -> tab.hostId == host.id && state.terminalOutput[tab.id].orEmpty().contains(query, ignoreCase = true) }
-        }
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Global search") },
-        text = {
-            Column {
-                OutlinedTextField(query, { query = it }, modifier = Modifier.fillMaxWidth(), placeholder = { Text("Search hosts, snippets, terminal output") }, singleLine = true, leadingIcon = { Icon(Icons.Default.Search, null) })
-                Spacer(Modifier.height(12.dp))
-                Column(Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f)).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (query.isBlank()) {
-                        Text("Type to search across your workspace.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    } else {
-                        if (hostResults.isNotEmpty()) {
-                            Text("Hosts", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            hostResults.forEach { host ->
-                                Row(Modifier.fillMaxWidth().clickable { onSelectHost(host) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Computer, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Text("${host.name} · ${host.username}@${host.host}", style = MaterialTheme.typography.bodyMedium)
-                                }
-                            }
-                        }
-                        if (snippetResults.isNotEmpty()) {
-                            Spacer(Modifier.height(6.dp))
-                            Text("Snippets", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            snippetResults.forEach { snippet ->
-                                Row(Modifier.fillMaxWidth().clickable { onCopySnippet(snippet.command) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Terminal, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Column { Text(snippet.label, style = MaterialTheme.typography.bodyMedium); Text(snippet.command, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontFamily = FontFamily.Monospace) }
-                                }
-                            }
-                        }
-                        if (terminalMatches.isNotEmpty()) {
-                            Spacer(Modifier.height(6.dp))
-                            Text("Terminal output", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                            terminalMatches.forEach { host ->
-                                Row(Modifier.fillMaxWidth().clickable { onSelectHost(host) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Terminal, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(10.dp)); Text(host.name, style = MaterialTheme.typography.bodyMedium) }
-                            }
-                        }
-                        if (hostResults.isEmpty() && snippetResults.isEmpty() && terminalMatches.isEmpty()) {
-                            Text("No matches for \"$query\".", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
 
