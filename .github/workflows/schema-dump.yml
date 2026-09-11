@@ -27,7 +27,7 @@ permissions:
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
   BUILD_TOOLS: '36.0.0'
-  COMPILE_SDK: 'android-37'
+  COMPILE_SDK: 'android-37.0'
   # Same pins as ci.yml: :app depends on :freerdp, so even this ksp-only
   # invocation compiles the native module (preBuild hangs off every variant
   # compilation) and needs the toolchain that builds it.

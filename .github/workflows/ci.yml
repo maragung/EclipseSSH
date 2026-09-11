@@ -33,7 +33,7 @@ env:
   # apksigner/aapt2 are addressed as $ANDROID_HOME/build-tools/$BUILD_TOOLS/...
   # so a future image cannot pick a different binary by accident.
   BUILD_TOOLS: '36.0.0'
-  COMPILE_SDK: 'android-37'
+  COMPILE_SDK: 'android-37.0'
   MIN_SDK: '28'
   TARGET_SDK: 'android-35'
   # The NDK and CMake the :freerdp module's native build is pinned to
@@ -68,7 +68,7 @@ jobs:
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
           # cmdline-tools 13.0 is the LTS line that ships platform-tools and
-          # supports platforms;android-37 + build-tools;36.0.0.
+          # supports platforms;android-37.0 + build-tools;36.0.0.
           cmdline-tools-version: '11479570'
           packages: >-
             platform-tools
