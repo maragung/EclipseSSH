@@ -88,7 +88,7 @@ jobs:
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbdcd598c601ff59a1f7b # v4.0.0
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
         with:
           # Read-only here unconditionally: this workflow never runs on main,
           # and its caches must not write into the branch's read-only posture.

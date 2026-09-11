@@ -34,7 +34,7 @@ class ZipArchiveTest {
         val stored = "0123456789".toByteArray()
         val zip = zipOf(
             ZipEntry("hello.txt") to deflated,
-            storedEntry("data.bin", stored),
+            storedEntry("data.bin", stored) to stored,
         )
 
         val entries = list(zip)
@@ -540,21 +540,6 @@ class ZipArchiveTest {
         }
     }
 
-    private fun le16(value: Int): ByteArray = byteArrayOf(
-        (value and 0xFF).toByte(),
-        ((value ushr 8) and 0xFF).toByte(),
-    )
-
-    private fun le32(value: Long): ByteArray = byteArrayOf(
-        (value and 0xFF).toByte(),
-        ((value ushr 8) and 0xFF).toByte(),
-        ((value ushr 16) and 0xFF).toByte(),
-        ((value ushr 24) and 0xFF).toByte(),
-    )
-
-    private fun le64(value: Long): ByteArray =
-        (0 until 8).map { index -> ((value ushr (8 * index)) and 0xFF).toByte() }.toByteArray()
-
     /**
      * A byte-level ZIP writer for the shapes no real writer will emit: lying EOCD fields,
      * path-escaping names, saturated sizes, headers that disagree with each other. Every field
@@ -702,6 +687,26 @@ class ZipArchiveTest {
     }
 
     private companion object {
+        /**
+         * The little-endian writers [HandZip] spells records with. Companion members (not
+         * instance helpers) because HandZip and CountingByteSource are nested classes that need
+         * them without holding a reference to the test instance.
+         */
+        fun le16(value: Int): ByteArray = byteArrayOf(
+            (value and 0xFF).toByte(),
+            ((value ushr 8) and 0xFF).toByte(),
+        )
+
+        fun le32(value: Long): ByteArray = byteArrayOf(
+            (value and 0xFF).toByte(),
+            ((value ushr 8) and 0xFF).toByte(),
+            ((value ushr 16) and 0xFF).toByte(),
+            ((value ushr 24) and 0xFF).toByte(),
+        )
+
+        fun le64(value: Long): ByteArray =
+            (0 until 8).map { index -> ((value ushr (8 * index)) and 0xFF).toByte() }.toByteArray()
+
         /** 1980-01-01T00:00:00Z - the DOS epoch the engine clamps impossible dates to. */
         val DOS_EPOCH_MILLIS: Long = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
             clear()
