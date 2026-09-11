@@ -185,6 +185,9 @@ class VaultBackupTest {
             blockScreenshots = true,
             reconnectAskFirst = true,
             vaultAutoLockMinutes = 60,
+            // Every field opposite its default for the same reason as blockScreenshots above.
+            editorPrefsJson = "{\"wordWrap\":true,\"showLineNumbers\":false,\"tabSize\":2," +
+                "\"spacesInsteadOfTabs\":true,\"autoSaveEnabled\":false,\"autoSaveDelayMillis\":5000}",
         )
         val knownHosts = mapOf("edge.example.com:2222" to EDGE_FINGERPRINT)
 
@@ -242,6 +245,8 @@ class VaultBackupTest {
         // Absent from a v1 backup, so it resolves to the default (re-lock after 5 minutes) rather
         // than to zero (never re-lock) by accident.
         assertThat(settings.vaultAutoLockMinutes).isEqualTo(defaults.vaultAutoLockMinutes)
+        // Same story for the editor blob: absent means "never configured", not a failed import.
+        assertThat(settings.editorPrefsJson).isEqualTo(defaults.editorPrefsJson)
         assertThat(hosts).hasSize(1)
         assertThat(hosts.single().proxyType).isEqualTo(ProxyType.NONE)
         assertThat(hosts.single().socksPort).isEqualTo(1080)
@@ -276,7 +281,7 @@ class VaultBackupTest {
     fun `out of range and unknown values are coerced instead of crashing the import`() {
         val hostile = """
             {"version":2,
-             "settings":{"terminalTheme":"NEON_PURPLE"},
+             "settings":{"terminalTheme":"NEON_PURPLE","editorPrefsJson":"truncated-not-json{"},
              "hosts":[{"name":"Bad","host":"h","username":"u","port":99999,
                        "authMethod":"MAGIC","proxyType":"TELEPATHY","socksPort":-3,
                        "group":"   ","accentColor":0,
@@ -287,6 +292,11 @@ class VaultBackupTest {
         val host = hosts.single()
 
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.DARK.name)
+        // The hostile blob is kept as-is here — VaultBackup only carries it — but the reader is
+        // the never-throwing EditorPrefsCodec, so on use it decodes to defaults rather than
+        // failing the import. The field must still be a string, not null: the vault round-trip
+        // contract keeps types even when values are nonsense.
+        assertThat(settings.editorPrefsJson).isEqualTo("truncated-not-json{")
         assertThat(host.port).isEqualTo(22)
         assertThat(host.authMethod).isEqualTo(AuthMethod.PASSWORD)
         assertThat(host.proxyType).isEqualTo(ProxyType.NONE)
