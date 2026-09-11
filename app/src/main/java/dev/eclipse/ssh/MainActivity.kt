@@ -192,6 +192,7 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeRemoteDesktop
+import dev.eclipse.ssh.data.model.decodeRdpTarget
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isBusy
@@ -237,6 +238,7 @@ import dev.eclipse.ssh.ui.files.ExplorerTopBar
 import dev.eclipse.ssh.ui.preview.FilePreviewSheet
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopConfigDialog
+import dev.eclipse.ssh.ui.remotedesktop.RdpConfigDialog
 import dev.eclipse.ssh.ui.remotedesktop.VncRequest
 import dev.eclipse.ssh.ui.remotedesktop.VncRequests
 import dev.eclipse.ssh.ui.AdvancedHostSection
@@ -946,6 +948,8 @@ private fun EclipseWorkspace(
     // forwarding manager above: the dialog saves into the live profile, and a snapshot taken at
     // open time would write a stale host back over a change made elsewhere while it was open.
     var remoteDesktopHostId by remember { mutableStateOf<String?>(null) }
+    // The RDP endpoint dialog's host, by id for the same reason as the VNC one beside it.
+    var rdpDesktopHostId by remember { mutableStateOf<String?>(null) }
     var pendingDeleteHost by remember { mutableStateOf<HostProfile?>(null) }
     // The host whose duplication is waiting on the "also copy the forwarding rules?" answer. Null
     // when nothing is pending; a host with no rules never lands here at all, so the only dialog a
@@ -1000,6 +1004,16 @@ private fun EclipseWorkspace(
         } else {
             remoteDesktopHostId = host.id
         }
+    }
+    // The menu's RDP desktop item. Every path here is the endpoint dialog, including a saved,
+    // enabled target's - deliberately the opposite of the VNC branch above, because the routing
+    // that branch takes (the token handoff into the viewer window) has no RDP counterpart yet:
+    // the viewer is the piece of the feature that has not landed. The dialog is what RDP honestly
+    // has, so that is what the item opens. The viewer's arrival turns this into the VNC item's
+    // shape - an enabled target goes to the viewer through the same token handoff, everything
+    // else to this dialog - and is also when the item stops hiding behind "an R target exists".
+    val requestRdpDesktop: (HostProfile) -> Unit = { host ->
+        rdpDesktopHostId = host.id
     }
     // A Quick Settings tile or home-screen widget tap resolves, on the view model, to the
     // most-recently-connected host and arrives here as a pending value. Route it through the same
@@ -1171,6 +1185,7 @@ private fun EclipseWorkspace(
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
                     onRemoteDesktop = requestRemoteDesktop,
+                    onRdpDesktop = requestRdpDesktop,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1346,6 +1361,7 @@ private fun EclipseWorkspace(
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
                     onRemoteDesktop = requestRemoteDesktop,
+                    onRdpDesktop = requestRdpDesktop,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1542,6 +1558,18 @@ private fun EclipseWorkspace(
                     openRemoteDesktop(host, target)
                 },
                 onDismiss = { remoteDesktopHostId = null },
+            )
+        }
+    }
+    rdpDesktopHostId?.let { hostId ->
+        // Same live-profile resolution as the VNC dialog above, for the same reasons. No onOpen
+        // half yet: the viewer the VNC dialog's Connect jumps to is the piece of RDP that has not
+        // landed, so this dialog saves and closes - its KDoc records where the jump goes in.
+        state.hosts.firstOrNull { it.id == hostId }?.let { host ->
+            RdpConfigDialog(
+                host = host,
+                onSave = { viewModel.saveRdpTarget(hostId, it) },
+                onDismiss = { rdpDesktopHostId = null },
             )
         }
     }
@@ -1918,6 +1946,12 @@ private fun WorkspaceScaffold(
      * "open": which one depends on the host's saved target, and the caller does not care.
      */
     onRemoteDesktop: (HostProfile) -> Unit = {},
+    /**
+     * Opens one host's RDP endpoint dialog - the card menu's RDP desktop item. Only the dialog for
+     * now: the viewer window the VNC item routes to is the piece of RDP that has not landed, so
+     * there is nothing else for this to open yet.
+     */
+    onRdpDesktop: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
     /** Long-press on a terminal tab: opens a second shell on the same host. */
     onDuplicateSession: (SessionTab) -> Unit = {},
@@ -2131,7 +2165,7 @@ private fun WorkspaceScaffold(
                 Destination.HOSTS -> HostsScreen(
                     state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
                     onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards,
-                    onRemoteDesktop,
+                    onRemoteDesktop, onRdpDesktop,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
@@ -2181,6 +2215,7 @@ private fun HostsScreen(
     onDuplicateHost: (HostProfile) -> Unit,
     onManageForwards: (HostProfile) -> Unit,
     onRemoteDesktop: (HostProfile) -> Unit,
+    onRdpDesktop: (HostProfile) -> Unit,
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
@@ -2210,7 +2245,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop, onRdpDesktop)
             }
         }
     }
@@ -2247,6 +2282,7 @@ private fun HostCard(
     onDuplicate: (HostProfile) -> Unit,
     onPortForwarding: (HostProfile) -> Unit,
     onRemoteDesktop: (HostProfile) -> Unit,
+    onRdpDesktop: (HostProfile) -> Unit,
 ) {
     // Keyed on the host id so a list that reorders (a favourite toggled, a search narrowed) cannot
     // leave the menu open over a different host than the one it was opened on.
@@ -2301,6 +2337,21 @@ private fun HostCard(
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRemoteDesktop(host) },
                         )
+                        // Beside the VNC item, and gated where that one is not: a host with no
+                        // saved RDP target does not see it, because unlike VNC the RDP entry has
+                        // no first-use story yet - its endpoint dialog is reachable only through
+                        // this item, so offering it on every host would be a menu entry that
+                        // mostly opens a form for a protocol the host has never spoken. The
+                        // viewer's arrival, which is also when the entry can lead somewhere
+                        // besides the dialog, is when this un-gates to the VNC item's rule.
+                        // The stopgap reader is the codec until the RDP codec branch lands.
+                        if (decodeRdpTarget(host.remoteDesktop) != null) {
+                            DropdownMenuItem(
+                                text = { Text("RDP desktop") },
+                                leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
+                                onClick = { menuOpen = false; onRdpDesktop(host) },
+                            )
+                        }
                         // The arrow this item replaced used to sit beside the kebab as a second way
                         // into the details sheet; now this is the way in, so it sits high in the
                         // menu, where the eye lands first.

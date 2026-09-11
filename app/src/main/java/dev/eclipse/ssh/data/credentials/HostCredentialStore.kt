@@ -120,8 +120,43 @@ data class HostCredentialUpdate(
 }
 
 /**
+ * The RDP credential NLA asks for, read back whole for the tunnel to answer a challenge with.
+ *
+ * Username and password are both required — an NLA answer is all three fields or it is nothing, so
+ * [HostCredentialStore.rdpCredentials] returns null rather than a half-credential. [domain] is the
+ * one optional field: local and UPN-style accounts have no domain worth naming, and an absent one
+ * is null rather than an empty string.
+ *
+ * A data class only so a caller can compare round trips; `toString` is overridden because the
+ * generated one would print the password, and a credential printed is a credential in a crash
+ * report — the reason [KeyEdit.Replace] is not a data class at all.
+ */
+data class RdpCredentials(
+    val username: String,
+    val domain: String?,
+    val password: String,
+) {
+    override fun toString(): String = "RdpCredentials(username=$username, domain=$domain, password=***)"
+}
+
+/**
+ * What to change about one host's RDP credential. Same three-state-per-field shape as
+ * [HostCredentialUpdate]: a saved secret is never rendered back into its field, so "the field was
+ * left blank" and "remove what is stored" are told apart by the edit, never by the text.
+ */
+data class RdpCredentialUpdate(
+    val username: SecretEdit = SecretEdit.Keep,
+    val domain: SecretEdit = SecretEdit.Keep,
+    val password: SecretEdit = SecretEdit.Keep,
+) {
+    /** True when applying this would not touch anything, so the caller can skip the write entirely. */
+    val isNoop: Boolean = username == SecretEdit.Keep && domain == SecretEdit.Keep && password == SecretEdit.Keep
+}
+
+/**
  * Durable per-host credentials: the password, private key and passphrase a user chooses to save on a
- * host profile so that connecting is one tap instead of a form.
+ * host profile so that connecting is one tap instead of a form, and the RDP credential (NLA
+ * username, domain and password) a remote-desktop session answers challenges with.
  *
  * Separate from [dev.eclipse.ssh.background.SessionRegistry], which looks like it could do this job
  * and cannot: the registry's whole purpose is to describe the sessions that are *live* right now for
@@ -194,6 +229,52 @@ class HostCredentialStore @Inject constructor(
         runCatching { Base64.decode(encoded, Base64.NO_WRAP) }.getOrNull()?.takeIf { it.isNotEmpty() }
     }
 
+    /**
+     * Applies [update] to [hostId]'s RDP credential, leaving every field it does not mention alone.
+     *
+     * One `edit` for the same reason [apply] is one: a username that landed without its password is
+     * a state every read below has to defend against forever. The whole credential is one unit to
+     * NLA, so it is one unit here too — see the orphan rule inside.
+     */
+    suspend fun applyRdp(hostId: String, update: RdpCredentialUpdate) {
+        require(hostId.isNotBlank()) { "Cannot store credentials for a host with no id" }
+        if (update.isNoop) return
+        editPrefs { prefs ->
+            applySecret(prefs, rdpUsernameKey(hostId), update.username)
+            applySecret(prefs, rdpDomainKey(hostId), update.domain)
+            applySecret(prefs, rdpPasswordKey(hostId), update.password)
+            // An RDP credential missing either half can never answer an NLA challenge, so it is a
+            // secret at rest that nothing can use — the same accounting as a passphrase with no
+            // key. Enforced here rather than asked of every caller, so no write can leave one
+            // behind: a password without a username, or a username without a password, clears the
+            // domain with it.
+            if (prefs[rdpUsernameKey(hostId)] == null || prefs[rdpPasswordKey(hostId)] == null) {
+                prefs.remove(rdpUsernameKey(hostId))
+                prefs.remove(rdpDomainKey(hostId))
+                prefs.remove(rdpPasswordKey(hostId))
+            }
+        }
+    }
+
+    /**
+     * The saved RDP credential for [hostId], or null when none is stored, only part of one is, or it
+     * cannot be decrypted. The domain is null when the credential was saved without one.
+     */
+    suspend fun rdpCredentials(hostId: String): RdpCredentials? {
+        val username = secret(rdpUsernameKey(hostId)) ?: return null
+        val password = secret(rdpPasswordKey(hostId)) ?: return null
+        return RdpCredentials(username = username, domain = secret(rdpDomainKey(hostId)), password = password)
+    }
+
+    /** Removes the stored RDP credential for [hostId], leaving the SSH credentials alone. */
+    suspend fun forgetRdp(hostId: String) {
+        editPrefs { prefs ->
+            prefs.remove(rdpUsernameKey(hostId))
+            prefs.remove(rdpDomainKey(hostId))
+            prefs.remove(rdpPasswordKey(hostId))
+        }
+    }
+
     /** Removes everything stored for [hostId]. Called when a host profile is deleted. */
     suspend fun forget(hostId: String) {
         editPrefs { prefs ->
@@ -202,6 +283,9 @@ class HostCredentialStore @Inject constructor(
             prefs.remove(passphraseKey(hostId))
             prefs.remove(keyLabelKey(hostId))
             prefs.remove(keyTypeKey(hostId))
+            prefs.remove(rdpUsernameKey(hostId))
+            prefs.remove(rdpDomainKey(hostId))
+            prefs.remove(rdpPasswordKey(hostId))
         }
     }
 
@@ -280,13 +364,23 @@ class HostCredentialStore @Inject constructor(
         const val KEY_TYPE = "meta_keytype_"
         const val DEFAULT_KEY_LABEL = "Private key"
 
-        val PREFIXES = listOf(PASSWORD, KEY, PASSPHRASE, KEY_LABEL, KEY_TYPE)
+        // The RDP credential's three fields, all encrypted: the password because it is a password,
+        // the username and domain because together they name an account on the server, and a
+        // partial NLA identity is worth less than the file it costs to keep it in the clear.
+        const val RDP_USERNAME = "secret_rdp_username_"
+        const val RDP_DOMAIN = "secret_rdp_domain_"
+        const val RDP_PASSWORD = "secret_rdp_password_"
+
+        val PREFIXES = listOf(PASSWORD, KEY, PASSPHRASE, KEY_LABEL, KEY_TYPE, RDP_USERNAME, RDP_DOMAIN, RDP_PASSWORD)
 
         fun passwordKey(hostId: String) = stringPreferencesKey("$PASSWORD$hostId")
         fun keyKey(hostId: String) = stringPreferencesKey("$KEY$hostId")
         fun passphraseKey(hostId: String) = stringPreferencesKey("$PASSPHRASE$hostId")
         fun keyLabelKey(hostId: String) = stringPreferencesKey("$KEY_LABEL$hostId")
         fun keyTypeKey(hostId: String) = stringPreferencesKey("$KEY_TYPE$hostId")
+        fun rdpUsernameKey(hostId: String) = stringPreferencesKey("$RDP_USERNAME$hostId")
+        fun rdpDomainKey(hostId: String) = stringPreferencesKey("$RDP_DOMAIN$hostId")
+        fun rdpPasswordKey(hostId: String) = stringPreferencesKey("$RDP_PASSWORD$hostId")
 
         fun String.isCredentialKey() = PREFIXES.any { startsWith(it) }
 
