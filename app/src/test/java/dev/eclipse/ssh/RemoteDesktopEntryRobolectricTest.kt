@@ -17,9 +17,11 @@ import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
 import java.time.Duration
 import org.junit.After
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -49,6 +51,25 @@ class RemoteDesktopEntryRobolectricTest {
 
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
+
+    /**
+     * The credential round-trip needs the vault to encrypt, and the vault needs an `AndroidKeyStore`
+     * to hold its key — the one platform piece Robolectric has none of. Without the stand-in every
+     * write through [dev.eclipse.ssh.data.credentials.HostCredentialStore] fails silently behind the
+     * ViewModel's `runCatching`, and the read asserts null against a save that never happened. The
+     * other classes that save credentials through the app install the same provider for the same
+     * reason; see [StandInAndroidKeyStore] for what it does and does not stand in for.
+     */
+    @Before
+    fun installKeyStore() {
+        StandInAndroidKeyStore.install()
+    }
+
+    /** Puts the JVM back as it was, so opting in does not change how the next test class behaves. */
+    @After
+    fun uninstallKeyStore() {
+        StandInAndroidKeyStore.uninstall()
+    }
 
     /** Deletes this class's hosts, so the next class sees the Room file the app ships with. */
     @After
