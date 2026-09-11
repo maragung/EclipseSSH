@@ -266,8 +266,8 @@ class RemoteDesktopEntryRobolectricTest {
         openRdpMenu(host)
         pumpUntil(describe = { "the viewer never started" }) { startedRemoteDesktopViewer() }
 
-        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
-        val token = intent.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)
+        val token = shadowOf(compose.activity.application).peekNextStartedActivity()
+            ?.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)
         assertWithMessage("the viewer was started without a handoff token").that(token).isNotEmpty()
         val request = RemoteDesktopRequests.take(checkNotNull(token))
         assertWithMessage("the RDP item handed the viewer a VNC request")
@@ -292,8 +292,8 @@ class RemoteDesktopEntryRobolectricTest {
         openRdpMenu(host)
         pumpUntil(describe = { "the viewer never started" }) { startedRemoteDesktopViewer() }
 
-        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
-        val token = intent.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)
+        val token = shadowOf(compose.activity.application).peekNextStartedActivity()
+            ?.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)
         assertWithMessage("the viewer was started without a handoff token").that(token).isNotEmpty()
         val request = RemoteDesktopRequests.take(checkNotNull(token))
         assertWithMessage("the RDP item handed the viewer a VNC request")
