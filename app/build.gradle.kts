@@ -16,7 +16,7 @@ plugins {
 
 android {
     namespace = "dev.eclipse.ssh"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "dev.eclipse.ssh"

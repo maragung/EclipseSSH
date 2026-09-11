@@ -85,7 +85,7 @@ val nativeJniLibs = File(nativeBuildRoot, "jniLibs")
 
 android {
     namespace = "dev.eclipse.ssh.freerdp"
-    compileSdk = 35
+    compileSdk = 37
     // The NDK upstream's freeRDPCore module builds with (their ndkVersion), and
     // the one the spike proved the build with. Do not bump one without the other.
     ndkVersion = freerdpNdkVersion
