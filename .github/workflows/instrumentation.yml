@@ -37,6 +37,11 @@ env:
   BUILD_TOOLS: '35.0.0'
   COMPILE_SDK: 'android-35'
   TARGET_SDK: 'android-35'
+  # Same pins as ci.yml: connectedDebugAndroidTest compiles :app's androidTest
+  # sources, and :app depends on :freerdp - whose native build needs the NDK
+  # toolchain and a CMake the SDK manager does not carry.
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
 
 jobs:
   instrumentation:
@@ -68,7 +73,24 @@ jobs:
             platform-tools
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
           cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        # The :freerdp native build drives CMake directly; the SDK manager
+        # does not carry the 4.x line it needs. Same step as ci.yml.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0

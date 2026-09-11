@@ -381,6 +381,9 @@ dependencies {
     // bcprov-jdk18on, which the VNC auth path uses and nothing else in the app pulls in.
     implementation(libs.vernacular.vnc)
 
+    // The RDP engine's JNI wrapper and native libraries.
+    implementation(project(":freerdp"))
+
     testImplementation(libs.junit)
     testImplementation(libs.truth)
     testImplementation(libs.turbine)

@@ -283,6 +283,32 @@ val buildFreerdpNative =
                 "The extracted FreeRDP tree has no bridge project at $bridgeCMakeDir"
             }
 
+            // A CI cache restore can hand back only half of this module's state:
+            // the cmake trees under build/native but not the extracted source
+            // (and, living inside it, the superbuild's installed dependency
+            // libraries). The fetch task then re-extracts, and Ninja pairs the
+            // stale cmake trees with the fresh source - whose absolute paths no
+            // longer match the ones baked into their CMakeCaches - so the
+            // superbuild re-runs its dependency detection and dies on cJSON
+            // (PRs #20/#22/#23, run 34528989907). The only consistent warm
+            // state is "both halves present": configured cmake trees AND the
+            // dependencies they installed. Anything else is a cold build
+            // pretending to be warm, so the trees are wiped and reconfigured.
+            val anyConfigured =
+                abis.any { File(File(buildRoot, "cmake/$it"), "build.ninja").isFile }
+            val firstAbiDeps = File(depsJniLibs, abis.first())
+            val depsInstalled =
+                File(firstAbiDeps, "libcjson.so").isFile ||
+                    File(firstAbiDeps, "lib/libcjson.so").isFile
+            if (anyConfigured && !depsInstalled) {
+                logger.lifecycle(
+                    "Native cmake trees exist but their installed dependencies are " +
+                        "missing - wiping $buildRoot and reconfiguring from scratch",
+                )
+                check(buildRoot.deleteRecursively()) { "failed to wipe the stale tree at $buildRoot" }
+                jniLibsOut.mkdirs()
+            }
+
             for (abi in abis) {
                 val cmakeDir = File(buildRoot, "cmake/$abi")
                 if (!File(cmakeDir, "build.ninja").isFile) {
