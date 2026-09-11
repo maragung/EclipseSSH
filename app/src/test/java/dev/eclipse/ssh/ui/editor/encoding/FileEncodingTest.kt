@@ -180,11 +180,15 @@ class FileEncodingTest {
 
     @Test
     fun `a truncated odd length utf 16 body decodes with a replacement character, not a crash`() {
-        // BOM + "a" + "b"'s first byte: the dangling 0x62 cannot form a code unit.
+        // BOM + "a" + "b"'s first byte: the dangling 0x62 cannot form a code unit, so the
+        // platform decoder replaces it with exactly one U+FFFD after the "a" - "ab" is not a
+        // decoding anyone can produce, because half a code unit is not a character. The expected
+        // string is what the JVM's own REPLACE decoder emits for these bytes (verified against
+        // JDK 17, the toolchain CI runs).
         val truncated = byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0x61, 0x00, 0x62)
         val decoded = FileEncodingCodec.decode(truncated)
         assertThat(decoded.encoding).isEqualTo(FileEncoding.UTF_16_LE)
-        assertThat(decoded.text).isEqualTo("ab�")
+        assertThat(decoded.text).isEqualTo("a�")
     }
 
     private companion object {

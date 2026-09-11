@@ -148,12 +148,19 @@ class EditorTabModel(
      *
      * The watcher calls this with a fresh stat; mtime alone is not trusted (some servers report
      * coarse timestamps), so a size change counts even when the timestamp has not moved.
+     *
+     * A field the server cannot report is *not* a change (unknown ≠ different): a backend with
+     * no stat must not put every tab into conflict. A file that vanished is the strongest change
+     * there is — but only *both* fields missing says vanished, because either provider can
+     * report one field and not the other (SFTP reports mtime with a null size for directories;
+     * SAF reports size with a zero mtime), and the "one field present, one unknown" shapes are
+     * exactly the cases the first two guards already answer.
      */
     fun serverStatsDiffer(modified: Long?, size: Long?): Boolean {
         if (modified != null && serverModified != null && modified != serverModified) return true
         if (size != null && serverSize != null && size != serverSize) return true
-        // A file that vanished is the strongest change there is.
-        if (modified == null && serverModified != null) return true
+        // Vanished, in the only spelling a stat offers: nothing left to report at all.
+        if (modified == null && size == null) return serverModified != null || serverSize != null
         return false
     }
 }
