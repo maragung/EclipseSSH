@@ -228,8 +228,14 @@ import dev.eclipse.ssh.presentation.ReconnectPrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.archive.ArchiveBrowserState
+import dev.eclipse.ssh.archive.ArchiveEntry
 import dev.eclipse.ssh.archive.ArchiveTarget
 import dev.eclipse.ssh.archive.ArchiveReader
+import dev.eclipse.ssh.archive.ArchiveUiState
+import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
+import dev.eclipse.ssh.ui.archive.ArchivePropertiesDialog
 import dev.eclipse.ssh.ui.archive.ArchiveActions
 import dev.eclipse.ssh.ui.archive.ArchiveBrowserScreen
 import dev.eclipse.ssh.ui.editor.EditorRequest
@@ -1879,6 +1885,12 @@ private fun EclipseWorkspace(
     // both fight the explorer's own bottom sheets and show one folder's worth of a 1M-entry tree in
     // a window measured for a file list. The layer reads the browser's state; dismissal is the
     // close above, which cancels the scan/watcher and releases the channel.
+    // The per-entry sheets live *here*, above the browser, not inside it: they act on this
+    // workspace's clipboard and extract destination, which the browser layer knows nothing about.
+    var archiveEntrySheet by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var archivePreviewEntry by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var archiveEntryProperties by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var showArchiveProperties by remember { mutableStateOf(false) }
     archiveTarget?.let { target ->
         val browser = target.browser
         ArchiveBrowserScreen(
@@ -1889,19 +1901,70 @@ private fun EclipseWorkspace(
                 onCancelScan = browser::cancelScan,
                 onRetry = browser::retry,
                 onUnlock = browser::unlock,
-                // The preview and the extract paths arrive with the entries they need; for now
-                // opening a file reports the honest not-yet, and the per-entry sheet the epic
-                // promises lands with them.
+                // Opening a file is the preview; only the ZIP format can fetch one entry's bytes
+                // by range, so a TAR entry falls to the action sheet's honest Extract verb rather
+                // than a preview that would secretly stream the whole archive.
                 onOpenEntry = { entry ->
-                    viewModel.reportUiMessage("Previewing \"${entry.path.substringAfterLast('/')}\" arrives with the extract work")
+                    if (ArchiveReader.supportsRandomAccess(browser.format)) {
+                        archivePreviewEntry = entry
+                    } else {
+                        archiveEntrySheet = entry
+                    }
                 },
-                onEntryActions = { entry ->
-                    viewModel.reportUiMessage("Actions for \"${entry.path.substringAfterLast('/')}\" arrive with the extract work")
-                },
+                onEntryActions = { entry -> archiveEntrySheet = entry },
                 onReload = browser::reload,
                 onDismissServerChange = browser::dismissServerChange,
+                onShowProperties = { showArchiveProperties = true },
             ),
         )
+        // The entry preview reads through the same ranged source the scan did - one entry's bytes,
+        // never the archive around it (the sheet's own KDoc holds the full reasoning).
+        archivePreviewEntry?.let { entry ->
+            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
+            ArchiveEntryPreviewSheet(
+                entry = entry,
+                readEntry = if (readable) {
+                    { ArchiveReader.readEntry(browser.format, browser.sourceForReading(), entry) }
+                } else null,
+                onDismiss = { archivePreviewEntry = null },
+            )
+        }
+        archiveEntrySheet?.let { entry ->
+            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
+            ArchiveEntryActionsSheet(
+                entry = entry,
+                canReadEntry = readable,
+                onDismiss = { archiveEntrySheet = null },
+                onPreview = if (readable) ({ archiveEntrySheet = null; archivePreviewEntry = entry }) else null,
+                // Extract (and single-entry Download, which is extract of one file by another
+                // name) arrives with the destination-picker work; the row is honest about that
+                // until then, because a button that did nothing would be worse than no button.
+                onExtract = {
+                    archiveEntrySheet = null
+                    viewModel.reportUiMessage("Extracting \"${entry.path.substringAfterLast('/')}\" needs a destination - that step lands next")
+                },
+                onCopyPath = {
+                    archiveEntrySheet = null
+                    viewModel.copyToClipboard(entry.path)
+                },
+                onProperties = { archiveEntrySheet = null; archiveEntryProperties = entry },
+            )
+        }
+        archiveEntryProperties?.let { entry ->
+            ArchiveEntryPropertiesDialog(
+                entry = entry,
+                formatLabel = browser.format.label,
+                onDismiss = { archiveEntryProperties = null },
+            )
+        }
+        val readyState = browser.state
+        if (showArchiveProperties && readyState is ArchiveUiState.Ready) {
+            ArchivePropertiesDialog(
+                state = readyState,
+                remotePath = browser.remotePath,
+                onDismiss = { showArchiveProperties = false },
+            )
+        }
     }
     // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
     // preview and the editor that some rows open are their own windows, and none of them should

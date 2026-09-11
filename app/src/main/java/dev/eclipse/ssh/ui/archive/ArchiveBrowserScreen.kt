@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Lock
@@ -85,6 +86,14 @@ fun ArchiveBrowserScreen(
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close archive")
                     }
                 },
+                // The archive's own facts, offered only once there is a tree to count entries
+                // from - a properties sheet that could not fill its own rows would be noise.
+                actions = {
+                    val ready = state is ArchiveUiState.Ready
+                    IconButton(onClick = actions.onShowProperties, enabled = ready) {
+                        Icon(Icons.AutoMirrored.Filled.List, contentDescription = "Archive properties")
+                    }
+                },
             )
         },
     ) { padding ->
@@ -121,6 +130,8 @@ class ArchiveActions(
     val onReload: () -> Unit,
     /** Dismiss the changed-on-server notification without reloading ("continue with what's shown"). */
     val onDismissServerChange: () -> Unit,
+    /** Shows the archive's own properties - the top bar's info action, when a tree exists. */
+    val onShowProperties: () -> Unit,
 )
 
 @Composable
