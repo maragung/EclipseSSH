@@ -98,6 +98,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -2713,6 +2714,10 @@ private fun TerminalScreen(
             // one host another host's trace. See [sessionDiagnostics].
             trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[activeTab.hostId]),
             onCopyTrace = onCopyTrace,
+            // The strip draws on the terminal's own background; these two are where every chrome
+            // colour on it is derived from. See TerminalTabStrip's parameter docs.
+            termBg = termBg,
+            termFg = termFg,
         )
         // The terminal takes every pixel that is left, and it is the only thing in this Column that
         // does. That is what makes it a screen rather than a card: the weight is why a full-screen
@@ -3368,9 +3373,22 @@ private fun TerminalTabStrip(
     terminalText: String,
     trace: List<SessionDiagnosticEvent>,
     onCopyTrace: (String) -> Unit,
+    /**
+     * The terminal's own background and foreground, the pair the strip sits on. Every chrome colour
+     * here is derived from these rather than from the app theme because the strip is drawn on top of
+     * [termBg]: an icon that follows the app theme is invisible on any terminal whose brightness
+     * disagrees with it - the app's dark scheme over the Light terminal theme is white icons on a
+     * near-white bar.
+     */
+    termBg: Color,
+    termFg: Color,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var showWhy by remember { mutableStateOf(false) }
+    // The tab whose X was tapped, while the confirmation below is on screen. Closing a session kills
+    // a live shell, and the X sits a thumb-width from the chip a user is aiming for - the same reason
+    // Remove on a host card asks first.
+    var confirmClose by remember { mutableStateOf<SessionTab?>(null) }
     Row(
         Modifier.fillMaxWidth().padding(start = 2.dp, end = 4.dp, top = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -3378,7 +3396,7 @@ private fun TerminalTabStrip(
         // The way back to the list of sessions, and the only visible one: a full-screen shell has no
         // navigation bar behind it. The system back gesture does the same thing.
         IconButton(onClick = onLeaveSession) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Show sessions")
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Show sessions", tint = termFg)
         }
         Row(
             Modifier.weight(1f).horizontalScroll(rememberScrollState()),
@@ -3396,7 +3414,14 @@ private fun TerminalTabStrip(
                         onLongClick = { onDuplicate(tab) },
                     ),
                     shape = RoundedCornerShape(12.dp),
-                    color = if (tab == activeTab) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    // Terminal-derived, like everything else on this strip: the app theme's
+                    // primaryContainer is a fixed mid-blue that vanishes on both a black terminal
+                    // (the High-contrast theme) and a pale one (Light, Solarized light). The active
+                    // chip is a blend of the terminal's own pair - distinct from the background on
+                    // every theme because it leans on the foreground, which the theme chose for
+                    // exactly that - and an inactive chip is a whisper of the foreground over the
+                    // background.
+                    color = if (tab == activeTab) blend(termBg, termFg, 0.22f) else blend(termBg, termFg, 0.08f),
                 ) {
                     Row(Modifier.padding(start = 12.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box(
@@ -3418,19 +3443,22 @@ private fun TerminalTabStrip(
                             if (tab == activeTab && !frame.title.isNullOrBlank()) frame.title!! else tab.title,
                             modifier = Modifier.widthIn(min = 48.dp, max = 168.dp),
                             style = MaterialTheme.typography.labelLarge,
+                            // The chip's own text follows the terminal pair too - see the Surface
+                            // colour above for why the app theme cannot decide this.
+                            color = termFg,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        IconButton(onClick = { onCloseTab(tab) }, modifier = Modifier.size(48.dp)) {
-                            Icon(Icons.Default.Close, contentDescription = "Close ${tab.title} session", modifier = Modifier.size(16.dp))
+                        IconButton(onClick = { confirmClose = tab }, modifier = Modifier.size(48.dp)) {
+                            Icon(Icons.Default.Close, contentDescription = "Close ${tab.title} session", tint = termFg, modifier = Modifier.size(16.dp))
                         }
                     }
                 }
             }
         }
-        IconButton(onClick = onToggleSearch) { Icon(Icons.Default.Search, "Search terminal") }
+        IconButton(onClick = onToggleSearch) { Icon(Icons.Default.Search, "Search terminal", tint = termFg) }
         Box {
-            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Terminal actions") }
+            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Terminal actions", tint = termFg) }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
                     text = { Text("Duplicate terminal") },
@@ -3529,8 +3557,12 @@ private fun TerminalTabStrip(
         // scrollback on the way. It goes through the same authentication sheet as any other connection,
         // so a host whose password was never saved asks for it again rather than failing silently.
         if (activeTab.state.isEnded) {
-            TextButton(onClick = onReconnect, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                Icon(Icons.Default.Wifi, null, modifier = Modifier.size(15.dp))
+            TextButton(
+                onClick = onReconnect,
+                contentPadding = PaddingValues(horizontal = 8.dp),
+                colors = ButtonDefaults.textButtonColors(contentColor = termFg),
+            ) {
+                Icon(Icons.Default.Wifi, null, tint = termFg, modifier = Modifier.size(15.dp))
                 Spacer(Modifier.width(4.dp))
                 Text("Reconnect", style = MaterialTheme.typography.labelMedium)
             }
@@ -3543,6 +3575,7 @@ private fun TerminalTabStrip(
             TextButton(
                 onClick = { showWhy = true },
                 contentPadding = PaddingValues(horizontal = 8.dp),
+                colors = ButtonDefaults.textButtonColors(contentColor = termFg),
                 modifier = Modifier.semantics { contentDescription = "Why this session is ${activeTab.state.name}" },
             ) {
                 Text("Why?", style = MaterialTheme.typography.labelMedium)
@@ -3552,7 +3585,9 @@ private fun TerminalTabStrip(
             Text(
                 "${frame.columns}x${frame.rows}",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // The terminal pair, dimmed, not the app theme's onSurfaceVariant - this sits on
+                // [termBg] like everything else in the strip.
+                color = termFg.copy(alpha = 0.7f),
             )
         }
     }
@@ -3563,6 +3598,18 @@ private fun TerminalTabStrip(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
             placeholder = { Text("Search terminal output") },
             singleLine = true,
+            // Drawn on the terminal's own background like the rest of the strip: the app theme's
+            // field colours assume the app surface and produce a pale field on a black terminal or
+            // an invisible outline on a light one.
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = termFg,
+                unfocusedTextColor = termFg,
+                cursorColor = termFg,
+                focusedBorderColor = termFg,
+                unfocusedBorderColor = termFg.copy(alpha = 0.5f),
+                focusedPlaceholderColor = termFg.copy(alpha = 0.6f),
+                unfocusedPlaceholderColor = termFg.copy(alpha = 0.6f),
+            ),
         )
         if (searchQuery.isNotBlank()) {
             // Splitting a 2 000-line scrollback on every keystroke is not free, and this recomposes
@@ -3573,7 +3620,7 @@ private fun TerminalTabStrip(
             Text(
                 "$matches matches",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = termFg,
                 modifier = Modifier.padding(horizontal = 12.dp),
             )
         }
@@ -3584,6 +3631,30 @@ private fun TerminalTabStrip(
             trace = trace,
             onCopy = onCopyTrace,
             onDismiss = { showWhy = false },
+        )
+    }
+    confirmClose?.let { tab ->
+        // App-themed on purpose, unlike everything else on the strip: an AlertDialog is a modal
+        // surface with its own scrim, not a control drawn on the terminal's background, so it
+        // follows the palette every other dialog in the app follows.
+        AlertDialog(
+            onDismissRequest = { confirmClose = null },
+            title = { Text("Close \"${tab.title}\"?") },
+            text = {
+                Text(
+                    if (tab.state.isLive) {
+                        "The session is still running. Closing it ends the shell on the server; nothing is saved on the way out."
+                    } else {
+                        "Close this session's tab?"
+                    }
+                )
+            },
+            confirmButton = {
+                Button(onClick = { confirmClose = null; onCloseTab(tab) }) { Text("Close session") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClose = null }) { Text("Cancel") }
+            },
         )
     }
 }
@@ -3603,6 +3674,21 @@ private fun TerminalTabStrip(
  * same amount, so the guarantee survives.
  */
 private val TERMINAL_STATUS_ROW_MIN_HEIGHT = 48.dp
+
+/**
+ * [base] leaned [fraction] towards [toward]: the colour a terminal-derived chrome element uses when
+ * it needs to sit on the terminal's background yet differ from it, on every terminal theme.
+ *
+ * The terminal themes are pairs the theme chose for maximum mutual contrast, so any blend of the two
+ * is legible against both ends - which is what makes this safer than the app palette, whose fixed
+ * values cannot know whether they landed on a black or a pale terminal.
+ */
+private fun blend(base: Color, toward: Color, fraction: Float): Color = Color(
+    red = base.red + (toward.red - base.red) * fraction,
+    green = base.green + (toward.green - base.green) * fraction,
+    blue = base.blue + (toward.blue - base.blue) * fraction,
+    alpha = 1f,
+)
 
 /**
  * Whether there is anything worth explaining about this state.

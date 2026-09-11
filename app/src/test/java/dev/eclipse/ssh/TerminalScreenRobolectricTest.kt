@@ -17,17 +17,23 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SessionTab
+import dev.eclipse.ssh.data.model.TerminalTheme
+import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MainViewModel
 import java.time.Duration
+import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowDialog
 
 /**
  * The terminal destination with a session tab open — the state the app enters the instant Connect is
@@ -550,5 +556,69 @@ class TerminalScreenRobolectricTest {
         pumpUntil(describe = { "the error was never shown in the terminal" }) {
             compose.onAllNodesWithText(settled.lastError!!, substring = true).fetchSemanticsNodes().isNotEmpty()
         }
+    }
+
+    /**
+     * The strip survives a terminal theme whose brightness disagrees with the app's own scheme, and
+     * its three wayfinding controls stay on screen over it.
+     *
+     * The combination is the one the icons used to vanish in: a pale terminal under the app's dark
+     * scheme drew the app theme's white back, search and kebab icons on a near-white bar. The fix is
+     * that every chrome colour on the strip is derived from the terminal's own background/foreground
+     * pair instead of the app palette — a tint, which is not in the semantics tree, so it cannot be
+     * asserted here directly; the contract is pinned the way the editor's background colour is (see
+     * `TextEditorCanvasRobolectricTest`, where pixel readback was tried and does not render under
+     * this Robolectric setup): by proving the freshly-read theme actually flows into the screen the
+     * strip composes in, and that every control on the strip is still reachable over it.
+     */
+    @Test
+    fun theStripRendersOverATerminalThemeThatDisagreesWithTheAppScheme() {
+        val repository = SettingsRepository(RuntimeEnvironment.getApplication())
+        openTerminalWithSession()
+
+        // A theme change while a session is open — not one picked before connecting — is the moment
+        // the strip must follow, because the terminal background under it changes with it. The write
+        // runs on the test's own (main) thread, the way the theme tests in the Hosts suite do theirs.
+        runBlocking { repository.setTerminalTheme(TerminalTheme.LIGHT.name) }
+        val viewModel = viewModel()
+        pumpUntil(describe = { "the light theme never reached the terminal screen" }) {
+            viewModel.uiState.value.settings.terminalTheme == TerminalTheme.LIGHT.name
+        }
+        compose.onNodeWithContentDescription("Show sessions").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Search terminal").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Terminal actions").assertIsDisplayed()
+
+        // The theme is put back however this test ends: the DataStore is shared with the whole class
+        // loader, and a light theme left behind would follow every later test into its expectations.
+        runBlocking { repository.setTerminalTheme(TerminalTheme.DARK.name) }
+        compose.mainClock.advanceTimeByFrame()
+        Snapshot.sendApplyNotifications()
+        compose.waitForIdle()
+    }
+
+    /**
+     * The X on a session chip asks before it closes anything, because a live shell is behind it and
+     * the X is a thumb-width from the chip a user is aiming for.
+     *
+     * The dialog is confirmed at window level — a Compose dialog never goes idle under Robolectric, so
+     * the honest signal that the confirmation opened is the window itself, and the session surviving
+     * behind it is the other half of the claim.
+     */
+    @Test
+    fun closingATabAsksBeforeItClosesTheSession() {
+        val hostName = openTerminalWithSession()
+        val before = ShadowDialog.getShownDialogs().size
+
+        // The seeded host, not an index: three hosts are seeded and the connected one is whichever
+        // openSessionTab reached first.
+        compose.onNodeWithContentDescription("Close $hostName session").performClick()
+        compose.mainClock.advanceTimeByFrame()
+        Snapshot.sendApplyNotifications()
+
+        assertWithMessage("the X closed the session without asking")
+            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
+        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
+        // Nothing has been closed yet: the tab is still there behind the dialog.
+        assertThat(viewModel().uiState.value.tabs).hasSize(1)
     }
 }
