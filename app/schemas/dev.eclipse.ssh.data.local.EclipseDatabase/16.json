@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 16,
-    "identityHash": "b58342052e5f117a460e074d10db03ca",
+    "identityHash": "b1b8c7c48a278acc48a8ea1c67c8069b",
     "entities": [
       {
         "tableName": "host_profiles",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `host` TEXT NOT NULL, `username` TEXT NOT NULL, `port` INTEGER NOT NULL, `authMethod` TEXT NOT NULL, `groupName` TEXT NOT NULL, `tags` TEXT NOT NULL, `isFavorite` INTEGER NOT NULL, `lastConnectedAt` INTEGER, `fingerprint` TEXT, `proxyType` TEXT NOT NULL, `proxyJump` TEXT, `socksHost` TEXT, `socksPort` INTEGER NOT NULL, `socksUsername` TEXT, `socksPassword` TEXT, `accentColor` INTEGER, `connectTimeoutSeconds` INTEGER NOT NULL, `keepAliveSeconds` INTEGER, `autoLoginSftp` INTEGER NOT NULL, `compression` INTEGER NOT NULL, `keepAliveEnabled` INTEGER NOT NULL, `serverAliveCountMax` INTEGER NOT NULL, `authTimeoutSeconds` INTEGER NOT NULL, `autoReconnect` INTEGER NOT NULL, `maxReconnectAttempts` INTEGER NOT NULL, `reconnectBackoffSeconds` INTEGER NOT NULL, `usePty` INTEGER NOT NULL, `terminalType` TEXT NOT NULL, `terminalColumns` INTEGER NOT NULL, `terminalRows` INTEGER NOT NULL, `keyboardInteractiveAuth` INTEGER NOT NULL, `legacyAlgorithms` INTEGER, `hostKeyPolicy` TEXT NOT NULL, `ciphers` TEXT, `kexAlgorithms` TEXT, `macs` TEXT, `hostKeyAlgorithms` TEXT, `startupCommand` TEXT NOT NULL, `environment` TEXT NOT NULL, `savedForwards` TEXT NOT NULL, `remoteDesktop` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `host` TEXT NOT NULL, `username` TEXT NOT NULL, `port` INTEGER NOT NULL, `authMethod` TEXT NOT NULL, `groupName` TEXT NOT NULL, `tags` TEXT NOT NULL, `isFavorite` INTEGER NOT NULL, `lastConnectedAt` INTEGER, `fingerprint` TEXT, `proxyType` TEXT NOT NULL, `proxyJump` TEXT, `socksHost` TEXT, `socksPort` INTEGER NOT NULL, `socksUsername` TEXT, `socksPassword` TEXT, `accentColor` INTEGER, `connectTimeoutSeconds` INTEGER NOT NULL, `keepAliveSeconds` INTEGER, `autoLoginSftp` INTEGER NOT NULL, `compression` INTEGER NOT NULL, `keepAliveEnabled` INTEGER NOT NULL, `serverAliveCountMax` INTEGER NOT NULL, `authTimeoutSeconds` INTEGER NOT NULL, `autoReconnect` INTEGER NOT NULL, `maxReconnectAttempts` INTEGER NOT NULL, `reconnectBackoffSeconds` INTEGER NOT NULL, `usePty` INTEGER NOT NULL, `terminalType` TEXT NOT NULL, `terminalColumns` INTEGER NOT NULL, `terminalRows` INTEGER NOT NULL, `keyboardInteractiveAuth` INTEGER NOT NULL, `legacyAlgorithms` INTEGER, `hostKeyPolicy` TEXT NOT NULL, `ciphers` TEXT, `kexAlgorithms` TEXT, `macs` TEXT, `hostKeyAlgorithms` TEXT, `startupCommand` TEXT NOT NULL, `environment` TEXT NOT NULL, `savedForwards` TEXT NOT NULL, `remoteDesktop` TEXT NOT NULL, `wakeOnLanMac` TEXT NOT NULL, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -252,6 +252,12 @@
             "columnName": "remoteDesktop",
             "affinity": "TEXT",
             "notNull": true
+          },
+          {
+            "fieldPath": "wakeOnLanMac",
+            "columnName": "wakeOnLanMac",
+            "affinity": "TEXT",
+            "notNull": true
           }
         ],
         "primaryKey": {
@@ -263,7 +269,7 @@
       },
       {
         "tableName": "transfer_queue",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `direction` TEXT NOT NULL, `hostName` TEXT NOT NULL, `progress` REAL NOT NULL, `status` TEXT NOT NULL, `sizeLabel` TEXT NOT NULL, `hostId` TEXT, `remotePath` TEXT, `localUri` TEXT, `sourceHostId` TEXT, `destPath` TEXT, `transferredBytes` INTEGER NOT NULL, `totalBytes` INTEGER, `retryCount` INTEGER NOT NULL, `scheduledAt` INTEGER, `repeatMinutes` INTEGER, `errorMessage` TEXT, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `direction` TEXT NOT NULL, `hostName` TEXT NOT NULL, `progress` REAL NOT NULL, `status` TEXT NOT NULL, `sizeLabel` TEXT NOT NULL, `hostId` TEXT, `remotePath` TEXT, `localUri` TEXT, `transferredBytes` INTEGER NOT NULL, `totalBytes` INTEGER, `retryCount` INTEGER NOT NULL, `scheduledAt` INTEGER, `repeatMinutes` INTEGER, `errorMessage` TEXT, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -323,16 +329,6 @@
             "affinity": "TEXT"
           },
           {
-            "fieldPath": "sourceHostId",
-            "columnName": "sourceHostId",
-            "affinity": "TEXT"
-          },
-          {
-            "fieldPath": "destPath",
-            "columnName": "destPath",
-            "affinity": "TEXT"
-          },
-          {
             "fieldPath": "transferredBytes",
             "columnName": "transferredBytes",
             "affinity": "INTEGER",
@@ -375,7 +371,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b58342052e5f117a460e074d10db03ca')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b1b8c7c48a278acc48a8ea1c67c8069b')"
     ]
   }
 }

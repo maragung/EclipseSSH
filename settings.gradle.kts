@@ -26,3 +26,9 @@ dependencyResolutionManagement {
 
 rootProject.name = "EclipseSSH"
 include(":app")
+
+// The RDP engine's native half: the JNI wrapper over a pinned, Gradle-fetched
+// FreeRDP tarball (see freerdp/build.gradle.kts). Not yet on :app's classpath -
+// it is wired in when the RdpTunnel engine lands, so for now CI builds and
+// verifies the module standalone.
+include(":freerdp")

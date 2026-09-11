@@ -31,6 +31,7 @@ import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.data.model.encodeForwardRules
 import dev.eclipse.ssh.data.model.encodeRemoteDesktop
 import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.feature.wakeonlan.parseMac
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.UUID
@@ -87,6 +88,7 @@ object VaultBackup {
             put("terminalFontSize", settings.terminalFontSize)
             put("terminalMinColumns", settings.terminalMinColumns)
             put("pinEnabled", settings.pinEnabled)
+            put("vaultAutoLockMinutes", settings.vaultAutoLockMinutes)
             put("legacyAlgorithms", settings.legacyAlgorithms)
             put("terminalTheme", settings.terminalTheme)
             put("blockScreenshots", settings.blockScreenshots)
@@ -147,6 +149,10 @@ object VaultBackup {
                 // Same treatment for the remote-desktop column, and it travels in the clear by
                 // design: the line is a host, a port and flags - nothing to redact.
                 put("remoteDesktop", encodeRemoteDesktop(decodeRemoteDesktop(host.remoteDesktop)))
+                // The Wake-on-LAN MAC, written unconditionally like the other non-secret per-host
+                // text: a MAC names a network card, not anything worth encrypting, and an empty
+                // string has to survive the trip too or a cleared address would come back restored.
+                put("wakeOnLanMac", host.wakeOnLanMac)
                 put("hostKeyPolicy", host.hostKeyPolicy.name)
             }) }
         })
@@ -175,6 +181,13 @@ object VaultBackup {
                 settingsObj.optInt("terminalMinColumns", defaults.terminalMinColumns),
             ),
             pinEnabled = settingsObj.optBoolean("pinEnabled", defaults.pinEnabled),
+            // Normalized on the way in like every other imported number: a backup is untrusted
+            // input, and a hand-edited delay the dialog never offered would show as a value nobody
+            // chose. Absent from backups written before the setting existed, which resolves to the
+            // default rather than to zero (never re-lock) by accident.
+            vaultAutoLockMinutes = SettingsRepository.normalizeVaultAutoLockMinutes(
+                settingsObj.optInt("vaultAutoLockMinutes", defaults.vaultAutoLockMinutes),
+            ),
             legacyAlgorithms = settingsObj.optBoolean("legacyAlgorithms", defaults.legacyAlgorithms),
             terminalTheme = settingsObj.optString("terminalTheme", defaults.terminalTheme)
                 .takeIf { name -> TerminalTheme.entries.any { it.name == name } } ?: defaults.terminalTheme,
@@ -273,6 +286,11 @@ object VaultBackup {
                 // The remote-desktop column reads the same way: what decoding accepts is what is kept,
                 // and an absent key (a backup from before the column existed) is simply no endpoint.
                 remoteDesktop = encodeRemoteDesktop(decodeRemoteDesktop(h.optString("remoteDesktop"))),
+                // Shape-checked through the same parser the form uses, for the same reason the
+                // fingerprint is: a hand-edited file must not install an address the wake would build
+                // a packet no card answers to. An unparseable value is dropped rather than fatal, and
+                // the spelling as typed is kept, so a host round-trips exactly as its owner wrote it.
+                wakeOnLanMac = h.optString("wakeOnLanMac").trim().takeIf { parseMac(it) != null }.orEmpty(),
                 hostKeyPolicy = HostKeyPolicy.entries.firstOrNull { it.name == h.optString("hostKeyPolicy") }
                     ?: HostKeyPolicy.ASK,
             )

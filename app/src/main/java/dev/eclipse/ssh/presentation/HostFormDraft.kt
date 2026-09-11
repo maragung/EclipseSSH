@@ -9,6 +9,7 @@ import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
 import dev.eclipse.ssh.data.model.PORT_RANGE
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.credentials.StoredCredentials
+import dev.eclipse.ssh.feature.wakeonlan.parseMac
 import dev.eclipse.ssh.ssh.SshKeyProbe
 
 /**
@@ -64,6 +65,15 @@ internal data class HostFormDraft(
     /** A key file was picked during this editing session. */
     val keyPicked: Boolean = false,
     /**
+     * The Wake-on-LAN MAC as typed, or blank for none.
+     *
+     * Blank is valid — most hosts have no address to wake — and a value that is present but not a
+     * MAC in any accepted spelling is not, because the kebab item would silently send a packet no
+     * card answers to. Validated through the same [parseMac] the importer and the sender use, so
+     * there is one definition of what a MAC is and not three that can drift.
+     */
+    val wakeOnLanMac: String = "",
+    /**
      * What reading that file produced, or null while the read is still running. See [SshKeyProbe].
      *
      * Split from [keyPicked] rather than folded into the sealed type because "picked, not read yet"
@@ -99,6 +109,9 @@ internal data class HostFormDraft(
     val fingerprintValid: Boolean = fingerprint.isBlank() ||
         FINGERPRINT_PATTERN.matches(fingerprint.trim()) ||
         fingerprint.trim() == storedFingerprint?.trim()
+
+    /** Blank is valid — it means no Wake-on-LAN. Anything typed has to parse as a MAC. */
+    val wakeOnLanMacValid: Boolean = wakeOnLanMac.isBlank() || parseMac(wakeOnLanMac) != null
 
     private val proxyNeedsRoute: Boolean =
         proxyType == ProxyType.SOCKS5 || proxyType == ProxyType.HTTP_CONNECT
@@ -150,7 +163,7 @@ internal data class HostFormDraft(
     val credentialsValid: Boolean = keyReadable && passphraseValid
 
     val canSave: Boolean = identityValid && portValid && timeoutValid && keepAliveValid &&
-        fingerprintValid && routeValid && credentialsValid
+        fingerprintValid && routeValid && credentialsValid && wakeOnLanMacValid
 
     /** Only flag a bad port once there is something to be wrong about; an empty field is mid-typing. */
     val showPortError: Boolean = port.isNotBlank() && !portValid

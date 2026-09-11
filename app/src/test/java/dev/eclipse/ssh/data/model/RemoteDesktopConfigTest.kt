@@ -13,8 +13,8 @@ import org.junit.Test
  * line that names nothing the engine could dial is dropped, never thrown.
  *
  * One rule here has no counterpart in the forward codec: an unknown *kind* is skipped rather
- * than fatal, because the `R:` line RDP will speak one day is a line today's decoder must be
- * able to read past without a migration.
+ * than fatal, so a protocol this decoder does not speak yet can sit in a hand-edited backup
+ * without costing the host its load.
  */
 class RemoteDesktopConfigTest {
 
@@ -82,12 +82,58 @@ class RemoteDesktopConfigTest {
     }
 
     @Test
-    fun `an RDP line is skipped today so RDP can arrive without a migration`() {
-        // The forward-decoder's "unknown line falls out" rule, one protocol early: today's reader
-        // must not choke on tomorrow's line shape, and tomorrow's reader must be able to read past
-        // it in an old backup.
+    fun `an RDP line decodes beside the VNC line`() {
+        // Both lines of a host that speaks both protocols come back, in either written order -
+        // and the text that comes back out is the codec's own order, VNC before RDP.
         val decoded = decodeRemoteDesktop("R:3389\nV:5900")
         assertThat(decoded.vnc).isEqualTo(RemoteDesktopTarget(port = 5900))
-        assertThat(encodeRemoteDesktop(decoded)).isEqualTo("V:5900")
+        assertThat(decoded.rdp).isEqualTo(RemoteDesktopTarget(port = 3389))
+        assertThat(encodeRemoteDesktop(decoded)).isEqualTo("V:5900\nR:3389")
+    }
+
+    @Test
+    fun `an RDP target round trips through its line`() {
+        val target = RemoteDesktopTarget(port = 3389)
+
+        val text = encodeRemoteDesktop(RemoteDesktopConfig(rdp = target))
+        assertThat(text).isEqualTo("R:3389")
+
+        val decoded = decodeRemoteDesktop(text)
+        assertThat(decoded.rdp).isEqualTo(target)
+    }
+
+    @Test
+    fun `every optional RDP field is written only when it is not the default`() {
+        // The same backward-compat guarantee the VNC lines make, in the RDP codec's own letter.
+        assertThat(encodeRemoteDesktop(RemoteDesktopConfig(rdp = RemoteDesktopTarget(port = 3389))))
+            .isEqualTo("R:3389")
+        assertThat(encodeRemoteDesktop(RemoteDesktopConfig(rdp = RemoteDesktopTarget(host = "10.0.1.5", port = 3390))))
+            .isEqualTo("R:10.0.1.5:3390")
+        assertThat(encodeRemoteDesktop(RemoteDesktopConfig(rdp = RemoteDesktopTarget(port = 3389, viewOnly = true))))
+            .isEqualTo("R:3389 view-only")
+        assertThat(encodeRemoteDesktop(RemoteDesktopConfig(rdp = RemoteDesktopTarget(port = 3389, enabled = false))))
+            .isEqualTo("#R:3389")
+    }
+
+    @Test
+    fun `the first RDP line wins when a hand edit leaves two`() {
+        // The VNC rule, verbatim, in the RDP slot: the first line wins, the duplicate does not
+        // survive the round trip.
+        val decoded = decodeRemoteDesktop("R:3390\nR:3391")
+        assertThat(decoded.rdp).isEqualTo(RemoteDesktopTarget(port = 3390))
+        assertThat(encodeRemoteDesktop(decoded)).isEqualTo("R:3390")
+    }
+
+    @Test
+    fun `a column with only an R line leaves VNC unset`() {
+        // A host configured for RDP alone has no VNC target to dial, and a VNC-only column -
+        // every existing row - leaves RDP just as unset.
+        val decoded = decodeRemoteDesktop("R:3389")
+        assertThat(decoded.vnc).isNull()
+        assertThat(decoded.rdp).isEqualTo(RemoteDesktopTarget(port = 3389))
+
+        val vncOnly = decodeRemoteDesktop("V:5900")
+        assertThat(vncOnly.rdp).isNull()
+        assertThat(vncOnly.vnc).isEqualTo(RemoteDesktopTarget(port = 5900))
     }
 }

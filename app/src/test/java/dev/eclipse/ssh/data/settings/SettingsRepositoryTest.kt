@@ -68,6 +68,7 @@ class SettingsRepositoryTest {
             repo.setTerminalScrollback(2_000)
             repo.setTerminalCursorStyle("block")
             repo.setTransferBytesPerSecond(0L)
+            repo.setVaultAutoLockMinutes(SettingsRepository.DEFAULT_VAULT_AUTO_LOCK_MINUTES)
             repo.clearPin()
         }
     }
@@ -86,6 +87,9 @@ class SettingsRepositoryTest {
         // first-run terminal that hid it would have no way to interrupt a command.
         assertThat(settings.terminalKeyRowVisible).isTrue()
         assertThat(settings.pinEnabled).isFalse()
+        // 5 minutes: long enough that a glance away and back does not ask again, short enough that
+        // a phone left on a desk is not an open vault.
+        assertThat(settings.vaultAutoLockMinutes).isEqualTo(SettingsRepository.DEFAULT_VAULT_AUTO_LOCK_MINUTES)
         assertThat(settings.legacyAlgorithms).isFalse()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.DARK.name)
         // Off unless asked for: FLAG_SECURE blocks the user's own screenshots too.
@@ -114,6 +118,7 @@ class SettingsRepositoryTest {
         repo.setTerminalScrollback(20_000)
         repo.setTerminalCursorStyle("bar")
         repo.setTransferBytesPerSecond(5L * 1024 * 1024)
+        repo.setVaultAutoLockMinutes(15)
 
         val settings = repo.settings.first()
 
@@ -131,6 +136,7 @@ class SettingsRepositoryTest {
         assertThat(settings.terminalScrollback).isEqualTo(20_000)
         assertThat(settings.terminalCursorStyle).isEqualTo("bar")
         assertThat(settings.transferBytesPerSecond).isEqualTo(5L * 1024 * 1024)
+        assertThat(settings.vaultAutoLockMinutes).isEqualTo(15)
     }
 
     @Test
@@ -233,6 +239,27 @@ class SettingsRepositoryTest {
         // Left as the default so this class's write does not leak into a sibling class through the
         // classloader-shared DataStore.
         repo.setReconnectBaseSeconds(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
+    }
+
+    @Test
+    fun `07b every auto-lock delay the UI offers round-trips unchanged`() = runTest {
+        val repo = repository
+
+        SettingsRepository.VAULT_AUTO_LOCK_CHOICES.forEach { choice ->
+            repo.setVaultAutoLockMinutes(choice)
+            assertWithMessage("the settings screen offers %s minutes", choice)
+                .that(repo.settings.first().vaultAutoLockMinutes)
+                .isEqualTo(choice)
+        }
+
+        // Non-empty and containing the default, so the dialog always has the current value to
+        // highlight; an empty or default-less list would render a dialog with nothing selected.
+        assertThat(SettingsRepository.VAULT_AUTO_LOCK_CHOICES)
+            .contains(SettingsRepository.DEFAULT_VAULT_AUTO_LOCK_MINUTES)
+
+        // Left as the default so this class's write does not leak into a sibling class through the
+        // classloader-shared DataStore.
+        repo.setVaultAutoLockMinutes(SettingsRepository.DEFAULT_VAULT_AUTO_LOCK_MINUTES)
     }
 
     /**

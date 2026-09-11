@@ -131,6 +131,10 @@ class MigrationTest {
         // Version 15's remote-desktop column is NOT NULL and empty for the same reason: "" is the
         // absence of an endpoint, so an upgraded host configures nothing until its user does.
         assertThat(host.remoteDesktop).isEmpty()
+        // Version 16's Wake-on-LAN column likewise: "" is "no address to wake", which is true of
+        // every host that predates the column, and null would only hand the read sites a second
+        // way to say nothing.
+        assertThat(host.wakeOnLanMac).isEmpty()
 
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.hostId).isNull()
@@ -275,6 +279,8 @@ class MigrationTest {
             // The version-15 column through the same door: packed lines, flags set off by
             // whitespace, exactly the text the form will put there.
             remoteDesktop = "V:10.0.1.5:5900 view-only",
+            // And the version-16 column: a MAC in the spelling a user would type, dashes included.
+            wakeOnLanMac = "4C-2E-81-1A-02-F7",
         )
         db.hostDao().upsert(configured)
 
@@ -294,7 +300,7 @@ class MigrationTest {
         val db = openWithMigrations()
 
         val host = db.hostDao().observeAll().first().single()
-        // Every value set at version 11 survives to 15, none of it reverted to a column default.
+        // Every value set at version 11 survives to 16, none of it reverted to a column default.
         assertThat(host.id).isEqualTo("v11-host")
         assertThat(host.port).isEqualTo(2211)
         assertThat(host.authMethod).isEqualTo("KEY")
@@ -327,6 +333,7 @@ class MigrationTest {
         assertThat(host.environment).isEmpty()
         assertThat(host.savedForwards).isEmpty()
         assertThat(host.remoteDesktop).isEmpty()
+        assertThat(host.wakeOnLanMac).isEmpty()
 
         // The transfer row and its version-11 columns survive the climb too, and version 16's
         // cross-host columns arrive null: an eleven-era transfer had no second host and no
@@ -344,9 +351,9 @@ class MigrationTest {
     }
 
     @Test
-    fun `a version 14 host keeps every configured value across the steps to 16`() = runTest {
-        // This release's step, on its own, for the same reason the 12->13 step test exists: the
-        // v2 and v11 climbs above can only ever see the new column at its default, which cannot
+    fun `a version 14 host keeps every configured value across the step to 15`() = runTest {
+        // The previous release's step, on its own, for the same reason the 12->13 step test exists:
+        // the v2 and v11 climbs above can only ever see the new column at its default, which cannot
         // catch the one failure an ALTER TABLE can commit without failing - rebuilding the table
         // instead of extending it, and losing everything the user configured. Seeded from the
         // committed 14.json with a fully configured row, so what survives is what was chosen.
@@ -397,24 +404,84 @@ class MigrationTest {
         assertThat(host.environment).isEqualTo("LANG=en_US.UTF-8")
         assertThat(host.savedForwards).isEqualTo("L:8080:intranet.example:80")
 
-        // And the one column that step added arrives empty: no endpoint configured, nothing bound.
+        // And the one column that step adds arrives empty: no endpoint configured, nothing bound.
         assertThat(host.remoteDesktop).isEmpty()
     }
 
     @Test
-    fun `a version 15 transfer keeps every configured value across the step to 16`() = runTest {
-        // This release's step, on its own, for the same reason the 14->15 step test exists: the v2
-        // and v11 climbs can only ever see the new columns at their null default, which cannot
+    fun `a version 15 host keeps every configured value across the step to 16`() = runTest {
+        // This release's step, on its own, for the same reason the 14->15 test above exists: the
+        // climbs from v2 and v11 can only ever see the new column at its default, which cannot
         // catch the one failure an ALTER TABLE can commit without failing - rebuilding the table
         // instead of extending it, and losing everything the user configured. Seeded from the
-        // committed 15.json with a fully configured transfer row, so what survives is what was
-        // chosen.
+        // committed 15.json with a fully configured row, so what survives is what was chosen.
         seedVersion15()
+
+        val host = openWithMigrations().hostDao().observeAll().first().single()
+
+        // Every version-15 column, read back after the step, none of them at its default.
+        assertThat(host.id).isEqualTo("v15-host")
+        assertThat(host.name).isEqualTo("V15 edge")
+        assertThat(host.host).isEqualTo("edge15.example.com")
+        assertThat(host.username).isEqualTo("ops")
+        assertThat(host.port).isEqualTo(2215)
+        assertThat(host.authMethod).isEqualTo("KEY")
+        assertThat(host.groupName).isEqualTo("Prod")
+        assertThat(host.toDomain().tags).containsExactly("eu", "edge")
+        assertThat(host.isFavorite).isTrue()
+        assertThat(host.lastConnectedAt).isEqualTo(1_750_000_000_003L)
+        assertThat(host.fingerprint).isEqualTo("SHA256:v15")
+        assertThat(host.proxyType).isEqualTo("SOCKS5")
+        assertThat(host.proxyJump).isEqualTo("bastion15.example.com")
+        assertThat(host.socksHost).isEqualTo("10.0.0.15")
+        assertThat(host.socksPort).isEqualTo(9053)
+        assertThat(host.socksUsername).isEqualTo("ops")
+        assertThat(host.accentColor).isEqualTo(0xFF2196F3)
+        assertThat(host.connectTimeoutSeconds).isEqualTo(23)
+        assertThat(host.keepAliveSeconds).isEqualTo(43)
+        assertThat(host.autoLoginSftp).isFalse()
+        assertThat(host.compression).isTrue()
+        assertThat(host.keepAliveEnabled).isFalse()
+        assertThat(host.serverAliveCountMax).isEqualTo(5)
+        assertThat(host.authTimeoutSeconds).isEqualTo(75)
+        assertThat(host.autoReconnect).isFalse()
+        assertThat(host.maxReconnectAttempts).isEqualTo(8)
+        assertThat(host.reconnectBackoffSeconds).isEqualTo(13)
+        assertThat(host.usePty).isFalse()
+        assertThat(host.terminalType).isEqualTo("screen-256color")
+        assertThat(host.terminalColumns).isEqualTo(125)
+        assertThat(host.terminalRows).isEqualTo(42)
+        assertThat(host.keyboardInteractiveAuth).isFalse()
+        assertThat(host.legacyAlgorithms).isTrue()
+        assertThat(host.hostKeyPolicy).isEqualTo("STRICT")
+        assertThat(host.ciphers).isEqualTo("aes256-gcm@openssh.com")
+        assertThat(host.kexAlgorithms).isEqualTo("curve25519-sha256")
+        assertThat(host.macs).isEqualTo("hmac-sha2-256-etm@openssh.com")
+        assertThat(host.hostKeyAlgorithms).isEqualTo("ssh-ed25519")
+        assertThat(host.startupCommand).isEqualTo("tmux attach || tmux new")
+        assertThat(host.environment).isEqualTo("LANG=en_US.UTF-8")
+        assertThat(host.savedForwards).isEqualTo("L:8080:intranet.example:80")
+        assertThat(host.remoteDesktop).isEqualTo("V:10.0.1.5:5900 view-only")
+
+        // And the one column this step adds arrives empty: no MAC saved, nothing to wake.
+        assertThat(host.wakeOnLanMac).isEmpty()
+    }
+
+    @Test
+    fun `a version 16 transfer keeps every configured value across the step to 17`() = runTest {
+        // This release's step, on its own, for the same reason the 15->16 step test above exists:
+        // the v2 and v11 climbs can only ever see the new columns at their null default, which
+        // cannot catch the one failure an ALTER TABLE can commit without failing - rebuilding the
+        // table instead of extending it, and losing everything the user configured. Seeded from
+        // the committed 16.json with a fully configured transfer row, so what survives is what was
+        // chosen. Numbered from 16 rather than 15 because the Wake-on-LAN column took 15->16 on
+        // main while this branch was open.
+        seedVersion16()
 
         val transfer = openWithMigrations().transferDao().observeAll().first().single()
 
-        // Every version-15 column, read back after the step, none of them at its default.
-        assertThat(transfer.id).isEqualTo("v15-transfer")
+        // Every version-16 column, read back after the step, none of them at its default.
+        assertThat(transfer.id).isEqualTo("v16-transfer")
         assertThat(transfer.name).isEqualTo("site-backup")
         assertThat(transfer.direction).isEqualTo("CROSS_HOST")
         assertThat(transfer.hostName).isEqualTo("Destination edge")
@@ -476,7 +543,7 @@ class MigrationTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
-                Migrations.MIGRATION_15_16,
+                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()
@@ -497,7 +564,7 @@ class MigrationTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
-                Migrations.MIGRATION_15_16,
+                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .allowMainThreadQueries()
@@ -658,16 +725,12 @@ class MigrationTest {
     }
 
     /**
-     * Writes the version-15 schema from its committed file, with one fully configured transfer row
-     * in it - the starting point of the 15->16 step test, and the last schema before the
-     * cross-host columns.
+     * Writes the version-15 schema from its committed file, with one fully configured host in it -
+     * the starting point of the 15->16 step test, and the last schema before the Wake-on-LAN column.
      *
      * Reconstructed from `schemas/15.json` for the same reason [seedVersion14] is: the committed
-     * file is the definition the shipped release validated against, and a hand-copied CREATE
-     * TABLE would be a second one that keeps passing after the first is found to differ. The row
-     * is a cross-host one in waiting - direction CROSS_HOST, no localUri - because that is the
-     * shape the new columns were added for, and the step has to prove it carries that row across
-     * without losing anything already configured.
+     * file is the definition the shipped release validated against, and a hand-copied CREATE TABLE
+     * would be a second one that keeps passing after the first is found to differ.
      */
     private fun seedVersion15() {
         val schema = JSONObject(schemaFile(15).readText()).getJSONObject("database")
@@ -680,14 +743,59 @@ class MigrationTest {
             db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
         }
         db.execSQL(
+            "INSERT INTO host_profiles (id, name, host, username, port, authMethod, groupName, tags, " +
+                "isFavorite, lastConnectedAt, fingerprint, proxyType, proxyJump, socksHost, socksPort, " +
+                "socksUsername, socksPassword, accentColor, connectTimeoutSeconds, keepAliveSeconds, " +
+                "autoLoginSftp, compression, keepAliveEnabled, serverAliveCountMax, authTimeoutSeconds, " +
+                "autoReconnect, maxReconnectAttempts, reconnectBackoffSeconds, usePty, terminalType, " +
+                "terminalColumns, terminalRows, keyboardInteractiveAuth, legacyAlgorithms, hostKeyPolicy, " +
+                "ciphers, kexAlgorithms, macs, hostKeyAlgorithms, startupCommand, environment, " +
+                "savedForwards, remoteDesktop) " +
+                "VALUES ('v15-host','V15 edge','edge15.example.com','ops',2215,'KEY','Prod'," +
+                "'eu' || char(31) || 'edge',1,1750000000003,'SHA256:v15','SOCKS5'," +
+                "'bastion15.example.com','10.0.0.15',9053,'ops'," +
+                // socksPassword stays NULL for the same reason as every other seed: no fixture in
+                // this repo carries anything shaped like a credential.
+                "NULL,4280391411,23,43,0,1,0,5,75,0,8,13,0,'screen-256color',125,42,0,1,'STRICT'," +
+                "'aes256-gcm@openssh.com','curve25519-sha256','hmac-sha2-256-etm@openssh.com'," +
+                "'ssh-ed25519','tmux attach || tmux new','LANG=en_US.UTF-8'," +
+                "'L:8080:intranet.example:80','V:10.0.1.5:5900 view-only')",
+        )
+        db.execSQL("PRAGMA user_version = 15")
+        db.close()
+    }
+
+    /**
+     * Writes the version-16 schema from its committed file, with one fully configured transfer row
+     * in it - the starting point of the 16->17 step test, and the last schema before the cross-host
+     * columns.
+     *
+     * Reconstructed from `schemas/16.json` for the same reason [seedVersion14] is: the committed
+     * file is the definition the shipped release validated against, and a hand-copied CREATE
+     * TABLE would be a second one that keeps passing after the first is found to differ. The row
+     * is a cross-host one in waiting - direction CROSS_HOST, no localUri - because that is the
+     * shape the new columns were added for, and the step has to prove it carries that row across
+     * without losing anything already configured.
+     */
+    private fun seedVersion16() {
+        val schema = JSONObject(schemaFile(16).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
             "INSERT INTO transfer_queue (id, name, direction, hostName, progress, status, " +
                 "sizeLabel, hostId, remotePath, localUri, transferredBytes, totalBytes, retryCount, " +
                 "scheduledAt, repeatMinutes, errorMessage) " +
-                "VALUES ('v15-transfer','site-backup','CROSS_HOST','Destination edge',0.25,'RUNNING'," +
+                "VALUES ('v16-transfer','site-backup','CROSS_HOST','Destination edge',0.25,'RUNNING'," +
                 "'1.2 GB','dest-host','/srv/incoming/site-backup',NULL,322122547,1288490188,1," +
                 "1750000000003,NULL,'Connection reset by peer')",
         )
-        db.execSQL("PRAGMA user_version = 15")
+        db.execSQL("PRAGMA user_version = 16")
         db.close()
     }
 

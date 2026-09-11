@@ -8,8 +8,8 @@ import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
-import dev.eclipse.ssh.ui.remotedesktop.VncRequest
-import dev.eclipse.ssh.ui.remotedesktop.VncRequests
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequest
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequests
 import org.apache.sshd.client.session.ClientSession
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -37,7 +37,7 @@ class RemoteDesktopActivityRobolectricTest {
     /** No session in this JVM: the viewer's own no-transport path, reported not thrown. */
     private val noSession: () -> ClientSession? = { null }
 
-    private fun request() = VncRequest(
+    private fun request() = RemoteDesktopRequest.Vnc(
         hostName = "desktop.example.test",
         target = RemoteDesktopTarget(port = 5900),
         sessionProvider = noSession,
@@ -51,7 +51,7 @@ class RemoteDesktopActivityRobolectricTest {
 
     @Test
     fun theViewerOpensInItsOwnWindowAndItsTokenIsSpent() {
-        val token = VncRequests.put(request())
+        val token = RemoteDesktopRequests.put(request())
         ActivityScenario.launch<RemoteDesktopActivity>(launchIntent(token)).use { scenario ->
             // androidx.test:core 1.6 reports the scenario's state as a Lifecycle.State — the nested
             // ActivityScenario.State of older versions no longer exists.
@@ -60,7 +60,31 @@ class RemoteDesktopActivityRobolectricTest {
         // One-shot by design, exactly like the editor's handoff: a re-delivery of the same intent
         // (recents, a relaunch) is a request for a desktop the user already closed, and it must
         // find nothing to reopen.
-        assertThat(VncRequests.take(token)).isNull()
+        assertThat(RemoteDesktopRequests.take(token)).isNull()
+    }
+
+    /**
+     * The RDP request opens the same window, through the same one-shot token, and takes the same
+     * no-transport path the VNC one does - which is also the whole RDP screen this JVM can
+     * honestly run: the native engine never loads under Robolectric, but it never needs to,
+     * because a viewer with no session to ride reports that on the failure panel and stops before
+     * the engine would have been asked for anything.
+     */
+    @Test
+    fun anRdpRequestOpensTheSameWindowAndReportsNoTransport() {
+        val token = RemoteDesktopRequests.put(
+            RemoteDesktopRequest.Rdp(
+                hostName = "desktop.example.test",
+                target = RemoteDesktopTarget(port = 3389),
+                sessionProvider = noSession,
+                credentials = null,
+                credentialsComplete = false,
+            ),
+        )
+        ActivityScenario.launch<RemoteDesktopActivity>(launchIntent(token)).use { scenario ->
+            assertThat(scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+        }
+        assertThat(RemoteDesktopRequests.take(token)).isNull()
     }
 
     @Test
