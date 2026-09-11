@@ -4568,7 +4568,7 @@ private fun TransferActionsSheet(
                 // Editing only a finished file: overwriting the source of a running upload, or a
                 // half-written download target, races the transfer that is still writing it.
                 if (item.status == TransferStatus.COMPLETE) {
-                    TransferActionRow("Edit as text") { onEditFile(item) }
+                    TransferActionRow("Edit") { onEditFile(item) }
                 }
                 TransferActionRow("Open") { onOpenFile(item) }
                 TransferActionRow("Open with") { onOpenFileWith(item) }
