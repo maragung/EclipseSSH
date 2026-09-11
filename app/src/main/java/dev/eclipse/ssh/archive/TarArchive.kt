@@ -12,6 +12,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.tukaani.xz.XZInputStream
+import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 
@@ -230,6 +231,212 @@ class TarArchive(private val source: ArchiveByteSource) {
         // watching both should never see a scan finish on stale numbers.
         onProgress(ArchiveScanProgress(scan.bytesConsumed, scan.totalBytes, scan.entriesScanned))
         return entries
+    }
+
+    /**
+     * Streams the archive forward ONCE, writing the payloads of the entries [wants] accepts out
+     * through [destination] - the extract twin of [listEntries].
+     *
+     * A compressed TAR cannot be seeked, so extracting N entries is not N reads but one forward
+     * pass that takes each wanted payload as it passes and skips the rest; re-walking per entry
+     * would be the full download the feature forbids, and this method is the reason it never
+     * happens. The pass is started from wherever the source's sequential cursor sits, so the
+     * CALLER must rewind ([ArchiveByteSource.seek] to 0) when the source has already been
+     * walked - the extract entry point in [ArchiveExtractor] does exactly that.
+     *
+     * Payload copying is this method's to do, not the caller's: the TAR stream the copy reads
+     * from lives inside the pass, and only the pass knows which entry is in flight. The caller
+     * supplies the [ArchiveExtractor.Destination] (where bytes go) and [onEntry] (what to tell
+     * the person about each one); path safety, folder chains, and refusals are handled here in
+     * the same vocabulary [ArchiveExtractor]'s ZIP path uses, so both formats answer the same
+     * questions the same way.
+     */
+    suspend fun extractEntries(
+        compression: TarCompression,
+        wants: (String) -> Boolean,
+        destination: ArchiveExtractor.Destination,
+        onEntry: (ArchiveEntry, ArchiveExtractor.Outcome) -> Unit = { _, _ -> },
+    ) = withContext(Dispatchers.IO) {
+        // The same machinery as listEntries, verbatim: a small channel keeps at most a couple of
+        // chunks in flight, and the bridge parks this IO thread while the producer feeds it.
+        val channel = Channel<ByteArray>(capacity = 2)
+        val scan = TarScanState(source.size)
+        val bridge = SourceChannelInputStream(channel, scan) { }
+        coroutineScope {
+            val producer = launch {
+                try {
+                    while (true) {
+                        val chunk = source.read(READ_CHUNK_BYTES)
+                        // The contract: a short read only happens at end of file.
+                        if (chunk.isEmpty()) break
+                        channel.send(chunk)
+                    }
+                    channel.close()
+                } catch (cause: Throwable) {
+                    // Close WITH the cause: the parser may be parked in the bridge's runBlocking,
+                    // and the only way it can learn the source died is the cause arriving on its
+                    // next receive. Deliberately not rethrown - a source that fails after the
+                    // parser already saw the end-of-archive marker must not fail an extract that
+                    // had already written its wanted entries.
+                    channel.close(cause)
+                }
+            }
+            try {
+                extractThroughBridge(bridge, compression, wants, destination, onEntry)
+            } finally {
+                // The pass is over, well or badly. Nothing may keep the producer reading ahead
+                // into a channel nobody will drain anymore.
+                producer.cancel()
+            }
+        }
+    }
+
+    /**
+     * The blocking extract loop: the same walk [readEntries] takes, but a wanted entry's payload
+     * is carried out to the destination chunk by chunk instead of being discarded. Unwanted
+     * payloads are skipped exactly as the listing skips them - one pass serves both audiences.
+     */
+    private fun extractThroughBridge(
+        bridge: InputStream,
+        compression: TarCompression,
+        wants: (String) -> Boolean,
+        destination: ArchiveExtractor.Destination,
+        onEntry: (ArchiveEntry, ArchiveExtractor.Outcome) -> Unit,
+    ) {
+        val decompressed: InputStream = when (compression) {
+            TarCompression.NONE -> bridge
+            TarCompression.GZIP -> GzipCompressorInputStream(bridge)
+            TarCompression.BZIP2 -> BZip2CompressorInputStream(bridge)
+            TarCompression.XZ -> XZInputStream(bridge)
+        }
+        val tar = TarArchiveInputStream(decompressed, 512, 512)
+        var currentName: String? = null
+        try {
+            while (true) {
+                val header = tar.getNextEntry() ?: break
+                currentName = header.name
+                // The same cap the listing enforces: the pass reads every header whether wanted
+                // or not, and a hostile tarbomb must not be able to make the walk unbounded in
+                // count even where it is bounded in bytes.
+                scan.entriesScanned++
+                if (scan.entriesScanned > MAX_ENTRIES) {
+                    throw ArchiveCorruptException(
+                        "archive holds more than $MAX_ENTRIES entries; refusing to extract from it",
+                    )
+                }
+                val normalized = normalizeArchivePath(header.name)
+                if (normalized != null && wants(normalized)) {
+                    val entry = ArchiveEntry(
+                        path = normalized,
+                        isDirectory = header.isDirectory,
+                        size = header.size,
+                        compressedSize = null,
+                        modifiedEpochMillis = header.modTime.time,
+                        method = null,
+                        dataOffset = null,
+                        encrypted = false,
+                    )
+                    // The same refusal vocabulary the ZIP path in ArchiveExtractor uses: a
+                    // hostile name is refused with an outcome while the honest entries around
+                    // it still extract - a hostile archive must not be able to abort the pass.
+                    val safe = SafeArchivePath.safeDestinationName(entry.path)
+                    val outcome = if (safe == null) {
+                        ArchiveExtractor.Outcome.Refused(entry.path)
+                    } else if (entry.isDirectory) {
+                        if (runBlocking { destination.ensureFolder(safe) }) {
+                            ArchiveExtractor.Outcome.Extracted(0L)
+                        } else {
+                            ArchiveExtractor.Outcome.DestinationRefused(safe)
+                        }
+                    } else if (!runBlocking { destination.ensureFolder(safe.substringBeforeLast('/', "")) }) {
+                        ArchiveExtractor.Outcome.DestinationRefused(safe)
+                    } else {
+                        copyPayload(tar, entry, safe, destination)
+                    }
+                    onEntry(entry, outcome)
+                    // Only an extracted FILE has had its payload carried out already; every
+                    // other wanted entry falls through to the skip loop below, which for
+                    // directories and refusals is a no-op (size 0 or bytes left unread).
+                    if (outcome is ArchiveExtractor.Outcome.Extracted && !entry.isDirectory) {
+                        continue
+                    }
+                }
+                // The payload skip, shared by every entry that did not just have its bytes
+                // carried out. Looping on skip() keeps payloads out of memory; a 0 return
+                // before exhaustion is a corrupt archive, not a short read.
+                var remaining = header.size
+                while (remaining > 0) {
+                    val skipped = tar.skip(remaining)
+                    if (skipped <= 0) {
+                        throw ArchiveCorruptException(
+                            "entry '$currentName' is truncated: ${remaining}B of data missing",
+                        )
+                    }
+                    remaining -= skipped
+                }
+            }
+        } catch (e: IOException) {
+            // The same net as the listing's: truncation, checksum failures, a codec that hits
+            // its own garbage - wrapped so the person is told which entry the archive died on.
+            val where = currentName?.let { " while reading '$it'" } ?: ""
+            throw ArchiveCorruptException("TAR stream ended early$where", e)
+        }
+    }
+
+    /**
+     * Carries one wanted payload from the TAR stream to the destination, chunk by chunk.
+     *
+     * The destination's [ArchiveExtractor.Destination.openFile] is suspend, and this loop runs
+     * inside the pass's blocking walk - so each suspend call parks in its own runBlocking the
+     * way the bridge's reads do, which on Dispatchers.IO is the intended trade (a parked pool
+     * thread per call, bounded by the entry's lifetime). A short read inside the payload is a
+     * truncated archive and names the entry; a destination write failure is the destination's
+     * to describe, and becomes the entry's [ArchiveExtractor.Outcome.Failed] without aborting
+     * the pass - the honest entries behind it still get their turn.
+     */
+    private fun copyPayload(
+        tar: TarArchiveInputStream,
+        entry: ArchiveEntry,
+        safe: String,
+        destination: ArchiveExtractor.Destination,
+    ): ArchiveExtractor.Outcome {
+        val target = try {
+            runBlocking { destination.openFile(safe) }
+        } catch (failure: Throwable) {
+            return ArchiveExtractor.Outcome.Failed(safe, failure.message ?: "could not be created")
+        } ?: return ArchiveExtractor.Outcome.DestinationRefused(safe)
+        val buffer = ByteArray(READ_CHUNK_BYTES)
+        var written = 0L
+        try {
+            target.use { stream ->
+                var remaining = entry.size
+                while (remaining > 0) {
+                    val count = tar.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+                    if (count <= 0) {
+                        throw EOFException("entry '${entry.path}' is truncated: ${remaining}B of data missing")
+                    }
+                    stream.write(buffer, 0, count)
+                    written += count
+                    remaining -= count
+                }
+                stream.flush()
+            }
+        } catch (failure: Throwable) {
+            // A half-copied entry leaves its unread bytes in the stream, and the walk after this
+            // must land on the NEXT header - not on payload garbage it would then parse as one.
+            // Draining the remainder (best-effort: the stream may already be dead on a read
+            // failure, where the whole walk is about to fail anyway) keeps every later entry's
+            // position honest; only then is the failure reported instead of thrown, so the
+            // honest entries behind this one still get their turn.
+            var drain = entry.size - written
+            while (drain > 0) {
+                val skipped = tar.skip(drain)
+                if (skipped <= 0) break
+                drain -= skipped
+            }
+            return ArchiveExtractor.Outcome.Failed(safe, failure.message ?: "the destination could not be written")
+        }
+        return ArchiveExtractor.Outcome.Extracted(written)
     }
 }
 

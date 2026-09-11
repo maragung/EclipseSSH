@@ -70,6 +70,18 @@ object ArchiveReader {
     }
 
     /**
+     * The compression a [Format]'s streaming extract needs, or null when the format is not the
+     * TAR family. The twin of the mapping inside [list] - same single place to add a format.
+     */
+    fun tarCompressionOf(format: Format): TarCompression? = when (format) {
+        Format.TAR -> TarCompression.NONE
+        Format.TAR_GZ -> TarCompression.GZIP
+        Format.TAR_BZ2 -> TarCompression.BZIP2
+        Format.TAR_XZ -> TarCompression.XZ
+        Format.ZIP -> null
+    }
+
+    /**
      * Reads one entry's bytes - the single-file preview and selective-extract path.
      *
      * ZIP: a bounded range read at the entry's data offset (the local header is validated on the

@@ -63,10 +63,14 @@ object ArchiveExtractor {
     /**
      * Extracts [entries] from the archive [source] into [destination].
      *
-     * ZIP extracts entry by entry through the same range read the preview performs; the TAR
-     * family currently cannot extract (the streaming pass lands next, and the honest interim
-     * answer is [Outcome.Failed] naming the gap, not a silent no-op and not a full download).
-     * Returns one [Outcome] per entry, in the order asked for.
+     * ZIP extracts entry by entry through the same range read the preview performs. The TAR
+     * family cannot: its bytes sit in one forward-only stream, so the whole set is extracted by
+     * ONE streaming pass ([TarArchive.extractEntries]) that takes each wanted entry's payload as
+     * it passes and skips the rest - N entries cost one walk, never N walks.
+     *
+     * Returns one [Outcome] per entry, in the order asked for. An entry the pass never met (the
+     * archive changed under the extract, or the caller passed a path the listing never saw)
+     * still gets an outcome - [Outcome.Failed] naming the miss - so the tally always adds up.
      */
     suspend fun extract(
         format: ArchiveReader.Format,
@@ -74,12 +78,29 @@ object ArchiveExtractor {
         entries: List<ArchiveEntry>,
         destination: Destination,
         onProgress: suspend (bytesWritten: Long, entry: ArchiveEntry) -> Unit = { _, _ -> },
+    ): List<Outcome> {
+        val compression = ArchiveReader.tarCompressionOf(format)
+        if (compression == null) {
+            return extractZipEntries(source, entries, destination, onProgress)
+        }
+        return extractStreaming(compression, source, entries, destination, onProgress)
+    }
+
+    /**
+     * The ZIP walk: per entry, the same range read the preview performs. An entry's bytes move
+     * only when it is asked for - the family's whole reason to exist.
+     */
+    private suspend fun extractZipEntries(
+        source: ArchiveByteSource,
+        entries: List<ArchiveEntry>,
+        destination: Destination,
+        onProgress: suspend (bytesWritten: Long, entry: ArchiveEntry) -> Unit,
     ): List<Outcome> = withContext(Dispatchers.IO) {
         val outcomes = mutableListOf<Outcome>()
         var written = 0L
         for (entry in entries) {
             coroutineContext.ensureActive()
-            outcomes += extractOne(format, source, entry, destination) { bytes ->
+            outcomes += extractOne(source, entry, destination) { bytes ->
                 written += bytes
             }
             // Reported per entry rather than per chunk: the chunk-level number belongs to the
@@ -90,9 +111,53 @@ object ArchiveExtractor {
         outcomes
     }
 
+    /**
+     * The TAR-family walk: one forward pass over the whole stream, keyed by the set of wanted
+     * normalized paths. The pass itself is [TarArchive.extractEntries] - it owns the stream, so
+     * it carries each wanted payload out chunk by chunk as it passes - and this method only
+     * accounts the outcomes, re-ordering them to the caller's asked order. The caller's contract
+     * is "one outcome per entry, in the order asked for", and the stream's order is the
+     * archive's business, not the caller's.
+     */
+    private suspend fun extractStreaming(
+        compression: TarCompression,
+        source: ArchiveByteSource,
+        entries: List<ArchiveEntry>,
+        destination: Destination,
+        onProgress: suspend (bytesWritten: Long, entry: ArchiveEntry) -> Unit,
+    ): List<Outcome> {
+        // The listing walked this source already; a second walk must start at the beginning, or
+        // it would see only the tail of the archive and answer "missing" for entries the user
+        // is looking right at. Rewinding is the source's own supported move.
+        source.seek(0)
+        val wanted = entries.associateBy { entry -> entry.path }
+        val landed = mutableMapOf<String, Outcome>()
+        var written = 0L
+        TarArchive(source).extractEntries(
+            compression,
+            wants = { path -> path in wanted },
+            destination = destination,
+            onEntry = { entry, outcome ->
+                landed[entry.path] = outcome
+                // The same per-entry byte count the ZIP walk feeds its progress: an Extracted
+                // folder is zero bytes, and a refused or failed entry moves none to count.
+                if (outcome is Outcome.Extracted) written += outcome.bytes
+            },
+        )
+        // Tally by the asked order, with every never-met entry named as a miss. The progress
+        // callback rides the tally so a caller that never looks at outcomes still sees bytes.
+        return entries.map { entry ->
+            val outcome = landed.remove(entry.path)
+                // The pass ended without meeting this path: the archive under the extract is
+                // not the archive that was listed. Said plainly, not guessed around.
+                ?: Outcome.Failed(entry.path, "the entry is not in the archive any more")
+            onProgress(written, entry)
+            outcome
+        }
+    }
+
     /** One entry's outcome, with its byte count (when any moved) fed back for progress. */
     private suspend fun extractOne(
-        format: ArchiveReader.Format,
         source: ArchiveByteSource,
         entry: ArchiveEntry,
         destination: Destination,
@@ -111,12 +176,6 @@ object ArchiveExtractor {
         // which the destination guarantees by existing.
         if (!destination.ensureFolder(safe.substringBeforeLast('/', ""))) {
             return Outcome.DestinationRefused(safe)
-        }
-        if (format != ArchiveReader.Format.ZIP) {
-            return Outcome.Failed(
-                safe,
-                "This archive's format extracts by streaming, which lands next",
-            )
         }
         return extractZipEntry(source, entry, safe, destination, onBytes)
     }
