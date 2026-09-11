@@ -4,26 +4,11 @@ import com.google.common.truth.Truth.assertThat
 import org.junit.Test
 
 /**
- * Pins the options sheet's pure helpers — the parts of the Tab-key and auto-save-delay paths
- * worth testing without Compose machinery. The key interception itself and the sheet's rows are
- * Compose surface that only a device can exercise honestly; these are the decisions underneath.
+ * Pins the options sheet's pure delay helpers. The Tab-key insertion has its own pin in
+ * [TabInsertionTest]; the key interception itself and the sheet's rows are Compose surface that
+ * only a device can exercise honestly, and these are the decisions underneath.
  */
 class EditorOptionsHelpersTest {
-
-    @Test
-    fun `tab insertion honors spaces instead of tabs`() {
-        val tabs = EditorPrefs(spacesInsteadOfTabs = false, tabSize = 4)
-        val spaces = EditorPrefs(spacesInsteadOfTabs = true, tabSize = 4)
-
-        assertThat(tabInsertion(tabs)).isEqualTo("\t")
-        assertThat(tabInsertion(spaces)).isEqualTo("    ")
-    }
-
-    @Test
-    fun `tab insertion spaces count follows the tab size`() {
-        assertThat(tabInsertion(EditorPrefs(spacesInsteadOfTabs = true, tabSize = 2))).isEqualTo("  ")
-        assertThat(tabInsertion(EditorPrefs(spacesInsteadOfTabs = true, tabSize = 8))).isEqualTo("        ")
-    }
 
     @Test
     fun `delay stepping walks the offered choices in order`() {

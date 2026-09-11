@@ -72,9 +72,9 @@ class TextEditorActivity : ComponentActivity() {
                 TextEditorScreen(
                     request,
                     prefs = prefs,
-                    onPrefsChange = { prefs ->
+                    onPrefsChange = { updated ->
                         scope.launch {
-                            settingsRepository.setEditorPrefsJson(EditorPrefsCodec.encode(prefs))
+                            settingsRepository.setEditorPrefsJson(EditorPrefsCodec.encode(updated))
                         }
                     },
                     onClose = { finish() },
