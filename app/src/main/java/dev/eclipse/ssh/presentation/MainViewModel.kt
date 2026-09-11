@@ -15,6 +15,8 @@ import dev.eclipse.ssh.data.backup.BackupFormatException
 import dev.eclipse.ssh.data.backup.VaultBackup
 import dev.eclipse.ssh.data.credentials.HostCredentialStore
 import dev.eclipse.ssh.data.credentials.KeyEdit
+import dev.eclipse.ssh.data.credentials.RdpCredentialUpdate
+import dev.eclipse.ssh.data.credentials.RdpCredentials
 import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.credentials.HostCredentialUpdate
 import dev.eclipse.ssh.data.credentials.StoredCredentials
@@ -3449,6 +3451,34 @@ class MainViewModel @Inject constructor(
         { sessionStore.primarySession(hostId) }
 
     /**
+     * Saves [hostId]'s RDP credential — the NLA username, domain and password — independently of the
+     * host profile, the same split [saveHost] makes: a credential write that cannot complete is
+     * reported, never allowed to take an endpoint edit down with it.
+     *
+     * Nothing consumes the credential yet; the RDP tunnel that will answer NLA challenges with it
+     * lands with the viewer. The store is the durable half of that feature, so it arrives first.
+     */
+    fun saveRdpCredentials(hostId: String, update: RdpCredentialUpdate) {
+        launchGuarded("Could not save the RDP credentials") {
+            credentialStore.applyRdp(hostId, update)
+        }
+    }
+
+    /**
+     * Reads [hostId]'s saved RDP credential and hands it to [onReady], or null when none is stored.
+     *
+     * A callback rather than a return because the read decrypts on [Dispatchers.IO] — the viewer's
+     * NLA prompt will call this when a challenge arrives, and a suspend call from a click handler is
+     * exactly the shape that would otherwise end up blocking a frame. Failures read as null, the
+     * same direction every read in this store falls back to: asking the user again is recoverable.
+     */
+    fun rdpCredentials(hostId: String, onReady: (RdpCredentials?) -> Unit) {
+        viewModelScope.launch {
+            onReady(runCatching { credentialStore.rdpCredentials(hostId) }.getOrNull())
+        }
+    }
+
+    /**
      * Reads uptime, load, memory and disk usage from [host] for the server card.
      *
      * A disconnected host is reported rather than ignored: the card keeps showing its "refresh" prompt
@@ -3772,6 +3802,9 @@ class MainViewModel @Inject constructor(
             // secret the user just asked to be rid of. Silent like [deleteHost]'s unregister: the
             // credential-store result below is the one worth a sentence.
             runCatching { sessionRegistry.unregister(host.id) }
+            // The one forget covers the RDP credential with the SSH fields: the store's own rule is
+            // that "forget this host" means everything durably stored for it, so an NLA username
+            // and password cannot survive the action the user asked to be rid of every secret.
             runCatching { credentialStore.forget(host.id) }
                 .onSuccess { report("Forgot saved credentials for ${host.name}") }
                 .onFailure { error -> report("Could not forget credentials for ${host.name}", error) }
@@ -3827,6 +3860,22 @@ class MainViewModel @Inject constructor(
             if (!update.isNoop) {
                 runCatching { credentialStore.apply(copy.id, update) }
                     .onFailure { error -> report("Duplicated ${host.name}, but its credentials could not be copied", error) }
+            }
+            // The RDP credential rides along for the same reason the SSH one does: the copy dials
+            // the same box, so its NLA answer is the same account. Re-encrypted under the new id,
+            // never shared, so forgetting either host's leaves the other's alone.
+            val rdp = runCatching { credentialStore.rdpCredentials(host.id) }.getOrNull()
+            if (rdp != null) {
+                runCatching {
+                    credentialStore.applyRdp(
+                        copy.id,
+                        RdpCredentialUpdate(
+                            username = SecretEdit.Replace(rdp.username),
+                            domain = rdp.domain?.let(SecretEdit::Replace) ?: SecretEdit.Keep,
+                            password = SecretEdit.Replace(rdp.password),
+                        ),
+                    )
+                }.onFailure { error -> report("Duplicated ${host.name}, but its RDP credentials could not be copied", error) }
             }
             report("Duplicated ${host.name} as $name")
         }
