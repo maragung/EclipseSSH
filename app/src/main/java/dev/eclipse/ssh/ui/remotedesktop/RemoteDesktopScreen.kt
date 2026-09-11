@@ -485,8 +485,10 @@ private fun ViewerShell(
                         val fx = (imagePos.x / scale).roundToInt().coerceIn(0, f.width - 1)
                         val fy = (imagePos.y / scale).roundToInt().coerceIn(0, f.height - 1)
                         input.moveMouse(fx, fy)
-                        input.mouseButton(1, pressed = true)
-                        input.mouseButton(1, pressed = false)
+                        // Positional, because `mouseButton` is a function-type property and
+                        // those take no named arguments - the tunnel's own method does.
+                        input.mouseButton(1, true)
+                        input.mouseButton(1, false)
                     }
                 },
                 onDoubleTap = { imagePos ->
