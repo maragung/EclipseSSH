@@ -1,0 +1,123 @@
+# Fast iteration gate. Lint and unit tests only, on demand or for branches
+# that opt in - the full CI gate (ci.yml) stays the only thing a merge waits
+# for, and this workflow never blocks it.
+#
+# The 45-60 minute verify suite is the price of "everything is verified in CI";
+# this is the cheaper loop for the pushes in between: the same pinned toolchain
+# and the same Robolectric cache as ci.yml, but it stops after the unit tests.
+# No APK, no AAB, no signing material, no dependency-lockfile check - a red X
+# from here means "fix before you ask for the full run", never "the build is
+# broken" on its own.
+#
+# Deliberately NOT triggered by pull_request: a PR's mergeability is defined by
+# the full gate, and a second, faster check on the same commits would be either
+# redundant (green means little) or misleading (red on a suite the merge does
+# not consult). Trigger it from the CLI with:
+#   gh workflow run fast-test.yml --ref <branch>
+# or push to a branch named fast-test/*.
+name: Fast test
+
+on:
+  push:
+    branches: ['fast-test/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One fast-test run per ref; a newer push replaces the older run, which is
+  # safe here precisely because nothing gates on this workflow's result.
+  group: fast-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  # The same pins as ci.yml - a fast loop that verifies against a different
+  # toolchain than the merge gate verifies against is not fast, it is wrong.
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+  MIN_SDK: '28'
+  TARGET_SDK: 'android-35'
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
+
+jobs:
+  fast-test:
+    name: Lint and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        # Kept even though this workflow does not assemble APKs: lint compiles
+        # :freerdp, and the native build drives CMake directly (same reasoning
+        # as ci.yml's step of the same name).
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbdcd598c601ff59a1f7b # v4.0.0
+        with:
+          # Read-only here unconditionally: this workflow never runs on main,
+          # and its caches must not write into the branch's read-only posture.
+          cache-read-only: true
+
+      - name: Cache Robolectric runtime jars
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
+
+      - name: Lint (release variant)
+        run: ./gradlew --stacktrace lintRelease
+
+      - name: Start the isolated OpenSSH sandbox
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          tools/local-sshd.sh start
+          test -f .tmp-build/sshd-test/port
+          test -f .tmp-build/sshd-test/port-no-shell
+
+      - name: Unit and integration tests
+        run: ./gradlew --stacktrace testDebugUnitTest
+
+      - name: Stop the OpenSSH sandbox
+        if: always()
+        run: tools/local-sshd.sh clean
