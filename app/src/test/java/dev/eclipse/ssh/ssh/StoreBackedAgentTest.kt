@@ -156,7 +156,7 @@ class StoreBackedAgentTest {
         // case where answering "the vault anyway" would offer the user's keys to a host that never
         // asked for forwarding.
         val plain = AttributeRepository.ofAttributesMap(
-            buildMap<AttributeRepository.AttributeKey<*>, Any>(),
+            emptyMap<AttributeRepository.AttributeKey<*>, Any>(),
         )
         assertThat(agentFor(plain)).isNull()
 
