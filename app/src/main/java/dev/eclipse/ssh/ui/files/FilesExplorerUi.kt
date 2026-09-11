@@ -519,7 +519,7 @@ fun ExplorerFileActionsSheet(
             ActionRow("Select", onSelect)
             ActionRow("Preview", onPreview)
             if (!entry.isDirectory) {
-                ActionRow("Edit as text", onEdit)
+                ActionRow("Edit", onEdit)
             }
             ActionRow("Rename", onRename)
             ActionRow("Copy to…", onCopy)

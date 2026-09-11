@@ -66,6 +66,7 @@ internal object Keys {
     val terminalScrollback = intPreferencesKey("terminal_scrollback")
     val terminalCursorStyle = stringPreferencesKey("terminal_cursor_style")
     val transferBytesPerSecond = androidx.datastore.preferences.core.longPreferencesKey("transfer_bytes_per_second")
+    val editorPrefsJson = stringPreferencesKey("editor_prefs_json")
     val localRootUri = stringPreferencesKey("local_root_uri")
 }
 
@@ -110,6 +111,9 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     terminalCursorStyle = prefs[Keys.terminalCursorStyle] ?: "block",
     transferBytesPerSecond = (prefs[Keys.transferBytesPerSecond] ?: 0L)
         .coerceIn(0L, SettingsRepository.MAX_BANDWIDTH_BYTES_PER_SECOND),
+    // "{}" rather than null: the blob is only ever rewritten whole by the editor screen, and a
+    // missing key means "never configured", which is the same JSON as "every toggle default".
+    editorPrefsJson = prefs[Keys.editorPrefsJson] ?: "{}",
     localRootUri = prefs[Keys.localRootUri],
 )
 

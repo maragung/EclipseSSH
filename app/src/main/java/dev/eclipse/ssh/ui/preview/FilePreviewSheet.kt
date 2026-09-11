@@ -158,7 +158,7 @@ fun FilePreviewSheet(
                 if (kind in setOf(PreviewKind.TEXT, PreviewKind.JSON, PreviewKind.MARKDOWN) &&
                     (state is PreviewState.Textual || state is PreviewState.Failed)
                 ) {
-                    FilledTonalButton(onClick = { onEdit(entry) }) { Text("Edit as text") }
+                    FilledTonalButton(onClick = { onEdit(entry) }) { Text("Edit") }
                 }
                 if (provider.providerId == "local" &&
                     kind in setOf(PreviewKind.IMAGE, PreviewKind.PDF, PreviewKind.MEDIA)

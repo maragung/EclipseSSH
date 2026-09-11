@@ -909,6 +909,19 @@ data class AppSettings(
      */
     val transferBytesPerSecond: Long = 0L,
     /**
+     * The file editor's per-user preferences, persisted as one JSON blob rather than one DataStore
+     * key per toggle.
+     *
+     * The editor's options (word wrap, line numbers, tab size, spaces-vs-tabs, auto-save) are
+     * view state, not safety state: a wrong default inconveniences, it does not endanger, and
+     * they change together from one sheet inside the editor. One key keeps the nine-step adding
+     * ceremony (field, key, setter, combine, row, backup round-trip, three tests) off a toggle
+     * that will be flipped a dozen times before anyone adds the next one. The blob decodes
+     * tolerantly — an unknown field is dropped, not fatal, which is what makes it evolvable
+     * without a migration.
+     */
+    val editorPrefsJson: String = "{}",
+    /**
      * The SAF tree URI the Local file browser was last pointed at, or null before the user has ever
      * granted a folder.
      *

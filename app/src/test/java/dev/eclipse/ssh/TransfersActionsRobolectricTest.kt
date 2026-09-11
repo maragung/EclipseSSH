@@ -63,7 +63,7 @@ class TransfersActionsRobolectricTest {
         // and nothing to remove from a list while the transfer is still in it.
         assertRowAbsent("Resume")
         assertRowAbsent("View file")
-        assertRowAbsent("Edit as text")
+        assertRowAbsent("Edit")
         assertRowAbsent("Open with")
         assertRowAbsent("Remove from list")
     }
@@ -102,7 +102,7 @@ class TransfersActionsRobolectricTest {
         awaitRow("Copy details")
         assertRowAbsent("Pause")
         assertRowAbsent("View file")
-        assertRowAbsent("Edit as text")
+        assertRowAbsent("Edit")
         assertRowAbsent("Open with")
         assertRowAbsent("Remove from list")
     }
@@ -130,7 +130,7 @@ class TransfersActionsRobolectricTest {
         longPress("site-backup.tar")
 
         awaitRow("View file")
-        awaitRow("Edit as text")
+        awaitRow("Edit")
         awaitRow("Open")
         awaitRow("Open with")
         awaitRow("Copy details")
@@ -172,13 +172,13 @@ class TransfersActionsRobolectricTest {
         // Drain whatever starts the setup made, so the peek below only ever reports this
         // click's doing — peeking does not consume, so a stale intent would mask the editor's.
         while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
-        clickSheetRow("Edit as text")
+        clickSheetRow("Edit")
 
         // Stage 1: the row's own first act is closing the sheet it lives in, so the sheet
         // leaving the tree is the observable proof that the click ran the app's code rather
         // than stalling in the harness.
         pumpUntil(describe = { "the sheet never closed after its Edit row was tapped" }) {
-            compose.onAllNodes(hasText("Edit as text") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasText("Edit") and hasClickAction()).fetchSemanticsNodes().isEmpty()
         }
         // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it,
         // which fires on a later frame. Robolectric records every startActivity
