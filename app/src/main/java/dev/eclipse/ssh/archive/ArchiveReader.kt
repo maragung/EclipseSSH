@@ -93,7 +93,13 @@ object ArchiveReader {
         zip.listEntries()
         val offset = zip.dataOffsetOf(entry)
         val compressedSize = entry.compressedSize ?: return null
-        val compressed = source.readAt(offset, compressedSize)
+        // The Int bound is the source contract's (a range read's length is an array length); an
+        // entry whose compressed size cannot fit one is past every ceiling this feature has and
+        // reads as corrupt here rather than OOM'ing somewhere more scenic.
+        if (compressedSize > Int.MAX_VALUE) {
+            throw ArchiveCorruptException("Entry '${entry.path}' spans $compressedSize compressed byte(s)")
+        }
+        val compressed = source.readAt(offset, compressedSize.toInt())
         return when (entry.method) {
             METHOD_STORED -> compressed
             METHOD_DEFLATED -> inflateDeflate(compressed, entry)
@@ -119,7 +125,11 @@ object ArchiveReader {
         if (declared < 0 || declared > Int.MAX_VALUE) {
             throw ArchiveCorruptException("Entry '${entry.path}' declares $declared byte(s) of data")
         }
-        Inflater().use { inflater ->
+        // Inflater implements AutoCloseable (JNI-held native state), and the stdlib's use{} runs on
+        // Closeable only - so the release is spelled by hand. Same shape as ByteArray above: the
+        // block's exceptions must not leak the inflater's native memory.
+        val inflater = Inflater()
+        try {
             inflater.setInput(compressed)
             // The declared size is the output bound as well as the check: allocating it up front
             // means no growing reallocations, and an archive that declares something absurd
@@ -144,6 +154,8 @@ object ArchiveReader {
                 )
             }
             output
+        } finally {
+            inflater.end()
         }
     }
 

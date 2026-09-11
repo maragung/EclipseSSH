@@ -296,7 +296,9 @@ class ZipArchive(private val source: ArchiveByteSource) {
 
         // Saturated 16/32-bit fields are the classic record's way of saying "the real values are
         // in the ZIP64 record"; any one of them being saturated means the locator must be there.
-        if (entryCount != 0xFFFF && cdSize != 0xFFFFFFFFL && cdOffset != 0xFFFFFFFFL) {
+        // The literals are Long because every field here is (u16's result was widened on purpose -
+        // one type for every count, so no comparison silently truncates).
+        if (entryCount != 0xFFFFL && cdSize != 0xFFFFFFFFL && cdOffset != 0xFFFFFFFFL) {
             return EndOfCentralDirectory(entryCount, cdSize, cdOffset)
         }
         return readZip64EndOfCentralDirectory(eocdOffset, onProgress)
