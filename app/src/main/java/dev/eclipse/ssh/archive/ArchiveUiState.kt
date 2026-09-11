@@ -31,11 +31,14 @@ sealed interface ArchiveUiState {
      * @property tree the lazy folder view over the scanned entries
      * @property format the container format, for the properties sheet
      * @property stats the size/mtime the archive was validated against - the watcher's baseline
+     * @property serverChanged raised by the watcher when the remote file no longer matches
+     *   [stats]; a notification, cleared only by an explicit reload or by the user's "continue"
      */
     data class Ready(
         val tree: ArchiveTree,
         val format: ArchiveReader.Format,
         val stats: ArchiveValidation,
+        val serverChanged: Boolean = false,
     ) : ArchiveUiState
 
     /** The scan ended in something the user must be told, with the message to tell them. */
