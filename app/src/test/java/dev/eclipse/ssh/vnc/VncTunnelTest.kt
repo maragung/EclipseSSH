@@ -167,6 +167,58 @@ class VncTunnelTest {
     }
 
     @Test
+    fun `a copy on the server reaches the phone as remote clipboard`() {
+        // The direction the user meets first: copy on the desktop, paste on the phone, no step in
+        // between. The server's cut text is the whole wire half of it, and the assertion reads
+        // the tunnel's published flow - the same thing the viewer collects into the Android
+        // clipboard - so what is proved is that the announcement survived the reader thread and
+        // landed where a paste would read it.
+        val rfb = FakeRfbServer()
+        try {
+            val t = VncTunnel(PortForwardingManager())
+            tunnel = t
+            t.start(session, RemoteDesktopTarget(port = rfb.port))
+            pumpUntil("the tunnel never connected: " + t.state.value) {
+                t.state.value is VncTunnelState.Connected
+            }
+
+            rfb.sendCutText("copied on the desktop")
+
+            pumpUntil("the server's cut text never arrived: " + t.state.value) {
+                t.remoteClipboard.value == "copied on the desktop"
+            }
+            // And it is text the tunnel keeps until the next cut replaces it, which is what a
+            // StateFlow contract means for a viewer that opens its collector late.
+            assertThat(t.remoteClipboard.value).isEqualTo("copied on the desktop")
+        } finally {
+            runCatching { rfb.close() }
+        }
+    }
+
+    @Test
+    fun `the phone's clipboard reaches the server as cut text`() {
+        // The other direction, on the wire rather than in the tunnel's own memory: what the
+        // viewer's toolbar button sends must arrive as a ClientCutText whose bytes are the text,
+        // because that is the message a real VNC server pastes from.
+        val rfb = FakeRfbServer()
+        try {
+            val t = VncTunnel(PortForwardingManager())
+            tunnel = t
+            t.start(session, RemoteDesktopTarget(port = rfb.port))
+            pumpUntil("the tunnel never connected: " + t.state.value) {
+                t.state.value is VncTunnelState.Connected
+            }
+
+            t.copyText("copied on the phone")
+
+            pumpUntil("the cut text never reached the server") { rfb.recordedCutText.isNotEmpty() }
+            assertThat(rfb.recordedCutText).containsExactly("copied on the phone")
+        } finally {
+            runCatching { rfb.close() }
+        }
+    }
+
+    @Test
     fun `an abandon before any start fails with the caller's reason`() {
         // The viewer's precondition failure - the host has no session to ride - is not the
         // tunnel's own error, so the reason is the caller's sentence, not a stack trace's.
@@ -301,8 +353,20 @@ private class FakeRfbServer : AutoCloseable {
     val recordedPointer = Collections.synchronizedList(mutableListOf<String>())
     val recordedKeys = Collections.synchronizedList(mutableListOf<Int>())
 
+    /** Cut texts the client sent, as strings - the clipboard's phone-to-remote half, verbatim. */
+    val recordedCutText = Collections.synchronizedList(mutableListOf<String>())
+
     /** Latched by the serve loop when the client's socket ends, for whoever wants to know. */
     val disconnected = CountDownLatch(1)
+
+    /**
+     * The client's stream once the handshake is done, so [sendCutText] can speak server-to-client
+     * outside the serve loop. Every write to it - the serve loop's frames included - goes through
+     * [wireLock], because a cut text sent while a frame is half-written would splice bytes into
+     * the middle of it and the client would read the frame's tail as a message type.
+     */
+    @Volatile private var output: DataOutputStream? = null
+    private val wireLock = Any()
 
     /** The pixel format the client last set; painted from until it changes. */
     @Volatile private var pixelFormat = intArrayOf(32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
@@ -314,29 +378,33 @@ private class FakeRfbServer : AutoCloseable {
 
     private fun serve(socket: Socket) {
         val input = DataInputStream(socket.getInputStream().buffered())
-        val output = DataOutputStream(socket.getOutputStream().buffered())
+        val out = DataOutputStream(socket.getOutputStream().buffered())
 
         // Handshake: version, then the security the server offers - None only, which is what a
         // VNC server behind an SSH tunnel is normally configured for, the tunnel being the auth.
-        output.writeBytes("RFB 003.008\n")
-        output.flush()
+        out.writeBytes("RFB 003.008\n")
+        out.flush()
         input.readFully(ByteArray(12)) // the client's version
-        output.writeByte(1); output.writeByte(1) // one security type: None
-        output.flush()
+        out.writeByte(1); out.writeByte(1) // one security type: None
+        out.flush()
         require(input.readUnsignedByte() == 1) { "client did not choose None" }
-        output.writeInt(0) // RFB 3.8: the security *result* follows even a None choice
-        output.flush()
+        out.writeInt(0) // RFB 3.8: the security *result* follows even a None choice
+        out.flush()
         input.readUnsignedByte() // ClientInit: the shared flag
 
         // ServerInit: geometry, the server's *offered* pixel format (32bpp true colour, the
         // textbook shape), and a name. The client answers with a SetPixelFormat of its own.
-        output.writeShort(FRAME_WIDTH)
-        output.writeShort(FRAME_HEIGHT)
-        writePixelFormat(output, pixelFormat)
+        out.writeShort(FRAME_WIDTH)
+        out.writeShort(FRAME_HEIGHT)
+        writePixelFormat(out, pixelFormat)
         val name = "fake".toByteArray()
-        output.writeInt(name.size)
-        output.write(name)
-        output.flush()
+        out.writeInt(name.size)
+        out.write(name)
+        out.flush()
+
+        // Handshake done: the stream is now shared property, and every write below (here or in
+        // [sendCutText], from whichever thread called it) goes through [wireLock].
+        output = out
 
         // The message loop: everything a client may send between init and goodbye. The client
         // dictates the pixel format and the encoding list; this server paints raw in whatever
@@ -368,7 +436,7 @@ private class FakeRfbServer : AutoCloseable {
                 }
                 3 -> { // FramebufferUpdateRequest
                     input.readFully(ByteArray(9)) // incremental + x, y, w, h
-                    paint(output)
+                    synchronized(wireLock) { paint(out) }
                 }
                 4 -> { // KeyEvent
                     val down = input.readUnsignedByte()
@@ -388,10 +456,31 @@ private class FakeRfbServer : AutoCloseable {
                 }
                 6 -> { // ClientCutText
                     input.readFully(ByteArray(3)) // padding
-                    input.readFully(ByteArray(input.readInt()))
+                    val bytes = ByteArray(input.readInt())
+                    input.readFully(bytes)
+                    // Latin-1, the encoding the wire format defines for cut text; the tests cut
+                    // ASCII only, which is its own subset either way.
+                    recordedCutText.add(String(bytes, Charsets.ISO_8859_1))
                 }
                 else -> return // a message this prop does not speak: end the session
             }
+        }
+    }
+
+    /**
+     * One ServerCutText, the server announcing a copy to whoever is listening - the
+     * clipboard-sync direction the *user* cares about, asserted here at the far end of the wire
+     * by reading what the tunnel published rather than what this prop wrote.
+     */
+    fun sendCutText(text: String) {
+        val out = output ?: return
+        val bytes = text.toByteArray(Charsets.ISO_8859_1)
+        synchronized(wireLock) {
+            out.writeByte(3) // ServerCutText
+            out.write(ByteArray(3)) // padding
+            out.writeInt(bytes.size)
+            out.write(bytes)
+            out.flush()
         }
     }
 

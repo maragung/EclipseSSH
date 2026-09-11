@@ -122,10 +122,14 @@ class RdpTunnelTest {
         t.scroll(up = true)
         t.scroll(up = false)
         t.type("text")
+        t.copyText("clipboard text")
         t.requestResolution(1280, 720)
 
         assertThat(t.state.value).isEqualTo(RdpTunnelState.Idle)
         assertThat(t.frames.value).isNull()
+        // The clipboard flow starts at null and stays there: no server has cut anything, and a
+        // no-op push must not manufacture a value a viewer's collector would paste.
+        assertThat(t.remoteClipboard.value).isNull()
     }
 
     @Test

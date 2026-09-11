@@ -107,6 +107,14 @@ class RdpTunnel(private val forwarding: PortForwardingManager) {
     private val _frames = MutableStateFlow<RdpFrame?>(null)
     val frames: StateFlow<RdpFrame?> = _frames
 
+    /**
+     * The last text the *server* cut, or null when it never has. Written from OnRemoteClipboard
+     * on a native thread, read by the viewer from composition - a StateFlow rather than anything
+     * buffered, because "the current value on arrival, then every change" is the whole contract.
+     */
+    private val _remoteClipboard = MutableStateFlow<String?>(null)
+    val remoteClipboard: StateFlow<String?> = _remoteClipboard
+
     /** Set by the first deliberate [stop], [abandon] or error, whichever comes first. */
     private val finished = AtomicBoolean(false)
 
@@ -354,11 +362,16 @@ class RdpTunnel(private val forwarding: PortForwardingManager) {
             _frames.value = RdpFrame(bitmap, width, height, sequence)
         }
 
-        // Clipboard and remote-app events: a full-desktop session over a phone-sized screen
-        // has no use for either yet, and dropping them here is cheaper than a stub listener
-        // class that would have to grow the same no-ops. Wiring the clipboard channel up is
-        // a viewer feature, not an engine one.
-        override fun OnRemoteClipboardChanged(data: String) {}
+        // Clipboard and remote-app events. The clipboard text half is the viewer's clipboard
+        // sync: setConnectionInfo negotiates /clipboard, and the engine announces the server's
+        // cuts here - published, not acted on, because what the phone does with its clipboard
+        // is the viewer's policy, not the engine's. The image half and the remote-app events
+        // remain no-ops: a full-desktop session over a phone-sized screen has no use for either,
+        // and dropping them here is cheaper than a stub listener class that would have to grow
+        // the same no-ops.
+        override fun OnRemoteClipboardChanged(data: String) {
+            _remoteClipboard.value = data
+        }
         override fun OnRemoteClipboardImageChanged(data: ByteArray) {}
         override fun OnPointerSet(pixels: IntArray, width: Int, height: Int, hotX: Int, hotY: Int) {
             // The viewer draws the platform cursor, as the VNC one does with its local
@@ -514,6 +527,19 @@ class RdpTunnel(private val forwarding: PortForwardingManager) {
             LibFreeRDP.sendUnicodeKeyEvent(instance, code, true)
             LibFreeRDP.sendUnicodeKeyEvent(instance, code, false)
         }
+    }
+
+    /**
+     * Sends [text] as the client's clipboard data over the /clipboard channel setConnectionInfo
+     * negotiated - the phone's clipboard, pasted onto the remote desktop. The same
+     * no-op-before-live rule as the input methods above: the engine would drop it without a
+     * session, and the viewer's clipboard control is hidden until Connected - a no-op here is
+     * the belt to that.
+     */
+    fun copyText(text: String) {
+        val instance = inst
+        if (instance == 0L) return
+        LibFreeRDP.sendClipboardData(instance, text)
     }
 
     /**
