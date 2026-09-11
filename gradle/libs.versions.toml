@@ -23,6 +23,8 @@ biometric = "1.1.0"
 documentfile = "1.1.0"
 splashscreen = "1.2.0"
 desugar = "2.1.5"
+commonsCompress = "1.28.0"
+xz = "1.12"
 junit = "4.13.2"
 androidxJunit = "1.3.0"
 espresso = "3.7.0"
@@ -85,6 +87,13 @@ vernacular-vnc = { module = "com.github.maragung:vernacular-vnc", version.ref = 
 eddsa = { module = "net.i2p.crypto:eddsa", version.ref = "eddsa" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
+# Archive codecs for the View Archive browser. commons-compress carries ZIP (central-directory
+# random access) and TAR; xz is the TAR.XZ/TXZ decompressor. Its POM marks xz optional, so the
+# explicit declaration here is what makes Xz support available - Gradle does not follow optional
+# dependencies. The zstd/brotli codecs are also optional and deliberately not pulled in: no
+# archive format the feature promises needs them.
+commons-compress = { module = "org.apache.commons:commons-compress", version.ref = "commonsCompress" }
+xz = { module = "org.tukaani:xz", version.ref = "xz" }
 
 # --- desugaring ---
 desugar-jdk-libs = { module = "com.android.tools:desugar_jdk_libs", version.ref = "desugar" }
