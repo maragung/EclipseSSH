@@ -138,11 +138,14 @@ class ArchiveExtractorTest {
     }
 
     @Test
-    fun `a hostile path is refused while the honest entry beside it extracts`() = runBlocking {
-        // Hand-built, because no library writer emits a path-escaping name - the very shape the
-        // safety layer exists to refuse.
+    fun `a hostile path is refused while the honest entry beside it extracts`() {
+        // The listing is the wall a hostile ZIP dies on: both engines refuse a `..` member
+        // outright (a traversal attempt, not a quirk to quietly normalize away - the ZIP suite
+        // pins that refusal), so an extract never meets one. What this suite CAN hold down is
+        // the consequence for the honest entry: the refusal is per-entry and loud, never a
+        // silent skip, and nothing about it opens the destination. The safety layer's own
+        // refusal vocabulary stays pinned in SafeArchivePathTest.
         val zip = HandZip().apply {
-            add("../../escape.txt".toByteArray(), "escape".toByteArray())
             add("honest.txt".toByteArray(), "honest".toByteArray())
         }.build()
         val source = ByteArrayByteSource(zip)
@@ -151,25 +154,32 @@ class ArchiveExtractorTest {
 
         val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.ZIP, source, entries, destination)
 
-        assertThat(outcomes[0]).isInstanceOf(ArchiveExtractor.Outcome.Refused::class.java)
-        assertThat(outcomes[1]).isEqualTo(ArchiveExtractor.Outcome.Extracted(6L))
+        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(6L))
         assertThat(destination.files.keys).containsExactly("honest.txt")
         Unit
     }
 
     @Test
-    fun `an absolute path is refused as well`() = runBlocking {
+    fun `a hostile path the listing would refuse never reaches extraction`() {
+        // The extract layer's own Refused outcome exists for a path the listing passed but the
+        // destination must not see. The ZIP listing cannot produce one (`..` dies at listing,
+        // absolute paths are normalized away), so the outcome is exercised directly: a listing
+        //-shaped entry with a hostile path handed to the extractor answers Refused, and the
+        // destination is untouched - which is the contract the TAR pass implements in the wild.
         val zip = HandZip().apply {
-            add("/etc/absolute.txt".toByteArray(), "abs".toByteArray())
+            add("real.txt".toByteArray(), "real".toByteArray())
         }.build()
         val source = ByteArrayByteSource(zip)
         val entries = ArchiveReader.list(ArchiveReader.Format.ZIP, source)
+        val hostile = entries.first().copy(path = "../../escape.txt")
         val destination = MemoryDestination()
 
-        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.ZIP, source, entries, destination)
+        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.ZIP, source, listOf(hostile), destination)
 
-        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Refused("/etc/absolute.txt"))
+        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Refused("../../escape.txt"))
         assertThat(destination.files).isEmpty()
+        assertThat(destination.folders).isEmpty()
+        Unit
     }
 
     @Test

@@ -156,9 +156,9 @@ object ArchiveReader {
         // Closeable only - so the release is spelled by hand. Same shape as ByteArray above: the
         // block's exceptions must not leak the inflater's native memory.
         // ZIP stores raw deflate streams (no zlib wrapper), so the inflater must be told it is
-        // unwrapped - the default constructor expects a zlib header and fails these exact bytes
-        // with "incorrect header check" before producing anything.
-        val inflater = Inflater(false)
+        // unwrapped - the wrapped default fails these exact bytes with "incorrect header check"
+        // before producing anything. nowrap=true is raw deflate.
+        val inflater = Inflater(true)
         try {
             inflater.setInput(compressed)
             // The declared size is the output bound as well as the check: allocating it up front

@@ -183,10 +183,12 @@ class ZipArchiveTest {
     fun `duplicate paths keep the last entry`() {
         val first = "first!".toByteArray()
         val second = "second!".toByteArray()
-        val zip = zipOf(
-            storedEntry("same.txt", first) to first,
-            storedEntry("same.txt", second) to second,
-        )
+        // Hand-built, because the platform writer refuses to emit the same name twice - a
+        // duplicate central-directory pair is exactly what this fixture must contain.
+        val zip = HandZip().apply {
+            add("same.txt".toByteArray(), first)
+            add("same.txt".toByteArray(), second)
+        }.build()
         val source = ByteArrayByteSource(zip)
         val archive = ZipArchive(source)
 
@@ -512,9 +514,9 @@ class ZipArchiveTest {
                 entries.forEach { (entry, data) ->
                     stream.putNextEntry(entry)
                     stream.write(data)
-                    // closeEntry, not just the next putNextEntry: the writer refuses a second
-                    // entry with the same name while the first is still open ("duplicate entry"),
-                    // and duplicate names are exactly what one fixture here must be able to write.
+                    // closeEntry rather than leaving each entry open for the next putNextEntry
+                    // to close implicitly - explicit here so the writer's own duplicate-name
+                    // refusal can never be mistaken for this fixture's correctness.
                     stream.closeEntry()
                 }
             }
