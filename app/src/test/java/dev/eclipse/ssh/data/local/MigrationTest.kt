@@ -809,6 +809,39 @@ class MigrationTest {
     }
 
     /**
+     * Writes the version-16 schema from its committed file, with one fully configured transfer row
+     * in it - the starting point of the 16->17 step test, and the last schema before the cross-host
+     * transfer columns.
+     *
+     * Reconstructed from `schemas/16.json` for the same reason [seedVersion14] is: the committed
+     * file is the definition the shipped release validated against, and a hand-copied CREATE TABLE
+     * would be a second one that keeps passing after the first is found to differ. The row is a
+     * CROSS_HOST transfer the restore pass can still find by its destination host, which is what
+     * the 16->17 step has to carry across.
+     */
+    private fun seedVersion16() {
+        val schema = JSONObject(schemaFile(16).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
+            "INSERT INTO transfer_queue (id, name, direction, hostName, progress, status, " +
+                "sizeLabel, hostId, remotePath, localUri, transferredBytes, totalBytes, retryCount, " +
+                "scheduledAt, repeatMinutes, errorMessage) " +
+                "VALUES ('v16-transfer','site-backup','CROSS_HOST','Destination edge',0.25,'RUNNING'," +
+                "'1.2 GB','dest-host','/srv/incoming/site-backup',NULL,322122547,1288490188,1," +
+                "1750000000003,NULL,'Connection reset by peer')",
+        )
+        db.execSQL("PRAGMA user_version = 16")
+        db.close()
+    }
+
+    /**
      * Writes the version-17 schema from its committed file, with one fully configured host row in
      * it - the starting point of the 17->18 step test, and the last schema before the
      * agent-forwarding switch.
