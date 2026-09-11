@@ -120,7 +120,12 @@ android {
 // and checks the toolchain path at execution time. That keeps Gradle
 // invocations that never touch native code (schema dumps, app-only tasks)
 // from demanding a multi-gigabyte NDK during configuration.
-val androidSdkRoot = android.sdkDirectory
+//
+// AGP 9 removed `android.sdkDirectory` from the old DSL extension; the
+// supported access is the sdkComponents API, whose sdkDirectory provider is
+// already populated when the plugin is applied (unlike bootClasspath, it is
+// safe to read at configuration time).
+val androidSdkRoot = androidComponents.sdkComponents.sdkDirectory.get().asFile
 
 val fetchFreerdpSource =
     tasks.register("fetchFreerdpSource") {
