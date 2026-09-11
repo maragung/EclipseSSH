@@ -227,6 +227,11 @@ import dev.eclipse.ssh.presentation.AuthFailurePrompt
 import dev.eclipse.ssh.presentation.ReconnectPrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.archive.ArchiveBrowserState
+import dev.eclipse.ssh.archive.ArchiveTarget
+import dev.eclipse.ssh.archive.ArchiveReader
+import dev.eclipse.ssh.ui.archive.ArchiveActions
+import dev.eclipse.ssh.ui.archive.ArchiveBrowserScreen
 import dev.eclipse.ssh.ui.editor.EditorRequest
 import dev.eclipse.ssh.ui.editor.EditorRequests
 import dev.eclipse.ssh.ui.editor.TextEditorActivity
@@ -705,6 +710,41 @@ private fun EclipseWorkspace(
     // deserves a window of its own rather than a layer over whatever the workspace was showing.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
     var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
+    // The View Archive browser target, held here for the same reason as the preview target: the
+    // scan runs against this workspace's provider, and the browser is one archive at a time by
+    // design - opening a second archive closes the first, because each one holds an SFTP channel
+    // for as long as it is open.
+    var archiveTarget by remember { mutableStateOf<ArchiveTarget?>(null) }
+    /**
+     * Opens one remote archive in the View Archive browser — the Files sheet's View Archive row.
+     *
+     * The archive's host is found from the explorer's session rather than the workspace's selected
+     * host, because the sheet can be open on a session the Hosts list never selected; getting the
+     * host wrong here would silently scan the wrong server's file. Format detection is by name
+     * only, before anything is read: it costs nothing and a name that suggests no browsable
+     * container means the row was offered in error — reported, not guessed around.
+     */
+    fun openArchive(entry: FsEntry, provider: FileSystemProvider) {
+        val format = ArchiveReader.formatFor(entry.name)
+            ?: return viewModel.reportUiMessage("\"${entry.name}\" is not an archive View Archive can browse")
+        val explorer = viewModel.filesExplorer.state.value
+        val sessionId = explorer.activeSessionId
+        val size = entry.size
+            ?: return viewModel.reportUiMessage("\"${entry.name}\" has no size to read by range")
+        val source = viewModel.filesExplorer.archiveSourceFor(sessionId, entry.path, size)
+            ?: return viewModel.reportUiMessage("View Archive needs a connected server session")
+        // Opening a second archive closes the first: each browser holds an SFTP channel for as
+        // long as it is open, and two of them is a leak the user never asked for.
+        archiveTarget?.browser?.close()
+        archiveTarget = ArchiveTarget(entry, ArchiveBrowserState(
+            archiveName = entry.name,
+            format = format,
+            source = source,
+            provider = provider,
+            remotePath = entry.path,
+            scope = scope,
+        ))
+    }
     // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
     // reason the preview target is: its file actions resolve against this workspace's context,
     // clipboard and overlays, none of which the screen should know about.
@@ -1203,6 +1243,7 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
+                    onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1380,6 +1421,7 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
+                    onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1832,6 +1874,35 @@ private fun EclipseWorkspace(
             },
         )
     }
+    // The View Archive browser, a full-window layer above the workspace for the same reason the
+    // editor is one: browsing an archive is a task of its own, and a sheet over the explorer would
+    // both fight the explorer's own bottom sheets and show one folder's worth of a 1M-entry tree in
+    // a window measured for a file list. The layer reads the browser's state; dismissal is the
+    // close above, which cancels the scan/watcher and releases the channel.
+    archiveTarget?.let { target ->
+        val browser = target.browser
+        ArchiveBrowserScreen(
+            archiveName = browser.archiveName,
+            state = browser.state,
+            actions = ArchiveActions(
+                onClose = { browser.close(); archiveTarget = null },
+                onCancelScan = browser::cancelScan,
+                onRetry = browser::retry,
+                onUnlock = browser::unlock,
+                // The preview and the extract paths arrive with the entries they need; for now
+                // opening a file reports the honest not-yet, and the per-entry sheet the epic
+                // promises lands with them.
+                onOpenEntry = { entry ->
+                    viewModel.reportUiMessage("Previewing \"${entry.path.substringAfterLast('/')}\" arrives with the extract work")
+                },
+                onEntryActions = { entry ->
+                    viewModel.reportUiMessage("Actions for \"${entry.path.substringAfterLast('/')}\" arrive with the extract work")
+                },
+                onReload = browser::reload,
+                onDismissServerChange = browser::dismissServerChange,
+            ),
+        )
+    }
     // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
     // preview and the editor that some rows open are their own windows, and none of them should
     // have to fight this sheet for the bottom of the screen.
@@ -1956,6 +2027,12 @@ private fun WorkspaceScaffold(
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
     onEditFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
+    /**
+     * Opens a remote archive in the View Archive browser - see the overlay state in
+     * [EclipseWorkspace]. Null-when-unsupported is decided by the caller (local session, unknown
+     * extension) so this scaffold and the Files screen below it stay format-agnostic.
+     */
+    onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)? = null,
     onDestination: (Destination) -> Unit,
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
@@ -2191,6 +2268,7 @@ private fun WorkspaceScaffold(
                     filesExplorer,
                     onPreviewFile,
                     onEditFile,
+                    onOpenArchive,
                     onUpload,
                     onDownloadFile,
                     onPickLocalFolder,
@@ -3738,6 +3816,8 @@ private fun ColumnScope.FilesScreen(
     filesExplorer: FilesExplorerController,
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit,
     onEditFile: (FsEntry, FileSystemProvider) -> Unit,
+    /** Null when View Archive cannot serve this entry (local session, unknown extension). */
+    onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)?,
     onUpload: () -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
     onPickLocalFolder: () -> Unit,
@@ -3891,6 +3971,11 @@ private fun ColumnScope.FilesScreen(
                 if (explorer.isLocal) onUploadLocal(entry.toLocalFile()) else onDownloadFile(entry.toRemoteFile())
             },
             onSendToHost = if (!explorer.isLocal) ({ actionEntry = null; sendEntry = entry }) else null,
+            // The row exists only when the session and the name can both be served: a local
+            // document tree has no ranged reads to browse with, and an unknown extension has no
+            // engine to browse with - hiding the verb beats offering it and failing.
+            onOpenArchive = onOpenArchive?.takeIf { !explorer.isLocal && ArchiveReader.formatFor(entry.name) != null }
+                ?.let { open -> { actionEntry = null; provider?.let { open(entry, it) } } },
         )
     }
 
