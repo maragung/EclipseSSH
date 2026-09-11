@@ -268,6 +268,22 @@ data class HostProfile(
      * first sighting is a question, and only [HostKeyPolicy] decides who answers it.
      */
     val hostKeyPolicy: HostKeyPolicy = HostKeyPolicy.ASK,
+    /**
+     * Whether this host's interactive shells may ask the phone to sign with the keys saved in its
+     * vault - SSH agent forwarding.
+     *
+     * A grant, not a convenience. While a session with this on is open, the host's administrator
+     * can request signatures as the user - that is what forwarding *is* - so the setting lives on
+     * the host form with helper text that says so, and defaults to off the way OpenSSH's own
+     * `ForwardAgent` does. Signing is silent: a per-signature confirmation would have to answer on
+     * the session's I/O thread, where a dialog cannot go.
+     *
+     * All keys in the vault are offered, not just the one this host connects with - the desktop
+     * `ssh-add` behaviour, and the reason the helper text warns rather than lists. It applies to
+     * terminal shells only; SFTP channels never ask and are never offered. A remote `ssh-add` is
+     * refused: the agent never accepts identities from the far end.
+     */
+    val agentForwarding: Boolean = false,
 ) {
     /**
      * Redacts [socksPassword].
@@ -298,6 +314,7 @@ data class HostProfile(
         // an answer of `null` versus `***` is the first thing that narrows it.
         "startupCommand=${redacted(startupCommand)}, environment=${redacted(environment)}, " +
         "savedForwards=$savedForwards, remoteDesktop=$remoteDesktop, wakeOnLanMac=$wakeOnLanMac, " +
+            "agentForwarding=$agentForwarding, " +
         "hostKeyPolicy=$hostKeyPolicy)"
 
     companion object {

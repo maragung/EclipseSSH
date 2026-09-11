@@ -135,6 +135,10 @@ class MigrationTest {
         // every host that predates the column, and null would only hand the read sites a second
         // way to say nothing.
         assertThat(host.wakeOnLanMac).isEmpty()
+        // Version 18's agent-forwarding switch is the one boolean whose default is a security
+        // property: enabling it grants the server's administrator signature requests while a
+        // session is open, so an upgraded host must keep it off until its own user turns it on.
+        assertThat(host.agentForwarding).isFalse()
 
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.hostId).isNull()
@@ -406,6 +410,7 @@ class MigrationTest {
 
         // And the one column that step adds arrives empty: no endpoint configured, nothing bound.
         assertThat(host.remoteDesktop).isEmpty()
+        assertThat(host.agentForwarding).isFalse()
     }
 
     @Test
@@ -468,6 +473,42 @@ class MigrationTest {
     }
 
     @Test
+    fun `a version 17 host keeps every configured value across the step to 18`() = runTest {
+        // This release's step, on its own, for the same reason the 15->16 step test above exists:
+        // the v2 and v11 climbs can only ever see the new column at its default, which cannot
+        // catch the one failure an ALTER TABLE can commit without failing - rebuilding the table
+        // instead of extending it, and losing everything the user configured. Seeded from the
+        // committed 17.json with a fully configured host row (the wake column's value included),
+        // so what survives is what was chosen. Numbered from 17 because wake-on-LAN took 15->16
+        // and the cross-host transfer columns 16->17 on main while this branch was open.
+        seedVersion17()
+
+        val host = openWithMigrations().hostDao().observeAll().first().single()
+
+        // Every version-17 column, read back after the step, none of them at its default.
+        assertThat(host.id).isEqualTo("v17-host")
+        assertThat(host.name).isEqualTo("V17 edge")
+        assertThat(host.host).isEqualTo("edge17.example.com")
+        assertThat(host.username).isEqualTo("ops")
+        assertThat(host.port).isEqualTo(2217)
+        assertThat(host.authMethod).isEqualTo("KEY")
+        assertThat(host.groupName).isEqualTo("Prod")
+        assertThat(host.toDomain().tags).containsExactly("eu", "edge")
+        assertThat(host.isFavorite).isTrue()
+        assertThat(host.fingerprint).isEqualTo("SHA256:v17")
+        assertThat(host.proxyType).isEqualTo("SOCKS5")
+        assertThat(host.socksPort).isEqualTo(9057)
+        assertThat(host.terminalType).isEqualTo("screen-256color")
+        assertThat(host.remoteDesktop).isEqualTo("V:10.0.1.5:5900 view-only")
+        assertThat(host.wakeOnLanMac).isEqualTo("4C-2E-81-1A-02-F7")
+
+        // And the one column this step adds arrives off. Its default is a security property: the
+        // switch is a grant to the server's administrator, so a migration that landed it on - or a
+        // rebuild that flipped it - would be a permission change no user made.
+        assertThat(host.agentForwarding).isFalse()
+    }
+
+    @Test
     fun `a version 16 transfer keeps every configured value across the step to 17`() = runTest {
         // This release's step, on its own, for the same reason the 15->16 step test above exists:
         // the v2 and v11 climbs can only ever see the new columns at their null default, which
@@ -524,11 +565,11 @@ class MigrationTest {
         // The half the audit kept on purpose (AUDIT-REPORT.md sections 5 and 12.9): a downgrade - a file
         // left by a build one version ahead, e.g. after a Play Store rollback - has no migration path
         // back and never can, so refusing to open it would be a crash loop with no way out from inside
-        // the app. Resetting is the recoverable direction. user_version 18 is that newer build; the row
+        // the app. Resetting is the recoverable direction. user_version 19 is that newer build; the row
         // shape beneath it is irrelevant, because a destructive downgrade drops every table first. One
-        // *ahead* of this build's own 17, not equal to it: a file that claims the current schema has
+        // *ahead* of this build's own 18, not equal to it: a file that claims the current schema has
         // its rows validated against it, and the v2 table below would not survive that.
-        seedVersion2(userVersion = 18)
+        seedVersion2(userVersion = 19)
 
         val db = openLikeProduction()
 
@@ -545,7 +586,7 @@ class MigrationTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
-                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17,
+                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17, Migrations.MIGRATION_17_18,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()
@@ -566,7 +607,7 @@ class MigrationTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
-                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17,
+                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17, Migrations.MIGRATION_17_18,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .allowMainThreadQueries()
@@ -770,14 +811,13 @@ class MigrationTest {
     /**
      * Writes the version-16 schema from its committed file, with one fully configured transfer row
      * in it - the starting point of the 16->17 step test, and the last schema before the cross-host
-     * columns.
+     * transfer columns.
      *
      * Reconstructed from `schemas/16.json` for the same reason [seedVersion14] is: the committed
-     * file is the definition the shipped release validated against, and a hand-copied CREATE
-     * TABLE would be a second one that keeps passing after the first is found to differ. The row
-     * is a cross-host one in waiting - direction CROSS_HOST, no localUri - because that is the
-     * shape the new columns were added for, and the step has to prove it carries that row across
-     * without losing anything already configured.
+     * file is the definition the shipped release validated against, and a hand-copied CREATE TABLE
+     * would be a second one that keeps passing after the first is found to differ. The row is a
+     * CROSS_HOST transfer the restore pass can still find by its destination host, which is what
+     * the 16->17 step has to carry across.
      */
     private fun seedVersion16() {
         val schema = JSONObject(schemaFile(16).readText()).getJSONObject("database")
@@ -798,6 +838,50 @@ class MigrationTest {
                 "1750000000003,NULL,'Connection reset by peer')",
         )
         db.execSQL("PRAGMA user_version = 16")
+        db.close()
+    }
+
+    /**
+     * Writes the version-17 schema from its committed file, with one fully configured host row in
+     * it - the starting point of the 17->18 step test, and the last schema before the
+     * agent-forwarding switch.
+     *
+     * Reconstructed from `schemas/17.json` for the same reason [seedVersion14] is: the committed
+     * file is the definition the shipped release validated against, and a hand-copied CREATE TABLE
+     * would be a second one that keeps passing after the first is found to differ. The row carries
+     * a Wake-on-LAN address too, because that column arrived (16) between this branch's base and
+     * its renumbered step - the step must carry it across with everything else.
+     */
+    private fun seedVersion17() {
+        val schema = JSONObject(schemaFile(17).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
+            "INSERT INTO host_profiles (id, name, host, username, port, authMethod, groupName, tags, " +
+                "isFavorite, lastConnectedAt, fingerprint, proxyType, proxyJump, socksHost, socksPort, " +
+                "socksUsername, socksPassword, accentColor, connectTimeoutSeconds, keepAliveSeconds, " +
+                "autoLoginSftp, compression, keepAliveEnabled, serverAliveCountMax, authTimeoutSeconds, " +
+                "autoReconnect, maxReconnectAttempts, reconnectBackoffSeconds, usePty, terminalType, " +
+                "terminalColumns, terminalRows, keyboardInteractiveAuth, legacyAlgorithms, hostKeyPolicy, " +
+                "ciphers, kexAlgorithms, macs, hostKeyAlgorithms, startupCommand, environment, " +
+                "savedForwards, remoteDesktop, wakeOnLanMac) " +
+                "VALUES ('v17-host','V17 edge','edge17.example.com','ops',2217,'KEY','Prod'," +
+                "'eu' || char(31) || 'edge',1,1750000000005,'SHA256:v17','SOCKS5'," +
+                "'bastion17.example.com','10.0.0.17',9057,'ops'," +
+                // socksPassword stays NULL for the same reason as every other seed: no fixture in
+                // this repo carries anything shaped like a credential.
+                "NULL,4280391411,27,47,0,1,0,6,85,0,9,17,0,'screen-256color',130,45,0,1,'STRICT'," +
+                "'aes256-gcm@openssh.com','curve25519-sha256','hmac-sha2-256-etm@openssh.com'," +
+                "'ssh-ed25519','tmux attach || tmux new','LANG=en_US.UTF-8'," +
+                "'L:8080:intranet.example:80','V:10.0.1.5:5900 view-only','4C-2E-81-1A-02-F7')",
+        )
+        db.execSQL("PRAGMA user_version = 17")
         db.close()
     }
 

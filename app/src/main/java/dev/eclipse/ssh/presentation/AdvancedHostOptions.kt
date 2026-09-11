@@ -45,7 +45,9 @@ import dev.eclipse.ssh.ssh.reviewAlgorithmList
  *    not from the session, so it cannot differ per host - and a read deadline on an interactive shell
  *    is the very bug this release exists to remove: a session sitting at a prompt with nothing to say
  *    is healthy, and a deadline cannot tell it from a dead one.
- *  - **Agent forwarding.** There is no SSH agent on the client path here to forward.
+ *  - **Agent forwarding.** Now present as [agentForwarding] - and its switch is the one place the
+ *    trust warning lives, because enabling it is a grant: the server's administrator can request
+ *    signatures as you while a session with forwarding is open.
  *  - **X11 forwarding.** MINA's client has no X11 channel implementation, so a switch would set a flag
  *    nothing reads.
  *  - **"Allow TCP forwarding".** Forwarding is per-tunnel on a client; the protocol has no session-wide
@@ -67,6 +69,13 @@ internal data class AdvancedHostOptions(
     /** Blank matches the on-screen terminal. */
     val terminalRows: String = "",
     val keyboardInteractiveAuth: Boolean = true,
+    /**
+     * Ask this host for SSH agent forwarding on its interactive shells.
+     *
+     * Off by default - the switch is a grant, and the form's helper text is where the user is told
+     * what they are granting rather than only what they are getting. See [HostProfile.agentForwarding].
+     */
+    val agentForwarding: Boolean = false,
     /** Null follows the app-wide legacy-algorithm switch; true or false overrides it for this host. */
     val legacyAlgorithms: Boolean? = null,
     val hostKeyPolicy: HostKeyPolicy = HostKeyPolicy.ASK,
@@ -183,6 +192,7 @@ internal data class AdvancedHostOptions(
         terminalColumns = terminalColumns.toIntOrNull()?.coerceIn(TERMINAL_COLUMNS_RANGE) ?: 0,
         terminalRows = terminalRows.toIntOrNull()?.coerceIn(TERMINAL_ROWS_RANGE) ?: 0,
         keyboardInteractiveAuth = keyboardInteractiveAuth,
+        agentForwarding = agentForwarding,
         legacyAlgorithms = legacyAlgorithms,
         // Blank becomes null, not "", because null is the column's "no opinion" and an empty list would
         // be a real instruction to propose nothing. See [Migrations.MIGRATION_12_13].
@@ -223,6 +233,7 @@ internal data class AdvancedHostOptions(
                 terminalColumns = profile.terminalColumns.takeIf { it != 0 }?.toString().orEmpty(),
                 terminalRows = profile.terminalRows.takeIf { it != 0 }?.toString().orEmpty(),
                 keyboardInteractiveAuth = profile.keyboardInteractiveAuth,
+                agentForwarding = profile.agentForwarding,
                 legacyAlgorithms = profile.legacyAlgorithms,
                 ciphers = profile.ciphers.orEmpty(),
                 kexAlgorithms = profile.kexAlgorithms.orEmpty(),

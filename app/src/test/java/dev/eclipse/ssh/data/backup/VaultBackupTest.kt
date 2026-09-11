@@ -590,6 +590,7 @@ class VaultBackupTest {
             // The spelling as typed, dashes rather than colons: the round trip has to carry text,
             // not a normalised form, or a host would silently change shape in its own backup.
             wakeOnLanMac = "4C-2E-81-1A-02-F7",
+            agentForwarding = true,
         )
 
         val restored = VaultBackup.fromJson(VaultBackup.toJson(listOf(tuned), AppSettings(), emptyMap())).first
@@ -633,6 +634,9 @@ class VaultBackupTest {
         assertThat(host.savedForwards).isEmpty()
         assertThat(host.remoteDesktop).isEmpty()
         assertThat(host.wakeOnLanMac).isEmpty()
+        // The grant again: a backup written before the flag existed imports it off, so the
+        // administrator of that host gains nothing the user never gave them.
+        assertThat(host.agentForwarding).isFalse()
     }
 
     @Test

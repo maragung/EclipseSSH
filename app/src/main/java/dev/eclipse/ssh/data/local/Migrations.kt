@@ -223,4 +223,23 @@ object Migrations {
             db.execSQL("ALTER TABLE transfer_queue ADD COLUMN destPath TEXT")
         }
     }
+
+    /**
+     * The per-host SSH agent forwarding switch.
+     *
+     * DEFAULT 0, not 1, for a stronger reason than most of the boolean columns before it: this
+     * column is not a preference about how to connect, it is a *grant* to the server's
+     * administrator while a session is open. Turning it on for every upgraded host would hand that
+     * grant to hosts whose users never made it, which is not a settings default - it is a
+     * permission change made on someone else's behalf. Off is also OpenSSH's own default.
+     *
+     * Numbered 17->18 rather than 15->16: the wake-on-LAN column took 15->16 and the cross-host
+     * transfer columns 16->17 on main while this branch was open, and a chain's steps must never
+     * share a number.
+     */
+    val MIGRATION_17_18 = object : Migration(17, 18) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN agentForwarding INTEGER NOT NULL DEFAULT 0")
+        }
+    }
 }

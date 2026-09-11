@@ -153,6 +153,12 @@ object VaultBackup {
                 // text: a MAC names a network card, not anything worth encrypting, and an empty
                 // string has to survive the trip too or a cleared address would come back restored.
                 put("wakeOnLanMac", host.wakeOnLanMac)
+                // Written unconditionally even though it is false by default, so a host whose
+                // forwarding was turned on and back off restores "off" rather than whatever the
+                // importing build ships as its default. Absent from every older backup, which
+                // optBoolean resolves to false - the grant stays opt-in on restore, the same way
+                // the Room migration keeps it off for upgraded rows.
+                put("agentForwarding", host.agentForwarding)
                 put("hostKeyPolicy", host.hostKeyPolicy.name)
             }) }
         })
@@ -291,6 +297,11 @@ object VaultBackup {
                 // a packet no card answers to. An unparseable value is dropped rather than fatal, and
                 // the spelling as typed is kept, so a host round-trips exactly as its owner wrote it.
                 wakeOnLanMac = h.optString("wakeOnLanMac").trim().takeIf { parseMac(it) != null }.orEmpty(),
+                // The one boolean in this file where "absent means false" is a security property and
+                // not just a default: an older backup predating the flag must not restore it on, for
+                // the same reason the migration keeps it off - it is a grant, and only the user can
+                // make it on the host that carries it.
+                agentForwarding = h.optBoolean("agentForwarding", false),
                 hostKeyPolicy = HostKeyPolicy.entries.firstOrNull { it.name == h.optString("hostKeyPolicy") }
                     ?: HostKeyPolicy.ASK,
             )

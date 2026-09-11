@@ -375,6 +375,12 @@ class TerminalChannel(
      * request the server will honour, and MINA's own `setEnv` documents the same window. Best-effort by
      * design: OpenSSH refuses anything its `AcceptEnv` does not list, and refuses it silently, so a
      * variable that does not arrive is not something this side can detect or report.
+     *
+     * [agentForwarding] asks the host, with `auth-agent-req@openssh.com`, to open an agent channel
+     * back at the phone while this shell is up - which is why it is a parameter of *the shell's*
+     * open and of nothing else. The request rides the block MINA sends at open, and a host without
+     * `AllowAgentForwarding` simply ignores it. What it grants is spelled out on the form's switch:
+     * the server's administrator can ask the phone to sign as the user while the session is open.
      */
     suspend fun open(
         columns: Int = this.columns,
@@ -382,6 +388,7 @@ class TerminalChannel(
         usePty: Boolean = true,
         terminalType: String = DEFAULT_TERMINAL_TYPE,
         environment: Map<String, String> = emptyMap(),
+        agentForwarding: Boolean = false,
     ) {
         // Clamped once and then used everywhere. Sending the *parameter* to the pty while storing the
         // clamped value in the field put the two sides permanently out of step: the remote came up at
@@ -394,6 +401,10 @@ class TerminalChannel(
         this.hasPty = usePty
         (channel as? PtyCapableChannelSession)?.apply {
             setUsePty(usePty)
+            // Sent from the same block, because MINA writes the agent-forwarding request in
+            // doOpenPty() - which runs for a pty-less channel too, so the guard here is not
+            // `usePty` but the flag itself.
+            setAgentForwarding(agentForwarding)
             setPtyType(terminalType)
             setPtyColumns(safeColumns)
             setPtyLines(safeRows)

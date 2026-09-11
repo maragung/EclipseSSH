@@ -104,7 +104,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15, Migrations.MIGRATION_15_16,
-                Migrations.MIGRATION_16_17,
+                Migrations.MIGRATION_16_17, Migrations.MIGRATION_17_18,
             )
             // Deliberately no destructive fallback: a broken migration must fail, not wipe data.
             .build()
@@ -120,7 +120,7 @@ class MigrationInstrumentedTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15, Migrations.MIGRATION_15_16,
-                Migrations.MIGRATION_16_17,
+                Migrations.MIGRATION_16_17, Migrations.MIGRATION_17_18,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .build()

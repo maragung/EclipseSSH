@@ -151,6 +151,7 @@ class HostMappingTest {
             // The spelling as typed, not normalised: the mapping moves text, and every MAC spelling
             // parseMac accepts is one the column can hold.
             wakeOnLanMac = "4C-2E-81-1A-02-F7",
+            agentForwarding = true,
             hostKeyPolicy = HostKeyPolicy.STRICT,
         )
 
@@ -182,6 +183,8 @@ class HostMappingTest {
         assertThat(fresh.terminalColumns).isEqualTo(0)
         assertThat(fresh.terminalRows).isEqualTo(0)
         assertThat(fresh.keyboardInteractiveAuth).isTrue()
+        // The grant is opt-in: a host that never spoke about forwarding must not acquire it.
+        assertThat(fresh.agentForwarding).isFalse()
         assertThat(fresh.legacyAlgorithms).isNull()
         assertThat(fresh.hostKeyPolicy).isEqualTo(HostKeyPolicy.ASK)
         // Null, not empty. An empty algorithm list is a real instruction - propose nothing - and a
