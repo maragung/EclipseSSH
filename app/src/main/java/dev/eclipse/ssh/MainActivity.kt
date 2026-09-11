@@ -192,7 +192,6 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeRemoteDesktop
-import dev.eclipse.ssh.data.model.decodeRdpTarget
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isBusy
@@ -238,9 +237,9 @@ import dev.eclipse.ssh.ui.files.ExplorerTopBar
 import dev.eclipse.ssh.ui.preview.FilePreviewSheet
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopConfigDialog
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequest
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequests
 import dev.eclipse.ssh.ui.remotedesktop.RdpConfigDialog
-import dev.eclipse.ssh.ui.remotedesktop.VncRequest
-import dev.eclipse.ssh.ui.remotedesktop.VncRequests
 import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -980,8 +979,9 @@ private fun EclipseWorkspace(
     // single-shot token handoff the editor uses - the request carries a live session provider an
     // intent cannot parcel. Built per call rather than remembered: the provider must close over
     // the view model, never over one session, so a reconnect inside the viewer re-asks it.
-    val openRemoteDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
-        val token = VncRequests.put(VncRequest(host.name, target, viewModel.vncSessionProvider(host.id)))
+    // Both protocol items mint through it, because both tunnels ride a ClientSession the same way.
+    val launchViewer: (RemoteDesktopRequest) -> Unit = { request ->
+        val token = RemoteDesktopRequests.put(request)
         runCatching {
             context.startActivity(
                 Intent(context, RemoteDesktopActivity::class.java)
@@ -991,6 +991,33 @@ private fun EclipseWorkspace(
             // The token was consumed by put; if the launch failed it is gone, and the next tap
             // mints a fresh one - so this is only ever a message, never a stuck state.
             viewModel.reportUiFailure("Could not open the remote desktop", error)
+        }
+    }
+    val openRemoteDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
+        launchViewer(
+            RemoteDesktopRequest.Vnc(
+                hostName = host.name,
+                target = target,
+                sessionProvider = viewModel.remoteDesktopSessionProvider(host.id),
+            ),
+        )
+    }
+    // The RDP handoff reads the saved NLA credential first, because the request it mints carries
+    // it: a complete one lets the tunnel answer NLA without asking, and whatever is saved
+    // pre-fills the sign-in form when the server asks anyway. The read is a callback (it
+    // decrypts off the main thread), so the viewer opens a moment after the tap rather than in
+    // it - the one difference from the VNC item's instant hop.
+    val openRdpDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
+        viewModel.rdpCredentials(host.id) { credentials ->
+            launchViewer(
+                RemoteDesktopRequest.Rdp(
+                    hostName = host.name,
+                    target = target,
+                    sessionProvider = viewModel.remoteDesktopSessionProvider(host.id),
+                    credentials = credentials,
+                    credentialsComplete = credentials != null,
+                ),
+            )
         }
     }
     // The menu's Remote desktop item: a saved, enabled target opens the viewer straight away;
@@ -1005,15 +1032,17 @@ private fun EclipseWorkspace(
             remoteDesktopHostId = host.id
         }
     }
-    // The menu's RDP desktop item. Every path here is the endpoint dialog, including a saved,
-    // enabled target's - deliberately the opposite of the VNC branch above, because the routing
-    // that branch takes (the token handoff into the viewer window) has no RDP counterpart yet:
-    // the viewer is the piece of the feature that has not landed. The dialog is what RDP honestly
-    // has, so that is what the item opens. The viewer's arrival turns this into the VNC item's
-    // shape - an enabled target goes to the viewer through the same token handoff, everything
-    // else to this dialog - and is also when the item stops hiding behind "an R target exists".
+    // The menu's RDP desktop item: the VNC item's rule, now that the viewer it routes to exists.
+    // A saved, enabled target goes straight to the viewer window through the token handoff;
+    // never configured or parked opens the endpoint dialog, which is also where a parked target
+    // gets re-enabled.
     val requestRdpDesktop: (HostProfile) -> Unit = { host ->
-        rdpDesktopHostId = host.id
+        val target = decodeRemoteDesktop(host.remoteDesktop).rdp
+        if (target != null && target.enabled) {
+            openRdpDesktop(host, target)
+        } else {
+            rdpDesktopHostId = host.id
+        }
     }
     // A Quick Settings tile or home-screen widget tap resolves, on the view model, to the
     // most-recently-connected host and arrives here as a pending value. Route it through the same
@@ -1562,13 +1591,17 @@ private fun EclipseWorkspace(
         }
     }
     rdpDesktopHostId?.let { hostId ->
-        // Same live-profile resolution as the VNC dialog above, for the same reasons. No onOpen
-        // half yet: the viewer the VNC dialog's Connect jumps to is the piece of RDP that has not
-        // landed, so this dialog saves and closes - its KDoc records where the jump goes in.
+        // Same live-profile resolution as the VNC dialog above, for the same reasons. Connect is
+        // the VNC dialog's Connect exactly: the save through the view model, then the jump into
+        // the viewer window through the same token handoff every RDP desktop opens by.
         state.hosts.firstOrNull { it.id == hostId }?.let { host ->
             RdpConfigDialog(
                 host = host,
                 onSave = { viewModel.saveRdpTarget(hostId, it) },
+                onOpen = { target ->
+                    rdpDesktopHostId = null
+                    openRdpDesktop(host, target)
+                },
                 onDismiss = { rdpDesktopHostId = null },
             )
         }
@@ -1947,9 +1980,10 @@ private fun WorkspaceScaffold(
      */
     onRemoteDesktop: (HostProfile) -> Unit = {},
     /**
-     * Opens one host's RDP endpoint dialog - the card menu's RDP desktop item. Only the dialog for
-     * now: the viewer window the VNC item routes to is the piece of RDP that has not landed, so
-     * there is nothing else for this to open yet.
+     * Opens one host's RDP desktop - the card menu's RDP desktop item, with the same routing the
+     * VNC one has: a saved, enabled target goes straight to the viewer window, the rest get the
+     * endpoint dialog first. Named `onRdpDesktop` rather than `onOpenRdpDesktop` for the same
+     * reason [onRemoteDesktop] is.
      */
     onRdpDesktop: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
@@ -2337,21 +2371,16 @@ private fun HostCard(
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRemoteDesktop(host) },
                         )
-                        // Beside the VNC item, and gated where that one is not: a host with no
-                        // saved RDP target does not see it, because unlike VNC the RDP entry has
-                        // no first-use story yet - its endpoint dialog is reachable only through
-                        // this item, so offering it on every host would be a menu entry that
-                        // mostly opens a form for a protocol the host has never spoken. The
-                        // viewer's arrival, which is also when the entry can lead somewhere
-                        // besides the dialog, is when this un-gates to the VNC item's rule.
-                        // The stopgap reader is the codec until the RDP codec branch lands.
-                        if (decodeRdpTarget(host.remoteDesktop) != null) {
-                            DropdownMenuItem(
-                                text = { Text("RDP desktop") },
-                                leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
-                                onClick = { menuOpen = false; onRdpDesktop(host) },
-                            )
-                        }
+                        // Beside the VNC item, and un-gated the way that one is now that the
+                        // viewer exists: a host with no saved RDP target gets the config dialog
+                        // rather than nothing, so this item is the protocol's first-use entry
+                        // point too - a saved, enabled target goes straight to the viewer, and
+                        // the routing for both lives with [requestRdpDesktop].
+                        DropdownMenuItem(
+                            text = { Text("RDP desktop") },
+                            leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
+                            onClick = { menuOpen = false; onRdpDesktop(host) },
+                        )
                         // The arrow this item replaced used to sit beside the kebab as a second way
                         // into the details sheet; now this is the way in, so it sits high in the
                         // menu, where the eye lands first.
