@@ -20,10 +20,19 @@ package dev.eclipse.ssh.archive
  */
 class ArchiveTree(entries: List<ArchiveEntry>) {
 
-    /** Entries in listing order, keyed by their normalized path for O(1) lookup. */
-    private val byPath: Map<String, ArchiveEntry> =
-        // LinkedHashMap: listing order preserved for the children() call's stable ordering.
-        entries.associateBy { it.path }
+    /** The listing with every directory's trailing slash stripped - the shape every query speaks. */
+    private val normalized: List<ArchiveEntry> = entries.map { entry ->
+        if (entry.isDirectory && entry.path.endsWith("/")) entry.copy(path = entry.path.trimEnd('/')) else entry
+    }
+
+    /**
+     * Every path the tree can name, keyed by its normalized path for O(1) lookup: the real
+     * entries in listing order, with the implied folder placeholders merged in behind them (the
+     * [childrenIndex] second pass). LinkedHashMap: insertion order is listing order, which
+     * [search]'s stable ordering and [subtreeOf]'s extract set both lean on.
+     */
+    private val byPath: LinkedHashMap<String, ArchiveEntry> =
+        normalized.associateTo(LinkedHashMap()) { it.path to it }
 
     /**
      * Folder path -> the entries directly inside it, in listing order. Built once in the
@@ -35,7 +44,7 @@ class ArchiveTree(entries: List<ArchiveEntry>) {
      * are kept and merged with implied parents (see [children]).
      */
     private val childrenIndex: Map<String, MutableList<ArchiveEntry>> = buildMap {
-        for (entry in entries) {
+        for (entry in normalized) {
             // Every real entry lives in its parent folder.
             parentOf(entry.path)?.let { parent ->
                 getOrPut(parent) { mutableListOf() }.add(entry)
@@ -55,14 +64,19 @@ class ArchiveTree(entries: List<ArchiveEntry>) {
                 }
             }
         }
-        // Second pass: the implied folders need to appear as children of THEIR parents. Doing
-        // this in a second pass keeps the first pass's iteration over `entries` clean while the
-        // map is still being built.
-        val impliedFolders = keys.filter { it !in byPath }
+        // Second pass: the implied folders need to appear as children of THEIR parents, and to be
+        // addressable by path like any real entry - entryAt/subtreeOf/search must not care whether
+        // the archive listed a folder or a nested file merely implied it. Doing this in a second
+        // pass keeps the first pass's iteration over `entries` clean while the map is still being
+        // built. The root ("") is a container key, never an entry - it is spelled "" only in
+        // storage, and byPath[""] would be a phantom nobody can query for.
+        val impliedFolders = keys.filter { it.isNotEmpty() && it !in byPath }
         for (folder in impliedFolders) {
+            val placeholder = impliedFolderEntry(folder)
             parentOf(folder)?.let { parent ->
-                getOrPut(parent) { mutableListOf() }.add(impliedFolderEntry(folder))
+                getOrPut(parent) { mutableListOf() }.add(placeholder)
             }
+            byPath[folder] = placeholder
         }
     }
 
@@ -104,9 +118,12 @@ class ArchiveTree(entries: List<ArchiveEntry>) {
      * breadcrumb renders and what "extract this folder" collects ancestors for.
      */
     fun ancestorsOf(path: String): List<String> =
+        // drop(1) sheds the seed: runningFold starts from "", which is the root's storage spelling
+        // and not a path anyone renders or extracts. An empty result for a root-level file falls
+        // out for free - dropLast(1) leaves nothing to fold.
         path.split('/').dropLast(1).runningFold("") { acc, segment ->
             if (acc.isEmpty()) segment else "$acc/$segment"
-        }
+        }.drop(1)
 
     /**
      * Every entry at or below [folderPath] - the selective-extract set for a folder. Includes the
@@ -119,7 +136,7 @@ class ArchiveTree(entries: List<ArchiveEntry>) {
         return byPath.values.filter { it.path == folder || it.path.startsWith(prefix) }
     }
 
-    /** Total entries the scan produced, including directories. */
+    /** Total addressable entries: the scan's listing plus the folders a nested file implied. */
     val entryCount: Int get() = byPath.size
 
     private fun normalizeFolder(path: String): String =

@@ -155,7 +155,10 @@ object ArchiveReader {
         // Inflater implements AutoCloseable (JNI-held native state), and the stdlib's use{} runs on
         // Closeable only - so the release is spelled by hand. Same shape as ByteArray above: the
         // block's exceptions must not leak the inflater's native memory.
-        val inflater = Inflater()
+        // ZIP stores raw deflate streams (no zlib wrapper), so the inflater must be told it is
+        // unwrapped - the default constructor expects a zlib header and fails these exact bytes
+        // with "incorrect header check" before producing anything.
+        val inflater = Inflater(false)
         try {
             inflater.setInput(compressed)
             // The declared size is the output bound as well as the check: allocating it up front

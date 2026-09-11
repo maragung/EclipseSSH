@@ -133,6 +133,8 @@ class ArchiveExtractorTest {
 
         assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(3L))
         assertThat(destination.files.keys).containsExactly("wanted.txt")
+        // runBlocking returns its last expression; JUnit needs void, so land on Unit explicitly.
+        Unit
     }
 
     @Test
@@ -152,6 +154,7 @@ class ArchiveExtractorTest {
         assertThat(outcomes[0]).isInstanceOf(ArchiveExtractor.Outcome.Refused::class.java)
         assertThat(outcomes[1]).isEqualTo(ArchiveExtractor.Outcome.Extracted(6L))
         assertThat(destination.files.keys).containsExactly("honest.txt")
+        Unit
     }
 
     @Test
@@ -254,6 +257,7 @@ class ArchiveExtractorTest {
 
         assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(3L))
         assertThat(destination.files.keys).containsExactly("wanted.txt")
+        Unit
     }
 
     @Test

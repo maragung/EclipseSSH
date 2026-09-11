@@ -525,7 +525,9 @@ fun ExplorerFileActionsSheet(
                 ActionRow("View Archive", onOpenArchive)
             }
             if (!entry.isDirectory) {
-                ActionRow("Edit", onEdit)
+                // "Edit as text", the preview sheet's own label, so both doors into the editor
+                // promise the same thing in the same words.
+                ActionRow("Edit as text", onEdit)
             }
             ActionRow("Rename", onRename)
             ActionRow("Copy to…", onCopy)

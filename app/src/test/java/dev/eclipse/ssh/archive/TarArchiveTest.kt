@@ -173,7 +173,12 @@ class TarArchiveTest {
         val boom = IllegalStateException("stop right there")
         val thrown = runCatching { list(tar) { throw boom } }.exceptionOrNull()
         // The scan must not swallow the callback's exception - it is the cancellation path.
-        assertThat(thrown).isSameInstanceAs(boom)
+        // Not isSameInstanceAs: the scan runs inside withContext, and coroutines' stack-trace
+        // recovery hands the caller a legal copy of any exception that crosses that boundary -
+        // same type, same message, original in the cause chain. Identity is the machinery's to
+        // give; type-and-message is the engine's promise, so that is what is asserted here.
+        assertThat(thrown).isInstanceOf(IllegalStateException::class.java)
+        assertThat(thrown).hasMessageThat().isEqualTo("stop right there")
     }
 
     @Test

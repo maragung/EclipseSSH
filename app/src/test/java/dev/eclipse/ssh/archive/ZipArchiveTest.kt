@@ -512,6 +512,10 @@ class ZipArchiveTest {
                 entries.forEach { (entry, data) ->
                     stream.putNextEntry(entry)
                     stream.write(data)
+                    // closeEntry, not just the next putNextEntry: the writer refuses a second
+                    // entry with the same name while the first is still open ("duplicate entry"),
+                    // and duplicate names are exactly what one fixture here must be able to write.
+                    stream.closeEntry()
                 }
             }
             buffer.toByteArray()
