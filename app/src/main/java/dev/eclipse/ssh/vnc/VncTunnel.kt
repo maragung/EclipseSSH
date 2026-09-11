@@ -98,6 +98,15 @@ class VncTunnel(private val forwarding: PortForwardingManager) {
     private val _frames = MutableStateFlow<VncFrame?>(null)
     val frames: StateFlow<VncFrame?> = _frames
 
+    /**
+     * The last text the *server* cut, or null when it never has. A StateFlow rather than a
+     * SharedFlow because the viewer collects it from composition, where "the current value on
+     * arrival, then every change" is exactly the shape wanted - and because vernacular delivers
+     * the listener on its own reader thread, which a StateFlow absorbs without a buffer policy.
+     */
+    private val _remoteClipboard = MutableStateFlow<String?>(null)
+    val remoteClipboard: StateFlow<String?> = _remoteClipboard
+
     /** Set by the first deliberate [stop] or the first error, whichever comes first. */
     private val finished = AtomicBoolean(false)
 
@@ -154,6 +163,19 @@ class VncTunnel(private val forwarding: PortForwardingManager) {
                     // server never learns we understand desktop-size changes, and [requestResolution]
                     // would be a no-op everywhere.
                     isEnableExtendedDesktopSize = true
+                    // The server's cut text, announced as it happens: the clipboard-sync half of
+                    // the feature, whose other direction is [copyText]. Deliberately the *plain*
+                    // cut-text messages and not the extended pseudo-encoding - which this
+                    // library's config defaults ON, so the off has to be said out loud. The
+                    // plain messages are the base protocol every RFB server answers; the
+                    // extended encoding is opt-in on the server side, and the moment the flag is
+                    // on the library switches its client-to-server wire format to it - a server
+                    // that never opted in would read the extended header as a text length and
+                    // stall. Text-only, too: the clipboard formats a desktop user actually
+                    // moves are text, and the image listener stays unwired for the same reason
+                    // RDP's does not.
+                    isEnableExtendedClipboard = false
+                    setRemoteClipboardListener { text -> _remoteClipboard.value = text }
                     setPasswordSupplier(Supplier { answerPasswordChallenge(password) })
                     setErrorListener { error -> onVncError(error) }
                     setScreenUpdateListener { image -> onScreenUpdate(image) }
@@ -279,6 +301,16 @@ class VncTunnel(private val forwarding: PortForwardingManager) {
     /** Types [text] as a run of key presses, printable ASCII only. */
     fun type(text: String) {
         client?.type(text)
+    }
+
+    /**
+     * Sends [text] as the client's cut text - the phone's clipboard, pasted onto the remote
+     * desktop. The same no-op-before-connected rule as the input methods above: vernacular
+     * would drop it without a writer, and the viewer's clipboard control is hidden until
+     * Connected - a no-op here is the belt to that.
+     */
+    fun copyText(text: String) {
+        client?.copyText(text)
     }
 
     /**

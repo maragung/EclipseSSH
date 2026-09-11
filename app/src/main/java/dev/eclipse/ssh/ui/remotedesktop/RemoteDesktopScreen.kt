@@ -1,5 +1,8 @@
 package dev.eclipse.ssh.ui.remotedesktop
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import androidx.activity.compose.LocalActivity
@@ -25,6 +28,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DesktopWindows
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Landscape
@@ -79,6 +83,7 @@ import dev.eclipse.ssh.vnc.VncTunnelState
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * How the desktop is fitted into the screen. The fit modes own the scale until the user takes it
@@ -180,6 +185,19 @@ private class DesktopInput(
 )
 
 /**
+ * The clipboard surface the shell syncs, wired per protocol the same way [DesktopInput] is:
+ * one direction to call (the phone's clipboard pushed to the desktop) and one to collect (the
+ * desktop's clipboard, as text, published whenever the server cuts). The two tunnels expose
+ * exactly this pair - [VncTunnel.copyText]/`remoteClipboard` and [RdpTunnel.copyText]/
+ * `remoteClipboard` - so the wiring is method references and a flow reference, and the shell
+ * never learns which protocol is holding the clipboard.
+ */
+private class DesktopClipboard(
+    val push: (text: String) -> Unit,
+    val remote: StateFlow<String?>,
+)
+
+/**
  * The remote desktop, fullscreen and immersive: the frames the tunnel delivers, zoomed and
  * panned, with a floating toolbar over them.
  *
@@ -264,6 +282,7 @@ private fun VncViewer(request: RemoteDesktopRequest.Vnc, onClose: () -> Unit) {
                 requestResolution = tunnel::requestResolution,
             )
         },
+        clipboard = remember(tunnel) { DesktopClipboard(tunnel::copyText, tunnel.remoteClipboard) },
         onReconnect = { reconnects++ },
         onClose = onClose,
     )
@@ -337,6 +356,7 @@ private fun RdpViewer(request: RemoteDesktopRequest.Rdp, onClose: () -> Unit) {
                 requestResolution = tunnel::requestResolution,
             )
         },
+        clipboard = remember(tunnel) { DesktopClipboard(tunnel::copyText, tunnel.remoteClipboard) },
         onReconnect = { reconnects++ },
         onClose = onClose,
     )
@@ -365,7 +385,11 @@ private fun RdpViewer(request: RemoteDesktopRequest.Rdp, onClose: () -> Unit) {
  * protocol half collected and drives whatever [input] that half wired - nothing here knows
  * whether the desktop at the other end of the tunnel speaks RFB or RDP, except the three RDP-only
  * affordances (keyboard, resolution, wheel scrolling), which appear exactly when the request is
- * the RDP one because the VNC half arrived without them and leaves unchanged.
+ * the RDP one because the VNC half arrived without them and leaves unchanged. The clipboard is
+ * the shell's one new shared surface: the remote half arrives on [DesktopClipboard.remote] and
+ * lands on the phone's clipboard automatically, while the push back is a toolbar button, because
+ * the automatic version of that direction would ship everything the user copies to the desktop
+ * without asking (see the comment where the button is wired).
  */
 @Composable
 private fun ViewerShell(
@@ -373,10 +397,12 @@ private fun ViewerShell(
     state: DesktopState,
     frame: DesktopFrame?,
     input: DesktopInput,
+    clipboard: DesktopClipboard,
     onReconnect: () -> Unit,
     onClose: () -> Unit,
 ) {
     val activity = LocalActivity.current
+    val context = LocalContext.current
 
     // The orientation the toolbar last asked for. The activity's own orientation (whatever the
     // user's system setting is) is restored on dispose, so leaving the viewer leaves the phone
@@ -447,6 +473,43 @@ private fun ViewerShell(
     // into that accepts input.
     val rdpControls = request is RemoteDesktopRequest.Rdp && !request.target.viewOnly
     var keyboardOpen by remember { mutableStateOf(false) }
+
+    // The clipboard sync. Remote-to-phone is automatic - a copy on the desktop lands on the
+    // phone's clipboard the moment the server announces it, because "copy there, paste here"
+    // with no step in between is what sync means. Phone-to-remote is a button instead of a
+    // listener, on purpose: an Android clipboard listener fires for *everything* the user
+    // copies while the viewer is open, and shipping each of those to a remote machine
+    // silently - passwords copied from a manager included - is exfiltration dressed as a
+    // feature. The button is the consent: one tap, the clipboard that is on the phone right
+    // now goes to the desktop, and nothing else ever does.
+    val clipboardManager = remember(context) {
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    }
+
+    /**
+     * The last text this viewer pushed to the desktop. Some servers announce a client's own
+     * paste back through the clipboard channel, and the phone's clipboard already holds that
+     * text - re-writing it would reset the paste timestamp (and any "copied just now" toast
+     * the system shows) on every push, so the echo is dropped instead of round-tripped.
+     */
+    var lastPushed by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(clipboard) {
+        clipboard.remote.collect { text ->
+            if (!text.isNullOrBlank() && text != lastPushed) {
+                clipboardManager.setPrimaryClip(ClipData.newPlainText("Remote desktop", text))
+            }
+        }
+    }
+
+    /** The phone's current clipboard as plain text, or null when it holds none. */
+    fun phoneClipboardText(): String? =
+        clipboardManager.primaryClip
+            ?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)
+            ?.coerceToText(context)
+            ?.toString()
+            ?.takeIf { it.isNotBlank() }
 
     // Auto-hide, armed only once there is a desktop to use without a toolbar in the way.
     LaunchedEffect(interaction, state, toolbarVisible) {
@@ -576,6 +639,22 @@ private fun ViewerShell(
             } else {
                 null
             },
+            // The clipboard push is offered to both protocols - VNC's copyText and RDP's
+            // /clipboard channel speak the same shape - and hidden for a view-only target, the
+            // same rule the input controls follow: a desktop that cannot be typed into cannot
+            // be pasted into either.
+            onClipboard = if (!request.target.viewOnly) {
+                {
+                    interaction++
+                    val text = phoneClipboardText()
+                    if (text != null) {
+                        lastPushed = text
+                        clipboard.push(text)
+                    }
+                }
+            } else {
+                null
+            },
             onResolution = if (request is RemoteDesktopRequest.Rdp) input.requestResolution else null,
             matchScreen = containerSize,
             onClose = onClose,
@@ -697,7 +776,9 @@ private fun DesktopSurface(
  * beside it stays touchable.
  *
  * [onKeyboard] and [onResolution] are the RDP-only controls; null (the VNC case) leaves them out
- * entirely, so the VNC toolbar is exactly the one that shipped.
+ * entirely, so the VNC toolbar is exactly the one that shipped. [onClipboard] is the one control
+ * both protocols share beyond the originals: the phone's clipboard pushed to whichever desktop
+ * is behind the viewer, hidden for view-only targets the way every input is.
  */
 @Composable
 private fun ViewerToolbar(
@@ -711,6 +792,7 @@ private fun ViewerToolbar(
     onZoomOut: () -> Unit,
     onOrientation: () -> Unit,
     onKeyboard: (() -> Unit)? = null,
+    onClipboard: (() -> Unit)? = null,
     onResolution: ((width: Int, height: Int) -> Unit)? = null,
     matchScreen: IntSize = IntSize.Zero,
     onClose: () -> Unit,
@@ -807,6 +889,11 @@ private fun ViewerToolbar(
             }
             if (onKeyboard != null) {
                 IconButton(onClick = onKeyboard) { Icon(Icons.Default.Keyboard, "Keyboard") }
+            }
+            if (onClipboard != null) {
+                IconButton(onClick = onClipboard) {
+                    Icon(Icons.Default.ContentPaste, "Send the phone's clipboard to the desktop")
+                }
             }
             IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close viewer") }
         }
