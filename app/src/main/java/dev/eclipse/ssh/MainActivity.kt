@@ -2081,6 +2081,9 @@ private fun WorkspaceScaffold(
     onReconnectAskFirst: (Boolean) -> Unit = {},
     onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
+    // The keep-system-bars switch was wired into SettingsScreen and both scaffold call sites, but
+    // never into the scaffold's own parameter list, so all three references failed to resolve.
+    onTerminalKeepSystemBars: (Boolean) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
     verifyPin: suspend (String) -> Boolean = { false },
