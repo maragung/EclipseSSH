@@ -15,6 +15,8 @@ import dev.eclipse.ssh.data.backup.BackupFormatException
 import dev.eclipse.ssh.data.backup.VaultBackup
 import dev.eclipse.ssh.data.credentials.HostCredentialStore
 import dev.eclipse.ssh.data.credentials.KeyEdit
+import dev.eclipse.ssh.data.credentials.RdpCredentialUpdate
+import dev.eclipse.ssh.data.credentials.RdpCredentials
 import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.credentials.HostCredentialUpdate
 import dev.eclipse.ssh.data.credentials.StoredCredentials
@@ -45,6 +47,7 @@ import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isPastAuthentication
+import dev.eclipse.ssh.data.model.isLive
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.Snippet
@@ -53,6 +56,8 @@ import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
+import dev.eclipse.ssh.feature.wakeonlan.WakeOnLan
+import dev.eclipse.ssh.feature.wakeonlan.parseMac
 import dev.eclipse.ssh.presentation.files.FilesExplorerController
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.connectFailureIsFinal
@@ -85,8 +90,11 @@ import dev.eclipse.ssh.ssh.TransferCoordinator
 import dev.eclipse.ssh.ssh.PortForwardingManager
 import dev.eclipse.ssh.ssh.ForwardingHandle
 import dev.eclipse.ssh.background.SessionRegistry
+import dev.eclipse.ssh.background.TransferNotifier
 import dev.eclipse.ssh.security.SecureClipboard
 import dev.eclipse.ssh.security.normalizePastedSecret
+import dev.eclipse.ssh.feature.terminallog.SessionLog
+import dev.eclipse.ssh.feature.terminallog.SilenceDetector
 import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
@@ -121,6 +129,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -148,6 +158,8 @@ class MainViewModel @Inject constructor(
     private val credentialStore: HostCredentialStore,
     private val diagnostics: SessionDiagnostics,
     private val livenessProbe: SessionLivenessProbe,
+    private val wakeOnLan: WakeOnLan,
+    private val transferNotifier: TransferNotifier,
     val filesExplorer: FilesExplorerController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
@@ -198,6 +210,34 @@ class MainViewModel @Inject constructor(
 
     /** When each host's searchable plain text was last rebuilt - see [publishTerminalText]. */
     private val textPublishedAt = ConcurrentHashMap<String, Long>()
+
+    /**
+     * The raw transcript each session keeps for "Save session log", keyed by session key.
+     *
+     * Beside [scrollOffsets] and [textPublishedAt] rather than inside the UI state because it is
+     * written from the collector at output rate and read only when the user exports it - putting a
+     * quarter megabyte of text through [uiState] would rebuild every screen in the app per chunk.
+     * Created by the collector alongside the session's buffer, so a reconnect (which keeps the
+     * same key and the same scrollback) keeps its log too; dropped in the same teardown that
+     * drops [terminalOutput] - [closeTab] and [deleteHost].
+     */
+    private val sessionLogs = ConcurrentHashMap<String, SessionLog>()
+
+    /**
+     * The armed "Notify when done" detector of each session that asked for one, keyed by session
+     * key and held only while an arming is outstanding - a session that has not asked costs
+     * nothing, and one whose detector fired or whose session ended is dropped from here. The
+     * [silenceWatchdog] is what turns their verdicts into notifications.
+     */
+    private val sessionDetectors = ConcurrentHashMap<String, SilenceDetector>()
+
+    /**
+     * The one coroutine that polls every armed [sessionDetectors] entry, started on the first
+     * arming and ending itself when none are left. One watchdog for all sessions rather than one
+     * per session, because the work is a map walk twice a second - a timer per terminal would be
+     * the only part of a quiet session that wakes up.
+     */
+    @Volatile private var silenceWatchdog: Job? = null
 
     /**
      * The command line each host appears to be typing, for the recent-commands list.
@@ -406,6 +446,27 @@ class MainViewModel @Inject constructor(
      * previous attempt rather than let it report against the transport that replaced it.
      */
     private val forwardJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * One lock per host, serialising every pass that stops, releases or binds that host's forwards.
+     *
+     * The reason this exists is the rebind's shape: a new pass (a connect's attach, a reconnect's
+     * ladder, an edit) cancels the previous [forwardJobs] entry and immediately wants the same
+     * ports back - but a bind that is already running cannot be interrupted, only abandoned once it
+     * lands (see [PortForwardingManager] and [abandonForward]). Without a lock, the new pass's stop
+     * could run before the dying pass's handle reached [forwardHandles] - so nothing would release
+     * it - and its bind could race the dying pass's for the same port, the loser reporting "Address
+     * already in use" against nobody. A mutex rather than a job join because joins chain only two
+     * deep: a pass cancelled while waiting on its own predecessor completes early, and the pass
+     * behind it would sail past a predecessor still in flight. The lock is held for the whole pass,
+     * so a cancelled holder unwinds - closing whatever it had just bound - before the next waiter
+     * enters.
+     */
+    private val forwardPasses = ConcurrentHashMap<String, Mutex>()
+
+    /** The serialisation lock for [hostId]'s forwards; see [forwardPasses]. */
+    private fun forwardPassesFor(hostId: String): Mutex =
+        forwardPasses.computeIfAbsent(hostId) { Mutex() }
     /** Remote home directory resolved from the server, keyed by host id. */
     private val homePaths = ConcurrentHashMap<String, String>()
 
@@ -1213,53 +1274,64 @@ class MainViewModel @Inject constructor(
      */
     private fun startSavedForwards(host: HostProfile) {
         forwardJobs.remove(host.id)?.cancel()
-        // Unconditional, including for a host with no rules: this also clears the previous transport's
-        // trackers, and a host whose last rule was just deleted has to end up with nothing bound and
-        // nothing claimed on its tab. [releaseDeadRides] beside it takes the hand-opened tunnels the
-        // dead transport took with it - forwards no rule will ever rebind, so no later pass would.
-        stopSavedForwards(host.id)
-        releaseDeadRides(host.id)
         val rules = decodeForwardRules(host.savedForwards, host.id)
-        // Every rule gets a row before anything is started, so the sheet can say "Disabled" about a
-        // rule that will never bind and "Stopped" about one that only a hand can start - a rule that is
-        // not running is only invisible until the user looks for it. The started ones below overwrite
-        // their row with STARTING the moment their attempt exists.
-        forwardStates.update { current ->
-            current + rules.associate { entry ->
-                entry.id to ForwardStatus(
-                    entry,
-                    when {
-                        !entry.enabled -> ForwardRuntime.DISABLED
-                        // Enabled but not auto-start: a connect brings up the automatic rules and
-                        // deliberately leaves this one for the forwarding sheet's Start button.
-                        else -> ForwardRuntime.STOPPED
-                    },
-                )
-            }
-        }
-        refreshForwardCounters(host.id)
-        updateHostTabs(host.id) { it?.copy(forwardError = null) }
         val toStart = rules.filter { it.enabled && it.autoStart }
-        if (toStart.isEmpty()) return
         val job = transportScope.launch {
-            // Forwards belong to the host, not to whichever terminal came up last, so the session they
-            // ride is the host's primary one - with a single terminal that is the session that just
-            // attached; with several, the first live session the host has.
-            val session = sessionStore.primarySession(host.id)
-            if (session == null) {
-                // Not an error worth a message: the only way to get here is a session that ended between
-                // the shell opening and this line, and whatever ended it is already on the tab. The rows
-                // above already say STOPPED, which is the truth about rules that were never attempted.
-                return@launch
+            // One host's forwards change hands one pass at a time - see [forwardPasses]. The
+            // cancelled predecessor may still be inside a bind, and a bind cannot be interrupted:
+            // without the lock this pass's stop would run before the predecessor's handle landed
+            // in [forwardHandles] - so nothing would release it - and this pass's bind would race
+            // the predecessor's for the same port, the loser reporting "Address already in use"
+            // against nobody.
+            forwardPassesFor(host.id).withLock {
+                // Unconditional, including for a host with no rules: this also clears the previous
+                // transport's trackers, and a host whose last rule was just deleted has to end up
+                // with nothing bound and nothing claimed on its tab. [releaseDeadRides] beside it
+                // takes the hand-opened tunnels the dead transport took with it - forwards no rule
+                // will ever rebind, so no later pass would.
+                stopSavedForwards(host.id)
+                releaseDeadRides(host.id)
+                // Every rule gets a row before anything is started, so the sheet can say "Disabled"
+                // about a rule that will never bind and "Stopped" about one that only a hand can
+                // start - a rule that is not running is only invisible until the user looks for it.
+                // The started ones below overwrite their row with STARTING the moment their attempt
+                // exists. Written after the stop above, because a release takes the released ids'
+                // rows with it.
+                forwardStates.update { current ->
+                    current + rules.associate { entry ->
+                        entry.id to ForwardStatus(
+                            entry,
+                            when {
+                                !entry.enabled -> ForwardRuntime.DISABLED
+                                // Enabled but not auto-start: a connect brings up the automatic
+                                // rules and deliberately leaves this one for the sheet's Start.
+                                else -> ForwardRuntime.STOPPED
+                            },
+                        )
+                    }
+                }
+                refreshForwardCounters(host.id)
+                updateHostTabs(host.id) { it?.copy(forwardError = null) }
+                // Forwards belong to the host, not to whichever terminal came up last, so the
+                // session they ride is the host's primary one - with a single terminal that is the
+                // session that just attached; with several, the first live session the host has.
+                val session = sessionStore.primarySession(host.id)
+                if (session == null) {
+                    // Not an error worth a message: the only way to get here is a session that
+                    // ended between the shell opening and this line, and whatever ended it is
+                    // already on the tab. The rows above already say STOPPED, which is the truth
+                    // about rules that were never attempted.
+                    return@launch
+                }
+                val failures = startForwardBatch(host, session, toStart)
+                if (failures.isEmpty()) return@launch
+                val reason = failures.joinToString(" · ")
+                updateHostTabs(host.id) { it?.copy(forwardError = reason) }
+                // One message for the whole set, and it names the host: this fires on a reconnect
+                // the user may not have asked for, so a snackbar per failed rule on a flaky link
+                // would be a queue of notifications about the same two ports.
+                report("Port forwarding on ${host.name}: $reason")
             }
-            val failures = startForwardBatch(host, session, toStart)
-            if (failures.isEmpty()) return@launch
-            val reason = failures.joinToString(" · ")
-            updateHostTabs(host.id) { it?.copy(forwardError = reason) }
-            // One message for the whole set, and it names the host: this fires on a reconnect the user
-            // may not have asked for, so a snackbar per failed rule on a flaky link would be a queue of
-            // notifications about the same two ports.
-            report("Port forwarding on ${host.name}: $reason")
         }
         forwardJobs[host.id] = job
         job.invokeOnCompletion { forwardJobs.remove(host.id, job) }
@@ -1283,6 +1355,9 @@ class MainViewModel @Inject constructor(
         // holding it - see [pendingReleases]. Joined as a set because one close serves several ids, and
         // joining another host's moment-long close is cheaper than being wrong about whose port it was.
         pendingReleases.values.toSet().forEach { it.join() }
+        // A bind this caller is cancelled out of is closed and registered rather than dropped, so
+        // the next bind of the same rule waits for the port it is giving back instead of racing it.
+        val abandon: (ForwardingHandle) -> Unit = { handle -> abandonForward(entry.id, handle) }
         return when (entry.type) {
             ForwardType.LOCAL -> portForwardingManager.startLocal(
                 session,
@@ -1290,6 +1365,7 @@ class MainViewModel @Inject constructor(
                 entry.localPort,
                 entry.remoteHost.orEmpty(),
                 entry.remotePort ?: 0,
+                abandon,
             )
             ForwardType.REMOTE -> portForwardingManager.startRemote(
                 session,
@@ -1297,9 +1373,27 @@ class MainViewModel @Inject constructor(
                 entry.remotePort ?: 0,
                 entry.localHost ?: DEFAULT_FORWARD_LISTEN_HOST,
                 entry.localPort,
+                abandon,
             )
-            ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort)
+            ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort, abandon)
         }
+    }
+
+    /**
+     * Closes a forward whose handle never reached [forwardHandles], and registers the close so the
+     * next bind of the same rule waits for it.
+     *
+     * Two callers, one shape: a bind that finished after its caller's reason for wanting it was
+     * taken away. The batch path's is a Stop (or a rewrite) that arrived while the bind was in
+     * flight and left STOPPED standing over the STARTING row; the manager's is a cancelled rebind
+     * whose `withContext` would otherwise discard a bound tracker on the way out. In both cases the
+     * port was genuinely claimed, so the close is registered in [pendingReleases] exactly like
+     * [releaseForwards] registers its own - a Start on the same rule must not race the give-back.
+     */
+    private fun abandonForward(id: String, handle: ForwardingHandle) {
+        val close = releaseScope.launch { runCatching { handle.close() } }
+        pendingReleases[id] = close
+        close.invokeOnCompletion { pendingReleases.remove(id, close) }
     }
 
     /**
@@ -1358,12 +1452,10 @@ class MainViewModel @Inject constructor(
                 // rewritten underneath it. Closed by hand because it never reached [forwardHandles],
                 // so no other path knows it exists.
                 if (forwardStates.value[entry.id]?.state == ForwardRuntime.STOPPED) {
-                    // Registered in [pendingReleases] like every other close, because the port this
-                    // handle just claimed is being given back and a Start on the same rule would race
-                    // it exactly like a rebind races a release.
-                    val close = releaseScope.launch { runCatching { handle.close() } }
-                    pendingReleases[entry.id] = close
-                    close.invokeOnCompletion { pendingReleases.remove(entry.id, close) }
+                    // Registered like every other close, because the port this handle just claimed
+                    // is being given back and a Start on the same rule would race it exactly like a
+                    // rebind races a release.
+                    abandonForward(entry.id, handle)
                     refreshForwardCounters(host.id)
                     return@forEach
                 }
@@ -1683,6 +1775,10 @@ class MainViewModel @Inject constructor(
     ): Job = viewModelScope.launch(Dispatchers.Default) {
         val incoming = Channel<ByteArray>(Channel.UNLIMITED)
         val decoder = Utf8StreamDecoder()
+        // Created here rather than beside the buffer in `connect` so every path that starts a
+        // collector - a fresh connect, an adopted session, a reconnect - gets one, and so a
+        // reconnect (same session key, same scrollback) keeps the log it already had.
+        val sessionLog = sessionLogs.getOrPut(sessionKey) { SessionLog() }
         // Answers to the queries the remote side sends: a cursor-position report, a device-attributes
         // reply. The buffer produces them while parsing and cannot write them itself; without this a
         // program that asks where the cursor is - anything using readline for a multi-line prompt -
@@ -1878,7 +1974,16 @@ class MainViewModel @Inject constructor(
                     // Decoded here rather than in the channel because the state that matters - the
                     // two or three bytes of a codepoint that straddled a network read - lives between
                     // chunks. See [Utf8StreamDecoder].
-                    buffer.feed(decoder.decode(chunk!!))
+                    val decoded = decoder.decode(chunk!!)
+                    buffer.feed(decoded)
+                    // The single tee point for everything a session showed: every decoded chunk
+                    // passes through here on its way to the buffer, so the session log and the
+                    // notify-when-done detector see exactly what the terminal saw. Typed input
+                    // needs no second plumbing - there is no local echo; a keystroke is written to
+                    // the channel and comes back through `terminal.output` like any other output,
+                    // so it reaches this tee when the shell echoes it.
+                    sessionLog.append(decoded)
+                    sessionDetectors[sessionKey]?.onOutput()
                     chunk = incoming.tryReceive().getOrNull()
                 } while (chunk != null)
                 pinScrollback(sessionKey, buffer, before)
@@ -1914,7 +2019,15 @@ class MainViewModel @Inject constructor(
             // A truncated codepoint at the end of the stream becomes one replacement character
             // instead of vanishing, so a session cut mid-character still ends with what arrived.
             val tail = decoder.flush()
-            if (tail.isNotEmpty()) buffer.feed(tail)
+            // The same tail goes into the session log - it is real output, the last thing the
+            // session ever said, and a log that stops one character short of the farewell it was
+            // built to keep would be a strange one. It also feeds the detector, for symmetry with
+            // the tee above; a session ending here disarms it via the watchdog's tab check.
+            if (tail.isNotEmpty()) {
+                buffer.feed(tail)
+                sessionLog.append(tail)
+                sessionDetectors[sessionKey]?.onOutput()
+            }
             // Unconditionally, and past the throttle. Cancelling `transcript` above cancels whatever
             // catch-up it still owed, and at the end of a session there is no next chunk to trigger
             // another one - so a shell whose last second was throttled ended with its farewell on
@@ -2434,6 +2547,49 @@ class MainViewModel @Inject constructor(
     /** One whole line of the buffer, for double-tap word selection and select-line. */
     fun terminalLineText(sessionKey: String, line: Int): String =
         terminalBuffers[sessionKey]?.textIn(line, 0, line, Int.MAX_VALUE).orEmpty()
+
+    /**
+     * The raw transcript of one session, for "Save session log".
+     *
+     * Read on demand rather than pushed through [uiState] because it is only ever wanted at the
+     * moment the user taps export - see [sessionLogs]. Null when the session has no log (its tab
+     * was closed or it never connected), empty when it has simply not produced output yet; the
+     * caller treats both as "nothing to save".
+     */
+    fun sessionLogText(sessionKey: String): String? = sessionLogs[sessionKey]?.snapshot()
+
+    /**
+     * Arms "Notify when done" for one session: a notification when the session's output - which
+     * must arrive *after* this call, so an idle shell is not mistaken for a finished command - has
+     * gone quiet. See [SilenceDetector] for why quiet is the signal.
+     *
+     * One notification per arming: the detector disarms itself when it fires, and re-arming (this
+     * call again) is how the user asks about the next command. The arming is dropped without a
+     * notification when the session ends, which the watchdog notices from the tab's state - a
+     * session that died under a command did not "finish" it.
+     */
+    fun notifyWhenDone(sessionKey: String) {
+        sessionDetectors.getOrPut(sessionKey) { SilenceDetector() }.arm()
+        // Restarting rather than relying on a session-lifetime loop: the watchdog ends itself when
+        // the last detector is dropped, so a session that never asks never wakes anything, and this
+        // check is what brings polling back.
+        if (silenceWatchdog?.isActive == true) return
+        silenceWatchdog = viewModelScope.launch {
+            while (true) {
+                delay(NOTIFY_WHEN_DONE_POLL_MS)
+                sessionDetectors.entries.removeIf { (key, detector) ->
+                    val tab = tabs.value.firstOrNull { it.id == key }
+                    // Gone or no longer live: the session ended, so the wait is over either way
+                    // and there is nothing to report - the ending itself is what the tab shows.
+                    if (tab == null || !tab.state.isLive) return@removeIf true
+                    if (!detector.poll()) return@removeIf false
+                    transferNotifier.notifyTerminalDone(key, tab.title)
+                    true
+                }
+                if (sessionDetectors.isEmpty()) break
+            }
+        }
+    }
 
     /**
      * Hands [bytes] to the session's outbound queue, in the order the caller produced them.
@@ -3238,26 +3394,31 @@ class MainViewModel @Inject constructor(
      * may not exist.
      */
     private suspend fun startHandForward(host: HostProfile, entry: ForwardEntry, failureTitle: String) {
-        val sessionKey = sessionStore.primarySessionFor(host.id)
-        val session = sessionStore.primarySession(host.id) ?: return report("${host.name} is not connected")
-        setForwardState(entry, ForwardRuntime.STARTING)
-        try {
-            val handle = openForward(session, entry)
-            forwardHandles[entry.id] = handle
-            if (sessionKey != null) forwardRides[entry.id] = ForwardRide(sessionKey, session)
-            forwardings.update { it + entry }
-            setForwardState(entry, ForwardRuntime.RUNNING)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            reportForwardFailure(failureTitle, error)
-            setForwardState(
-                entry,
-                ForwardRuntime.FAILED,
-                error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName,
-            )
+        // Same wait as [startForwardRule]: a rebind in flight for this host has binds that have not
+        // reached [forwardHandles] yet, and a hand-opened port colliding with one of them would
+        // fail against a tunnel nothing can name.
+        forwardPassesFor(host.id).withLock {
+            val sessionKey = sessionStore.primarySessionFor(host.id)
+            val session = sessionStore.primarySession(host.id) ?: return report("${host.name} is not connected")
+            setForwardState(entry, ForwardRuntime.STARTING)
+            try {
+                val handle = openForward(session, entry)
+                forwardHandles[entry.id] = handle
+                if (sessionKey != null) forwardRides[entry.id] = ForwardRide(sessionKey, session)
+                forwardings.update { it + entry }
+                setForwardState(entry, ForwardRuntime.RUNNING)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                reportForwardFailure(failureTitle, error)
+                setForwardState(
+                    entry,
+                    ForwardRuntime.FAILED,
+                    error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName,
+                )
+            }
+            refreshForwardCounters(host.id)
         }
-        refreshForwardCounters(host.id)
     }
 
     /**
@@ -3324,24 +3485,30 @@ class MainViewModel @Inject constructor(
             val entry = forwardStates.value[ruleId]?.entry
                 ?: decodeForwardRules(host.savedForwards, host.id).firstOrNull { it.id == ruleId }
                 ?: return@launch
-            // Already up, or on its way up: re-attempting a running rule would find its own port
-            // claimed and report a conflict with itself. The *displayed* state is what decides,
-            // because a recorded RUNNING whose session has died is a tunnel that no longer exists.
-            val recorded = forwardStates.value[ruleId]
-            if (forwardHandles.containsKey(ruleId) && recorded != null &&
-                displayedForwardState(recorded, tabs.value) == ForwardRuntime.RUNNING
-            ) return@launch
-            val session = sessionStore.primarySession(hostId) ?: run {
-                setForwardState(entry, ForwardRuntime.STOPPED)
-                refreshForwardCounters(hostId)
-                report("${host.name} is not connected")
-                return@launch
+            // One host's forwards change hands one pass at a time - see [forwardPasses]. A rebind in
+            // flight for this host has binds that have not reached [forwardHandles] yet, so the
+            // guard below could not see them; waiting costs nothing and the guard then decides on
+            // settled books.
+            forwardPassesFor(hostId).withLock {
+                // Already up, or on its way up: re-attempting a running rule would find its own port
+                // claimed and report a conflict with itself. The *displayed* state is what decides,
+                // because a recorded RUNNING whose session has died is a tunnel that no longer exists.
+                val recorded = forwardStates.value[ruleId]
+                if (forwardHandles.containsKey(ruleId) && recorded != null &&
+                    displayedForwardState(recorded, tabs.value) == ForwardRuntime.RUNNING
+                ) return@launch
+                val session = sessionStore.primarySession(hostId) ?: run {
+                    setForwardState(entry, ForwardRuntime.STOPPED)
+                    refreshForwardCounters(hostId)
+                    report("${host.name} is not connected")
+                    return@launch
+                }
+                val failures = startForwardBatch(host, session, listOf(entry))
+                if (failures.isEmpty()) return@launch
+                val reason = failures.joinToString(" · ")
+                updateHostTabs(hostId) { it?.copy(forwardError = reason) }
+                report("Port forwarding on ${host.name}: $reason")
             }
-            val failures = startForwardBatch(host, session, listOf(entry))
-            if (failures.isEmpty()) return@launch
-            val reason = failures.joinToString(" · ")
-            updateHostTabs(hostId) { it?.copy(forwardError = reason) }
-            report("Port forwarding on ${host.name}: $reason")
         }
     }
 
@@ -3382,36 +3549,45 @@ class MainViewModel @Inject constructor(
             // A rebind still running for the previous column is working from stale rules; abandoning it
             // costs at most a STARTING row, which the rewrite below replaces.
             forwardJobs.remove(hostId)?.cancel()
-            // Removed and changed rules only - unchanged ids keep their tunnels.
-            releaseForwards(oldIds - newIds)
-            forwardStates.update { current ->
-                val next = current.toMutableMap()
-                saved.forEach { entry ->
-                    // A handle on a live session is a tunnel that is up right now, whatever the row
-                    // said a moment ago - including a row a just-cancelled rebind never finished
-                    // writing. An id that survived the edit with its tunnel intact keeps both.
-                    val running = forwardHandles.containsKey(entry.id) && forwardRideIsLive(entry.id)
-                    next[entry.id] = when {
-                        !entry.enabled -> ForwardStatus(entry, ForwardRuntime.DISABLED)
-                        running -> ForwardStatus(entry, ForwardRuntime.RUNNING)
-                        else -> ForwardStatus(entry, ForwardRuntime.STOPPED)
-                    }
-                }
-                next
-            }
-            refreshForwardCounters(hostId)
-            updateHostTabs(hostId) { it?.copy(forwardError = null) }
-            val toStart = saved.filter { it.enabled && it.autoStart && !forwardHandles.containsKey(it.id) }
-            if (toStart.isEmpty() || sessionStore.primarySession(hostId) == null) return@launchGuarded
             val job = transportScope.launch {
-                // Asked for here rather than carried from before the launch, so a session that died
-                // while the save was in flight is not handed to the bind as though it were alive.
-                val session = sessionStore.primarySession(hostId) ?: return@launch
-                val failures = startForwardBatch(host, session, toStart)
-                if (failures.isEmpty()) return@launch
-                val reason = failures.joinToString(" · ")
-                updateHostTabs(hostId) { it?.copy(forwardError = reason) }
-                report("Port forwarding on ${host.name}: $reason")
+                // One host's forwards change hands one pass at a time - see [forwardPasses]. The
+                // cancelled predecessor may still be inside a bind for one of the old ids, and a
+                // bind cannot be interrupted: without the lock the release below could run before
+                // the predecessor's handle landed in [forwardHandles] - so nothing would release
+                // it - and this pass's bind would race it for the same port.
+                forwardPassesFor(hostId).withLock {
+                    // Removed and changed rules only - unchanged ids keep their tunnels.
+                    releaseForwards(oldIds - newIds)
+                    forwardStates.update { current ->
+                        val next = current.toMutableMap()
+                        saved.forEach { entry ->
+                            // A handle on a live session is a tunnel that is up right now, whatever
+                            // the row said a moment ago - including a row a just-cancelled rebind
+                            // never finished writing. An id that survived the edit with its tunnel
+                            // intact keeps both.
+                            val running = forwardHandles.containsKey(entry.id) && forwardRideIsLive(entry.id)
+                            next[entry.id] = when {
+                                !entry.enabled -> ForwardStatus(entry, ForwardRuntime.DISABLED)
+                                running -> ForwardStatus(entry, ForwardRuntime.RUNNING)
+                                else -> ForwardStatus(entry, ForwardRuntime.STOPPED)
+                            }
+                        }
+                        next
+                    }
+                    refreshForwardCounters(hostId)
+                    updateHostTabs(hostId) { it?.copy(forwardError = null) }
+                    val toStart = saved.filter { it.enabled && it.autoStart && !forwardHandles.containsKey(it.id) }
+                    if (toStart.isEmpty()) return@launch
+                    // Asked for here rather than carried from before the launch, so a session that
+                    // died while the save was in flight is not handed to the bind as though it
+                    // were alive.
+                    val session = sessionStore.primarySession(hostId) ?: return@launch
+                    val failures = startForwardBatch(host, session, toStart)
+                    if (failures.isEmpty()) return@launch
+                    val reason = failures.joinToString(" · ")
+                    updateHostTabs(hostId) { it?.copy(forwardError = reason) }
+                    report("Port forwarding on ${host.name}: $reason")
+                }
             }
             forwardJobs[hostId] = job
             job.invokeOnCompletion { forwardJobs.remove(hostId, job) }
@@ -3440,13 +3616,63 @@ class MainViewModel @Inject constructor(
     }
 
     /**
+     * Persists [hostId]'s RDP endpoint. The same validation rule as [saveRemoteDesktopTarget] -
+     * re-read what the packed-text column will say and refuse an endpoint that does not survive the
+     * trip - plus the one rule an RDP save has and a VNC save does not: the R line is written into a
+     * column that may already carry a V line, and that line must come through the save untouched.
+     */
+    fun saveRdpTarget(hostId: String, target: RemoteDesktopTarget) {
+        launchGuarded("Could not save the RDP target") {
+            val host = hostRepository.hosts.first().firstOrNull { it.id == hostId }
+                ?: return@launchGuarded report("The host for this target no longer exists")
+            val text = encodeRemoteDesktop(
+                decodeRemoteDesktop(host.remoteDesktop).copy(rdp = target),
+            )
+            if (decodeRemoteDesktop(text).rdp == null ||
+                decodeRemoteDesktop(text).vnc != decodeRemoteDesktop(host.remoteDesktop).vnc
+            ) {
+                return@launchGuarded report("That RDP endpoint could not be saved")
+            }
+            hostRepository.save(host.copy(remoteDesktop = text))
+        }
+    }
+
+    /**
      * Where the viewer's tunnel gets its SSH session, asked fresh on every (re)connect. A provider
      * and not a session because the viewer outlives the session it started with: SSH's own
      * reconnect ladder may have replaced the transport in between, and the viewer's Reconnect
      * wants whatever the host has *then*, not the object it was handed at open.
      */
-    fun vncSessionProvider(hostId: String): () -> ClientSession? =
+    fun remoteDesktopSessionProvider(hostId: String): () -> ClientSession? =
         { sessionStore.primarySession(hostId) }
+
+    /**
+     * Saves [hostId]'s RDP credential — the NLA username, domain and password — independently of the
+     * host profile, the same split [saveHost] makes: a credential write that cannot complete is
+     * reported, never allowed to take an endpoint edit down with it.
+     *
+     * Nothing consumes the credential yet; the RDP tunnel that will answer NLA challenges with it
+     * lands with the viewer. The store is the durable half of that feature, so it arrives first.
+     */
+    fun saveRdpCredentials(hostId: String, update: RdpCredentialUpdate) {
+        launchGuarded("Could not save the RDP credentials") {
+            credentialStore.applyRdp(hostId, update)
+        }
+    }
+
+    /**
+     * Reads [hostId]'s saved RDP credential and hands it to [onReady], or null when none is stored.
+     *
+     * A callback rather than a return because the read decrypts on [Dispatchers.IO] — the viewer's
+     * NLA prompt will call this when a challenge arrives, and a suspend call from a click handler is
+     * exactly the shape that would otherwise end up blocking a frame. Failures read as null, the
+     * same direction every read in this store falls back to: asking the user again is recoverable.
+     */
+    fun rdpCredentials(hostId: String, onReady: (RdpCredentials?) -> Unit) {
+        viewModelScope.launch {
+            onReady(runCatching { credentialStore.rdpCredentials(hostId) }.getOrNull())
+        }
+    }
 
     /**
      * Reads uptime, load, memory and disk usage from [host] for the server card.
@@ -3688,6 +3914,10 @@ class MainViewModel @Inject constructor(
         tabs.value = tabs.value.filterNot { it.id == tab.id }
         terminalOutput.update { it - tab.id }
         terminalFrames.update { it - tab.id }
+        sessionLogs.remove(tab.id)
+        // Silently: a tab the user closed is not a command that finished, and the notification
+        // would arrive for a session that no longer exists.
+        sessionDetectors.remove(tab.id)
         scrollOffsets.remove(tab.id)
         textPublishedAt.remove(tab.id)
         typedLines.remove(tab.id)
@@ -3772,6 +4002,9 @@ class MainViewModel @Inject constructor(
             // secret the user just asked to be rid of. Silent like [deleteHost]'s unregister: the
             // credential-store result below is the one worth a sentence.
             runCatching { sessionRegistry.unregister(host.id) }
+            // The one forget covers the RDP credential with the SSH fields: the store's own rule is
+            // that "forget this host" means everything durably stored for it, so an NLA username
+            // and password cannot survive the action the user asked to be rid of every secret.
             runCatching { credentialStore.forget(host.id) }
                 .onSuccess { report("Forgot saved credentials for ${host.name}") }
                 .onFailure { error -> report("Could not forget credentials for ${host.name}", error) }
@@ -3828,7 +4061,63 @@ class MainViewModel @Inject constructor(
                 runCatching { credentialStore.apply(copy.id, update) }
                     .onFailure { error -> report("Duplicated ${host.name}, but its credentials could not be copied", error) }
             }
+            // The RDP credential rides along for the same reason the SSH one does: the copy dials
+            // the same box, so its NLA answer is the same account. Re-encrypted under the new id,
+            // never shared, so forgetting either host's leaves the other's alone.
+            val rdp = runCatching { credentialStore.rdpCredentials(host.id) }.getOrNull()
+            if (rdp != null) {
+                runCatching {
+                    credentialStore.applyRdp(
+                        copy.id,
+                        RdpCredentialUpdate(
+                            username = SecretEdit.Replace(rdp.username),
+                            domain = rdp.domain?.let(SecretEdit::Replace) ?: SecretEdit.Keep,
+                            password = SecretEdit.Replace(rdp.password),
+                        ),
+                    )
+                }.onFailure { error -> report("Duplicated ${host.name}, but its RDP credentials could not be copied", error) }
+            }
             report("Duplicated ${host.name} as $name")
+        }
+    }
+
+    /**
+     * Sends one host's Wake-on-LAN magic packet.
+     *
+     * Deliberately needs no session, no credentials and no reachability: the whole premise of the
+     * feature is that the machine is off and nothing on it can answer, so nothing here touches
+     * [SshConnectionManager], the session store or the reconnect ladder - a wake is not a connect and
+     * must never look like one on a tab.
+     *
+     * A host with no address saved (or one that no longer parses, which can only happen through a
+     * hand-edited backup, since the form refuses to save one) is answered with a sentence pointing
+     * at Edit rather than silence, because an item in the menu that does nothing is indistinguishable
+     * from a broken one.
+     *
+     * Reports "packet sent", never "host is awake": there is no acknowledgement in Wake-on-LAN, and
+     * the machine may take a minute to boot even when the wake worked. Whether it is up is answered
+     * by the user tapping Connect.
+     */
+    fun wakeHost(host: HostProfile) {
+        val mac = parseMac(host.wakeOnLanMac)
+        if (mac == null) {
+            report("No Wake-on-LAN address saved for ${host.name} — add one in Edit")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                // A socket call: Dispatchers.IO, never the main thread, exactly like every other
+                // network operation in this class. viewModelScope dispatches on Main.immediate.
+                withContext(Dispatchers.IO) { wakeOnLan.wake(mac) }
+                report("Wake-on-LAN packet sent to ${host.name}")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                // The socket's own story ("network unreachable", "no route to host") is the useful
+                // half here: it is the difference between the phone being off the LAN and the
+                // radio being off entirely.
+                report("Wake-on-LAN for ${host.name} failed", error)
+            }
         }
     }
 
@@ -3877,6 +4166,8 @@ class MainViewModel @Inject constructor(
             tabs.value = tabs.value.filterNot { it.hostId == host.id }
             terminalOutput.update { current -> current - keys.toSet() }
             terminalFrames.update { current -> current - keys.toSet() }
+            keys.forEach { key -> sessionLogs.remove(key) }
+            keys.forEach { key -> sessionDetectors.remove(key) }
             commandHistory.value = commandHistory.value - host.id
             serverStats.update { it - host.id }
             remoteListings.update { it - host.id }
@@ -4009,6 +4300,7 @@ class MainViewModel @Inject constructor(
             settingsRepository.setTerminalTheme(settings.terminalTheme)
             settingsRepository.setBlockScreenshots(settings.blockScreenshots)
             settingsRepository.setReconnectAskFirst(settings.reconnectAskFirst)
+            settingsRepository.setVaultAutoLockMinutes(settings.vaultAutoLockMinutes)
             report("Imported ${hosts.size} host(s)")
         }
     }
@@ -4087,6 +4379,7 @@ class MainViewModel @Inject constructor(
     fun setBiometricUnlock(enabled: Boolean) = writeSetting("the unlock setting") { settingsRepository.setBiometricUnlock(enabled) }
     fun setBlockScreenshots(enabled: Boolean) = writeSetting("the screenshot setting") { settingsRepository.setBlockScreenshots(enabled) }
     fun setReconnectAskFirst(enabled: Boolean) = writeSetting("the reconnect prompt setting") { settingsRepository.setReconnectAskFirst(enabled) }
+    fun setVaultAutoLockMinutes(minutes: Int) = writeSetting("the vault auto-lock delay") { settingsRepository.setVaultAutoLockMinutes(minutes) }
     fun setDarkTheme(enabled: Boolean) = writeSetting("the theme setting") { settingsRepository.setDarkTheme(enabled) }
     fun setClipboardSeconds(seconds: Int) = writeSetting("the clipboard timeout") { settingsRepository.setClipboardSeconds(seconds) }
     fun setKeepAliveSeconds(seconds: Int) = writeSetting("the keep-alive interval") { settingsRepository.setKeepAliveSeconds(seconds) }
@@ -4397,6 +4690,13 @@ class MainViewModel @Inject constructor(
 
         /** A sane bound on the reconstructed command line, so a `cat` of binary cannot grow it. */
         const val MAX_TYPED_LINE = 4_096
+
+        /**
+         * How often the armed notify-when-done detectors are asked whether their session has gone
+         * quiet. A quarter of [SilenceDetector.SILENCE_MS], so the notification lands within a
+         * beat of the silence being real rather than up to a whole window late.
+         */
+        const val NOTIFY_WHEN_DONE_POLL_MS = 500L
 
         /**
          * Resource name given to a key picked from the file picker, for the parser's error messages.

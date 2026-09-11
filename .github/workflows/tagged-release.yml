@@ -11,7 +11,7 @@
 # maintainer has to hit "Publish" in the GitHub UI. A v1.2.3-rc.1 tag
 # is also marked pre-release automatically.
 #
-# Toolchain is pinned to JDK 17.0.13, Android SDK 35, build-tools 35.0.0
+# Toolchain is pinned to JDK 17.0.13, Android SDK 37, build-tools 36.0.0
 # on ubuntu-24.04. Every action is pinned to a commit SHA.
 name: Tagged release
 
@@ -29,8 +29,8 @@ concurrency:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
-  BUILD_TOOLS: '35.0.0'
-  COMPILE_SDK: 'android-35'
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: 'android-37.0'
   TARGET_SDK: 'android-35'
   # Same pins as ci.yml; the root-invoked assemble/bundle tasks compile the
   # :freerdp module, whose native build needs them.
@@ -47,12 +47,12 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up JDK 17.0.13
-        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
         with:
           distribution: temurin
           java-version: '17.0.13'
@@ -80,10 +80,10 @@ jobs:
           ninja --version
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
@@ -123,7 +123,7 @@ jobs:
       - name: Cache the FreeRDP native build tree
         # Same entry ci.yml restores; placed after `clean` so the restored
         # tree survives into the build.
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -239,7 +239,7 @@ jobs:
             echo
             echo "### Verification"
             echo
-            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 35, build-tools 35.0.0, NDK 29.0.13113456)"
+            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 37, build-tools 36.0.0, NDK 29.0.13113456)"
             echo "- All release APKs verified with \`apksigner verify\` (v2 + v3)"
             echo "- The AAB is verified and uploaded alongside the per-ABI APKs"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
@@ -257,7 +257,7 @@ jobs:
           cat RELEASE_NOTES.md
 
       - name: Create the GitHub release
-        uses: softprops/action-gh-release@80dccdfcca550bfea3bec6643ce0294b259a33d9 # v2.0.4
+        uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564 # v2.0.4
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: "EclipseSSH ${{ steps.meta.outputs.version }}"

@@ -236,8 +236,8 @@ data class HostProfile(
      */
     val savedForwards: String = "",
     /**
-     * The remote-desktop endpoints saved on this host, one line per protocol - `V:5900` for VNC,
-     * with an `R:...` shape reserved for RDP. Encoded by [encodeRemoteDesktop] and read back by
+     * The remote-desktop endpoints saved on this host, one line per protocol - `V:5900` for
+     * VNC, `R:3389` for RDP. Encoded by [encodeRemoteDesktop] and read back by
      * [decodeRemoteDesktop], which doubles as validation exactly like [savedForwards] above it:
      * the column can arrive from a hand-edited backup file.
      *
@@ -246,6 +246,21 @@ data class HostProfile(
      * no secrets - host, port and flags - so it travels in vault backups in the clear.
      */
     val remoteDesktop: String = "",
+    /**
+     * The MAC address this host's network card can be woken with, or empty when the host has none.
+     *
+     * Stored as the text the user typed — colons, dashes or bare hex, whatever spelling they chose —
+     * and parsed at the moment it is used by `parseMac`, which is the same parser the form validates
+     * with and the vault importer checks against, so the three cannot disagree about what a MAC is.
+     * Not normalised on the way in, because a host edited on another device should read back exactly
+     * the way its owner wrote it.
+     *
+     * Empty rather than null for the same reason [startupCommand] is: "no address" and "never
+     * configured" are the same thing here, so a second way to say it would only give read sites a
+     * null to forget about. The kebab menu's Wake on LAN item is what consumes it, and it needs no
+     * SSH session - the whole point is that the server is asleep.
+     */
+    val wakeOnLanMac: String = "",
     /**
      * What to do when this host presents a key that is not in known-hosts.
      *
@@ -298,7 +313,8 @@ data class HostProfile(
         // printed. Their *presence* is, because "the startup command did not run" is a real report and
         // an answer of `null` versus `***` is the first thing that narrows it.
         "startupCommand=${redacted(startupCommand)}, environment=${redacted(environment)}, " +
-        "savedForwards=$savedForwards, remoteDesktop=$remoteDesktop, agentForwarding=$agentForwarding, " +
+        "savedForwards=$savedForwards, remoteDesktop=$remoteDesktop, wakeOnLanMac=$wakeOnLanMac, " +
+            "agentForwarding=$agentForwarding, " +
         "hostKeyPolicy=$hostKeyPolicy)"
 
     companion object {
@@ -807,6 +823,19 @@ data class AppSettings(
      */
     val terminalMinColumns: Int = 80,
     val pinEnabled: Boolean = false,
+    /**
+     * How long the app may sit in the background before the vault asks for the PIN (or biometric)
+     * again, in minutes. 0 means never re-lock.
+     *
+     * The countdown starts the moment the app leaves the foreground and the lock is applied when it
+     * next comes back — see [dev.eclipse.ssh.feature.vault.shouldRelockVault] and the ON_START
+     * observer in `MainActivity`. 5 by default: long enough that glancing at a password manager or
+     * answering a message and coming straight back does not ask again, short enough that a phone
+     * left on a desk for a few minutes is not an open vault. Only meaningful while a lock is
+     * actually configured: with no PIN set there is no lock screen to return to, and the setting is
+     * inert (the row's subtitle says so).
+     */
+    val vaultAutoLockMinutes: Int = 5,
     val legacyAlgorithms: Boolean = false,
     val terminalTheme: String = TerminalTheme.DARK.name,
     /**

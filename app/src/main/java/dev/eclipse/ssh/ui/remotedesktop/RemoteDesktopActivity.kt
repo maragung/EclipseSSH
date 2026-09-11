@@ -8,6 +8,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import dagger.hilt.android.AndroidEntryPoint
+import dev.eclipse.ssh.data.credentials.RdpCredentials
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -25,16 +26,16 @@ import org.apache.sshd.client.session.ClientSession
  * immersive fullscreen with no chrome to tap by accident, and an orientation the user can lock
  * from the toolbar without rotating the terminal behind it.
  *
- * The session the tunnel rides is handed over through [VncRequests] rather than the intent,
- * because a [ClientSession] is a live object an intent cannot parcel. The token is consumed on
- * arrival, so a stale intent (a recents re-delivery, a crash and relaunch) finds nothing to
- * reopen and the activity finishes.
+ * The session the tunnel rides is handed over through [RemoteDesktopRequests] rather than the
+ * intent, because a [ClientSession] is a live object an intent cannot parcel. The token is
+ * consumed on arrival, so a stale intent (a recents re-delivery, a crash and relaunch) finds
+ * nothing to reopen and the activity finishes.
  *
- * The [VncRequest.sessionProvider] is a *provider* and not a session on purpose: the viewer is
- * single-shot per connection ([dev.eclipse.ssh.vnc.VncTunnel] owns exactly one), so its
- * Reconnect button needs a fresh answer to "what session does this host have now", not the
- * session it happened to start with. Re-dialling stays in the view model, where every other
- * dial lives; the provider here only ever reports what the host already has.
+ * Every variant's `sessionProvider` is a *provider* and not a session on purpose: the viewer is
+ * single-shot per connection (each tunnel owns exactly one), so its Reconnect button needs a
+ * fresh answer to "what session does this host have now", not the session it happened to start
+ * with. Re-dialling stays in the view model, where every other dial lives; the provider here
+ * only ever reports what the host already has.
  */
 @AndroidEntryPoint
 class RemoteDesktopActivity : ComponentActivity() {
@@ -47,7 +48,7 @@ class RemoteDesktopActivity : ComponentActivity() {
         // the same way. The viewer supplies its own inset handling (which is: none - the desktop
         // goes under the bars and the toolbar floats above it).
         enableEdgeToEdge()
-        val request = intent?.getStringExtra(EXTRA_REQUEST_TOKEN)?.let(VncRequests::take)
+        val request = intent?.getStringExtra(EXTRA_REQUEST_TOKEN)?.let(RemoteDesktopRequests::take)
         if (request == null) {
             finish()
             return
@@ -65,40 +66,68 @@ class RemoteDesktopActivity : ComponentActivity() {
     }
 
     companion object {
-        /** The intent extra carrying the [VncRequests] token. */
+        /** The intent extra carrying the [RemoteDesktopRequests] token. */
         const val EXTRA_REQUEST_TOKEN = "dev.eclipse.ssh.remotedesktop.REQUEST_TOKEN"
     }
 }
 
 /**
  * One remote-desktop viewing request: the endpoint as saved on the host, and where to get the
- * SSH session the tunnel rides.
+ * SSH session the tunnel rides. One variant per protocol the viewer speaks - the shared half
+ * is what the shell renders (the endpoint, the session, the target's flags); the variant is
+ * what the screen drives with it.
  *
  * [hostName] travels along only for the screen to say whose desktop this is - the viewer never
  * touches the profile, and saving a changed endpoint is the menu's job, not the viewer's.
  */
-class VncRequest(
-    val hostName: String,
-    val target: RemoteDesktopTarget,
-    val sessionProvider: () -> ClientSession?,
-)
+sealed interface RemoteDesktopRequest {
+    val hostName: String
+    val target: RemoteDesktopTarget
+    val sessionProvider: () -> ClientSession?
+
+    /** A VNC desktop: the RFB viewer dials the target and asks for a password when the server does. */
+    data class Vnc(
+        override val hostName: String,
+        override val target: RemoteDesktopTarget,
+        override val sessionProvider: () -> ClientSession?,
+    ) : RemoteDesktopRequest
+
+    /**
+     * An RDP desktop: the FreeRDP viewer dials the target and answers NLA with what the host has
+     * saved.
+     *
+     * [credentials] is the saved NLA credential, or null when the host has none - carried so the
+     * viewer can connect without asking and pre-fill the challenge form when it has to ask anyway.
+     * [credentialsComplete] says whether that credential can answer NLA on its own; the store
+     * saves the whole credential or nothing, so today the two agree, but "complete" is the
+     * viewer's contract rather than a fact to re-derive from the credential's shape - a future
+     * store that returns partials wants no handoff change.
+     */
+    data class Rdp(
+        override val hostName: String,
+        override val target: RemoteDesktopTarget,
+        override val sessionProvider: () -> ClientSession?,
+        val credentials: RdpCredentials?,
+        val credentialsComplete: Boolean,
+    ) : RemoteDesktopRequest
+}
 
 /**
- * One-shot handoff of a [VncRequest] to [RemoteDesktopActivity].
+ * One-shot handoff of a [RemoteDesktopRequest] to [RemoteDesktopActivity].
  *
  * [put] mints a token and [take] consumes it, exactly like the editor's handoff: a replayed
  * intent is a request for a desktop the user already closed, not a reason to reopen one behind
  * their back. The provider it carries closes over the app's session store, so a token left
  * behind by a crashed launch is a small closure, not a session held open.
  */
-object VncRequests {
-    private val pending = ConcurrentHashMap<String, VncRequest>()
+object RemoteDesktopRequests {
+    private val pending = ConcurrentHashMap<String, RemoteDesktopRequest>()
 
-    fun put(request: VncRequest): String {
+    fun put(request: RemoteDesktopRequest): String {
         val token = UUID.randomUUID().toString()
         pending[token] = request
         return token
     }
 
-    fun take(token: String): VncRequest? = pending.remove(token)
+    fun take(token: String): RemoteDesktopRequest? = pending.remove(token)
 }

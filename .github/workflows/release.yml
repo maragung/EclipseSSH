@@ -24,8 +24,8 @@ concurrency:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
-  BUILD_TOOLS: '35.0.0'
-  COMPILE_SDK: 'android-35'
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: 'android-37.0'
   TARGET_SDK: 'android-35'
   # Same pins as ci.yml; the root-invoked assemble/bundle tasks compile the
   # :freerdp module, whose native build needs them.
@@ -49,10 +49,10 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up JDK 17.0.13
-        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
         with:
           distribution: temurin
           java-version: '17.0.13'
@@ -83,18 +83,18 @@ jobs:
         # Same entry ci.yml restores: warm builds skip configure and Ninja
         # rebuilds nothing. The release build is a release of exactly what CI
         # verified, so sharing the cache keeps that literally true.
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@fb1f4ada2cbb5ec87bbd7dcd598c601ff59a1f7b # v4.0.0
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
@@ -172,7 +172,7 @@ jobs:
           cat app/build/outputs/SHA256SUMS.txt
 
       - name: Upload release APKs, AAB and checksums
-        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: eclipse-ssh-release
           path: |

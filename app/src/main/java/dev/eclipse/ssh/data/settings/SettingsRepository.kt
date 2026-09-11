@@ -58,6 +58,7 @@ internal object Keys {
         val pinEnabled = booleanPreferencesKey("pin_enabled")
         val pinHash = stringPreferencesKey("pin_hash")
         val pinSalt = stringPreferencesKey("pin_salt")
+    val vaultAutoLockMinutes = intPreferencesKey("vault_auto_lock_minutes")
     val legacyAlgorithms = booleanPreferencesKey("legacy_algorithms")
     val terminalTheme = stringPreferencesKey("terminal_theme")
     val blockScreenshots = booleanPreferencesKey("block_screenshots")
@@ -92,6 +93,12 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     // `setPin` ever writes the two together, so this state is unreachable today; it is guarded
     // because the cost of being wrong is a bricked install and the check costs one map lookup.
     pinEnabled = prefs[Keys.pinEnabled] == true && prefs[Keys.pinHash] != null,
+    // Normalized on the way out for the same reason as the font size: this number also arrives from
+    // a restored backup, where it is whatever the file says, and a delay the dialog never offered
+    // would show as a value nobody chose.
+    vaultAutoLockMinutes = SettingsRepository.normalizeVaultAutoLockMinutes(
+        prefs[Keys.vaultAutoLockMinutes] ?: SettingsRepository.DEFAULT_VAULT_AUTO_LOCK_MINUTES,
+    ),
     legacyAlgorithms = prefs[Keys.legacyAlgorithms] ?: false,
     terminalTheme = prefs[Keys.terminalTheme] ?: TerminalTheme.DARK.name,
     blockScreenshots = prefs[Keys.blockScreenshots] ?: false,
@@ -225,6 +232,17 @@ class SettingsRepository(private val context: Context) {
         it[Keys.terminalMinColumns] = normalizeMinColumns(columns)
     }
     suspend fun setLegacyAlgorithms(enabled: Boolean) = editPrefs { it[Keys.legacyAlgorithms] = enabled }
+
+    /**
+     * How long the app may sit in the background before the vault re-locks, in minutes; 0 = never.
+     *
+     * Normalized rather than trusted for the same reason as every other stored number: only
+     * [setVaultAutoLockMinutes] and a restored backup write it, and a backup is a file the user can
+     * hand-edit.
+     */
+    suspend fun setVaultAutoLockMinutes(minutes: Int) = editPrefs {
+        it[Keys.vaultAutoLockMinutes] = normalizeVaultAutoLockMinutes(minutes)
+    }
     suspend fun setTerminalTheme(name: String) = editPrefs { it[Keys.terminalTheme] = name }
 
     suspend fun setPin(pin: String) {
@@ -306,5 +324,20 @@ class SettingsRepository(private val context: Context) {
          * `SettingsRepositoryTest.07 every reconnect delay the UI offers round-trips unchanged`.
          */
         val RECONNECT_BASE_CHOICES = listOf(1, 2, 5, 10, 30, 60)
+
+        const val DEFAULT_VAULT_AUTO_LOCK_MINUTES = 5
+
+        /**
+         * The auto-lock delays the settings screen offers, in minutes; 0 = never re-lock.
+         *
+         * Here rather than inline in the UI for the same reason as [RECONNECT_BASE_CHOICES]: it sits
+         * next to the clamp it has to respect, so a chip cannot offer a delay that
+         * [setVaultAutoLockMinutes] would store as a different number than the one the user picked.
+         */
+        val VAULT_AUTO_LOCK_CHOICES = listOf(1, 5, 15, 60, 0)
+
+        /** 0 stays 0; anything else is pulled inside the range of delays worth offering. */
+        fun normalizeVaultAutoLockMinutes(minutes: Int): Int =
+            if (minutes <= 0) 0 else minutes.coerceIn(1, 60)
     }
 }

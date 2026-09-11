@@ -190,6 +190,22 @@ object Migrations {
     }
 
     /**
+     * The per-host Wake-on-LAN MAC address, as one text column holding whatever spelling the user
+     * typed - the same shape the other optional per-host text columns use.
+     *
+     * NOT NULL DEFAULT '' like [MIGRATION_12_13]'s text columns rather than nullable like the
+     * algorithm lists: an empty string already means "this host has no address to wake", which is the
+     * only thing a null could add here, so nullable would hand every read site a second absence to
+     * handle. An upgraded row therefore configures nothing, which is what every host that predates
+     * the column means.
+     */
+    val MIGRATION_15_16 = object : Migration(15, 16) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE host_profiles ADD COLUMN wakeOnLanMac TEXT NOT NULL DEFAULT ''")
+        }
+    }
+
+    /**
      * The per-host SSH agent forwarding switch.
      *
      * DEFAULT 0, not 1, for a stronger reason than most of the boolean columns before it: this
@@ -197,8 +213,12 @@ object Migrations {
      * administrator while a session is open. Turning it on for every upgraded host would hand that
      * grant to hosts whose users never made it, which is not a settings default - it is a
      * permission change made on someone else's behalf. Off is also OpenSSH's own default.
+     *
+     * Numbered 17->18 rather than 15->16: the wake-on-LAN column took 15->16 and the cross-host
+     * transfer columns 16->17 on main while this branch was open, and a chain's steps must never
+     * share a number.
      */
-    val MIGRATION_15_16 = object : Migration(15, 16) {
+    val MIGRATION_17_18 = object : Migration(17, 18) {
         override fun migrate(db: SupportSQLiteDatabase) {
             db.execSQL("ALTER TABLE host_profiles ADD COLUMN agentForwarding INTEGER NOT NULL DEFAULT 0")
         }

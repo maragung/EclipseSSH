@@ -73,11 +73,13 @@ import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -210,7 +212,9 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
+import dev.eclipse.ssh.feature.about.OPEN_SOURCE_LICENSES
 import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
+import dev.eclipse.ssh.feature.vault.shouldRelockVault
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
@@ -234,8 +238,9 @@ import dev.eclipse.ssh.ui.files.ExplorerTopBar
 import dev.eclipse.ssh.ui.preview.FilePreviewSheet
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopConfigDialog
-import dev.eclipse.ssh.ui.remotedesktop.VncRequest
-import dev.eclipse.ssh.ui.remotedesktop.VncRequests
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequest
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequests
+import dev.eclipse.ssh.ui.remotedesktop.RdpConfigDialog
 import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -943,6 +948,8 @@ private fun EclipseWorkspace(
     // forwarding manager above: the dialog saves into the live profile, and a snapshot taken at
     // open time would write a stale host back over a change made elsewhere while it was open.
     var remoteDesktopHostId by remember { mutableStateOf<String?>(null) }
+    // The RDP endpoint dialog's host, by id for the same reason as the VNC one beside it.
+    var rdpDesktopHostId by remember { mutableStateOf<String?>(null) }
     var pendingDeleteHost by remember { mutableStateOf<HostProfile?>(null) }
     // The host whose duplication is waiting on the "also copy the forwarding rules?" answer. Null
     // when nothing is pending; a host with no rules never lands here at all, so the only dialog a
@@ -973,8 +980,9 @@ private fun EclipseWorkspace(
     // single-shot token handoff the editor uses - the request carries a live session provider an
     // intent cannot parcel. Built per call rather than remembered: the provider must close over
     // the view model, never over one session, so a reconnect inside the viewer re-asks it.
-    val openRemoteDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
-        val token = VncRequests.put(VncRequest(host.name, target, viewModel.vncSessionProvider(host.id)))
+    // Both protocol items mint through it, because both tunnels ride a ClientSession the same way.
+    val launchViewer: (RemoteDesktopRequest) -> Unit = { request ->
+        val token = RemoteDesktopRequests.put(request)
         runCatching {
             context.startActivity(
                 Intent(context, RemoteDesktopActivity::class.java)
@@ -984,6 +992,33 @@ private fun EclipseWorkspace(
             // The token was consumed by put; if the launch failed it is gone, and the next tap
             // mints a fresh one - so this is only ever a message, never a stuck state.
             viewModel.reportUiFailure("Could not open the remote desktop", error)
+        }
+    }
+    val openRemoteDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
+        launchViewer(
+            RemoteDesktopRequest.Vnc(
+                hostName = host.name,
+                target = target,
+                sessionProvider = viewModel.remoteDesktopSessionProvider(host.id),
+            ),
+        )
+    }
+    // The RDP handoff reads the saved NLA credential first, because the request it mints carries
+    // it: a complete one lets the tunnel answer NLA without asking, and whatever is saved
+    // pre-fills the sign-in form when the server asks anyway. The read is a callback (it
+    // decrypts off the main thread), so the viewer opens a moment after the tap rather than in
+    // it - the one difference from the VNC item's instant hop.
+    val openRdpDesktop: (HostProfile, RemoteDesktopTarget) -> Unit = { host, target ->
+        viewModel.rdpCredentials(host.id) { credentials ->
+            launchViewer(
+                RemoteDesktopRequest.Rdp(
+                    hostName = host.name,
+                    target = target,
+                    sessionProvider = viewModel.remoteDesktopSessionProvider(host.id),
+                    credentials = credentials,
+                    credentialsComplete = credentials != null,
+                ),
+            )
         }
     }
     // The menu's Remote desktop item: a saved, enabled target opens the viewer straight away;
@@ -996,6 +1031,18 @@ private fun EclipseWorkspace(
             openRemoteDesktop(host, target)
         } else {
             remoteDesktopHostId = host.id
+        }
+    }
+    // The menu's RDP desktop item: the VNC item's rule, now that the viewer it routes to exists.
+    // A saved, enabled target goes straight to the viewer window through the token handoff;
+    // never configured or parked opens the endpoint dialog, which is also where a parked target
+    // gets re-enabled.
+    val requestRdpDesktop: (HostProfile) -> Unit = { host ->
+        val target = decodeRemoteDesktop(host.remoteDesktop).rdp
+        if (target != null && target.enabled) {
+            openRdpDesktop(host, target)
+        } else {
+            rdpDesktopHostId = host.id
         }
     }
     // A Quick Settings tile or home-screen widget tap resolves, on the view model, to the
@@ -1013,21 +1060,46 @@ private fun EclipseWorkspace(
     }
     // Deliberately `remember`, NOT `rememberSaveable`: this is a security gate, so it has to fail
     // closed. rememberSaveable persists into the saved-instance-state Bundle, which survives
-    // system-initiated process death — and the ON_STOP re-lock below cannot clear it in time,
-    // because ProcessLifecycleOwner debounces ON_STOP by 700ms while onSaveInstanceState runs
-    // immediately after onStop on API 28+. The Bundle was therefore written with `true`, and
-    // returning to a background-killed process skipped the lock screen entirely. `remember` still
-    // survives rotation (MainActivity handles those configChanges itself, so it is never
-    // recreated); anything that does recreate the activity now re-locks, which is the safe default.
+    // system-initiated process death — and the ON_START re-lock below cannot undo that, because
+    // the timestamp it needs is exactly as ephemeral: restored to `unlocked = true` with no
+    // backgrounded-at to compare against, a background-killed process would come back unlocked.
+    // `remember` still survives rotation (MainActivity handles those configChanges itself, so it is
+    // never recreated); anything that does recreate the activity now re-locks, which is the safe
+    // default.
     var unlocked by remember { mutableStateOf(false) }
 
-    // Re-lock automatically when the app leaves the foreground, so an unlocked
-    // vault is never left exposed in the background. A file picker (SAF) briefly
-    // stops the activity too, so we skip re-locking while one is in flight.
+    // Re-lock the vault after the app has been in the background past the auto-lock delay, so a
+    // phone left on a desk is not an open vault while an unlocked one stays usable through the
+    // glance-away-and-back that a zero-tolerance rule would punish. The countdown starts at ON_STOP
+    // and the decision — pure, and unit-tested in [shouldRelockVault] — runs at ON_START, the first
+    // moment the elapsed time is known. Clearing `unlocked` here is what makes the re-lock real:
+    // the same `pinEnabled && !unlocked` branch below that gates a cold launch then composes the
+    // same LockScreen, biometric button and all, before anything else is reachable.
+    // A file picker (SAF) briefly stops the activity too, so one in flight suspends the countdown
+    // rather than starting it. With no PIN set there is no lock to re-arm and the setting is inert.
     val pinEnabled by rememberUpdatedState(state.settings.pinEnabled)
+    val vaultAutoLockMinutes by rememberUpdatedState(state.settings.vaultAutoLockMinutes)
+    var backgroundedAtMs by remember { mutableStateOf<Long?>(null) }
     DisposableEffect(Unit) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && pinEnabled && !pickerActive) unlocked = false
+            when (event) {
+                Lifecycle.Event.ON_STOP ->
+                    if (!pickerActive) backgroundedAtMs = System.currentTimeMillis()
+                Lifecycle.Event.ON_START -> {
+                    val wentAwayAtMs = backgroundedAtMs
+                    backgroundedAtMs = null
+                    if (
+                        wentAwayAtMs != null &&
+                        shouldRelockVault(
+                            autoLockMinutes = vaultAutoLockMinutes,
+                            lockConfigured = pinEnabled,
+                            backgroundedAtMs = wentAwayAtMs,
+                            nowMs = System.currentTimeMillis(),
+                        )
+                    ) unlocked = false
+                }
+                else -> Unit
+            }
         }
         ProcessLifecycleOwner.get().lifecycle.addObserver(observer)
         onDispose { ProcessLifecycleOwner.get().lifecycle.removeObserver(observer) }
@@ -1143,6 +1215,8 @@ private fun EclipseWorkspace(
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
                     onRemoteDesktop = requestRemoteDesktop,
+                    onWakeOnLan = viewModel::wakeHost,
+                    onRdpDesktop = requestRdpDesktop,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1171,6 +1245,21 @@ private fun EclipseWorkspace(
                         pickerActive = true
                         textExportPicker.launch("eclipse-$hostId.log")
                     },
+                    // The raw log comes straight from the view model's per-session transcript -
+                    // keyed by session, so the shell on screen is the one saved - and rides the
+                    // same SAF launcher and pending-bytes slot the diagnostics save uses. Nothing
+                    // is written unless a log exists, which the menu item already ensured.
+                    onSaveSessionLog = { sessionKey, hostName ->
+                        val text = viewModel.sessionLogText(sessionKey)
+                        if (text.isNullOrEmpty()) {
+                            viewModel.reportUiMessage("This session has no output to save yet")
+                        } else {
+                            pendingTextExport = text.toByteArray()
+                            pickerActive = true
+                            textExportPicker.launch("$hostName-session.log")
+                        }
+                    },
+                    onNotifyWhenDone = viewModel::notifyWhenDone,
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1240,6 +1329,7 @@ private fun EclipseWorkspace(
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
+                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1302,6 +1392,8 @@ private fun EclipseWorkspace(
                     onDuplicateHost = requestDuplicateHost,
                     onManageForwards = { forwardManagerHostId = it.id },
                     onRemoteDesktop = requestRemoteDesktop,
+                    onWakeOnLan = viewModel::wakeHost,
+                    onRdpDesktop = requestRdpDesktop,
                     onCloseTab = viewModel::closeTab,
                     onDuplicateSession = viewModel::duplicateSession,
                     onDisconnectAll = viewModel::disconnectAll,
@@ -1330,6 +1422,21 @@ private fun EclipseWorkspace(
                         pickerActive = true
                         textExportPicker.launch("eclipse-$hostId.log")
                     },
+                    // The raw log comes straight from the view model's per-session transcript -
+                    // keyed by session, so the shell on screen is the one saved - and rides the
+                    // same SAF launcher and pending-bytes slot the diagnostics save uses. Nothing
+                    // is written unless a log exists, which the menu item already ensured.
+                    onSaveSessionLog = { sessionKey, hostName ->
+                        val text = viewModel.sessionLogText(sessionKey)
+                        if (text.isNullOrEmpty()) {
+                            viewModel.reportUiMessage("This session has no output to save yet")
+                        } else {
+                            pendingTextExport = text.toByteArray()
+                            pickerActive = true
+                            textExportPicker.launch("$hostName-session.log")
+                        }
+                    },
+                    onNotifyWhenDone = viewModel::notifyWhenDone,
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1399,6 +1506,7 @@ private fun EclipseWorkspace(
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
+                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1482,6 +1590,22 @@ private fun EclipseWorkspace(
                     openRemoteDesktop(host, target)
                 },
                 onDismiss = { remoteDesktopHostId = null },
+            )
+        }
+    }
+    rdpDesktopHostId?.let { hostId ->
+        // Same live-profile resolution as the VNC dialog above, for the same reasons. Connect is
+        // the VNC dialog's Connect exactly: the save through the view model, then the jump into
+        // the viewer window through the same token handoff every RDP desktop opens by.
+        state.hosts.firstOrNull { it.id == hostId }?.let { host ->
+            RdpConfigDialog(
+                host = host,
+                onSave = { viewModel.saveRdpTarget(hostId, it) },
+                onOpen = { target ->
+                    rdpDesktopHostId = null
+                    openRdpDesktop(host, target)
+                },
+                onDismiss = { rdpDesktopHostId = null },
             )
         }
     }
@@ -1858,6 +1982,19 @@ private fun WorkspaceScaffold(
      * "open": which one depends on the host's saved target, and the caller does not care.
      */
     onRemoteDesktop: (HostProfile) -> Unit = {},
+    /**
+     * Sends one host's Wake-on-LAN packet - the card menu's Wake on LAN item. An injectable no-op
+     * default like the other per-host actions, so previews and the destinations that never show a
+     * host card do not have to name it.
+     */
+    onWakeOnLan: (HostProfile) -> Unit = {},
+    /**
+     * Opens one host's RDP desktop - the card menu's RDP desktop item, with the same routing the
+     * VNC one has: a saved, enabled target goes straight to the viewer window, the rest get the
+     * endpoint dialog first. Named `onRdpDesktop` rather than `onOpenRdpDesktop` for the same
+     * reason [onRemoteDesktop] is.
+     */
+    onRdpDesktop: (HostProfile) -> Unit = {},
     onCloseTab: (SessionTab) -> Unit,
     /** Long-press on a terminal tab: opens a second shell on the same host. */
     onDuplicateSession: (SessionTab) -> Unit = {},
@@ -1884,6 +2021,10 @@ private fun WorkspaceScaffold(
     onSaveSnippet: (String, String) -> Unit = { _, _ -> },
     onDeleteSnippet: (String) -> Unit = {},
     onSaveLogs: (String, String) -> Unit = { _, _ -> },
+    /** Saves a session's raw output log - session key and the host name to name the file after. */
+    onSaveSessionLog: (String, String) -> Unit = { _, _ -> },
+    /** Arms the finished-command notification for a session key. */
+    onNotifyWhenDone: (String) -> Unit = {},
     onSaveText: (String, String) -> Unit = { _, _ -> },
     onSaveScreen: (String, String) -> Unit = { _, _ -> },
     onClearCompleted: () -> Unit = {},
@@ -1922,6 +2063,7 @@ private fun WorkspaceScaffold(
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
     onReconnectAskFirst: (Boolean) -> Unit = {},
+    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
@@ -1960,6 +2102,8 @@ private fun WorkspaceScaffold(
             onSaveSnippet = onSaveSnippet,
             onDeleteSnippet = onDeleteSnippet,
             onSaveLogs = onSaveLogs,
+            onSaveSessionLog = onSaveSessionLog,
+            onNotifyWhenDone = onNotifyWhenDone,
             onSaveText = onSaveText,
             onSaveScreen = onSaveScreen,
             fontSize = state.settings.terminalFontSize,
@@ -2064,7 +2208,7 @@ private fun WorkspaceScaffold(
                 Destination.HOSTS -> HostsScreen(
                     state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
                     onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards,
-                    onRemoteDesktop,
+                    onRemoteDesktop, onWakeOnLan, onRdpDesktop,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
@@ -2081,6 +2225,7 @@ private fun WorkspaceScaffold(
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
                     onReconnectAskFirst = onReconnectAskFirst,
+                    onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
@@ -2113,6 +2258,8 @@ private fun HostsScreen(
     onDuplicateHost: (HostProfile) -> Unit,
     onManageForwards: (HostProfile) -> Unit,
     onRemoteDesktop: (HostProfile) -> Unit,
+    onWakeOnLan: (HostProfile) -> Unit,
+    onRdpDesktop: (HostProfile) -> Unit,
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
@@ -2142,7 +2289,7 @@ private fun HostsScreen(
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
-                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop)
+                HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop, onWakeOnLan, onRdpDesktop)
             }
         }
     }
@@ -2179,6 +2326,8 @@ private fun HostCard(
     onDuplicate: (HostProfile) -> Unit,
     onPortForwarding: (HostProfile) -> Unit,
     onRemoteDesktop: (HostProfile) -> Unit,
+    onWakeOnLan: (HostProfile) -> Unit,
+    onRdpDesktop: (HostProfile) -> Unit,
 ) {
     // Keyed on the host id so a list that reorders (a favourite toggled, a search narrowed) cannot
     // leave the menu open over a different host than the one it was opened on.
@@ -2232,6 +2381,26 @@ private fun HostCard(
                             text = { Text("Remote desktop") },
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRemoteDesktop(host) },
+                        )
+                        // Beside the things that use a *running* session, because it is the one action
+                        // that cannot: the whole point of waking the machine is that nothing is
+                        // listening yet. Not gated on a saved address - the item is the discoverable
+                        // half of the feature, and "no address saved" is an answer the snackbar can
+                        // give, pointing at Edit, rather than an item that quietly is not there.
+                        DropdownMenuItem(
+                            text = { Text("Wake on LAN") },
+                            leadingIcon = { Icon(Icons.Default.Bolt, null) },
+                            onClick = { menuOpen = false; onWakeOnLan(host) },
+                        )
+                        // Beside the VNC item, and un-gated the way that one is now that the
+                        // viewer exists: a host with no saved RDP target gets the config dialog
+                        // rather than nothing, so this item is the protocol's first-use entry
+                        // point too - a saved, enabled target goes straight to the viewer, and
+                        // the routing for both lives with [requestRdpDesktop].
+                        DropdownMenuItem(
+                            text = { Text("RDP desktop") },
+                            leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
+                            onClick = { menuOpen = false; onRdpDesktop(host) },
                         )
                         // The arrow this item replaced used to sit beside the kebab as a second way
                         // into the details sheet; now this is the way in, so it sits high in the
@@ -2312,6 +2481,10 @@ private fun TerminalScreen(
     onSaveSnippet: (String, String) -> Unit,
     onDeleteSnippet: (String) -> Unit,
     onSaveLogs: (String, String) -> Unit,
+    /** Saves the raw session log - see MainViewModel.sessionLogText. */
+    onSaveSessionLog: (String, String) -> Unit,
+    /** Arms the finished-command notification - see MainViewModel.notifyWhenDone. */
+    onNotifyWhenDone: (String) -> Unit,
     onSaveText: (String, String) -> Unit,
     onSaveScreen: (String, String) -> Unit,
     /**
@@ -2519,6 +2692,10 @@ private fun TerminalScreen(
             onToggleHistory = { showHistory = !showHistory },
             onSnippets = { showSnippets = true },
             onSaveLogs = { onSaveLogs(activeTab.hostId, terminalText) },
+            // The session's own key, not the host: a host with two shells has two logs, and the
+            // tab's title is the host name the file should be called after.
+            onSaveSessionLog = { onSaveSessionLog(activeTab.id, activeTab.title) },
+            onNotifyWhenDone = { onNotifyWhenDone(activeTab.id) },
             onSaveText = { onSaveText(activeTab.hostId, terminalText) },
             onSaveScreen = { onSaveScreen(activeTab.hostId, terminalText) },
             onCopyAll = { onCopyText(terminalText) },
@@ -3172,6 +3349,10 @@ private fun TerminalTabStrip(
     onToggleHistory: () -> Unit,
     onSnippets: () -> Unit,
     onSaveLogs: () -> Unit,
+    /** Saves the raw session log; the item is hidden until the session has output to save. */
+    onSaveSessionLog: () -> Unit,
+    /** Arms the finished-command notification for the session on screen. */
+    onNotifyWhenDone: () -> Unit,
     onSaveText: () -> Unit,
     onSaveScreen: () -> Unit,
     onCopyAll: () -> Unit,
@@ -3255,6 +3436,15 @@ private fun TerminalTabStrip(
                     text = { Text("Duplicate terminal") },
                     onClick = { menuOpen = false; onDuplicate(activeTab) },
                 )
+                // Only on a live session: the wait is for a command to *finish*, and a session
+                // that has already ended cannot finish anything. The notification the arming
+                // eventually posts is one-shot - the detector disarms itself when it fires.
+                if (activeTab.state.isLive) {
+                    DropdownMenuItem(
+                        text = { Text("Notify when done") },
+                        onClick = { menuOpen = false; onNotifyWhenDone() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text(if (showCommandBar) "Hide command bar" else "Show command bar") },
                     onClick = { menuOpen = false; onToggleCommandBar() },
@@ -3272,6 +3462,13 @@ private fun TerminalTabStrip(
                 DropdownMenuItem(text = { Text("Copy all output") }, onClick = { menuOpen = false; onCopyAll() })
                 DropdownMenuItem(text = { Text("Jump to live output") }, onClick = { menuOpen = false; onScrollToBottom() })
                 DropdownMenuItem(text = { Text("Save logs") }, onClick = { menuOpen = false; onSaveLogs() })
+                // Only once there is something to save: the session log is created with the
+                // session, so on a shell that has not spoken yet the item would offer an empty
+                // file. `terminalText` is the observable proxy for "this session has output" -
+                // it is what the transcript view and the other saves read.
+                if (terminalText.isNotBlank()) {
+                    DropdownMenuItem(text = { Text("Save session log") }, onClick = { menuOpen = false; onSaveSessionLog() })
+                }
                 DropdownMenuItem(text = { Text("Save text") }, onClick = { menuOpen = false; onSaveText() })
                 DropdownMenuItem(text = { Text("Save screen") }, onClick = { menuOpen = false; onSaveScreen() })
                 DropdownMenuItem(text = { Text("Disconnect all") }, onClick = { menuOpen = false; onDisconnectAll() })
@@ -4421,6 +4618,7 @@ private fun SettingsScreen(
     onLegacyAlgorithms: (Boolean) -> Unit,
     onBlockScreenshots: (Boolean) -> Unit,
     onReconnectAskFirst: (Boolean) -> Unit = {},
+    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
@@ -4441,9 +4639,11 @@ private fun SettingsScreen(
     var showFontDialog by remember { mutableStateOf(false) }
     var showWidthDialog by remember { mutableStateOf(false) }
     var showPinDialog by remember { mutableStateOf(false) }
+    var showVaultAutoLockDialog by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var showAbout by remember { mutableStateOf(false) }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -4453,6 +4653,17 @@ private fun SettingsScreen(
         SettingRow(Icons.Default.Lock, "Biometric vault lock", "Protect passwords and private keys") { Switch(checked = state.settings.biometricUnlock, onCheckedChange = onBiometric) }
         SettingRow(Icons.Default.Key, "Generate SSH key pair", "RSA 2048/4096 or ECDSA P-256, exported as PEM") { TextButton(onClick = onGenerateKey) { Text("Generate") } }
         SettingRow(Icons.Default.Lock, "PIN lock", if (state.settings.pinEnabled) "Enabled · PIN fallback at launch" else "Set a PIN for quick unlock") { TextButton(onClick = { showPinDialog = true }) { Text(if (state.settings.pinEnabled) "Change" else "Set") } }
+        // The subtitle says so when there is no lock to re-arm: with no PIN set the vault has no
+        // lock screen at all, so the delay would be a setting over nothing.
+        SettingRow(
+            Icons.Default.Lock,
+            "Auto-lock vault",
+            when {
+                !state.settings.pinEnabled -> "No PIN is set, so there is no lock to re-arm"
+                state.settings.vaultAutoLockMinutes == 0 -> "Never re-locks while the app is in the background"
+                else -> "Re-locks after ${state.settings.vaultAutoLockMinutes} minutes in the background"
+            },
+        ) { TextButton(onClick = { showVaultAutoLockDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Encrypted vault", "AES-256-GCM · Android Keystore") { Text("Protected", color = EclipseSuccess, style = MaterialTheme.typography.labelMedium) }
         SettingRow(Icons.Default.Key, "Known hosts", "${state.knownHosts.size} trusted fingerprint(s)") { TextButton(onClick = { showKnownHosts = true }) { Text("Manage") } }
         SettingRow(
@@ -4571,6 +4782,22 @@ private fun SettingsScreen(
             },
         ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
     }
+    Spacer(Modifier.height(14.dp))
+    SettingsSection("About") {
+        SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
+            // Two "View" buttons sit on this screen once diagnostics is counted, and a screen reader
+            // hears both of them as just "View" — so the button carries the row it belongs to, the
+            // same "setting, action" shape the theme picker's content description uses.
+            TextButton(
+                onClick = { showAbout = true },
+                modifier = Modifier.semantics { contentDescription = "About EclipseSSH" },
+            ) { Text("View") }
+        }
+    }
+
+    if (showAbout) {
+        AboutDialog(onDismiss = { showAbout = false })
+    }
 
     if (showDiagnostics) {
         DiagnosticsDialog(
@@ -4616,6 +4843,13 @@ private fun SettingsScreen(
             options = listOf(0, 15, 30, 60, 120),
             onDismiss = { showClipboardDialog = false },
             onConfirm = { onClipboard(it); showClipboardDialog = false },
+        )
+    }
+    if (showVaultAutoLockDialog) {
+        VaultAutoLockDialog(
+            current = state.settings.vaultAutoLockMinutes,
+            onDismiss = { showVaultAutoLockDialog = false },
+            onConfirm = { onVaultAutoLock(it); showVaultAutoLockDialog = false },
         )
     }
     if (showFontDialog) {
@@ -4820,6 +5054,72 @@ private fun DiagnosticsDialog(
     )
 }
 
+/**
+ * Version, credits and the library list — the screen a licence question or a "what is this app"
+ * question is answered from.
+ *
+ * The version is read from the PackageManager rather than from a generated `BuildConfig` field: the
+ * app builds with no buildConfig fields at all, and this answer is the one Android itself shows in
+ * system settings, so the dialog cannot disagree with it.
+ */
+@Composable
+private fun AboutDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("About EclipseSSH") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.70f))) {
+                Text("EclipseSSH", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Version ${packageInfo.versionName} (${packageInfo.longVersionCode})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "An SSH and SFTP client for Android: a full-screen VT/ANSI terminal, concurrent " +
+                        "sessions in tabs, a two-pane SFTP browser with resumable transfers, port " +
+                        "forwarding and remote desktop, with credentials kept in an Android " +
+                        "Keystore-backed vault.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("Created by Maragung", style = MaterialTheme.typography.titleSmall)
+                // The repo is private, so this link serves the owner and contributors rather than the
+                // public — anyone else lands on GitHub's sign-in, which is still the honest
+                // destination for "where is the source".
+                TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ABOUT_REPO_URL))) }) {
+                    Text("Source code · github.com/maragung/EclipseSSH")
+                }
+                Text("Libraries", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // The one list the repo keeps: the dialog renders OPEN_SOURCE_LICENSES as-is, so
+                // what an About screen says and what the repo claims cannot drift apart.
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(OPEN_SOURCE_LICENSES) { library ->
+                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text("${library.name} ${library.version}", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    // Bouncy Castle is the one entry with no purpose line - a
+                                    // transitive dependency nothing calls directly - so its row
+                                    // is the licence alone, not a sentence ending in a dangling dot.
+                                    library.purpose?.let { "${library.license} · $it" } ?: library.license,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+/** Where the source lives. Private repository — see the comment on the dialog's link. */
+private const val ABOUT_REPO_URL = "https://github.com/maragung/EclipseSSH"
+
 @Composable
 private fun KnownHostsDialog(
     hosts: Map<String, String>,
@@ -4875,6 +5175,44 @@ private fun IntervalDialog(title: String, subtitle: String, current: Int, option
                             selected = selected == option,
                             onClick = { selected = option },
                             label = { Text(if (option == 0) "Off" else "$option s") },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Picks how long the app may sit in the background before the vault re-locks. See
+ * [dev.eclipse.ssh.data.model.AppSettings.vaultAutoLockMinutes].
+ *
+ * Its own dialog rather than an [IntervalDialog], only because that one labels every chip in
+ * seconds and this setting is in minutes, with a "Never" choice rather than an "Off" one. The
+ * choices come from the repository that clamps them, so a chip cannot offer a delay that would be
+ * stored as a different number.
+ */
+@Composable
+private fun VaultAutoLockDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+    var selected by remember { mutableIntStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Auto-lock vault") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "How long the app may sit in the background before the PIN is asked for again. " +
+                        "The countdown starts the moment you leave the app.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                    SettingsRepository.VAULT_AUTO_LOCK_CHOICES.forEach { option ->
+                        FilterChip(
+                            selected = selected == option,
+                            onClick = { selected = option },
+                            label = { Text(if (option == 0) "Never" else "$option min") },
                         )
                     }
                 }
@@ -5442,6 +5780,8 @@ private fun AddHostDialog(
     // so clearing the field is expressible at all — a numeric field cannot represent "unset".
     var keepAlive by remember(initialHost?.id) { mutableStateOf(initialHost?.keepAliveSeconds?.toString().orEmpty()) }
     var fingerprint by remember(initialHost?.id) { mutableStateOf(initialHost?.fingerprint.orEmpty()) }
+    // The MAC as typed, blank for none - the same convention the profile column uses.
+    var wakeOnLanMac by remember(initialHost?.id) { mutableStateOf(initialHost?.wakeOnLanMac.orEmpty()) }
     // Seeded from the profile, and from the shipped default for a new one, so the box reflects what
     // this host will actually do rather than a hardcoded position.
     var autoLoginSftp by remember(initialHost?.id) {
@@ -5485,6 +5825,7 @@ private fun AddHostDialog(
         keepAlive = keepAlive,
         fingerprint = fingerprint,
         storedFingerprint = initialHost?.fingerprint,
+        wakeOnLanMac = wakeOnLanMac,
         proxyType = proxyType,
         proxyJump = proxyJump,
         socksHost = socksHost,
@@ -5710,6 +6051,24 @@ private fun AddHostDialog(
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                OutlinedTextField(
+                    wakeOnLanMac,
+                    { wakeOnLanMac = it },
+                    label = { Text("Wake-on-LAN MAC (optional)") },
+                    placeholder = { Text("AA:BB:CC:DD:EE:FF") },
+                    singleLine = true,
+                    isError = !draft.wakeOnLanMacValid,
+                    supportingText = {
+                        Text(
+                            if (!draft.wakeOnLanMacValid) "Six pairs of hex digits — AA:BB:CC:DD:EE:FF"
+                            // The same-LAN limit is stated here, in the field's own helper line, rather
+                            // than left to a failure to explain: a wake sent from another network stops
+                            // at the first router and nothing on screen would say why.
+                            else "Wakes the machine from the host menu — phone and machine must be on the same network",
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 // A switch rather than a chip row: it is one binary choice whose off state has to be
                 // as visible as its on state. The whole row is the target — `toggleable` puts the
                 // label, the explanation and the switch in a single accessible node, so TalkBack
@@ -5786,6 +6145,10 @@ private fun AddHostDialog(
                             connectTimeoutSeconds = draft.timeoutNumber ?: DEFAULT_CONNECT_TIMEOUT_SECONDS,
                             keepAliveSeconds = draft.keepAliveNumber,
                             autoLoginSftp = autoLoginSftp,
+                            // Trimmed rather than normalised to one spelling: the text as typed is
+                            // what the profile shows the next time the form opens, and parseMac takes
+                            // every spelling at the moment the address is used.
+                            wakeOnLanMac = wakeOnLanMac.trim(),
                         ).let(advanced::applyTo),
                         HostCredentialUpdate(
                             // A typed replacement beats a pending forget; a pending forget beats
