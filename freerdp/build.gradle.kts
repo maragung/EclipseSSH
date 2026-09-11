@@ -85,7 +85,7 @@ val nativeJniLibs = File(nativeBuildRoot, "jniLibs")
 
 android {
     namespace = "dev.eclipse.ssh.freerdp"
-    compileSdk = 35
+    compileSdk = 37
     // The NDK upstream's freeRDPCore module builds with (their ndkVersion), and
     // the one the spike proved the build with. Do not bump one without the other.
     ndkVersion = freerdpNdkVersion
@@ -104,13 +104,23 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+}
 
-    sourceSets.getByName("main") {
-        // Populated by buildFreerdpNative. Because every :freerdp compilation
-        // hangs off preBuild, which depends on the native task, a clean checkout
-        // cannot package (or compile against) a half-built module: the .so files
-        // are either built or the build has already failed.
-        jniLibs.srcDir(nativeJniLibs)
+// Populated by buildFreerdpNative. Because every :freerdp compilation
+// hangs off preBuild, which depends on the native task, a clean checkout
+// cannot package (or compile against) a half-built module: the .so files
+// are either built or the build has already failed.
+//
+// Registered through the variant sources API rather than
+// `android { sourceSets.getByName("main") { jniLibs.srcDir(...) } }`:
+// AGP 9 cut the old AndroidLibrarySourceSet typing that the sourceSets
+// accessor resolves to, which fails at configuration time with a
+// ClassCastException. addStaticSourceDirectory is the supported form for
+// prebuilt-content directories and applies to every variant, exactly what
+// the "main" source set did.
+androidComponents {
+    onVariants { variant ->
+        variant.sources.jniLibs?.addStaticSourceDirectory(nativeJniLibs.absolutePath)
     }
 }
 
@@ -120,7 +130,12 @@ android {
 // and checks the toolchain path at execution time. That keeps Gradle
 // invocations that never touch native code (schema dumps, app-only tasks)
 // from demanding a multi-gigabyte NDK during configuration.
-val androidSdkRoot = android.sdkDirectory
+//
+// AGP 9 removed `android.sdkDirectory` from the old DSL extension; the
+// supported access is the sdkComponents API, whose sdkDirectory provider is
+// already populated when the plugin is applied (unlike bootClasspath, it is
+// safe to read at configuration time).
+val androidSdkRoot = androidComponents.sdkComponents.sdkDirectory.get().asFile
 
 val fetchFreerdpSource =
     tasks.register("fetchFreerdpSource") {

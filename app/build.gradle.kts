@@ -5,7 +5,10 @@ import java.util.zip.ZipOutputStream
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    // No org.jetbrains.kotlin.android here: since AGP 9.0 Kotlin support is built
+    // into the Android plugins, and applying the KGP android plugin on top of it
+    // fails the build at configuration time. Compiler options live in the
+    // android.kotlin block below (the built-in Kotlin DSL).
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)
@@ -13,7 +16,7 @@ plugins {
 
 android {
     namespace = "dev.eclipse.ssh"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "dev.eclipse.ssh"
@@ -250,10 +253,16 @@ android {
 // SftpFileSystemProvider, which fails under Robolectric's sandbox classloaders and
 // breaks every java.nio.file call. Android is unaffected (the platform hardcodes
 // its providers), so tests use copies of both jars without that registration.
-val strippedSshd by configurations.creating { isCanBeConsumed = false; isCanBeResolved = true }
+// Gradle 9.6 deprecates the `by configurations.creating` / `by tasks.registering`
+// property delegates; create()/register() with the same name keeps the val's
+// type (Configuration / TaskProvider) and the config-cache discipline below.
+val strippedSshd = configurations.create("strippedSshd") {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
 dependencies { strippedSshd(libs.sshd.common); strippedSshd(libs.sshd.sftp) }
 
-val stripSshdServices by tasks.registering {
+val stripSshdServices = tasks.register("stripSshdServices") {
     val outCommon = layout.buildDirectory.file("sshd-nosvc/sshd-common-nosvc.jar")
     val outSftp = layout.buildDirectory.file("sshd-nosvc/sshd-sftp-nosvc.jar")
     inputs.files(strippedSshd.incoming.artifacts.artifactFiles)

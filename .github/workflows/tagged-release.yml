@@ -11,7 +11,7 @@
 # maintainer has to hit "Publish" in the GitHub UI. A v1.2.3-rc.1 tag
 # is also marked pre-release automatically.
 #
-# Toolchain is pinned to JDK 17.0.13, Android SDK 35, build-tools 35.0.0
+# Toolchain is pinned to JDK 17.0.13, Android SDK 37, build-tools 36.0.0
 # on ubuntu-24.04. Every action is pinned to a commit SHA.
 name: Tagged release
 
@@ -29,8 +29,8 @@ concurrency:
 
 env:
   GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
-  BUILD_TOOLS: '35.0.0'
-  COMPILE_SDK: 'android-35'
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: 'android-37.0'
   TARGET_SDK: 'android-35'
   # Same pins as ci.yml; the root-invoked assemble/bundle tasks compile the
   # :freerdp module, whose native build needs them.
@@ -239,7 +239,7 @@ jobs:
             echo
             echo "### Verification"
             echo
-            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 35, build-tools 35.0.0, NDK 29.0.13113456)"
+            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 37, build-tools 36.0.0, NDK 29.0.13113456)"
             echo "- All release APKs verified with \`apksigner verify\` (v2 + v3)"
             echo "- The AAB is verified and uploaded alongside the per-ABI APKs"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
