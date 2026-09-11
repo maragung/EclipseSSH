@@ -282,7 +282,7 @@ class TarArchive(private val source: ArchiveByteSource) {
                 }
             }
             try {
-                extractThroughBridge(bridge, compression, wants, destination, onEntry)
+                extractThroughBridge(bridge, compression, scan, wants, destination, onEntry)
             } finally {
                 // The pass is over, well or badly. Nothing may keep the producer reading ahead
                 // into a channel nobody will drain anymore.
@@ -299,6 +299,7 @@ class TarArchive(private val source: ArchiveByteSource) {
     private fun extractThroughBridge(
         bridge: InputStream,
         compression: TarCompression,
+        scan: TarScanState,
         wants: (String) -> Boolean,
         destination: ArchiveExtractor.Destination,
         onEntry: (ArchiveEntry, ArchiveExtractor.Outcome) -> Unit,
