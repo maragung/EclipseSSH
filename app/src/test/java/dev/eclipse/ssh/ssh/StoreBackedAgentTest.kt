@@ -155,7 +155,9 @@ class StoreBackedAgentTest {
         // A context that carries no agent identities: what every ordinary login dials with, and the
         // case where answering "the vault anyway" would offer the user's keys to a host that never
         // asked for forwarding.
-        val plain = AttributeRepository.ofAttributesMap(emptyMap())
+        val plain = AttributeRepository.ofAttributesMap(
+            buildMap<AttributeRepository.AttributeKey<*>, Any>(),
+        )
         assertThat(agentFor(plain)).isNull()
 
         val forwarding = AttributeRepository.ofAttributesMap(mapOf(AGENT_IDENTITIES_KEY to identities))
