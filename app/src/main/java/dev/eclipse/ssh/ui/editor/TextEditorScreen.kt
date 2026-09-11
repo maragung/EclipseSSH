@@ -70,6 +70,8 @@ import androidx.compose.ui.unit.sp
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FsModificationConflictException
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.ui.editor.highlight.SyntaxColors
+import dev.eclipse.ssh.ui.editor.highlight.syntaxTransformationFor
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -517,6 +519,15 @@ private fun EditorBody(
     // Read here in composition and handed to the transformation, which itself cannot ask the theme.
     val otherMatchColor = MaterialTheme.colorScheme.secondaryContainer
     val currentMatchColor = MaterialTheme.colorScheme.primaryContainer
+    // Syntax coloring, resolved once per file: the palette follows the theme, the language follows
+    // the name, and neither can change without a recomposition that rebuilds this anyway. The
+    // field's own text color stays SyntaxColors.plain (see fromScheme) so uncolored runs and the
+    // status bar keep agreeing; find-matches swap in over it because a match highlight must win
+    // over grammar coloring while the bar is open.
+    val syntaxTransformation = syntaxTransformationFor(
+        request.entry.name,
+        SyntaxColors.fromScheme(MaterialTheme.colorScheme),
+    )
 
     // Bring the requested offset into view — from go-to-line or from stepping through matches.
     LaunchedEffect(scrollRequest) {
@@ -631,7 +642,7 @@ private fun EditorBody(
                 visualTransformation = if (findOpen && findQuery.isNotEmpty()) {
                     MatchHighlightTransformation(findQuery, findCaseSensitive, matchIndex, otherMatchColor, currentMatchColor)
                 } else {
-                    VisualTransformation.None
+                    syntaxTransformation
                 },
                 modifier = Modifier
                     .weight(1f)
