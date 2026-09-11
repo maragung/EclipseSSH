@@ -15,12 +15,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -76,6 +79,14 @@ fun ArchiveBrowserScreen(
     // View state, saveable so a rotation inside a deep folder keeps the folder.
     var folder by rememberSaveable { mutableStateOf("") }
     var searchQuery by rememberSaveable { mutableStateOf("") }
+    // The multi-extract selection, path -> entry. It holds the entries themselves, not just
+    // paths, because a selection may span folders and a path alone cannot find its entry again
+    // without walking the lazy tree — and it must outlive the folder it was made in, since the
+    // destination picker is a whole activity round-trip away. Deliberately not saveable: an
+    // [ArchiveEntry] is not a Bundle value, and losing a half-made selection to a rotation is
+    // cheaper than serializing one. A reload that invalidates it needs no special case either:
+    // the extractor reports a per-entry outcome for entries that no longer exist.
+    var selectedEntries by remember { mutableStateOf<Map<String, ArchiveEntry>>(emptyMap()) }
 
     Scaffold(
         topBar = {
@@ -110,6 +121,15 @@ fun ArchiveBrowserScreen(
                     onFolderChange = { folder = it },
                     searchQuery = searchQuery,
                     onSearchQueryChange = { searchQuery = it },
+                    selectedEntries = selectedEntries,
+                    onToggleSelect = { entry ->
+                        selectedEntries = if (entry.path in selectedEntries) {
+                            selectedEntries - entry.path
+                        } else {
+                            selectedEntries + (entry.path to entry)
+                        }
+                    },
+                    onClearSelection = { selectedEntries = emptyMap() },
                     actions = actions,
                 )
             }
@@ -126,6 +146,12 @@ class ArchiveActions(
     val onUnlock: (password: String) -> Unit,
     val onOpenEntry: (ArchiveEntry) -> Unit,
     val onEntryActions: (ArchiveEntry) -> Unit,
+    /**
+     * Extract several entries at once. The browser hands the entries over and the destination
+     * picker (and the extract behind it) is the caller's plumbing — the same one the per-entry
+     * sheet's Extract row uses, so there is exactly one extract path to keep honest.
+     */
+    val onExtractEntries: (List<ArchiveEntry>) -> Unit,
     /** The reload behind the changed-on-server notification and the refresh control. */
     val onReload: () -> Unit,
     /** Dismiss the changed-on-server notification without reloading ("continue with what's shown"). */
@@ -221,6 +247,9 @@ private fun ArchiveReady(
     onFolderChange: (String) -> Unit,
     searchQuery: String,
     onSearchQueryChange: (String) -> Unit,
+    selectedEntries: Map<String, ArchiveEntry>,
+    onToggleSelect: (ArchiveEntry) -> Unit,
+    onClearSelection: () -> Unit,
     actions: ArchiveActions,
 ) {
     Column(Modifier.fillMaxSize()) {
@@ -233,24 +262,67 @@ private fun ArchiveReady(
         } else {
             state.tree.children(folder) ?: emptyList()
         }
-        when {
-            entries.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    if (searching) "Nothing matched \"$searchQuery\"." else "This folder is empty.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            else -> LazyColumn(Modifier.fillMaxSize()) {
-                items(entries, key = { it.path }) { entry ->
-                    ArchiveEntryRow(
-                        entry = entry,
-                        onOpen = {
-                            if (entry.isDirectory) onFolderChange(entry.path) else actions.onOpenEntry(entry)
-                        },
-                        onOpenActions = { actions.onEntryActions(entry) },
+        // The list is weighted rather than fillMaxSize so the selection bar below it stays on
+        // screen — the same arrangement the Files explorer's list and batch bar use.
+        Box(Modifier.fillMaxWidth().weight(1f)) {
+            when {
+                entries.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(
+                        if (searching) "Nothing matched \"$searchQuery\"." else "This folder is empty.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                else -> LazyColumn(Modifier.fillMaxSize()) {
+                    items(entries, key = { it.path }) { entry ->
+                        ArchiveEntryRow(
+                            entry = entry,
+                            selected = entry.path in selectedEntries,
+                            selecting = selectedEntries.isNotEmpty(),
+                            onOpen = {
+                                if (entry.isDirectory) onFolderChange(entry.path) else actions.onOpenEntry(entry)
+                            },
+                            onToggleSelect = { onToggleSelect(entry) },
+                            onOpenActions = { actions.onEntryActions(entry) },
+                        )
+                    }
+                }
             }
+        }
+        if (selectedEntries.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            ArchiveSelectionBar(
+                count = selectedEntries.size,
+                onClear = onClearSelection,
+                // Not cleared here: the extract waits on the destination picker, and a
+                // cancelled pick must return the user to the selection they made so a retry is
+                // one tap, not a re-selection. The bar's Clear is the way out.
+                onExtract = { actions.onExtractEntries(selectedEntries.values.toList()) },
+            )
+        }
+    }
+}
+
+/**
+ * The batch bar under an archive selection: the count, a way out, and the one batch verb an
+ * archive has. Extract is all it offers because the archive is read-only where it stands —
+ * there is no copy, move, or delete to batch, and offering them would be the pretending this
+ * screen refuses everywhere else.
+ */
+@Composable
+private fun ArchiveSelectionBar(count: Int, onClear: () -> Unit, onExtract: () -> Unit) {
+    Surface(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("$count selected", style = MaterialTheme.typography.labelLarge)
+            Spacer(Modifier.width(16.dp))
+            TextButton(onClick = onClear) { Text("Clear") }
+            Button(onClick = onExtract) { Text("Extract") }
         }
     }
 }
@@ -315,24 +387,40 @@ private fun ArchiveBreadcrumb(folder: String, onFolderChange: (String) -> Unit) 
 @Composable
 private fun ArchiveEntryRow(
     entry: ArchiveEntry,
+    selected: Boolean,
+    selecting: Boolean,
     onOpen: () -> Unit,
+    onToggleSelect: () -> Unit,
     onOpenActions: () -> Unit,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .combinedClickable(onClick = onOpen, onLongClick = onOpenActions)
+            // Long-press selects — the classic batch gesture, and the archive's answer to the
+            // Files explorer's selection mode. It used to open this sheet, so the sheet's home
+            // is now the row's overflow (where its own KDoc already said it lived); the
+            // per-entry verbs are one tap away instead of one long-press away, and batch
+            // selection gets the gesture people reach for first.
+            .combinedClickable(
+                onClick = if (selecting) onToggleSelect else onOpen,
+                onLongClick = onToggleSelect,
+            )
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
             if (entry.isDirectory) Icons.Filled.Folder else Icons.Filled.Description,
             contentDescription = null,
-            tint = if (entry.isDirectory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            tint = if (selected || entry.isDirectory) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(entry.path.substringAfterLast('/'), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                entry.path.substringAfterLast('/'),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+            )
             if (entry.encrypted) {
                 Text(
                     "Encrypted",
@@ -347,6 +435,12 @@ private fun ArchiveEntryRow(
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+        if (selected) {
+            Icon(Icons.Filled.CheckCircle, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)
+        }
+        IconButton(onClick = onOpenActions) {
+            Icon(Icons.Filled.MoreVert, contentDescription = "Entry actions")
         }
     }
 }

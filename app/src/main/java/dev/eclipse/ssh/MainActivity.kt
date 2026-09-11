@@ -1970,6 +1970,14 @@ private fun EclipseWorkspace(
                     }
                 },
                 onEntryActions = { entry -> archiveEntrySheet = entry },
+                // The batch extract from the browser's selection bar: the same pendingExtract +
+                // picker the per-entry sheet's Extract row feeds, so there is one extract path,
+                // not two. The browser keeps its selection behind the picker; a cancelled pick
+                // returns to it intact for a retry.
+                onExtractEntries = { entries ->
+                    pendingExtract = target to entries
+                    archiveExtractPicker.launch(null)
+                },
                 onReload = browser::reload,
                 onDismissServerChange = browser::dismissServerChange,
                 onShowProperties = { showArchiveProperties = true },

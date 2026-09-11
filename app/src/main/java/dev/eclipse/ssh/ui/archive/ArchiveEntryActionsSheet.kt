@@ -26,9 +26,9 @@ import java.text.DateFormat
 import java.util.Date
 
 /**
- * The per-entry action sheet inside the archive: long-press (or the row's own overflow) offers
- * everything one entry can do, exactly as the Files sheet does — with the archive's honest
- * vocabulary instead of the explorer's.
+ * The per-entry action sheet inside the archive: the row's overflow offers everything one
+ * entry can do, exactly as the Files sheet does — with the archive's honest vocabulary instead
+ * of the explorer's. (The row's long-press selects, so the overflow is the sheet's one home.)
  *
  * The verbs deliberately differ from a normal file manager:
  *  - there is no Rename, Move, or Delete — the archive is read-only where it stands, on the
