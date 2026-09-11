@@ -35,7 +35,11 @@ class StoreBackedAgentTest {
 
     @Test
     fun `identities are every stored key with its comment, in order`() {
-        val agent = StoreBackedAgent(fixtureIdentities())
+        // Built once, not re-generated for the comparison below: every kind here is freshly
+        // generated, so a second call would mint different keys and the comparison would ask
+        // whether the agent serves keys it was never handed.
+        val held = fixtureIdentities()
+        val agent = StoreBackedAgent(held)
 
         val identities = agent.getIdentities().toList()
 
@@ -43,7 +47,6 @@ class StoreBackedAgentTest {
         // The public half is the key itself, compared the way the agent itself compares keys -
         // java.security PublicKey implementations do not promise equals, and a fingerprint or
         // type-only check would pass with a re-encoded stranger.
-        val held = fixtureIdentities()
         assertThat(identities).hasSize(held.size)
         identities.zip(held).forEach { (offered, stored) ->
             assertThat(KeyUtils.compareKeys(offered.key, stored.keyPair.public)).isTrue()

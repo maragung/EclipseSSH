@@ -26,6 +26,7 @@ import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.password.PasswordAuthenticator
 import org.apache.sshd.server.channel.ChannelSession
 import org.apache.sshd.server.command.Command
+import org.apache.sshd.server.forward.AcceptAllForwardingFilter
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider
 import org.apache.sshd.server.shell.ShellFactory
 import org.junit.AfterClass
@@ -76,8 +77,12 @@ class AgentForwardingEndToEndTest {
                 username == USER && password == PASSWORD
             }
             // The server-side half of forwarding: accept the request, and expose an agent client
-            // that opens the agent channel back at whoever asked. The AgentForwardingFilter default
-            // already allows the request, so nothing else is needed here.
+            // that opens the agent channel back at whoever asked. The filter is not optional:
+            // MINA's ChannelSession refuses auth-agent-req when the manager's forwarding filter
+            // is null (its "AllowAgentForwarding" gate), and a server built by setUpDefaultServer
+            // carries none - without it, SSH_AUTH_SOCK never reaches the shell and the positive
+            // test would prove nothing about the client's request at all.
+            server.forwardingFilter = AcceptAllForwardingFilter.INSTANCE
             server.agentFactory = ProxyAgentFactory()
             server.shellFactory = ShellFactory { EnvRecordingShell().also(shells::add) }
             server.start()
