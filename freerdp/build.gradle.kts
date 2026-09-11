@@ -104,13 +104,23 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+}
 
-    sourceSets.getByName("main") {
-        // Populated by buildFreerdpNative. Because every :freerdp compilation
-        // hangs off preBuild, which depends on the native task, a clean checkout
-        // cannot package (or compile against) a half-built module: the .so files
-        // are either built or the build has already failed.
-        jniLibs.srcDir(nativeJniLibs)
+// Populated by buildFreerdpNative. Because every :freerdp compilation
+// hangs off preBuild, which depends on the native task, a clean checkout
+// cannot package (or compile against) a half-built module: the .so files
+// are either built or the build has already failed.
+//
+// Registered through the variant sources API rather than
+// `android { sourceSets.getByName("main") { jniLibs.srcDir(...) } }`:
+// AGP 9 cut the old AndroidLibrarySourceSet typing that the sourceSets
+// accessor resolves to, which fails at configuration time with a
+// ClassCastException. addStaticSourceDirectory is the supported form for
+// prebuilt-content directories and applies to every variant, exactly what
+// the "main" source set did.
+androidComponents {
+    onVariants { variant ->
+        variant.sources.jniLibs?.addStaticSourceDirectory(nativeJniLibs.absolutePath)
     }
 }
 
