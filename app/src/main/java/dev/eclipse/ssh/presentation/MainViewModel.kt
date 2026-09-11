@@ -129,6 +129,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -444,6 +446,27 @@ class MainViewModel @Inject constructor(
      * previous attempt rather than let it report against the transport that replaced it.
      */
     private val forwardJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * One lock per host, serialising every pass that stops, releases or binds that host's forwards.
+     *
+     * The reason this exists is the rebind's shape: a new pass (a connect's attach, a reconnect's
+     * ladder, an edit) cancels the previous [forwardJobs] entry and immediately wants the same
+     * ports back - but a bind that is already running cannot be interrupted, only abandoned once it
+     * lands (see [PortForwardingManager] and [abandonForward]). Without a lock, the new pass's stop
+     * could run before the dying pass's handle reached [forwardHandles] - so nothing would release
+     * it - and its bind could race the dying pass's for the same port, the loser reporting "Address
+     * already in use" against nobody. A mutex rather than a job join because joins chain only two
+     * deep: a pass cancelled while waiting on its own predecessor completes early, and the pass
+     * behind it would sail past a predecessor still in flight. The lock is held for the whole pass,
+     * so a cancelled holder unwinds - closing whatever it had just bound - before the next waiter
+     * enters.
+     */
+    private val forwardPasses = ConcurrentHashMap<String, Mutex>()
+
+    /** The serialisation lock for [hostId]'s forwards; see [forwardPasses]. */
+    private fun forwardPassesFor(hostId: String): Mutex =
+        forwardPasses.computeIfAbsent(hostId) { Mutex() }
     /** Remote home directory resolved from the server, keyed by host id. */
     private val homePaths = ConcurrentHashMap<String, String>()
 
@@ -1251,53 +1274,64 @@ class MainViewModel @Inject constructor(
      */
     private fun startSavedForwards(host: HostProfile) {
         forwardJobs.remove(host.id)?.cancel()
-        // Unconditional, including for a host with no rules: this also clears the previous transport's
-        // trackers, and a host whose last rule was just deleted has to end up with nothing bound and
-        // nothing claimed on its tab. [releaseDeadRides] beside it takes the hand-opened tunnels the
-        // dead transport took with it - forwards no rule will ever rebind, so no later pass would.
-        stopSavedForwards(host.id)
-        releaseDeadRides(host.id)
         val rules = decodeForwardRules(host.savedForwards, host.id)
-        // Every rule gets a row before anything is started, so the sheet can say "Disabled" about a
-        // rule that will never bind and "Stopped" about one that only a hand can start - a rule that is
-        // not running is only invisible until the user looks for it. The started ones below overwrite
-        // their row with STARTING the moment their attempt exists.
-        forwardStates.update { current ->
-            current + rules.associate { entry ->
-                entry.id to ForwardStatus(
-                    entry,
-                    when {
-                        !entry.enabled -> ForwardRuntime.DISABLED
-                        // Enabled but not auto-start: a connect brings up the automatic rules and
-                        // deliberately leaves this one for the forwarding sheet's Start button.
-                        else -> ForwardRuntime.STOPPED
-                    },
-                )
-            }
-        }
-        refreshForwardCounters(host.id)
-        updateHostTabs(host.id) { it?.copy(forwardError = null) }
         val toStart = rules.filter { it.enabled && it.autoStart }
-        if (toStart.isEmpty()) return
         val job = transportScope.launch {
-            // Forwards belong to the host, not to whichever terminal came up last, so the session they
-            // ride is the host's primary one - with a single terminal that is the session that just
-            // attached; with several, the first live session the host has.
-            val session = sessionStore.primarySession(host.id)
-            if (session == null) {
-                // Not an error worth a message: the only way to get here is a session that ended between
-                // the shell opening and this line, and whatever ended it is already on the tab. The rows
-                // above already say STOPPED, which is the truth about rules that were never attempted.
-                return@launch
+            // One host's forwards change hands one pass at a time - see [forwardPasses]. The
+            // cancelled predecessor may still be inside a bind, and a bind cannot be interrupted:
+            // without the lock this pass's stop would run before the predecessor's handle landed
+            // in [forwardHandles] - so nothing would release it - and this pass's bind would race
+            // the predecessor's for the same port, the loser reporting "Address already in use"
+            // against nobody.
+            forwardPassesFor(host.id).withLock {
+                // Unconditional, including for a host with no rules: this also clears the previous
+                // transport's trackers, and a host whose last rule was just deleted has to end up
+                // with nothing bound and nothing claimed on its tab. [releaseDeadRides] beside it
+                // takes the hand-opened tunnels the dead transport took with it - forwards no rule
+                // will ever rebind, so no later pass would.
+                stopSavedForwards(host.id)
+                releaseDeadRides(host.id)
+                // Every rule gets a row before anything is started, so the sheet can say "Disabled"
+                // about a rule that will never bind and "Stopped" about one that only a hand can
+                // start - a rule that is not running is only invisible until the user looks for it.
+                // The started ones below overwrite their row with STARTING the moment their attempt
+                // exists. Written after the stop above, because a release takes the released ids'
+                // rows with it.
+                forwardStates.update { current ->
+                    current + rules.associate { entry ->
+                        entry.id to ForwardStatus(
+                            entry,
+                            when {
+                                !entry.enabled -> ForwardRuntime.DISABLED
+                                // Enabled but not auto-start: a connect brings up the automatic
+                                // rules and deliberately leaves this one for the sheet's Start.
+                                else -> ForwardRuntime.STOPPED
+                            },
+                        )
+                    }
+                }
+                refreshForwardCounters(host.id)
+                updateHostTabs(host.id) { it?.copy(forwardError = null) }
+                // Forwards belong to the host, not to whichever terminal came up last, so the
+                // session they ride is the host's primary one - with a single terminal that is the
+                // session that just attached; with several, the first live session the host has.
+                val session = sessionStore.primarySession(host.id)
+                if (session == null) {
+                    // Not an error worth a message: the only way to get here is a session that
+                    // ended between the shell opening and this line, and whatever ended it is
+                    // already on the tab. The rows above already say STOPPED, which is the truth
+                    // about rules that were never attempted.
+                    return@launch
+                }
+                val failures = startForwardBatch(host, session, toStart)
+                if (failures.isEmpty()) return@launch
+                val reason = failures.joinToString(" · ")
+                updateHostTabs(host.id) { it?.copy(forwardError = reason) }
+                // One message for the whole set, and it names the host: this fires on a reconnect
+                // the user may not have asked for, so a snackbar per failed rule on a flaky link
+                // would be a queue of notifications about the same two ports.
+                report("Port forwarding on ${host.name}: $reason")
             }
-            val failures = startForwardBatch(host, session, toStart)
-            if (failures.isEmpty()) return@launch
-            val reason = failures.joinToString(" · ")
-            updateHostTabs(host.id) { it?.copy(forwardError = reason) }
-            // One message for the whole set, and it names the host: this fires on a reconnect the user
-            // may not have asked for, so a snackbar per failed rule on a flaky link would be a queue of
-            // notifications about the same two ports.
-            report("Port forwarding on ${host.name}: $reason")
         }
         forwardJobs[host.id] = job
         job.invokeOnCompletion { forwardJobs.remove(host.id, job) }
@@ -1321,6 +1355,9 @@ class MainViewModel @Inject constructor(
         // holding it - see [pendingReleases]. Joined as a set because one close serves several ids, and
         // joining another host's moment-long close is cheaper than being wrong about whose port it was.
         pendingReleases.values.toSet().forEach { it.join() }
+        // A bind this caller is cancelled out of is closed and registered rather than dropped, so
+        // the next bind of the same rule waits for the port it is giving back instead of racing it.
+        val abandon: (ForwardingHandle) -> Unit = { handle -> abandonForward(entry.id, handle) }
         return when (entry.type) {
             ForwardType.LOCAL -> portForwardingManager.startLocal(
                 session,
@@ -1328,6 +1365,7 @@ class MainViewModel @Inject constructor(
                 entry.localPort,
                 entry.remoteHost.orEmpty(),
                 entry.remotePort ?: 0,
+                abandon,
             )
             ForwardType.REMOTE -> portForwardingManager.startRemote(
                 session,
@@ -1335,9 +1373,27 @@ class MainViewModel @Inject constructor(
                 entry.remotePort ?: 0,
                 entry.localHost ?: DEFAULT_FORWARD_LISTEN_HOST,
                 entry.localPort,
+                abandon,
             )
-            ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort)
+            ForwardType.DYNAMIC -> portForwardingManager.startDynamic(session, entry.listenHost, entry.localPort, abandon)
         }
+    }
+
+    /**
+     * Closes a forward whose handle never reached [forwardHandles], and registers the close so the
+     * next bind of the same rule waits for it.
+     *
+     * Two callers, one shape: a bind that finished after its caller's reason for wanting it was
+     * taken away. The batch path's is a Stop (or a rewrite) that arrived while the bind was in
+     * flight and left STOPPED standing over the STARTING row; the manager's is a cancelled rebind
+     * whose `withContext` would otherwise discard a bound tracker on the way out. In both cases the
+     * port was genuinely claimed, so the close is registered in [pendingReleases] exactly like
+     * [releaseForwards] registers its own - a Start on the same rule must not race the give-back.
+     */
+    private fun abandonForward(id: String, handle: ForwardingHandle) {
+        val close = releaseScope.launch { runCatching { handle.close() } }
+        pendingReleases[id] = close
+        close.invokeOnCompletion { pendingReleases.remove(id, close) }
     }
 
     /**
@@ -1396,12 +1452,10 @@ class MainViewModel @Inject constructor(
                 // rewritten underneath it. Closed by hand because it never reached [forwardHandles],
                 // so no other path knows it exists.
                 if (forwardStates.value[entry.id]?.state == ForwardRuntime.STOPPED) {
-                    // Registered in [pendingReleases] like every other close, because the port this
-                    // handle just claimed is being given back and a Start on the same rule would race
-                    // it exactly like a rebind races a release.
-                    val close = releaseScope.launch { runCatching { handle.close() } }
-                    pendingReleases[entry.id] = close
-                    close.invokeOnCompletion { pendingReleases.remove(entry.id, close) }
+                    // Registered like every other close, because the port this handle just claimed
+                    // is being given back and a Start on the same rule would race it exactly like a
+                    // rebind races a release.
+                    abandonForward(entry.id, handle)
                     refreshForwardCounters(host.id)
                     return@forEach
                 }
@@ -3340,26 +3394,31 @@ class MainViewModel @Inject constructor(
      * may not exist.
      */
     private suspend fun startHandForward(host: HostProfile, entry: ForwardEntry, failureTitle: String) {
-        val sessionKey = sessionStore.primarySessionFor(host.id)
-        val session = sessionStore.primarySession(host.id) ?: return report("${host.name} is not connected")
-        setForwardState(entry, ForwardRuntime.STARTING)
-        try {
-            val handle = openForward(session, entry)
-            forwardHandles[entry.id] = handle
-            if (sessionKey != null) forwardRides[entry.id] = ForwardRide(sessionKey, session)
-            forwardings.update { it + entry }
-            setForwardState(entry, ForwardRuntime.RUNNING)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            reportForwardFailure(failureTitle, error)
-            setForwardState(
-                entry,
-                ForwardRuntime.FAILED,
-                error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName,
-            )
+        // Same wait as [startForwardRule]: a rebind in flight for this host has binds that have not
+        // reached [forwardHandles] yet, and a hand-opened port colliding with one of them would
+        // fail against a tunnel nothing can name.
+        forwardPassesFor(host.id).withLock {
+            val sessionKey = sessionStore.primarySessionFor(host.id)
+            val session = sessionStore.primarySession(host.id) ?: return report("${host.name} is not connected")
+            setForwardState(entry, ForwardRuntime.STARTING)
+            try {
+                val handle = openForward(session, entry)
+                forwardHandles[entry.id] = handle
+                if (sessionKey != null) forwardRides[entry.id] = ForwardRide(sessionKey, session)
+                forwardings.update { it + entry }
+                setForwardState(entry, ForwardRuntime.RUNNING)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                reportForwardFailure(failureTitle, error)
+                setForwardState(
+                    entry,
+                    ForwardRuntime.FAILED,
+                    error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName,
+                )
+            }
+            refreshForwardCounters(host.id)
         }
-        refreshForwardCounters(host.id)
     }
 
     /**
@@ -3426,24 +3485,30 @@ class MainViewModel @Inject constructor(
             val entry = forwardStates.value[ruleId]?.entry
                 ?: decodeForwardRules(host.savedForwards, host.id).firstOrNull { it.id == ruleId }
                 ?: return@launch
-            // Already up, or on its way up: re-attempting a running rule would find its own port
-            // claimed and report a conflict with itself. The *displayed* state is what decides,
-            // because a recorded RUNNING whose session has died is a tunnel that no longer exists.
-            val recorded = forwardStates.value[ruleId]
-            if (forwardHandles.containsKey(ruleId) && recorded != null &&
-                displayedForwardState(recorded, tabs.value) == ForwardRuntime.RUNNING
-            ) return@launch
-            val session = sessionStore.primarySession(hostId) ?: run {
-                setForwardState(entry, ForwardRuntime.STOPPED)
-                refreshForwardCounters(hostId)
-                report("${host.name} is not connected")
-                return@launch
+            // One host's forwards change hands one pass at a time - see [forwardPasses]. A rebind in
+            // flight for this host has binds that have not reached [forwardHandles] yet, so the
+            // guard below could not see them; waiting costs nothing and the guard then decides on
+            // settled books.
+            forwardPassesFor(hostId).withLock {
+                // Already up, or on its way up: re-attempting a running rule would find its own port
+                // claimed and report a conflict with itself. The *displayed* state is what decides,
+                // because a recorded RUNNING whose session has died is a tunnel that no longer exists.
+                val recorded = forwardStates.value[ruleId]
+                if (forwardHandles.containsKey(ruleId) && recorded != null &&
+                    displayedForwardState(recorded, tabs.value) == ForwardRuntime.RUNNING
+                ) return@launch
+                val session = sessionStore.primarySession(hostId) ?: run {
+                    setForwardState(entry, ForwardRuntime.STOPPED)
+                    refreshForwardCounters(hostId)
+                    report("${host.name} is not connected")
+                    return@launch
+                }
+                val failures = startForwardBatch(host, session, listOf(entry))
+                if (failures.isEmpty()) return@launch
+                val reason = failures.joinToString(" · ")
+                updateHostTabs(hostId) { it?.copy(forwardError = reason) }
+                report("Port forwarding on ${host.name}: $reason")
             }
-            val failures = startForwardBatch(host, session, listOf(entry))
-            if (failures.isEmpty()) return@launch
-            val reason = failures.joinToString(" · ")
-            updateHostTabs(hostId) { it?.copy(forwardError = reason) }
-            report("Port forwarding on ${host.name}: $reason")
         }
     }
 
@@ -3484,36 +3549,45 @@ class MainViewModel @Inject constructor(
             // A rebind still running for the previous column is working from stale rules; abandoning it
             // costs at most a STARTING row, which the rewrite below replaces.
             forwardJobs.remove(hostId)?.cancel()
-            // Removed and changed rules only - unchanged ids keep their tunnels.
-            releaseForwards(oldIds - newIds)
-            forwardStates.update { current ->
-                val next = current.toMutableMap()
-                saved.forEach { entry ->
-                    // A handle on a live session is a tunnel that is up right now, whatever the row
-                    // said a moment ago - including a row a just-cancelled rebind never finished
-                    // writing. An id that survived the edit with its tunnel intact keeps both.
-                    val running = forwardHandles.containsKey(entry.id) && forwardRideIsLive(entry.id)
-                    next[entry.id] = when {
-                        !entry.enabled -> ForwardStatus(entry, ForwardRuntime.DISABLED)
-                        running -> ForwardStatus(entry, ForwardRuntime.RUNNING)
-                        else -> ForwardStatus(entry, ForwardRuntime.STOPPED)
-                    }
-                }
-                next
-            }
-            refreshForwardCounters(hostId)
-            updateHostTabs(hostId) { it?.copy(forwardError = null) }
-            val toStart = saved.filter { it.enabled && it.autoStart && !forwardHandles.containsKey(it.id) }
-            if (toStart.isEmpty() || sessionStore.primarySession(hostId) == null) return@launchGuarded
             val job = transportScope.launch {
-                // Asked for here rather than carried from before the launch, so a session that died
-                // while the save was in flight is not handed to the bind as though it were alive.
-                val session = sessionStore.primarySession(hostId) ?: return@launch
-                val failures = startForwardBatch(host, session, toStart)
-                if (failures.isEmpty()) return@launch
-                val reason = failures.joinToString(" · ")
-                updateHostTabs(hostId) { it?.copy(forwardError = reason) }
-                report("Port forwarding on ${host.name}: $reason")
+                // One host's forwards change hands one pass at a time - see [forwardPasses]. The
+                // cancelled predecessor may still be inside a bind for one of the old ids, and a
+                // bind cannot be interrupted: without the lock the release below could run before
+                // the predecessor's handle landed in [forwardHandles] - so nothing would release
+                // it - and this pass's bind would race it for the same port.
+                forwardPassesFor(hostId).withLock {
+                    // Removed and changed rules only - unchanged ids keep their tunnels.
+                    releaseForwards(oldIds - newIds)
+                    forwardStates.update { current ->
+                        val next = current.toMutableMap()
+                        saved.forEach { entry ->
+                            // A handle on a live session is a tunnel that is up right now, whatever
+                            // the row said a moment ago - including a row a just-cancelled rebind
+                            // never finished writing. An id that survived the edit with its tunnel
+                            // intact keeps both.
+                            val running = forwardHandles.containsKey(entry.id) && forwardRideIsLive(entry.id)
+                            next[entry.id] = when {
+                                !entry.enabled -> ForwardStatus(entry, ForwardRuntime.DISABLED)
+                                running -> ForwardStatus(entry, ForwardRuntime.RUNNING)
+                                else -> ForwardStatus(entry, ForwardRuntime.STOPPED)
+                            }
+                        }
+                        next
+                    }
+                    refreshForwardCounters(hostId)
+                    updateHostTabs(hostId) { it?.copy(forwardError = null) }
+                    val toStart = saved.filter { it.enabled && it.autoStart && !forwardHandles.containsKey(it.id) }
+                    if (toStart.isEmpty()) return@launch
+                    // Asked for here rather than carried from before the launch, so a session that
+                    // died while the save was in flight is not handed to the bind as though it
+                    // were alive.
+                    val session = sessionStore.primarySession(hostId) ?: return@launch
+                    val failures = startForwardBatch(host, session, toStart)
+                    if (failures.isEmpty()) return@launch
+                    val reason = failures.joinToString(" · ")
+                    updateHostTabs(hostId) { it?.copy(forwardError = reason) }
+                    report("Port forwarding on ${host.name}: $reason")
+                }
             }
             forwardJobs[hostId] = job
             job.invokeOnCompletion { forwardJobs.remove(hostId, job) }
