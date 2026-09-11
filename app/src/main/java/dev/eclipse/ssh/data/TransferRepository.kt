@@ -24,7 +24,7 @@ data class TransferEntity(
     val hostId: String?,
     val remotePath: String?,
     val localUri: String?,
-    // The cross-host columns, added in Migrations.MIGRATION_15_16. Nullable with no backfill for
+    // The cross-host columns, added in Migrations.MIGRATION_16_17. Nullable with no backfill for
     // the same reason localUri is: every row that predates them was an ordinary upload or download
     // with no second host and no destination directory, and null is the only value that says so
     // without inventing a sentinel path an old row would be read as configuring.
