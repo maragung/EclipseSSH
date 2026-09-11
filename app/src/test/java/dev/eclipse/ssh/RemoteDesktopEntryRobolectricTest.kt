@@ -242,6 +242,11 @@ class RemoteDesktopEntryRobolectricTest {
      * make comes back through the callback read, and deleting the host takes the credential with
      * it - the store's forget covers all three fields, so nothing outlives the profile it belongs
      * to.
+     *
+     * Both ends read through [awaitRdpCredentials], not one bare read: the save and the delete's
+     * forget are fire-and-forget (a click handler's shape) and land through the DataStore edit
+     * path while the read goes through its state flow, so a read racing either write observes the
+     * pre-write value. Waiting for the value to settle is the same honesty as the pump for the UI.
      */
     @Test
     fun rdpCredentialsRoundTripThroughTheViewModelAndDieWithTheHost() {
@@ -258,8 +263,7 @@ class RemoteDesktopEntryRobolectricTest {
             )
         }
 
-        val first = readRdpCredentials(host.id)
-        assertThat(first?.username).isEqualTo("administrator")
+        val first = awaitRdpCredentials(host.id) { it?.username == "administrator" }
         assertThat(first?.domain).isEqualTo("CORP")
         assertThat(first?.password).isEqualTo("rdp-secret")
 
@@ -268,7 +272,7 @@ class RemoteDesktopEntryRobolectricTest {
             viewModel().uiState.value.hosts.none { it.id == host.id }
         }
 
-        assertThat(readRdpCredentials(host.id)).isNull()
+        assertThat(awaitRdpCredentials(host.id) { it == null }).isNull()
     }
 
     // ---------------------------------------------------------------- driving the app
@@ -343,6 +347,26 @@ class RemoteDesktopEntryRobolectricTest {
         }
         pumpUntil(describe = { "the RDP credential never read back" }) { done }
         return result
+    }
+
+    /**
+     * Reads [hostId]'s credential until [settled] accepts what came back, re-issuing the same
+     * callback read the NLA prompt will use. The store's writes are fire-and-forget from the
+     * ViewModel's side and land through the DataStore edit path while this read goes through its
+     * state flow, so a single read that races a save (or the delete's forget) observes the
+     * pre-write value without anything being wrong; polling is the wait for "the store has caught
+     * up", the way [pumpUntil] is the wait for the UI.
+     */
+    private fun awaitRdpCredentials(
+        hostId: String,
+        settled: (RdpCredentials?) -> Boolean,
+    ): RdpCredentials? {
+        var latest: RdpCredentials? = null
+        pumpUntil(describe = { "the RDP credential never settled to the expected value" }) {
+            latest = readRdpCredentials(hostId)
+            settled(latest)
+        }
+        return latest
     }
 
     /** Whether the viewer activity was started, by peeking at what the application recorded. */
