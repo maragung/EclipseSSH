@@ -53,11 +53,14 @@ class ZipArchive(private val source: ArchiveByteSource) {
 
         // Signature words, little-endian in the file but written here as the conventional
         // documentation value (read them only through the little-endian helpers below).
-        private const val EOCD_SIGNATURE = 0x06054b50
-        private const val CENTRAL_ENTRY_SIGNATURE = 0x02014b50
-        private const val LOCAL_HEADER_SIGNATURE = 0x04034b50
-        private const val ZIP64_EOCD_SIGNATURE = 0x06064b50
-        private const val ZIP64_LOCATOR_SIGNATURE = 0x07064b50
+        // Long so every comparison against u32()'s result is same-type: the five signatures are
+        // the only constants a 4-byte read is ever compared to, and Kotlin refuses mixed
+        // Long/Int equality.
+        private const val EOCD_SIGNATURE = 0x06054b50L
+        private const val CENTRAL_ENTRY_SIGNATURE = 0x02014b50L
+        private const val LOCAL_HEADER_SIGNATURE = 0x04034b50L
+        private const val ZIP64_EOCD_SIGNATURE = 0x06064b50L
+        private const val ZIP64_LOCATOR_SIGNATURE = 0x07064b50L
 
         /** Fixed part of a central directory entry: signature through the local header offset. */
         private const val CENTRAL_ENTRY_FIXED_BYTES = 46

@@ -1,5 +1,9 @@
 package dev.eclipse.ssh.archive
 
+import java.util.zip.Inflater
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
 /**
  * The format-agnostic front door: name an archive, get its entries.
  *
@@ -69,15 +73,81 @@ object ArchiveReader {
      * Reads one entry's bytes - the single-file preview and selective-extract path.
      *
      * ZIP: a bounded range read at the entry's data offset (the local header is validated on the
-     * way). Everything else: null, telling the caller that this entry needs the streaming path
-     * ([TarArchive] re-scans forward); refusing to pretend is why the UI can label the TAR
-     * preview honestly ("reading through the archive") instead of discovering a hidden full
-     * download.
+     * way), then decompressed per the entry's method - STORED bytes pass through, DEFLATED ones
+     * are inflated to the entry's declared [ArchiveEntry.size] and refused when they do not match,
+     * because a mismatch is a corrupt archive, not a preview to render anyway. Anything else the
+     * method field can name is unsupported, honestly rather than guessed. Everything else: null,
+     * telling the caller that this entry needs the streaming path ([TarArchive] re-scans forward);
+     * refusing to pretend is why the UI can label the TAR preview honestly ("reading through the
+     * archive") instead of discovering a hidden full download.
      */
     suspend fun readEntry(format: Format, source: ArchiveByteSource, entry: ArchiveEntry): ByteArray? {
         if (!supportsRandomAccess(format)) return null
+        // A fresh instance must re-list before dataOffsetOf: the local-header offset bookkeeping
+        // lives in the instance that scanned the central directory, so querying an instance that
+        // never listed would refuse every entry as unknown. The re-list costs the metadata again
+        // (EOCD window plus the central directory) and never the payloads - the same bounded cost
+        // the original scan paid, which is the price of readEntry being a stateless one-shot
+        // rather than a browser-session-scoped engine instance.
         val zip = ZipArchive(source)
+        zip.listEntries()
         val offset = zip.dataOffsetOf(entry)
-        return source.readAt(offset, entry.compressedSize?.toInt() ?: return null)
+        val compressedSize = entry.compressedSize ?: return null
+        val compressed = source.readAt(offset, compressedSize)
+        return when (entry.method) {
+            METHOD_STORED -> compressed
+            METHOD_DEFLATED -> inflateDeflate(compressed, entry)
+            // The one honest answer for a method this reader cannot decode: null, which the
+            // callers already treat as "no range read for this entry".
+            else -> null
+        }
     }
+
+    /**
+     * Inflates a deflated entry, verifying it lands on the entry's declared size.
+     *
+     * Size is checked because an inflater will happily return a prefix of the data (or an empty
+     * array) for a truncated stream, and a preview that quietly shows half a file is worse than
+     * the error that names it. [Inflater] is fed on the caller's dispatcher by its own
+     * `withContext` - the call is CPU work on what may be megabytes.
+     */
+    private suspend fun inflateDeflate(compressed: ByteArray, entry: ArchiveEntry): ByteArray =
+        withContext(Dispatchers.Default) {
+        // Above 2 GB the size cannot be a ByteArray length at all, and the entry is past every
+        // preview/extract ceiling this feature has - corrupt-or-oversized reads identically here.
+        val declared = entry.size
+        if (declared < 0 || declared > Int.MAX_VALUE) {
+            throw ArchiveCorruptException("Entry '${entry.path}' declares $declared byte(s) of data")
+        }
+        Inflater().use { inflater ->
+            inflater.setInput(compressed)
+            // The declared size is the output bound as well as the check: allocating it up front
+            // means no growing reallocations, and an archive that declares something absurd
+            // (a 4 GB "size" over 200 compressed bytes) fails on the check below rather than by
+            // OOM'ing the app - but only after allocating, so the size cap is the caller's job
+            // (the preview sheet refuses oversized entries before reading).
+            val output = ByteArray(declared.toInt())
+            var produced = 0
+            while (produced < output.size) {
+                if (inflater.needsInput() && inflater.remaining == 0) break
+                val count = inflater.inflate(output, produced, output.size - produced)
+                if (count == 0) {
+                    if (inflater.finished()) break
+                    if (inflater.needsDictionary() || inflater.needsInput()) break
+                }
+                produced += count
+            }
+            if (!inflater.finished() || produced != output.size) {
+                throw ArchiveCorruptException(
+                    "Entry '${entry.path}' decompresses to $produced byte(s), not the " +
+                        "${entry.size} its header declares",
+                )
+            }
+            output
+        }
+    }
+
+    /** ZIP method codes this reader can decode; see [readEntry]. */
+    private const val METHOD_STORED = 0
+    private const val METHOD_DEFLATED = 8
 }

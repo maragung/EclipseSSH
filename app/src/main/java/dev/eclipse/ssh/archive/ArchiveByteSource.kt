@@ -52,6 +52,18 @@ interface ArchiveByteSource {
 
     /** Repositions the sequential cursor. Never called by the TAR reader; kept for symmetry. */
     suspend fun seek(offset: Long)
+
+    /**
+     * Releases whatever the source holds: the SFTP channel pair, or nothing at all for a
+     * [ByteArray] backing.
+     *
+     * Suspend rather than [AutoCloseable] because closing an SFTP channel is a blocking round-trip
+     * to the server, and the browser's lifecycle (a coroutine scope) is the only place that calls
+     * it - a `use {}` shape would invite closing from the main thread, which the app already
+     * learned to treat as a transport failure the hard way. Idempotent: a close after a cancelled
+     * scan's close is a no-op, not a double-release.
+     */
+    suspend fun close()
 }
 
 /**
@@ -89,4 +101,7 @@ class ByteArrayByteSource(private val bytes: ByteArray) : ArchiveByteSource {
     override suspend fun seek(offset: Long) {
         cursor = offset.coerceIn(0L, bytes.size.toLong())
     }
+
+    /** There is nothing to release; a byte array's lifetime is the caller's. */
+    override suspend fun close() {}
 }

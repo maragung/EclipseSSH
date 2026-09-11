@@ -425,6 +425,65 @@ class ZipArchiveTest {
         assertThat(paths).containsExactly("München.txt", "art░.txt", "résumé.txt")
     }
 
+    @Test
+    fun `readEntry inflates a deflated entry to its original bytes`() {
+        // The preview path's whole promise: compressible text, deflated by the platform writer,
+        // comes back out as the exact original - not as the compressed bytes with a text
+        // renderer pointed at them.
+        val original = "line one\nline two\n".repeat(64).toByteArray()
+        val zip = zipOf(ZipEntry("log.txt") to original)
+        val entry = list(zip).single()
+
+        val bytes = read(zip, entry)
+
+        assertThat(bytes).isEqualTo(original)
+    }
+
+    @Test
+    fun `readEntry passes a stored entry through untouched`() {
+        val stored = "0123456789abcdef".toByteArray()
+        val zip = zipOf(storedEntry("data.bin", stored) to stored)
+        val entry = list(zip).single()
+
+        assertThat(read(zip, entry)).isEqualTo(stored)
+    }
+
+    @Test
+    fun `readEntry refuses a deflated entry whose declared size disagrees with the data`() {
+        // A lying central directory: the entry claims more bytes than the deflate stream can
+        // produce. A preview that quietly showed a prefix (or an empty buffer) would be worse
+        // than this error, which names both numbers.
+        val original = "compressible ".repeat(32).toByteArray()
+        val zip = zipOf(ZipEntry("log.txt") to original)
+        val entry = list(zip).first().let { it.copy(size = it.size + 7) }
+
+        val failure = runCatching { read(zip, entry) }.exceptionOrNull()
+
+        assertThat(failure).isInstanceOf(ArchiveCorruptException::class.java)
+    }
+
+    @Test
+    fun `readEntry inflates a stream the platform round-trips`() {
+        // Incompressible bytes at a size large enough that the inflater loops more than once,
+        // proving the produced-bytes accounting survives a multi-fill inflate.
+        val original = ByteArray(64 * 1024) { index -> ((index * 31 + 7) and 0xFF).toByte() }
+        val zip = zipOf(ZipEntry("blob.bin") to original)
+        val entry = list(zip).single()
+
+        assertThat(read(zip, entry)).isEqualTo(original)
+    }
+
+    /**
+     * Runs one [ArchiveReader.readEntry] call, for the same reason [list] runs a listing: the
+     * whole API is suspend and every preview-path test boils down to "read this entry, then
+     * assert".
+     */
+    private fun read(bytes: ByteArray, entry: ArchiveEntry): ByteArray? = runBlocking {
+        val source = ByteArrayByteSource(bytes)
+        ZipArchive(source).listEntries()
+        ArchiveReader.readEntry(ArchiveReader.Format.ZIP, source, entry)
+    }
+
     /**
      * Runs a listing to completion (or to its first exception), because the engine's whole API
      * is suspend and every test boils down to "list these bytes, then assert".

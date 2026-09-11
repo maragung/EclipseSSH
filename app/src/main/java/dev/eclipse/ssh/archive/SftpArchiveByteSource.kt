@@ -35,7 +35,7 @@ class SftpArchiveByteSource(
     private val remotePath: String,
     /** The archive's size as the caller's stat reported it - avoids a stat round-trip here. */
     override val size: Long,
-) : ArchiveByteSource, AutoCloseable {
+) : ArchiveByteSource {
 
     private val session = sessionStore.primarySession(hostId)
         ?: throw IllegalStateException("$hostName is not connected")
