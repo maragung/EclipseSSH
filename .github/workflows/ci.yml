@@ -172,7 +172,11 @@ jobs:
           test -f .tmp-build/sshd-test/port-no-shell
 
       - name: Unit and integration tests
-        run: ./gradlew --stacktrace testDebugUnitTest testReleaseUnitTest
+        # Debug variant only: AGP 9 removed the release unit-test variant
+        # (`testReleaseUnitTest` no longer exists), and the AndroidX/Robolectric
+        # suites here are variant-independent — the release side keeps its own
+        # coverage through lintRelease and the assembled release artifacts below.
+        run: ./gradlew --stacktrace testDebugUnitTest
 
       - name: Stop the OpenSSH sandbox
         if: always()
