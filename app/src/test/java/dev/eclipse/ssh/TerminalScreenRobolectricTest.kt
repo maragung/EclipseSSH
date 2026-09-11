@@ -17,7 +17,6 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
-import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SessionTab
@@ -410,8 +409,15 @@ class TerminalScreenRobolectricTest {
         }
         assertThat(viewModel.uiState.value.commandHistory[hosts[0].id].orEmpty()).doesNotContain("whoami")
 
-        // The close button is reachable by its own screen-reader label and closes only its own tab.
+        // The close button is reachable by its own screen-reader label and closes only its own tab -
+        // after asking, because a live shell is behind it. Confirming the dialog is the part of the
+        // flow this test owns since asking landed; the pump-until idiom is the one every dialog in
+        // this suite uses, for the reasons closingATabAsksBeforeItClosesTheSession spells out.
         compose.onNodeWithContentDescription("Close ${hosts[0].name} session").performScrollTo().performClick()
+        pumpUntil(describe = { "the close confirmation never opened" }) {
+            ShadowDialog.getShownDialogs().isNotEmpty() && ShadowDialog.getLatestDialog()?.isShowing == true
+        }
+        compose.onNodeWithText("Close session").performClick()
         pumpUntil(describe = { "closing one tab left ${viewModel.uiState.value.tabs.size}" }) {
             viewModel.uiState.value.tabs.size == 1
         }
@@ -612,11 +618,12 @@ class TerminalScreenRobolectricTest {
         // The seeded host, not an index: three hosts are seeded and the connected one is whichever
         // openSessionTab reached first.
         compose.onNodeWithContentDescription("Close $hostName session").performClick()
-        compose.mainClock.advanceTimeByFrame()
-        Snapshot.sendApplyNotifications()
-
-        assertWithMessage("the X closed the session without asking")
-            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
+        // Pumped, not a fixed frame count: the click only flips a remembered flag, the dialog
+        // composes on the next frame, and the WindowManager.addView that shows it is posted to the
+        // paused main looper - how many pumps that takes depends on what ran earlier in this JVM.
+        pumpUntil(describe = { "the X closed the session without asking" }) {
+            ShadowDialog.getShownDialogs().size > before
+        }
         assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
         // Nothing has been closed yet: the tab is still there behind the dialog.
         assertThat(viewModel().uiState.value.tabs).hasSize(1)

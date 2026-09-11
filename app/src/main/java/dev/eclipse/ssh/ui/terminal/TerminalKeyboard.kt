@@ -151,10 +151,12 @@ fun TerminalInputBridge(
     BasicTextField(
         value = field,
         onValueChange = { change ->
-            // A reset pending means the platform may still hold the pre-reset content for a frame;
-            // the diff has to be against what the platform actually held, whichever of the two that
-            // is, or a keystroke racing the reset gets diffed against the wrong base and sent twice.
-            val base = pendingResetBase(resetPendingFrom, change.text)
+            // The diff base is what the platform held when the IME computed this edit: normally the
+            // value the field already carries (the last adopted edit, which is exactly what the
+            // platform holds - adoption pushes nothing), but while a reset is in flight the
+            // platform may still hold the pre-reset content for a frame, and diffing against the
+            // wrong one of the two is how a keystroke gets sent twice or not at all.
+            val base = pendingResetBase(resetPendingFrom, field.text, change.text)
             val edit = diffTerminalEdit(base, change.text)
             // Deletions first: an edit that both replaces and inserts emulates the replacement as
             // Backspaces followed by the new text, which is the order a shell would need to see.
@@ -361,24 +363,30 @@ internal fun diffTerminalEdit(base: String, incoming: String): TerminalEdit {
 }
 
 /**
- * The content an incoming edit was diffed against, when a reset is in flight.
+ * The content an incoming edit was diffed against.
  *
  * Compose pushes a programmatic value change to the platform field at the next recomposition, so
- * between `field = sentinelValue()` and that frame landing there are two candidates: the content
- * the platform still holds (the pre-reset text) and the sentinel the recomposition is installing.
- * The discriminator is structural: an edit computed against the pre-reset content carries its
- * keystroke tail - it *starts* with that content minus the leading sentinel - while anything the
- * platform computed after the reset starts with a fresh sentinel. A tail match means the old base;
- * anything else means the reset landed.
+ * between `field = sentinelValue()` and that frame landing there are two candidates for what the
+ * platform held when the IME computed its edit: the pre-reset text the platform may still hold, or
+ * the reset value the recomposition is installing ([adopted], which is what the field carries).
+ * The discriminator is structural: an edit computed against the pre-reset content worked from its
+ * keystroke tail, so one of the two tails extends the other - an insertion appends past it, a
+ * deletion truncates it - while an edit computed after the reset landed starts a tail of its own
+ * that merely happens to overlap. Tail relation means the old base; anything else means the reset
+ * landed and [adopted] is the truth.
+ *
+ * Both tails must be non-empty for the relation to mean anything: an empty pre-reset tail carries
+ * no evidence (the reset was from a bare sentinel), and an empty incoming tail is the
+ * reset-landed-then-backspace-into-the-padding case, where guessing "raced" would send a handful
+ * of spurious Backspaces for what was one press.
  */
-internal fun pendingResetBase(resetPendingFrom: String?, incoming: String): String {
-    if (resetPendingFrom == null) return incoming
-    val preResetTail = resetPendingFrom.drop(SENTINEL.length)
-    return if (incoming.drop(SENTINEL.length).startsWith(preResetTail) && !preResetTail.isEmpty()) {
-        resetPendingFrom
-    } else {
-        incoming
-    }
+internal fun pendingResetBase(resetPendingFrom: String?, adopted: String, incoming: String): String {
+    if (resetPendingFrom == null) return adopted
+    val preResetTail = resetPendingFrom.drop(SENTINEL_LENGTH)
+    val incomingTail = incoming.drop(SENTINEL_LENGTH)
+    val raced = preResetTail.isNotEmpty() && incomingTail.isNotEmpty() &&
+        (incomingTail.startsWith(preResetTail) || preResetTail.startsWith(incomingTail))
+    return if (raced) resetPendingFrom else adopted
 }
 
 /**

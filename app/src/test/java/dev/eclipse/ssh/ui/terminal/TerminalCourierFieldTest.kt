@@ -54,7 +54,7 @@ class TerminalCourierFieldTest {
         // held. A reset pending from a pre-reset tail still carries that tail, so the base is the
         // pre-reset content and the new keystroke diffs against it exactly once.
         val preReset = sentinel("help")
-        val base = pendingResetBase(preReset, sentinel("hel"))
+        val base = pendingResetBase(preReset, SENTINEL_TEST, sentinel("hel"))
         assertThat(base).isEqualTo(preReset)
         val edit = diffTerminalEdit(base, sentinel("hel"))
         assertThat(edit.deleted).isEqualTo(1)
@@ -62,22 +62,36 @@ class TerminalCourierFieldTest {
     }
 
     @Test
+    fun `a keystroke extending the tail while the reset is pending also races`() {
+        // The other direction of the same race: the IME commits the next character computed
+        // against the pre-reset content, so the incoming tail *extends* the pending one. Reading
+        // that as "reset landed" would diff against the bare sentinel and re-send the whole tail.
+        val preReset = sentinel("hel")
+        val base = pendingResetBase(preReset, SENTINEL_TEST, sentinel("help"))
+        assertThat(base).isEqualTo(preReset)
+        val edit = diffTerminalEdit(base, sentinel("help"))
+        assertThat(edit.deleted).isEqualTo(0)
+        assertThat(edit.inserted).isEqualTo("p")
+    }
+
+    @Test
     fun `an edit after the reset landed uses the fresh sentinel as its base`() {
-        // The reset did reach the platform, so the incoming text no longer carries the pre-reset
-        // tail; the base is the incoming text itself and the diff is the plain insertion.
-        val base = pendingResetBase(sentinel("help"), sentinel("n"))
-        assertThat(base).isEqualTo(sentinel("n"))
+        // The reset did reach the platform, so the incoming text starts a tail of its own that
+        // merely overlaps the pre-reset one instead of extending it; the base is the adopted
+        // field value - the bare sentinel - and the diff is the plain insertion.
+        val base = pendingResetBase(sentinel("help"), SENTINEL_TEST, sentinel("n"))
+        assertThat(base).isEqualTo(SENTINEL_TEST)
         val edit = diffTerminalEdit(base, sentinel("n"))
         assertThat(edit.deleted).isEqualTo(0)
         assertThat(edit.inserted).isEqualTo("n")
     }
 
     @Test
-    fun `a pending reset with an empty tail treats the incoming text as the base`() {
-        // The common case: the reset was from a bare sentinel, so there is no tail to match and the
-        // only honest base is what arrived.
-        val base = pendingResetBase(SENTINEL_TEST, sentinel("x"))
-        assertThat(base).isEqualTo(sentinel("x"))
+    fun `a pending reset with an empty tail treats the adopted field as the base`() {
+        // The common case: the reset was from a bare sentinel, so there is no tail to match and
+        // the only honest base is what the field carries.
+        val base = pendingResetBase(SENTINEL_TEST, SENTINEL_TEST, sentinel("x"))
+        assertThat(base).isEqualTo(SENTINEL_TEST)
     }
 
     @Test
