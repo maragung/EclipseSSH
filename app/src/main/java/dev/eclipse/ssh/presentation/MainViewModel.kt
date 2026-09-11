@@ -45,6 +45,7 @@ import dev.eclipse.ssh.data.model.matchesQuery
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isPastAuthentication
+import dev.eclipse.ssh.data.model.isLive
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.Snippet
@@ -85,8 +86,11 @@ import dev.eclipse.ssh.ssh.TransferCoordinator
 import dev.eclipse.ssh.ssh.PortForwardingManager
 import dev.eclipse.ssh.ssh.ForwardingHandle
 import dev.eclipse.ssh.background.SessionRegistry
+import dev.eclipse.ssh.background.TransferNotifier
 import dev.eclipse.ssh.security.SecureClipboard
 import dev.eclipse.ssh.security.normalizePastedSecret
+import dev.eclipse.ssh.feature.terminallog.SessionLog
+import dev.eclipse.ssh.feature.terminallog.SilenceDetector
 import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
@@ -148,6 +152,7 @@ class MainViewModel @Inject constructor(
     private val credentialStore: HostCredentialStore,
     private val diagnostics: SessionDiagnostics,
     private val livenessProbe: SessionLivenessProbe,
+    private val transferNotifier: TransferNotifier,
     val filesExplorer: FilesExplorerController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
@@ -198,6 +203,34 @@ class MainViewModel @Inject constructor(
 
     /** When each host's searchable plain text was last rebuilt - see [publishTerminalText]. */
     private val textPublishedAt = ConcurrentHashMap<String, Long>()
+
+    /**
+     * The raw transcript each session keeps for "Save session log", keyed by session key.
+     *
+     * Beside [scrollOffsets] and [textPublishedAt] rather than inside the UI state because it is
+     * written from the collector at output rate and read only when the user exports it - putting a
+     * quarter megabyte of text through [uiState] would rebuild every screen in the app per chunk.
+     * Created by the collector alongside the session's buffer, so a reconnect (which keeps the
+     * same key and the same scrollback) keeps its log too; dropped in the same teardown that
+     * drops [terminalOutput] - [closeTab] and [deleteHost].
+     */
+    private val sessionLogs = ConcurrentHashMap<String, SessionLog>()
+
+    /**
+     * The armed "Notify when done" detector of each session that asked for one, keyed by session
+     * key and held only while an arming is outstanding - a session that has not asked costs
+     * nothing, and one whose detector fired or whose session ended is dropped from here. The
+     * [silenceWatchdog] is what turns their verdicts into notifications.
+     */
+    private val sessionDetectors = ConcurrentHashMap<String, SilenceDetector>()
+
+    /**
+     * The one coroutine that polls every armed [sessionDetectors] entry, started on the first
+     * arming and ending itself when none are left. One watchdog for all sessions rather than one
+     * per session, because the work is a map walk twice a second - a timer per terminal would be
+     * the only part of a quiet session that wakes up.
+     */
+    @Volatile private var silenceWatchdog: Job? = null
 
     /**
      * The command line each host appears to be typing, for the recent-commands list.
@@ -1683,6 +1716,10 @@ class MainViewModel @Inject constructor(
     ): Job = viewModelScope.launch(Dispatchers.Default) {
         val incoming = Channel<ByteArray>(Channel.UNLIMITED)
         val decoder = Utf8StreamDecoder()
+        // Created here rather than beside the buffer in `connect` so every path that starts a
+        // collector - a fresh connect, an adopted session, a reconnect - gets one, and so a
+        // reconnect (same session key, same scrollback) keeps the log it already had.
+        val sessionLog = sessionLogs.getOrPut(sessionKey) { SessionLog() }
         // Answers to the queries the remote side sends: a cursor-position report, a device-attributes
         // reply. The buffer produces them while parsing and cannot write them itself; without this a
         // program that asks where the cursor is - anything using readline for a multi-line prompt -
@@ -1878,7 +1915,16 @@ class MainViewModel @Inject constructor(
                     // Decoded here rather than in the channel because the state that matters - the
                     // two or three bytes of a codepoint that straddled a network read - lives between
                     // chunks. See [Utf8StreamDecoder].
-                    buffer.feed(decoder.decode(chunk!!))
+                    val decoded = decoder.decode(chunk!!)
+                    buffer.feed(decoded)
+                    // The single tee point for everything a session showed: every decoded chunk
+                    // passes through here on its way to the buffer, so the session log and the
+                    // notify-when-done detector see exactly what the terminal saw. Typed input
+                    // needs no second plumbing - there is no local echo; a keystroke is written to
+                    // the channel and comes back through `terminal.output` like any other output,
+                    // so it reaches this tee when the shell echoes it.
+                    sessionLog.append(decoded)
+                    sessionDetectors[sessionKey]?.onOutput()
                     chunk = incoming.tryReceive().getOrNull()
                 } while (chunk != null)
                 pinScrollback(sessionKey, buffer, before)
@@ -1914,7 +1960,15 @@ class MainViewModel @Inject constructor(
             // A truncated codepoint at the end of the stream becomes one replacement character
             // instead of vanishing, so a session cut mid-character still ends with what arrived.
             val tail = decoder.flush()
-            if (tail.isNotEmpty()) buffer.feed(tail)
+            // The same tail goes into the session log - it is real output, the last thing the
+            // session ever said, and a log that stops one character short of the farewell it was
+            // built to keep would be a strange one. It also feeds the detector, for symmetry with
+            // the tee above; a session ending here disarms it via the watchdog's tab check.
+            if (tail.isNotEmpty()) {
+                buffer.feed(tail)
+                sessionLog.append(tail)
+                sessionDetectors[sessionKey]?.onOutput()
+            }
             // Unconditionally, and past the throttle. Cancelling `transcript` above cancels whatever
             // catch-up it still owed, and at the end of a session there is no next chunk to trigger
             // another one - so a shell whose last second was throttled ended with its farewell on
@@ -2434,6 +2488,49 @@ class MainViewModel @Inject constructor(
     /** One whole line of the buffer, for double-tap word selection and select-line. */
     fun terminalLineText(sessionKey: String, line: Int): String =
         terminalBuffers[sessionKey]?.textIn(line, 0, line, Int.MAX_VALUE).orEmpty()
+
+    /**
+     * The raw transcript of one session, for "Save session log".
+     *
+     * Read on demand rather than pushed through [uiState] because it is only ever wanted at the
+     * moment the user taps export - see [sessionLogs]. Null when the session has no log (its tab
+     * was closed or it never connected), empty when it has simply not produced output yet; the
+     * caller treats both as "nothing to save".
+     */
+    fun sessionLogText(sessionKey: String): String? = sessionLogs[sessionKey]?.snapshot()
+
+    /**
+     * Arms "Notify when done" for one session: a notification when the session's output - which
+     * must arrive *after* this call, so an idle shell is not mistaken for a finished command - has
+     * gone quiet. See [SilenceDetector] for why quiet is the signal.
+     *
+     * One notification per arming: the detector disarms itself when it fires, and re-arming (this
+     * call again) is how the user asks about the next command. The arming is dropped without a
+     * notification when the session ends, which the watchdog notices from the tab's state - a
+     * session that died under a command did not "finish" it.
+     */
+    fun notifyWhenDone(sessionKey: String) {
+        sessionDetectors.getOrPut(sessionKey) { SilenceDetector() }.arm()
+        // Restarting rather than relying on a session-lifetime loop: the watchdog ends itself when
+        // the last detector is dropped, so a session that never asks never wakes anything, and this
+        // check is what brings polling back.
+        if (silenceWatchdog?.isActive == true) return
+        silenceWatchdog = viewModelScope.launch {
+            while (true) {
+                delay(NOTIFY_WHEN_DONE_POLL_MS)
+                sessionDetectors.entries.removeIf { (key, detector) ->
+                    val tab = tabs.value.firstOrNull { it.id == key }
+                    // Gone or no longer live: the session ended, so the wait is over either way
+                    // and there is nothing to report - the ending itself is what the tab shows.
+                    if (tab == null || !tab.state.isLive) return@removeIf true
+                    if (!detector.poll()) return@removeIf false
+                    transferNotifier.notifyTerminalDone(key, tab.title)
+                    true
+                }
+                if (sessionDetectors.isEmpty()) break
+            }
+        }
+    }
 
     /**
      * Hands [bytes] to the session's outbound queue, in the order the caller produced them.
@@ -3688,6 +3785,10 @@ class MainViewModel @Inject constructor(
         tabs.value = tabs.value.filterNot { it.id == tab.id }
         terminalOutput.update { it - tab.id }
         terminalFrames.update { it - tab.id }
+        sessionLogs.remove(tab.id)
+        // Silently: a tab the user closed is not a command that finished, and the notification
+        // would arrive for a session that no longer exists.
+        sessionDetectors.remove(tab.id)
         scrollOffsets.remove(tab.id)
         textPublishedAt.remove(tab.id)
         typedLines.remove(tab.id)
@@ -3877,6 +3978,8 @@ class MainViewModel @Inject constructor(
             tabs.value = tabs.value.filterNot { it.hostId == host.id }
             terminalOutput.update { current -> current - keys.toSet() }
             terminalFrames.update { current -> current - keys.toSet() }
+            keys.forEach { key -> sessionLogs.remove(key) }
+            keys.forEach { key -> sessionDetectors.remove(key) }
             commandHistory.value = commandHistory.value - host.id
             serverStats.update { it - host.id }
             remoteListings.update { it - host.id }
@@ -4399,6 +4502,13 @@ class MainViewModel @Inject constructor(
 
         /** A sane bound on the reconstructed command line, so a `cat` of binary cannot grow it. */
         const val MAX_TYPED_LINE = 4_096
+
+        /**
+         * How often the armed notify-when-done detectors are asked whether their session has gone
+         * quiet. A quarter of [SilenceDetector.SILENCE_MS], so the notification lands within a
+         * beat of the silence being real rather than up to a whole window late.
+         */
+        const val NOTIFY_WHEN_DONE_POLL_MS = 500L
 
         /**
          * Resource name given to a key picked from the file picker, for the parser's error messages.
