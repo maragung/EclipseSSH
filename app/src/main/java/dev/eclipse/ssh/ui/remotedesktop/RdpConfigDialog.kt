@@ -29,7 +29,7 @@ import dev.eclipse.ssh.data.model.DEFAULT_RDP_PORT
 import dev.eclipse.ssh.data.model.DEFAULT_REMOTE_DESKTOP_HOST
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
-import dev.eclipse.ssh.data.model.decodeRdpTarget
+import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.data.model.isForwardHostName
 import dev.eclipse.ssh.data.model.toPortOrNull
 
@@ -38,24 +38,23 @@ import dev.eclipse.ssh.data.model.toPortOrNull
  * [RemoteDesktopConfigDialog]: same fields, same "where the SSH server dials" question, different
  * default port.
  *
- * There is no Connect button yet, and that is the honest shape of this dialog until the RDP
- * viewer lands: the VNC dialog's Connect is a save plus a jump into a viewer window that can dial
- * what was just saved, and no RDP viewer exists to jump into. A Connect that saved and did
- * nothing would be a button that lies. The viewer's arrival adds the button - and an
- * `onOpen` callback to feed it - beside the Save that is here now.
+ * Connect is Save plus a jump into the viewer window, exactly the VNC dialog's shape: it commits
+ * what the form says through [onSave] and hands the same target to [onOpen], which routes it to
+ * the viewer every RDP desktop opens in.
  *
- * The saved target is read through the stopgap R-line decoder rather than the remote-desktop
- * codec, which does not speak R yet; when the codec branch lands, `decodeRdpTarget` here becomes
- * `decodeRemoteDesktop(host.remoteDesktop).rdp` and the stopgap file is deleted.
+ * The saved target is read through the remote-desktop codec's `rdp` slot; the `R:` line and the
+ * `V:` line beside it are one column, so an RDP save reaching the host leaves the VNC target
+ * alone.
  */
 @Composable
 fun RdpConfigDialog(
     host: HostProfile,
     onSave: (RemoteDesktopTarget) -> Unit,
+    onOpen: (RemoteDesktopTarget) -> Unit,
     onDismiss: () -> Unit,
 ) {
     // The saved target, or the defaults; the dialog edits a copy and only Save commits it.
-    val saved = decodeRdpTarget(host.remoteDesktop)
+    val saved = decodeRemoteDesktop(host.remoteDesktop).rdp
     var targetHost by remember {
         mutableStateOf(saved?.host ?: DEFAULT_REMOTE_DESKTOP_HOST)
     }
@@ -133,10 +132,21 @@ fun RdpConfigDialog(
             }
         },
         confirmButton = {
-            TextButton(enabled = canSave, onClick = { onSave(buildTarget()) }) { Text("Save") }
+            TextButton(
+                enabled = canSave,
+                onClick = {
+                    val target = buildTarget()
+                    onSave(target)
+                    onOpen(target)
+                },
+            ) { Text("Connect") }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            Row {
+                TextButton(enabled = canSave, onClick = { onSave(buildTarget()) }) { Text("Save") }
+                Spacer(Modifier.width(4.dp))
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            }
         },
     )
 }
