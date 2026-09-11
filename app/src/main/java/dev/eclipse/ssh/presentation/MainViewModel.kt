@@ -36,7 +36,9 @@ import dev.eclipse.ssh.data.model.RemoteDesktopConfig
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.decodeRemoteDesktop
+import dev.eclipse.ssh.data.model.decodeRdpTarget
 import dev.eclipse.ssh.data.model.encodeRemoteDesktop
+import dev.eclipse.ssh.data.model.withRdpTarget
 import dev.eclipse.ssh.data.model.describe
 import dev.eclipse.ssh.data.model.deviceListenAddress
 import dev.eclipse.ssh.data.model.encodeForwardRules
@@ -3436,6 +3438,29 @@ class MainViewModel @Inject constructor(
             val text = encodeRemoteDesktop(RemoteDesktopConfig(vnc = target))
             if (decodeRemoteDesktop(text).vnc == null) {
                 return@launchGuarded report("That VNC endpoint could not be saved")
+            }
+            hostRepository.save(host.copy(remoteDesktop = text))
+        }
+    }
+
+    /**
+     * Persists [hostId]'s RDP endpoint. The same validation rule as [saveRemoteDesktopTarget] -
+     * re-read what the packed-text column will say and refuse an endpoint that does not survive the
+     * trip - plus the one rule an RDP save has and a VNC save does not: the R line is written into a
+     * column that may already carry a V line, and that line must come through the save untouched.
+     *
+     * Written through the stopgap R-line helpers until the remote-desktop codec learns R; the swap
+     * is mechanical and noted on the stopgap file itself.
+     */
+    fun saveRdpTarget(hostId: String, target: RemoteDesktopTarget) {
+        launchGuarded("Could not save the RDP target") {
+            val host = hostRepository.hosts.first().firstOrNull { it.id == hostId }
+                ?: return@launchGuarded report("The host for this target no longer exists")
+            val text = withRdpTarget(host.remoteDesktop, target)
+            if (decodeRdpTarget(text) == null ||
+                decodeRemoteDesktop(text).vnc != decodeRemoteDesktop(host.remoteDesktop).vnc
+            ) {
+                return@launchGuarded report("That RDP endpoint could not be saved")
             }
             hostRepository.save(host.copy(remoteDesktop = text))
         }
