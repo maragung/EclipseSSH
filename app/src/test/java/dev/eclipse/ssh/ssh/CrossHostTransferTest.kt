@@ -12,6 +12,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.session.ClientSession
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
@@ -36,6 +37,15 @@ import org.junit.Test
  * temp directory, so a path handed to the engine is an ordinary file this test can also seed with
  * `Files` and read back to compare byte for byte.
  *
+ * Two namespaces, deliberately not mixed. What `Files` touches are host paths under [sourceRoot] /
+ * [destRoot]; what the engine is handed are *jail-rooted* paths, where "/" is that same temp
+ * directory. [VirtualFileSystemFactory] mounts its root through MINA's `RootedFileSystem`, and a
+ * rooted FS resolves an absolute path *inside itself* - the host path
+ * `/tmp/eclipse-cross-host-source123/payload.bin` is, to the server, the equally-jail-rooted path
+ * `/tmp/eclipse-cross-host-source123/payload.bin`, a nonexistent one. Every remote argument below
+ * is therefore spelled "/name" while its host twin is `sourceRoot.resolve("name")`, and the pairing
+ * between the two spellings is the whole of what each test is saying.
+ *
  * No Robolectric: [CrossHostTransfer] has no Android imports, and driving it through a MINA client
  * directly is the whole of what it needs from the world. That keeps this suite off the main looper
  * entirely while it still shares one small JVM with every other test, which is why every session
@@ -53,7 +63,7 @@ class CrossHostTransferTest {
         Files.write(sourceRoot.resolve("payload.bin"), bytes)
 
         val result = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("payload.bin").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/payload.bin", "/",
         )
 
         assertThat(result.entriesCopied).isEqualTo(1)
@@ -74,7 +84,7 @@ class CrossHostTransferTest {
         Files.write(sourceRoot.resolve("site/sub/b.bin"), b)
         Files.createDirectories(sourceRoot.resolve("site/empty"))
 
-        val result = engine.transfer(sourceSftp(), destSftp(), sourceRoot.resolve("site").toString(), destRoot.toString())
+        val result = engine.transfer(sourceSftp(), destSftp(), "/site", "/")
 
         // The folder itself, a.txt, sub, empty and sub/b.bin: five entries landed.
         assertThat(result.entriesCopied).isEqualTo(5)
@@ -100,7 +110,7 @@ class CrossHostTransferTest {
 
         val reports = mutableListOf<Pair<Long, Long>>()
         val result = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("batch").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/batch", "/",
         ) { transferred, total -> reports += transferred to total }
 
         val total = 200_000L
@@ -127,15 +137,21 @@ class CrossHostTransferTest {
 
         val firstChunk = CompletableDeferred<Unit>()
         val job = launch {
-            engine.transfer(sourceSftp(), destSftp(), sourceRoot.resolve("huge.bin").toString(), destRoot.toString()) { bytes, _ ->
+            engine.transfer(sourceSftp(), destSftp(), "/huge.bin", "/") { bytes, _ ->
                 if (bytes > 0) firstChunk.complete(Unit)
             }
         }
-        firstChunk.await()
+        // Bounded, because this await is the one place a silent engine failure turns into a hang
+        // rather than a red test: a transfer that ends without ever calling onProgress (it failed
+        // before its first chunk, as a refused stat once did here) leaves this deferred forever
+        // un-completed, and the timeout turns that into a failure with the job's own stack instead
+        // of a suite that sits until the runner is cancelled - which is how this bug first showed
+        // up, as a workflow that ran green-silent for an hour and three quarters.
+        withTimeout(60_000) { firstChunk.await() }
         job.cancelAndJoin()
 
         assertThat(job.isCancelled).isTrue()
-        val names = destSftp().readDir(destRoot.toString())
+        val names = destSftp().readDir("/")
             .map { it.filename }
             .filter { it != "." && it != ".." }
         assertThat(names).containsExactly("huge.bin")
@@ -153,7 +169,7 @@ class CrossHostTransferTest {
         Files.write(destRoot.resolve("cfg.conf"), "old setting".toByteArray())
 
         val result = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("cfg.conf").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/cfg.conf", "/",
             collision = CrossHostTransfer.CollisionPolicy.OVERWRITE,
         )
 
@@ -169,7 +185,7 @@ class CrossHostTransferTest {
         Files.write(destRoot.resolve("cfg.conf"), "old setting".toByteArray())
 
         val result = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("cfg.conf").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/cfg.conf", "/",
             collision = CrossHostTransfer.CollisionPolicy.SKIP,
         )
 
@@ -190,17 +206,17 @@ class CrossHostTransferTest {
         Files.write(destRoot.resolve("cfg.conf"), "old setting".toByteArray())
 
         val first = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("cfg.conf").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/cfg.conf", "/",
             collision = CrossHostTransfer.CollisionPolicy.RENAME,
         )
         val second = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("cfg.conf").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/cfg.conf", "/",
             collision = CrossHostTransfer.CollisionPolicy.RENAME,
         )
 
         assertThat(first.entriesCopied).isEqualTo(1)
         assertThat(second.entriesCopied).isEqualTo(1)
-        val names = destSftp().readDir(destRoot.toString())
+        val names = destSftp().readDir("/")
             .map { it.filename }
             .filter { it != "." && it != ".." }
         assertThat(names).containsExactly("cfg.conf", "cfg.conf (1)", "cfg.conf (2)")
@@ -218,7 +234,7 @@ class CrossHostTransferTest {
         Files.write(destRoot.resolve("notes/older.txt"), "the old note".toByteArray())
 
         val result = engine.transfer(
-            sourceSftp(), destSftp(), sourceRoot.resolve("notes").toString(), destRoot.toString(),
+            sourceSftp(), destSftp(), "/notes", "/",
             collision = CrossHostTransfer.CollisionPolicy.RENAME,
         )
 
@@ -246,7 +262,7 @@ class CrossHostTransferTest {
         )
         Files.write(sourceRoot.resolve("pack/sub/later.txt"), "later".toByteArray())
 
-        val result = engine.transfer(sourceSftp(), destSftp(), sourceRoot.resolve("pack").toString(), destRoot.toString())
+        val result = engine.transfer(sourceSftp(), destSftp(), "/pack", "/")
 
         // pack itself, first.txt, sub and sub/later.txt landed; secret.bin alone failed.
         assertThat(result.entriesCopied).isEqualTo(4)
@@ -279,7 +295,7 @@ class CrossHostTransferTest {
         Files.write(deep.resolve("bottom.txt"), "never copied".toByteArray())
 
         val thrown = runCatching {
-            engine.transfer(sourceSftp(), destSftp(), sourceRoot.resolve("deep").toString(), destRoot.toString())
+            engine.transfer(sourceSftp(), destSftp(), "/deep", "/")
         }.exceptionOrNull()
 
         assertThat(thrown).isInstanceOf(IOException::class.java)
@@ -291,9 +307,9 @@ class CrossHostTransferTest {
     /** A source that has vanished since the user picked it is a result, not a crash. */
     @Test
     fun aMissingSourcePathIsACleanFailureResult() = runBlocking {
-        val missing = sourceRoot.resolve("not-there.bin").toString()
+        val missing = "/not-there.bin"
 
-        val result = engine.transfer(sourceSftp(), destSftp(), missing, destRoot.toString())
+        val result = engine.transfer(sourceSftp(), destSftp(), missing, "/")
 
         assertThat(result.entriesCopied).isEqualTo(0)
         assertThat(result.entriesSkipped).isEqualTo(0)
