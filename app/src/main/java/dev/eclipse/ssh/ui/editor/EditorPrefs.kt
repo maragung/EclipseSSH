@@ -127,7 +127,9 @@ object EditorPrefsCodec {
      */
     private fun JSONObject.intIn(key: String, fallback: Int, min: Int, max: Int): Int {
         val value = integralValueOf(key) ?: return fallback
-        return value.coerceIn(min, max).toInt()
+        // Long throughout, Int only at the boundary: integralValueOf speaks Long (the delay
+        // field needs it), and the Int bounds widen without loss — Int.MAX_VALUE fits a Long.
+        return value.coerceIn(min.toLong(), max.toLong()).toInt()
     }
 
     /**
