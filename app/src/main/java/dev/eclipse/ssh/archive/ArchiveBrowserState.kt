@@ -33,15 +33,6 @@ class ArchiveBrowserState(
     /** Reads the archive's bytes where they are. Closed exactly once, by [close]. */
     private val source: ArchiveByteSource,
 
-    /**
-     * The byte source for read-throughs after the scan: the preview's range read and the extract
-     * path both fetch entry data through this, on the same channel the scan opened.
-     *
-     * Exposed rather than wrapping a readEntry method here, because [ArchiveReader] already owns
-     * the format dispatch - a second copy of it in this class would be the one place the two
-     * vocabularies could drift apart.
-     */
-    fun sourceForReading(): ArchiveByteSource = source,
     /** The provider the archive was listed from - the watcher stats through it. */
     private val provider: FileSystemProvider,
     /** The archive's provider-opaque path, for the properties sheet and watcher stat. */
@@ -63,6 +54,16 @@ class ArchiveBrowserState(
     init {
         startScan()
     }
+
+    /**
+     * The byte source for read-throughs after the scan: the preview's range read and the extract
+     * path both fetch entry data through this, on the same channel the scan opened.
+     *
+     * Exposed rather than wrapping a readEntry method here, because [ArchiveReader] already owns
+     * the format dispatch - a second copy of it in this class would be the one place the two
+     * vocabularies could drift apart.
+     */
+    fun sourceForReading(): ArchiveByteSource = source
 
     /** Cancels the in-flight scan. The screen's Cancel button; the source closes with [close]. */
     fun cancelScan() {

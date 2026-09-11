@@ -67,8 +67,13 @@ import kotlinx.coroutines.withContext
 @Composable
 fun ArchiveEntryPreviewSheet(
     entry: ArchiveEntry,
-    /** The reader callback that fetches this entry's bytes, or null when the format cannot. */
-    readEntry: (suspend () -> ByteArray)?,
+    /**
+     * The reader callback that fetches this entry's bytes, or null when the format cannot. Null is
+     * also the answer the reader itself can give for an entry it cannot decode (an unsupported
+     * compression method, say) - both mean the same thing to a preview: nothing to render, and the
+     * failure state says so rather than an empty body that looks like an empty file.
+     */
+    readEntry: (suspend () -> ByteArray?)?,
     onDismiss: () -> Unit,
 ) {
     // Text is the only kind previewed in-archive beyond images: the MIME sniffing the Files
@@ -180,13 +185,16 @@ private fun previewKindOf(entry: ArchiveEntry): EntryPreviewKind =
 private suspend fun loadEntryPreview(
     entry: ArchiveEntry,
     kind: EntryPreviewKind,
-    readEntry: suspend () -> ByteArray,
+    readEntry: suspend () -> ByteArray?,
 ): EntryPreviewState {
     val size = entry.size
     val ceiling = if (kind == EntryPreviewKind.IMAGE) MAX_IMAGE_BYTES else MAX_TEXT_BYTES
     if (size != null && size > ceiling) return EntryPreviewState.TooLarge(size)
     return try {
         val bytes = readEntry()
+            // The reader's "cannot" - an entry this format or method cannot serve by range - is
+            // the sheet's Failed state, not an empty preview that reads as an empty file.
+            ?: return EntryPreviewState.Failed("This entry cannot be read from the archive as-is.")
         if (bytes.size > ceiling) return EntryPreviewState.TooLarge(bytes.size.toLong())
         when (kind) {
             EntryPreviewKind.IMAGE -> {
