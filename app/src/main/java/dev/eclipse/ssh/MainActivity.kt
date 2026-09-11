@@ -229,6 +229,7 @@ import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.archive.ArchiveBrowserState
 import dev.eclipse.ssh.archive.ArchiveEntry
+import dev.eclipse.ssh.archive.ArchiveExtractor
 import dev.eclipse.ssh.archive.ArchiveTarget
 import dev.eclipse.ssh.archive.ArchiveReader
 import dev.eclipse.ssh.archive.ArchiveUiState
@@ -238,6 +239,7 @@ import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
 import dev.eclipse.ssh.ui.archive.ArchivePropertiesDialog
 import dev.eclipse.ssh.ui.archive.ArchiveActions
 import dev.eclipse.ssh.ui.archive.ArchiveBrowserScreen
+import dev.eclipse.ssh.ui.archive.SafArchiveDestination
 import dev.eclipse.ssh.ui.editor.EditorRequest
 import dev.eclipse.ssh.ui.editor.EditorRequests
 import dev.eclipse.ssh.ui.editor.TextEditorActivity
@@ -750,6 +752,30 @@ private fun EclipseWorkspace(
             remotePath = entry.path,
             scope = scope,
         ))
+    }
+
+    /**
+     * Turns an extract's per-entry outcomes into the one-line report a person can act on, without
+     * a stack trace in sight. The honest summary is tiered: all good says how many and how much;
+     * anything refused or failed says so, because a silent skip is how a hostile member hides.
+     */
+    fun reportExtractOutcome(archiveName: String, outcomes: List<ArchiveExtractor.Outcome>) {
+        val extracted = outcomes.filterIsInstance<ArchiveExtractor.Outcome.Extracted>()
+        if (outcomes.size == extracted.size) {
+            val total = extracted.sumOf { it.bytes }
+            viewModel.reportUiMessage("Extracted ${extracted.size} item(s) from \"$archiveName\" ($total bytes)")
+            return
+        }
+        val refused = outcomes.count { it is ArchiveExtractor.Outcome.Refused }
+        val destinationRefused = outcomes.count { it is ArchiveExtractor.Outcome.DestinationRefused }
+        val failed = outcomes.filterIsInstance<ArchiveExtractor.Outcome.Failed>()
+        val parts = buildList {
+            if (extracted.isNotEmpty()) add("${extracted.size} extracted")
+            if (refused > 0) add("$refused skipped for safety")
+            if (destinationRefused > 0) add("$destinationRefused could not be created")
+            failed.firstOrNull()?.let { add("first failure: ${it.reason}") }
+        }
+        viewModel.reportUiMessage("Extract from \"$archiveName\": ${parts.joinToString("; ")}")
     }
     // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
     // reason the preview target is: its file actions resolve against this workspace's context,
@@ -1891,6 +1917,38 @@ private fun EclipseWorkspace(
     var archivePreviewEntry by remember { mutableStateOf<ArchiveEntry?>(null) }
     var archiveEntryProperties by remember { mutableStateOf<ArchiveEntry?>(null) }
     var showArchiveProperties by remember { mutableStateOf(false) }
+    // The extract that is waiting on the user to pick a destination folder. The entries are held
+    // here - outside the browser, like every other per-entry action target - because the picker
+    // is an activity result that lands in this workspace's scope, not the browser's; when it
+    // returns, the extract runs against the browser's byte source, which is why the target holds
+    // both. Null entry list = nothing pending.
+    var pendingExtract by remember { mutableStateOf<Pair<ArchiveTarget, List<ArchiveEntry>>?>(null) }
+    // The SAF folder picker for extraction. Unlike the explorer's Local root picker, this one
+    // takes no persistable grant and changes no setting: the destination is a one-shot answer to
+    // "where should these files land", and remembering it silently would make the second extract
+    // write somewhere the user forgot they picked weeks ago.
+    val archiveExtractPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        val pending = pendingExtract
+        pendingExtract = null
+        if (uri == null) return@rememberLauncherForActivityResult
+        val (target, entries) = pending ?: return@rememberLauncherForActivityResult
+        val browser = target.browser
+        scope.launch {
+            val destination = runCatching { SafArchiveDestination(context, uri) }
+                .getOrElse {
+                    viewModel.reportUiMessage("The picked folder cannot be written")
+                    return@launch
+                }
+            viewModel.reportUiMessage("Extracting ${entries.size} item(s) from \"${browser.archiveName}\"…")
+            val outcomes = ArchiveExtractor.extract(
+                browser.format,
+                browser.sourceForReading(),
+                entries,
+                destination,
+            )
+            reportExtractOutcome(browser.archiveName, outcomes)
+        }
+    }
     archiveTarget?.let { target ->
         val browser = target.browser
         ArchiveBrowserScreen(
@@ -1937,11 +1995,13 @@ private fun EclipseWorkspace(
                 onDismiss = { archiveEntrySheet = null },
                 onPreview = if (readable) ({ archiveEntrySheet = null; archivePreviewEntry = entry }) else null,
                 // Extract (and single-entry Download, which is extract of one file by another
-                // name) arrives with the destination-picker work; the row is honest about that
-                // until then, because a button that did nothing would be worse than no button.
+                // name): hand the entries to the destination picker, and the extract itself runs
+                // when the picker answers. The archive stays remote throughout - what moves is
+                // each entry's own bytes.
                 onExtract = {
                     archiveEntrySheet = null
-                    viewModel.reportUiMessage("Extracting \"${entry.path.substringAfterLast('/')}\" needs a destination - that step lands next")
+                    pendingExtract = target to listOf(entry)
+                    archiveExtractPicker.launch(null)
                 },
                 onCopyPath = {
                     archiveEntrySheet = null
