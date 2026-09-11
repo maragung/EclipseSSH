@@ -342,6 +342,173 @@ class HostCredentialStoreTest {
         assertThat(SecretEdit.Replace("hunter2").toString()).doesNotContain("hunter2")
     }
 
+    // ---------------------------------------------------------------- the RDP credential
+
+    @Test
+    fun `a saved RDP credential round-trips and stays out of the SSH metadata`() = withStore { store, _ ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(
+                username = SecretEdit.Replace("administrator"),
+                domain = SecretEdit.Replace("CORP"),
+                password = SecretEdit.Replace("rdp-secret"),
+            ),
+        )
+
+        val rdp = store.rdpCredentials(HOST)
+        assertThat(rdp?.username).isEqualTo("administrator")
+        assertThat(rdp?.domain).isEqualTo("CORP")
+        assertThat(rdp?.password).isEqualTo("rdp-secret")
+        // The SSH form's view of the host is untouched: an RDP credential is not an SSH password,
+        // and reporting it there would put "Password" on a host whose terminal login asks for one.
+        assertThat(store.stored(HOST)).isEqualTo(StoredCredentials())
+        assertThat(store.credentials.first()).isEmpty()
+    }
+
+    @Test
+    fun `an RDP credential without a domain round-trips with a null one`() = withStore { store, _ ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(
+                username = SecretEdit.Replace("administrator"),
+                domain = SecretEdit.Replace(""),
+                password = SecretEdit.Replace("rdp-secret"),
+            ),
+        )
+
+        assertThat(store.rdpCredentials(HOST)?.domain).isNull()
+    }
+
+    @Test
+    fun `RDP secrets are not written to disk in the clear`() = withStore { store, file ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(
+                username = SecretEdit.Replace("plaintext-user"),
+                domain = SecretEdit.Replace("plaintext-domain"),
+                password = SecretEdit.Replace("plaintext-password"),
+            ),
+        )
+
+        val raw = file.readBytes().toString(Charsets.ISO_8859_1)
+        assertThat(raw).doesNotContain("plaintext-user")
+        assertThat(raw).doesNotContain("plaintext-domain")
+        assertThat(raw).doesNotContain("plaintext-password")
+    }
+
+    @Test
+    fun `Keep leaves the other RDP fields alone`() = withStore { store, _ ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(
+                username = SecretEdit.Replace("administrator"),
+                domain = SecretEdit.Replace("CORP"),
+                password = SecretEdit.Replace("old"),
+            ),
+        )
+
+        // The shape of "the viewer's NLA prompt replaced the password and nothing else".
+        store.applyRdp(HOST, RdpCredentialUpdate(password = SecretEdit.Replace("new")))
+
+        val rdp = store.rdpCredentials(HOST)
+        assertThat(rdp?.username).isEqualTo("administrator")
+        assertThat(rdp?.domain).isEqualTo("CORP")
+        assertThat(rdp?.password).isEqualTo("new")
+    }
+
+    @Test
+    fun `forgetting the RDP password forgets the whole credential`() = withStore { store, _ ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(
+                username = SecretEdit.Replace("administrator"),
+                domain = SecretEdit.Replace("CORP"),
+                password = SecretEdit.Replace("rdp-secret"),
+            ),
+        )
+
+        store.applyRdp(HOST, RdpCredentialUpdate(password = SecretEdit.Forget))
+
+        // A username with no password to authenticate it is a secret at rest that nothing can use.
+        assertThat(store.rdpCredentials(HOST)).isNull()
+    }
+
+    @Test
+    fun `a password offered with no username at all is dropped`() = withStore { store, _ ->
+        store.applyRdp(HOST, RdpCredentialUpdate(password = SecretEdit.Replace("orphan")))
+
+        assertThat(store.rdpCredentials(HOST)).isNull()
+    }
+
+    @Test
+    fun `forgetRdp leaves the SSH credentials alone`() = withStore { store, _ ->
+        store.apply(HOST, HostCredentialUpdate(password = SecretEdit.Replace("pw")))
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(username = SecretEdit.Replace("u"), password = SecretEdit.Replace("rdp-secret")),
+        )
+
+        store.forgetRdp(HOST)
+
+        assertThat(store.rdpCredentials(HOST)).isNull()
+        assertThat(store.password(HOST)).isEqualTo("pw")
+    }
+
+    @Test
+    fun `forget removes the RDP credential with everything else`() = withStore { store, _ ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(
+                username = SecretEdit.Replace("administrator"),
+                domain = SecretEdit.Replace("CORP"),
+                password = SecretEdit.Replace("rdp-secret"),
+            ),
+        )
+        store.apply(OTHER, HostCredentialUpdate(password = SecretEdit.Replace("keep me")))
+
+        store.forget(HOST)
+
+        assertThat(store.rdpCredentials(HOST)).isNull()
+        assertThat(store.password(OTHER)).isEqualTo("keep me")
+    }
+
+    @Test
+    fun `forgetAll clears the RDP credential too`() = withStore { store, _ ->
+        store.applyRdp(
+            HOST,
+            RdpCredentialUpdate(username = SecretEdit.Replace("administrator"), password = SecretEdit.Replace("rdp-secret")),
+        )
+
+        store.forgetAll()
+
+        assertThat(store.rdpCredentials(HOST)).isNull()
+    }
+
+    @Test
+    fun `an undecryptable RDP credential reads as absent rather than throwing`() = withStoreAndPrefs(
+        cipher = FailingCipher(),
+    ) { store, _, dataStore ->
+        // The same restored-onto-another-device case as the SSH secret: the payload is intact, the
+        // vault key that produced it is gone, and the fallback is to ask the user again.
+        dataStore.edit { it[stringPreferencesKey("secret_rdp_password_$HOST")] = "garbage" }
+
+        assertThat(store.rdpCredentials(HOST)).isNull()
+    }
+
+    @Test
+    fun `RDP credentials are kept apart per host`() = withStore { store, _ ->
+        store.applyRdp(HOST, RdpCredentialUpdate(username = SecretEdit.Replace("one"), password = SecretEdit.Replace("one")))
+        store.applyRdp(OTHER, RdpCredentialUpdate(username = SecretEdit.Replace("two"), password = SecretEdit.Replace("two")))
+
+        assertThat(store.rdpCredentials(HOST)?.username).isEqualTo("one")
+        assertThat(store.rdpCredentials(OTHER)?.username).isEqualTo("two")
+    }
+
+    @Test
+    fun `RdpCredentials does not print its password`() {
+        assertThat(RdpCredentials("administrator", "CORP", "hunter2").toString()).doesNotContain("hunter2")
+    }
+
     @Test
     fun `describe names what is saved without naming a secret`() {
         assertThat(StoredCredentials().describe()).isEqualTo("Asked at every connect")
