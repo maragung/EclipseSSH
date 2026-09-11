@@ -165,13 +165,16 @@ class VncTunnel(private val forwarding: PortForwardingManager) {
                     isEnableExtendedDesktopSize = true
                     // The server's cut text, announced as it happens: the clipboard-sync half of
                     // the feature, whose other direction is [copyText]. Deliberately the *plain*
-                    // cut-text messages and not the extended pseudo-encoding: the plain ones are
-                    // the base protocol every RFB server answers, where the extended encoding is
-                    // opt-in on the server side and vernacular switches its client-to-server wire
-                    // format to it the moment the flag is set - a server that never opted in would
-                    // read the extended header as a text length and stall. Text-only, too: the
-                    // clipboard formats a desktop user actually moves are text, and the image
-                    // listener stays unwired for the same reason RDP's does not.
+                    // cut-text messages and not the extended pseudo-encoding - which this
+                    // library's config defaults ON, so the off has to be said out loud. The
+                    // plain messages are the base protocol every RFB server answers; the
+                    // extended encoding is opt-in on the server side, and the moment the flag is
+                    // on the library switches its client-to-server wire format to it - a server
+                    // that never opted in would read the extended header as a text length and
+                    // stall. Text-only, too: the clipboard formats a desktop user actually
+                    // moves are text, and the image listener stays unwired for the same reason
+                    // RDP's does not.
+                    isEnableExtendedClipboard = false
                     setRemoteClipboardListener { text -> _remoteClipboard.value = text }
                     setPasswordSupplier(Supplier { answerPasswordChallenge(password) })
                     setErrorListener { error -> onVncError(error) }
