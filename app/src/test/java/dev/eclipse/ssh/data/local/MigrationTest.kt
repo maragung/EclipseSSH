@@ -152,6 +152,11 @@ class MigrationTest {
         // Version 14's column is null for the same reason the algorithm lists are: null is the only
         // value that can mean "no failure is recorded", which is true of every row that predates it.
         assertThat(transfer.errorMessage).isNull()
+        // Version 16's cross-host columns, same reasoning: a transfer that predates them had no
+        // second host and no destination directory, and both stay null until a cross-host copy
+        // writes them.
+        assertThat(transfer.sourceHostId).isNull()
+        assertThat(transfer.destPath).isNull()
     }
 
     @Test
@@ -177,6 +182,11 @@ class MigrationTest {
                 scheduledAt = 1_800_000_000_000L,
                 repeatMinutes = 60L,
                 errorMessage = "Connection reset by peer",
+                // Version 16's columns, through the same door: a host id and a real path with a
+                // space in it, the shape most likely to be mangled by a mis-typed column name or
+                // an affinity that quietly truncates it.
+                sourceHostId = "origin-host",
+                destPath = "/srv/incoming/site backups",
             ),
         )
 
@@ -188,6 +198,8 @@ class MigrationTest {
         // and lowercase is the shape most likely to be mangled by a mis-typed affinity or a NOT NULL
         // default that silently empties it.
         assertThat(stored.errorMessage).isEqualTo("Connection reset by peer")
+        assertThat(stored.sourceHostId).isEqualTo("origin-host")
+        assertThat(stored.destPath).isEqualTo("/srv/incoming/site backups")
     }
 
     @Test
@@ -327,7 +339,10 @@ class MigrationTest {
         assertThat(host.remoteDesktop).isEmpty()
         assertThat(host.wakeOnLanMac).isEmpty()
 
-        // The transfer row and its version-11 columns survive the climb too.
+        // The transfer row and its version-11 columns survive the climb too, and version 16's
+        // cross-host columns arrive null: an eleven-era transfer had no second host and no
+        // destination directory, and null is the only value that says so without inventing a
+        // sentinel path an old row would be read as configuring.
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.id).isEqualTo("v11-transfer")
         assertThat(transfer.transferredBytes).isEqualTo(4_194_304L)
@@ -335,6 +350,8 @@ class MigrationTest {
         assertThat(transfer.retryCount).isEqualTo(3)
         assertThat(transfer.scheduledAt).isEqualTo(1_750_000_000_001L)
         assertThat(transfer.repeatMinutes).isEqualTo(15L)
+        assertThat(transfer.sourceHostId).isNull()
+        assertThat(transfer.destPath).isNull()
     }
 
     @Test
@@ -489,6 +506,43 @@ class MigrationTest {
         // switch is a grant to the server's administrator, so a migration that landed it on - or a
         // rebuild that flipped it - would be a permission change no user made.
         assertThat(host.agentForwarding).isFalse()
+    }
+
+    @Test
+    fun `a version 16 transfer keeps every configured value across the step to 17`() = runTest {
+        // This release's step, on its own, for the same reason the 15->16 step test above exists:
+        // the v2 and v11 climbs can only ever see the new columns at their null default, which
+        // cannot catch the one failure an ALTER TABLE can commit without failing - rebuilding the
+        // table instead of extending it, and losing everything the user configured. Seeded from
+        // the committed 16.json with a fully configured transfer row, so what survives is what was
+        // chosen. Numbered from 16 rather than 15 because the Wake-on-LAN column took 15->16 on
+        // main while this branch was open.
+        seedVersion16()
+
+        val transfer = openWithMigrations().transferDao().observeAll().first().single()
+
+        // Every version-16 column, read back after the step, none of them at its default.
+        assertThat(transfer.id).isEqualTo("v16-transfer")
+        assertThat(transfer.name).isEqualTo("site-backup")
+        assertThat(transfer.direction).isEqualTo("CROSS_HOST")
+        assertThat(transfer.hostName).isEqualTo("Destination edge")
+        assertThat(transfer.progress).isEqualTo(0.25f)
+        assertThat(transfer.status).isEqualTo("RUNNING")
+        assertThat(transfer.sizeLabel).isEqualTo("1.2 GB")
+        assertThat(transfer.hostId).isEqualTo("dest-host")
+        assertThat(transfer.remotePath).isEqualTo("/srv/incoming/site-backup")
+        assertThat(transfer.localUri).isNull()
+        assertThat(transfer.transferredBytes).isEqualTo(322_122_547L)
+        assertThat(transfer.totalBytes).isEqualTo(1_288_490_188L)
+        assertThat(transfer.retryCount).isEqualTo(1)
+        assertThat(transfer.scheduledAt).isEqualTo(1_750_000_000_003L)
+        assertThat(transfer.repeatMinutes).isNull()
+        assertThat(transfer.errorMessage).isEqualTo("Connection reset by peer")
+
+        // And the two columns this step adds arrive null: null is the absence of a second host and
+        // of a destination directory, which is true of every row written before this release.
+        assertThat(transfer.sourceHostId).isNull()
+        assertThat(transfer.destPath).isNull()
     }
 
     @Test

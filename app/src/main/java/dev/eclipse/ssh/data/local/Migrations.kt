@@ -214,8 +214,8 @@ object Migrations {
      * destination directory. `hostId` stays the destination host, unchanged, so the restore pass
      * and the Transfers list keep finding these rows exactly where they found them yesterday.
      *
-     * Numbered 16->17 rather than 15->16: the wake-on-LAN column took 15->16 on main while the
-     * cross-host branch was open, and a chain's steps must never share a number.
+     * Numbered 16->17 rather than 15->16: the wake-on-LAN column took 15->16 on main while this
+     * branch was open, and a chain's steps must never share a number.
      */
     val MIGRATION_16_17 = object : Migration(16, 17) {
         override fun migrate(db: SupportSQLiteDatabase) {

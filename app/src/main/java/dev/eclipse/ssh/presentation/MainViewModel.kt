@@ -3789,6 +3789,14 @@ class MainViewModel @Inject constructor(
     fun resumeTransfer(id: String) {
         transportScope.launch {
             val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launch
+            // A cross-host transfer has no local file to reopen and no local stream to append into,
+            // so the resume ladder below - which is entirely about reopening a SAF document and an
+            // SFTP channel - has nothing to say to it. Refused here with a reason, rather than in
+            // the `when` arms as a typed stream that cannot exist: restart semantics for these
+            // rows arrive with the transfer UI, and until then a sentence is what the card can show.
+            if (item.direction == TransferDirection.CROSS_HOST) {
+                return@launch report("${item.name} cannot be resumed: it is a server-to-server transfer with no local file")
+            }
             val host = hostRepository.hosts.first().firstOrNull { it.id == item.hostId }
                 ?: return@launch report("The host for ${item.name} no longer exists")
             val uri = item.localUri?.let(Uri::parse) ?: return@launch report("${item.name} has no local file")
@@ -3834,6 +3842,10 @@ class MainViewModel @Inject constructor(
                 when (item.direction) {
                     TransferDirection.DOWNLOAD -> context.contentResolver.openOutputStream(uri, "wa")
                     TransferDirection.UPLOAD -> context.contentResolver.openInputStream(uri)
+                    // Unreachable rather than reachable-but-wrong: CROSS_HOST is refused at the top
+                    // of this function, so a branch that opened anything would mean that guard had
+                    // regressed. The null lands in the "Cannot reopen" report below either way.
+                    TransferDirection.CROSS_HOST -> null
                 }
             }.getOrNull() ?: return@launch report("Cannot reopen ${item.name}")
             val sftp = runCatching { sshConnectionManager.openSftp(session) }.getOrNull() ?: run {
@@ -3843,6 +3855,11 @@ class MainViewModel @Inject constructor(
             when (item.direction) {
                 TransferDirection.DOWNLOAD -> transferCoordinator.resumeDownload(item, sftp, stream as OutputStream, existingBytes)
                 TransferDirection.UPLOAD -> transferCoordinator.resumeUpload(item, sftp, stream as InputStream)
+                // Unreachable for the same reason as the stream open above: CROSS_HOST rows are
+                // refused at the top of this function. error() rather than a silent skip, so a
+                // regression in that guard surfaces as a loud line instead of a transfer the user
+                // pressed Resume on and nothing happened.
+                TransferDirection.CROSS_HOST -> error("Cross-host transfers are refused above and cannot be resumed")
             }
         }
     }
