@@ -5,7 +5,10 @@ import java.util.zip.ZipOutputStream
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+    // No org.jetbrains.kotlin.android here: since AGP 9.0 Kotlin support is built
+    // into the Android plugins, and applying the KGP android plugin on top of it
+    // fails the build at configuration time. Compiler options live in the
+    // android.kotlin block below (the built-in Kotlin DSL).
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)

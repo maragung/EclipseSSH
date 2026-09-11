@@ -152,6 +152,20 @@ jobs:
           fi
           echo "androidTest sources: $COUNT"
 
+      - name: Regenerate the dependency lockfile (TEMPORARY)
+        # The version bump changed every resolved coordinate in
+        # releaseRuntimeClasspath, so the committed lockfile is stale. Regenerating
+        # it needs a Gradle resolve, which cannot run on the dev host - this step
+        # is the same command as the verification step below, run FIRST so every
+        # later step resolves against the fresh lock state, and it prints the
+        # result so the file can be copied back into the repo. Remove this step
+        # once app/gradle.lockfile carries the regenerated content.
+        run: |
+          ./gradlew --stacktrace :app:dependencies --configuration releaseRuntimeClasspath --write-locks
+          echo '=====BEGIN app/gradle.lockfile====='
+          cat app/gradle.lockfile
+          echo '=====END app/gradle.lockfile====='
+
       - name: Lint (release variant)
         run: ./gradlew --stacktrace lintRelease
 

@@ -102,7 +102,10 @@ android-application = { id = "com.android.application", version.ref = "agp" }
 # The :freerdp module is pure Java (the JNI wrapper), so it needs the library
 # plugin and no Kotlin plugin.
 android-library = { id = "com.android.library", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+# No org.jetbrains.kotlin.android alias: AGP 9 ships built-in Kotlin support and
+# the KGP android plugin must not be applied (it fails the build at configuration
+# time). The compose plugin stays - it configures the Compose compiler regardless
+# of where the Kotlin toolchain comes from.
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
