@@ -206,6 +206,25 @@ object Migrations {
     }
 
     /**
+     * The cross-host transfer columns: where a server-to-server copy came from and where it landed.
+     *
+     * Both nullable with no backfill for the same reason [MIGRATION_3_4]'s `localUri` was: every
+     * row that predates them was an upload or a download - one host, one local document - so null
+     * is not a gap to fill but an accurate statement that the transfer had no second host and no
+     * destination directory. `hostId` stays the destination host, unchanged, so the restore pass
+     * and the Transfers list keep finding these rows exactly where they found them yesterday.
+     *
+     * Numbered 16->17 rather than 15->16: the wake-on-LAN column took 15->16 on main while the
+     * cross-host branch was open, and a chain's steps must never share a number.
+     */
+    val MIGRATION_16_17 = object : Migration(16, 17) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE transfer_queue ADD COLUMN sourceHostId TEXT")
+            db.execSQL("ALTER TABLE transfer_queue ADD COLUMN destPath TEXT")
+        }
+    }
+
+    /**
      * The per-host SSH agent forwarding switch.
      *
      * DEFAULT 0, not 1, for a stronger reason than most of the boolean columns before it: this
