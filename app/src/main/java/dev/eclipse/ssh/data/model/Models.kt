@@ -236,8 +236,8 @@ data class HostProfile(
      */
     val savedForwards: String = "",
     /**
-     * The remote-desktop endpoints saved on this host, one line per protocol - `V:5900` for VNC,
-     * with an `R:...` shape reserved for RDP. Encoded by [encodeRemoteDesktop] and read back by
+     * The remote-desktop endpoints saved on this host, one line per protocol - `V:5900` for
+     * VNC, `R:3389` for RDP. Encoded by [encodeRemoteDesktop] and read back by
      * [decodeRemoteDesktop], which doubles as validation exactly like [savedForwards] above it:
      * the column can arrive from a hand-edited backup file.
      *

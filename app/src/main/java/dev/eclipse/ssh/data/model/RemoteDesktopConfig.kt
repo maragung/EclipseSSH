@@ -27,7 +27,21 @@ data class RemoteDesktopTarget(
  * should not have to find the settings screen first.
  */
 data class RemoteDesktopConfig(
+    /** One slot per protocol; null means the protocol is not configured for the host. */
     val vnc: RemoteDesktopTarget? = null,
+    val rdp: RemoteDesktopTarget? = null,
+)
+
+/** The protocols the remote-desktop column speaks, one line kind letter each. */
+private enum class RemoteDesktopProtocol(val kindLetter: String) {
+    VNC("V"),
+    RDP("R"),
+}
+
+/** One line read back: the protocol the target belongs to, and the target. */
+private data class ParsedRemoteDesktopLine(
+    val protocol: RemoteDesktopProtocol,
+    val target: RemoteDesktopTarget,
 )
 
 /**
@@ -44,43 +58,58 @@ data class RemoteDesktopConfig(
  *    desktop menu greys it out rather than forgetting it, mirroring the forward rules'
  *    disabled marker.
  *
- * RDP is a line this codec does not read yet (`R:...`). The menu entry exists because the
- * user asked for the feature knowing RDP follows; a future decoder reads that line without
- * a migration, because an unknown line is skipped rather than fatal - the same rule the
- * forward codec lives by.
+ * The `R:` line carries an RDP target with the same shape - `R:3389` - and is read exactly
+ * like the V line. A kind this codec does not speak at all is skipped rather than fatal -
+ * the same rule the forward codec lives by - so a future protocol can arrive without a
+ * migration.
  *
  * Decoding is validation, for the same reason it is there in [decodeForwardRules]: the
  * column can arrive from a hand-edited vault backup, and a malformed line must not cost
  * the host its load.
  */
 fun encodeRemoteDesktop(config: RemoteDesktopConfig): String {
-    val vnc = config.vnc ?: return ""
-    val marker = if (vnc.enabled) "" else "#"
-    val host = if (vnc.host == DEFAULT_REMOTE_DESKTOP_HOST) "" else "${vnc.host}:"
-    val flags = if (vnc.viewOnly) " $REMOTE_DESKTOP_VIEW_ONLY_FLAG" else ""
-    return "$marker" + "V:${host}${vnc.port}" + flags
+    // VNC before RDP on every write, so the same config always encodes to the same text: the
+    // round trip is stable, and a vault diff shows a change rather than a shuffle.
+    return listOfNotNull(
+        config.vnc?.let { remoteDesktopLine(RemoteDesktopProtocol.VNC, it) },
+        config.rdp?.let { remoteDesktopLine(RemoteDesktopProtocol.RDP, it) },
+    ).joinToString("\n")
+}
+
+/** One target as its protocol's line, every optional field written only when it is not the default. */
+private fun remoteDesktopLine(protocol: RemoteDesktopProtocol, target: RemoteDesktopTarget): String {
+    val marker = if (target.enabled) "" else "#"
+    val host = if (target.host == DEFAULT_REMOTE_DESKTOP_HOST) "" else "${target.host}:"
+    val flags = if (target.viewOnly) " $REMOTE_DESKTOP_VIEW_ONLY_FLAG" else ""
+    return "$marker" + "${protocol.kindLetter}:${host}${target.port}" + flags
 }
 
 /**
  * The remote-desktop targets in [text], dropping every line that is not one.
  *
- * The first VNC line wins: a column with two was hand-edited, and asking which one the user
- * meant is a question no screen in this app can ask. RDP lines and anything that does not
- * parse are skipped, so the shape can grow without the reader growing first.
+ * The first line of each protocol wins: a column with two V lines or two R lines was
+ * hand-edited, and asking which one the user meant is a question no screen in this app can
+ * ask. Unknown kinds and anything that does not parse are skipped, so the shape can grow
+ * without the reader growing first.
  */
 fun decodeRemoteDesktop(text: String): RemoteDesktopConfig {
     var vnc: RemoteDesktopTarget? = null
+    var rdp: RemoteDesktopTarget? = null
     text.lineSequence()
         .map(String::trim)
         .filter(String::isNotEmpty)
         .forEach { line ->
-            if (vnc == null) vnc = parseRemoteDesktopLine(line)
+            val parsed = parseRemoteDesktopLine(line) ?: return@forEach
+            when (parsed.protocol) {
+                RemoteDesktopProtocol.VNC -> if (vnc == null) vnc = parsed.target
+                RemoteDesktopProtocol.RDP -> if (rdp == null) rdp = parsed.target
+            }
         }
-    return RemoteDesktopConfig(vnc = vnc)
+    return RemoteDesktopConfig(vnc = vnc, rdp = rdp)
 }
 
-/** One line as a VNC target, or null for anything the app should not act on. */
-private fun parseRemoteDesktopLine(line: String): RemoteDesktopTarget? {
+/** One line as a target and the protocol it belongs to, or null for anything the app should not act on. */
+private fun parseRemoteDesktopLine(line: String): ParsedRemoteDesktopLine? {
     var rest = line
     var enabled = true
     if (rest.startsWith("#")) {
@@ -96,7 +125,8 @@ private fun parseRemoteDesktopLine(line: String): RemoteDesktopTarget? {
 
     val kind = rulePart.substringBefore(':', missingDelimiterValue = "")
     val tail = rulePart.substringAfter(':', missingDelimiterValue = "")
-    if (kind != "V" || tail.isEmpty()) return null
+    val protocol = RemoteDesktopProtocol.entries.firstOrNull { it.kindLetter == kind } ?: return null
+    if (tail.isEmpty()) return null
     // A first field that is not a port is the target host - the same slot a local forward's
     // rule has, and for the same reason: the port is the field the line cannot do without.
     val firstField = tail.substringBefore(':')
@@ -111,11 +141,14 @@ private fun parseRemoteDesktopLine(line: String): RemoteDesktopTarget? {
         portText = tail
     }
     val port = portText.toPortOrNull() ?: return null
-    return RemoteDesktopTarget(
-        host = host,
-        port = port,
-        enabled = enabled,
-        viewOnly = flagPart == REMOTE_DESKTOP_VIEW_ONLY_FLAG,
+    return ParsedRemoteDesktopLine(
+        protocol = protocol,
+        target = RemoteDesktopTarget(
+            host = host,
+            port = port,
+            enabled = enabled,
+            viewOnly = flagPart == REMOTE_DESKTOP_VIEW_ONLY_FLAG,
+        ),
     )
 }
 
@@ -124,5 +157,8 @@ const val DEFAULT_REMOTE_DESKTOP_HOST = "127.0.0.1"
 
 /** The port a VNC server is on when the line says nothing - display :0 in Xvnc's numbering. */
 const val DEFAULT_VNC_PORT = 5900
+
+/** The port an RDP server is on when the line says nothing. */
+const val DEFAULT_RDP_PORT = 3389
 
 private const val REMOTE_DESKTOP_VIEW_ONLY_FLAG = "view-only"
