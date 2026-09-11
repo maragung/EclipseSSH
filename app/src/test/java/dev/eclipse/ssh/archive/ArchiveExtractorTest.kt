@@ -138,7 +138,7 @@ class ArchiveExtractorTest {
     }
 
     @Test
-    fun `a hostile path is refused while the honest entry beside it extracts`() {
+    fun `a hostile path is refused while the honest entry beside it extracts`() = runBlocking {
         // The listing is the wall a hostile ZIP dies on: both engines refuse a `..` member
         // outright (a traversal attempt, not a quirk to quietly normalize away - the ZIP suite
         // pins that refusal), so an extract never meets one. What this suite CAN hold down is
@@ -160,7 +160,7 @@ class ArchiveExtractorTest {
     }
 
     @Test
-    fun `a hostile path the listing would refuse never reaches extraction`() {
+    fun `a hostile path the listing would refuse never reaches extraction`() = runBlocking {
         // The extract layer's own Refused outcome exists for a path the listing passed but the
         // destination must not see. The ZIP listing cannot produce one (`..` dies at listing,
         // absolute paths are normalized away), so the outcome is exercised directly: a listing
