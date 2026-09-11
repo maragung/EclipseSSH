@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.ui.remotedesktop
 
 import android.content.pm.ActivityInfo
+import android.graphics.Bitmap
 import androidx.activity.compose.LocalActivity
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
@@ -25,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Landscape
 import androidx.compose.material.icons.filled.Portrait
 import androidx.compose.material.icons.filled.Remove
@@ -54,9 +56,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -64,6 +68,10 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.eclipse.ssh.data.credentials.RdpCredentials
+import dev.eclipse.ssh.rdp.RdpFrame
+import dev.eclipse.ssh.rdp.RdpTunnel
+import dev.eclipse.ssh.rdp.RdpTunnelState
 import dev.eclipse.ssh.ssh.PortForwardingManager
 import dev.eclipse.ssh.vnc.VncFrame
 import dev.eclipse.ssh.vnc.VncTunnel
@@ -96,48 +104,135 @@ private const val DOUBLE_TAP_SCALE = 2.5f
 /** How long the toolbar waits after the last touch before hiding itself. */
 private const val TOOLBAR_HIDE_DELAY_MS = 4_000L
 
+/** The desktop sizes the RDP resolution menu offers, beyond "whatever fits this screen". */
+private val RDP_RESOLUTION_CHOICES = listOf(1280 to 720, 1920 to 1080)
+
+/**
+ * What the shell - the protocol-agnostic half of the viewer - renders. Both tunnels publish the
+ * same shape, so the shell gets one vocabulary instead of two: it never asks *which* protocol is
+ * waiting for a secret, only that the session is parked on the user rather than the network,
+ * because the prompt itself is protocol UI and stays with the protocol's half below.
+ */
+private sealed interface DesktopState {
+    /** Constructed but never started. */
+    data object Idle : DesktopState
+
+    /** Binding the tunnel and negotiating with the server. */
+    data object Connecting : DesktopState
+
+    /** The server asked for something only the user can supply; the protocol half owns the form. */
+    data object AwaitingInput : DesktopState
+
+    /** Session live; frames begin delivering as updates arrive. */
+    data class Connected(val width: Int, val height: Int) : DesktopState
+
+    /** The session ended against the user's will; [reason] is one line for the screen. */
+    data class Failed(val reason: String) : DesktopState
+
+    /** The session ended because the viewer left it. */
+    data object Closed : DesktopState
+}
+
+/** One delivered frame, in the shape the shell renders regardless of which engine drew it. */
+private data class DesktopFrame(
+    val bitmap: Bitmap,
+    val width: Int,
+    val height: Int,
+)
+
+/** The VNC engine's state as the shell's. */
+private fun VncTunnelState.asDesktopState(): DesktopState = when (this) {
+    VncTunnelState.Idle -> DesktopState.Idle
+    VncTunnelState.Connecting -> DesktopState.Connecting
+    VncTunnelState.AwaitingPassword -> DesktopState.AwaitingInput
+    is VncTunnelState.Connected -> DesktopState.Connected(width, height)
+    is VncTunnelState.Failed -> DesktopState.Failed(reason)
+    VncTunnelState.Closed -> DesktopState.Closed
+}
+
+/** The RDP engine's state as the shell's. */
+private fun RdpTunnelState.asDesktopState(): DesktopState = when (this) {
+    RdpTunnelState.Idle -> DesktopState.Idle
+    RdpTunnelState.Connecting -> DesktopState.Connecting
+    RdpTunnelState.AwaitingCredentials -> DesktopState.AwaitingInput
+    is RdpTunnelState.Connected -> DesktopState.Connected(width, height)
+    is RdpTunnelState.Failed -> DesktopState.Failed(reason)
+    RdpTunnelState.Closed -> DesktopState.Closed
+}
+
+/** One VNC frame as the shell's. */
+private fun VncFrame.asDesktopFrame(): DesktopFrame = DesktopFrame(bitmap, width, height)
+
+/** One RDP frame as the shell's. */
+private fun RdpFrame.asDesktopFrame(): DesktopFrame = DesktopFrame(bitmap, width, height)
+
+/**
+ * The input surface the shell drives, wired per protocol from that protocol's tunnel - the two
+ * tunnels' input methods already agree on names and shapes, so the wiring is method references
+ * and the shell never learns which class it is calling.
+ */
+private class DesktopInput(
+    val moveMouse: (x: Int, y: Int) -> Unit,
+    val mouseButton: (button: Int, pressed: Boolean) -> Unit,
+    val scroll: (up: Boolean) -> Unit,
+    val type: (text: String) -> Unit,
+    val requestResolution: (width: Int, height: Int) -> Unit,
+)
+
 /**
  * The remote desktop, fullscreen and immersive: the frames the tunnel delivers, zoomed and
  * panned, with a floating toolbar over them.
  *
+ * The protocol halves ([VncViewer], [RdpViewer]) each own a tunnel and its protocol-specific
+ * moments - how a session starts, what a challenge asks for - and hand everything else to
+ * [ViewerShell], which owns the parts that are the same desktop either way: the zoom and pan,
+ * the gestures, the toolbar, the failure panel. VNC keeps exactly the behaviour it had; RDP
+ * rides the same shell and adds the three affordances its tunnel offers and the VNC one does
+ * not show - a keyboard strip that types Unicode, a resolution menu that asks the server to
+ * resize, and wheel events forwarded as remote scrolls.
+ *
  * The toolbar hides itself a few seconds after the last touch and comes back from a small handle
  * in the corner - the desktop beneath it is what the user came to touch, and a toolbar that
  * stayed would be a permanent hazard zone: every remote click near the top edge would hit a
- * button of ours instead. It only hides while [VncTunnelState.Connected], never in the states
+ * button of ours instead. It only hides while [DesktopState.Connected], never in the states
  * where the user is about to act on the viewer rather than the desktop (asking for a password,
  * reporting a failure).
  *
  * Input is mapped by position: a tap on the screen is a remote click wherever it landed, in
- * framebuffer coordinates after the current zoom is undone. A one-finger drag pans the view
+ * desktop coordinates after the current zoom is undone. A one-finger drag pans the view
  * rather than the remote pointer - on a phone screen the finger *is* the pointer's position, so
  * dragging it would have to mean drag-and-drop, and a viewer that cannot scroll a zoomed desktop
  * is the more broken half of that pair. View-only targets skip the remote half entirely; the
  * local half (pan, zoom, rotate) stays, because none of it reaches the wire.
  *
  * The tunnel is one per connection and the viewer owns it: minted on entry, stopped on exit (or
- * on a Reconnect, which mints the next one). The VNC password typed into the prompt is kept for
- * the life of this screen only - in memory, never persisted - so a reconnect does not ask for
- * it again while the same viewer is open, and closing the viewer forgets it.
+ * on a Reconnect, which mints the next one - re-keying the tunnel on the reconnect counter is
+ * what makes that true, and the disposal stops the one being replaced). The VNC password and the
+ * RDP credentials typed into a prompt are kept for the life of this screen only - in memory,
+ * never persisted - so a reconnect does not ask for them again while the same viewer is open,
+ * and closing the viewer forgets them.
  */
 @Composable
-fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
-    val activity = LocalActivity.current
-    val tunnel = remember { VncTunnel(PortForwardingManager()) }
+fun RemoteDesktopScreen(request: RemoteDesktopRequest, onClose: () -> Unit) {
+    when (request) {
+        is RemoteDesktopRequest.Vnc -> VncViewer(request, onClose)
+        is RemoteDesktopRequest.Rdp -> RdpViewer(request, onClose)
+    }
+}
+
+/**
+ * The VNC half: a [VncTunnel] per connection, the password prompt when the server asks, and the
+ * remembered password a reconnect re-answers with.
+ */
+@Composable
+private fun VncViewer(request: RemoteDesktopRequest.Vnc, onClose: () -> Unit) {
     var reconnects by remember { mutableStateOf(0) }
+    val tunnel = remember(reconnects) { VncTunnel(PortForwardingManager()) }
     var rememberedPassword by remember { mutableStateOf<String?>(null) }
 
-    // The orientation the toolbar last asked for. The activity's own orientation (whatever the
-    // user's system setting is) is restored on dispose, so leaving the viewer leaves the phone
-    // as it was.
-    var orientation by remember { mutableStateOf(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) }
-    DisposableEffect(Unit) {
-        val original = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        onDispose {
-            tunnel.stop()
-            activity?.requestedOrientation = original
-        }
+    DisposableEffect(tunnel) {
+        onDispose { tunnel.stop() }
     }
-    LaunchedEffect(orientation) { activity?.requestedOrientation = orientation }
 
     // (Re)connect. Keyed on `reconnects` so the Reconnect button is a state bump, not a captured
     // call. The session provider is asked here and now every time: a reconnect that reused the
@@ -155,6 +250,143 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
     }
     val state by tunnel.state.collectAsStateWithLifecycle()
     val frame by tunnel.frames.collectAsStateWithLifecycle()
+
+    ViewerShell(
+        request = request,
+        state = state.asDesktopState(),
+        frame = frame?.asDesktopFrame(),
+        input = remember(tunnel) {
+            DesktopInput(
+                moveMouse = tunnel::moveMouse,
+                mouseButton = tunnel::mouseButton,
+                scroll = tunnel::scroll,
+                type = tunnel::type,
+                requestResolution = tunnel::requestResolution,
+            )
+        },
+        onReconnect = { reconnects++ },
+        onClose = onClose,
+    )
+
+    when (state) {
+        VncTunnelState.AwaitingPassword -> PasswordDialog(
+            hostName = request.hostName,
+            onSubmit = { password ->
+                rememberedPassword = password
+                tunnel.submitPassword(password)
+            },
+            onDisconnect = onClose,
+        )
+        else -> {}
+    }
+}
+
+/**
+ * The RDP half: an [RdpTunnel] per connection, the NLA sign-in form when the server asks, and
+ * the credentials that answer it - the saved ones the request carried when they were complete,
+ * the remembered ones once the user has typed an answer here.
+ *
+ * The saved credential rides along for two different moments: a complete one is handed to
+ * [RdpTunnel.start] so the negotiation answers NLA without asking, and whatever the request
+ * carried pre-fills the sign-in form for the challenge that still arrives - a server that
+ * wants different credentials than were saved, or none that were.
+ */
+@Composable
+private fun RdpViewer(request: RemoteDesktopRequest.Rdp, onClose: () -> Unit) {
+    // Application context: FreeRDP's engine reads its certificate store location from it and
+    // holds it for the session's lifetime, which outlives this composition's activity anyway.
+    val appContext = LocalContext.current.applicationContext
+    var reconnects by remember { mutableStateOf(0) }
+    val tunnel = remember(reconnects) { RdpTunnel(PortForwardingManager()) }
+    var rememberedCredentials by remember { mutableStateOf<RdpCredentials?>(null) }
+
+    DisposableEffect(tunnel) {
+        onDispose { tunnel.stop() }
+    }
+
+    LaunchedEffect(reconnects) {
+        val session = request.sessionProvider()
+        if (session == null) {
+            tunnel.abandon("${request.hostName} is not connected - connect the host first")
+        } else {
+            val credentials = rememberedCredentials
+                ?: request.credentials?.takeIf { request.credentialsComplete }
+            tunnel.start(
+                appContext,
+                session,
+                request.target,
+                username = credentials?.username,
+                domain = credentials?.domain,
+                password = credentials?.password,
+            )
+        }
+    }
+    val state by tunnel.state.collectAsStateWithLifecycle()
+    val frame by tunnel.frames.collectAsStateWithLifecycle()
+
+    ViewerShell(
+        request = request,
+        state = state.asDesktopState(),
+        frame = frame?.asDesktopFrame(),
+        input = remember(tunnel) {
+            DesktopInput(
+                moveMouse = tunnel::moveMouse,
+                mouseButton = tunnel::mouseButton,
+                scroll = tunnel::scroll,
+                type = tunnel::type,
+                requestResolution = tunnel::requestResolution,
+            )
+        },
+        onReconnect = { reconnects++ },
+        onClose = onClose,
+    )
+
+    when (state) {
+        RdpTunnelState.AwaitingCredentials -> RdpCredentialsDialog(
+            hostName = request.hostName,
+            prefill = rememberedCredentials ?: request.credentials,
+            onSubmit = { username, domain, password ->
+                rememberedCredentials = RdpCredentials(
+                    username = username,
+                    domain = domain.ifBlank { null },
+                    password = password,
+                )
+                tunnel.submitCredentials(username, domain, password)
+            },
+            onDisconnect = onClose,
+        )
+        else -> {}
+    }
+}
+
+/**
+ * The protocol-agnostic half of the viewer: the desktop surface, the zoom and pan, the toolbar,
+ * the failure panel and the connecting overlay. It renders whatever [state] and [frame] the
+ * protocol half collected and drives whatever [input] that half wired - nothing here knows
+ * whether the desktop at the other end of the tunnel speaks RFB or RDP, except the three RDP-only
+ * affordances (keyboard, resolution, wheel scrolling), which appear exactly when the request is
+ * the RDP one because the VNC half arrived without them and leaves unchanged.
+ */
+@Composable
+private fun ViewerShell(
+    request: RemoteDesktopRequest,
+    state: DesktopState,
+    frame: DesktopFrame?,
+    input: DesktopInput,
+    onReconnect: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val activity = LocalActivity.current
+
+    // The orientation the toolbar last asked for. The activity's own orientation (whatever the
+    // user's system setting is) is restored on dispose, so leaving the viewer leaves the phone
+    // as it was.
+    var orientation by remember { mutableStateOf(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) }
+    LaunchedEffect(orientation) { activity?.requestedOrientation = orientation }
+    DisposableEffect(Unit) {
+        val original = activity?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        onDispose { activity?.requestedOrientation = original }
+    }
 
     // Zoom and pan. `scale` is only authoritative in FREE; every other mode recomputes it from
     // the frame and the container, which is what makes display-mode switching live rather than a
@@ -211,9 +443,14 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
     var interaction by remember { mutableStateOf(0) }
     var toolbarVisible by remember { mutableStateOf(true) }
 
+    // The RDP keyboard strip: open only on purpose, and only while there is a desktop to type
+    // into that accepts input.
+    val rdpControls = request is RemoteDesktopRequest.Rdp && !request.target.viewOnly
+    var keyboardOpen by remember { mutableStateOf(false) }
+
     // Auto-hide, armed only once there is a desktop to use without a toolbar in the way.
     LaunchedEffect(interaction, state, toolbarVisible) {
-        if (toolbarVisible && state is VncTunnelState.Connected) {
+        if (toolbarVisible && state is DesktopState.Connected) {
             delay(TOOLBAR_HIDE_DELAY_MS)
             toolbarVisible = false
         }
@@ -226,29 +463,30 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
             .onSizeChanged { containerSize = it },
     ) {
         when (val s = state) {
-            is VncTunnelState.Failed -> FailurePanel(
+            is DesktopState.Failed -> FailurePanel(
                 reason = s.reason,
-                onReconnect = { reconnects++ },
+                onReconnect = onReconnect,
                 onClose = onClose,
             )
-            VncTunnelState.Closed -> Box(Modifier.fillMaxSize()) // dispose is imminent; panels would only flash
+            DesktopState.Closed -> Box(Modifier.fillMaxSize()) // dispose is imminent; panels would only flash
             else -> DesktopSurface(
                 frame = frame,
                 scale = scale,
                 offset = offset,
+                onScroll = if (request is RemoteDesktopRequest.Rdp) input.scroll else null,
                 onTap = { imagePos ->
                     interaction++
                     val f = frame
-                    if (!request.target.viewOnly && state is VncTunnelState.Connected && f != null) {
-                        // Where this position lands in the framebuffer: undo the zoom. The
-                        // position arrives in the image's own coordinates, so this is the whole
-                        // mapping - the centring and the pan are already spent. Clamped so a tap
-                        // on a rounded pixel at the edge is an edge click, not a click at -3.
+                    if (!request.target.viewOnly && state is DesktopState.Connected && f != null) {
+                        // Where this position lands in the desktop: undo the zoom. The position
+                        // arrives in the image's own coordinates, so this is the whole mapping -
+                        // the centring and the pan are already spent. Clamped so a tap on a
+                        // rounded pixel at the edge is an edge click, not a click at -3.
                         val fx = (imagePos.x / scale).roundToInt().coerceIn(0, f.width - 1)
                         val fy = (imagePos.y / scale).roundToInt().coerceIn(0, f.height - 1)
-                        tunnel.moveMouse(fx, fy)
-                        tunnel.mouseButton(1, pressed = true)
-                        tunnel.mouseButton(1, pressed = false)
+                        input.moveMouse(fx, fy)
+                        input.mouseButton(1, pressed = true)
+                        input.mouseButton(1, pressed = false)
                     }
                 },
                 onDoubleTap = { imagePos ->
@@ -262,7 +500,7 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
                     } else {
                         // Zooming in on the tap means the point under the finger stays under the
                         // finger: the offset moves by how much that point's distance from the
-                        // centre grows, which is (scale - newScale) per framebuffer unit.
+                        // centre grows, which is (scale - newScale) per desktop unit.
                         val newScale = (scale * DOUBLE_TAP_SCALE).coerceAtMost(MAX_SCALE)
                         val vX = imagePos.x / scale - f.width / 2f
                         val vY = imagePos.y / scale - f.height / 2f
@@ -291,18 +529,7 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
             )
         }
 
-        if (state is VncTunnelState.AwaitingPassword) {
-            PasswordDialog(
-                hostName = request.hostName,
-                onSubmit = { password ->
-                    rememberedPassword = password
-                    tunnel.submitPassword(password)
-                },
-                onDisconnect = onClose,
-            )
-        }
-
-        if (state is VncTunnelState.Connecting) {
+        if (state is DesktopState.Connecting) {
             Surface(color = Color.Black.copy(alpha = 0.6f), modifier = Modifier.fillMaxSize()) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -315,8 +542,8 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
 
         ViewerToolbar(
             visible = toolbarVisible &&
-                state !is VncTunnelState.Closed &&
-                state !is VncTunnelState.Failed,
+                state !is DesktopState.Closed &&
+                state !is DesktopState.Failed,
             hostName = request.hostName,
             viewOnly = request.target.viewOnly,
             mode = mode,
@@ -342,13 +569,32 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
                     else -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                 }
             },
+            onKeyboard = if (rdpControls) {
+                { interaction++; keyboardOpen = !keyboardOpen }
+            } else {
+                null
+            },
+            onResolution = if (request is RemoteDesktopRequest.Rdp) input.requestResolution else null,
+            matchScreen = containerSize,
             onClose = onClose,
             modifier = Modifier.align(Alignment.TopCenter),
         )
 
+        // The keyboard strip the RDP toolbar's keyboard button drops: characters typed here are
+        // typed on the desktop, one key press per codepoint.
+        if (keyboardOpen && rdpControls && state is DesktopState.Connected) {
+            KeyboardStrip(
+                onType = input.type,
+                onClose = { keyboardOpen = false },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(12.dp),
+            )
+        }
+
         // The handle that brings a hidden toolbar back. A plain transparent strip would eat the
         // remote clicks it sits on; a button eats exactly its own size, and says what it does.
-        if (!toolbarVisible && state is VncTunnelState.Connected) {
+        if (!toolbarVisible && !keyboardOpen && state is DesktopState.Connected) {
             IconButton(
                 onClick = { interaction++; toolbarVisible = true },
                 modifier = Modifier
@@ -367,19 +613,22 @@ fun RemoteDesktopScreen(request: VncRequest, onClose: () -> Unit) {
  * The desktop itself: the frame, scaled and panned, with the gestures.
  *
  * Tap positions are reported in the *image's* coordinates - the position within the drawn
- * desktop, whatever the zoom and pan did to it - so the caller's framebuffer mapping is a
- * division by the scale and nothing else. The transform gesture, in contrast, reports in the
- * container's coordinates, because a pinch that starts on the letterbox is still a pinch, and
- * confining it to the image would make the black bars dead zones for no reason.
+ * desktop, whatever the zoom and pan did to it - so the caller's desktop mapping is a division
+ * by the scale and nothing else. The transform gesture, in contrast, reports in the container's
+ * coordinates, because a pinch that starts on the letterbox is still a pinch, and confining it
+ * to the image would make the black bars dead zones for no reason.
  *
- * Two pointerInput modifiers, because the two gesture detectors each want the whole stream:
- * [detectTransformGestures] consumes drags and pinches, [detectTapGestures] the taps.
+ * The pointerInput modifiers stack, because the gesture detectors each want the whole stream:
+ * [detectTransformGestures] consumes drags and pinches, [detectTapGestures] the taps, and - when
+ * [onScroll] is wired, the RDP case - a third awaits the wheel events a mouse or trackpad sends
+ * and forwards them as remote scrolls, one notch per event.
  */
 @Composable
 private fun DesktopSurface(
-    frame: VncFrame?,
+    frame: DesktopFrame?,
     scale: Float,
     offset: Offset,
+    onScroll: ((up: Boolean) -> Unit)? = null,
     onTap: (Offset) -> Unit,
     onDoubleTap: (Offset) -> Unit,
     onGesture: (centroid: Offset, pan: Offset, zoomChange: Float) -> Unit,
@@ -415,6 +664,28 @@ private fun DesktopSurface(
                     detectTransformGestures { centroid, pan, zoom, _ -> onGesture(centroid, pan, zoom) }
                 },
         )
+        if (onScroll != null) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                if (event.type != PointerEventType.Scroll) continue
+                                // A wheel's y is the direction Compose's scroll conventions use:
+                                // positive is the wheel rolled down, which scrolls the remote
+                                // view down - the same direction the desktop under it must go.
+                                val wheelY = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
+                                when {
+                                    wheelY > 0f -> onScroll(false)
+                                    wheelY < 0f -> onScroll(true)
+                                }
+                            }
+                        }
+                    },
+            )
+        }
     }
 }
 
@@ -422,6 +693,9 @@ private fun DesktopSurface(
  * The floating toolbar: title, display mode, zoom, orientation, close. Transparent to input
  * except for its own buttons - it is a Row in a Surface, not a full-width bar, so the desktop
  * beside it stays touchable.
+ *
+ * [onKeyboard] and [onResolution] are the RDP-only controls; null (the VNC case) leaves them out
+ * entirely, so the VNC toolbar is exactly the one that shipped.
  */
 @Composable
 private fun ViewerToolbar(
@@ -434,6 +708,9 @@ private fun ViewerToolbar(
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     onOrientation: () -> Unit,
+    onKeyboard: (() -> Unit)? = null,
+    onResolution: ((width: Int, height: Int) -> Unit)? = null,
+    matchScreen: IntSize = IntSize.Zero,
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -481,6 +758,39 @@ private fun ViewerToolbar(
                         }
                 }
             }
+            // Asking the *server* for a different desktop size, which only the RDP display
+            // channel can do. The choices are the screen the user is looking at plus the common
+            // laptop panel sizes; a server that cannot resize ignores the ask, and the frame's
+            // next size report - not this menu - is the truth about what happened.
+            if (onResolution != null) {
+                var resolutionOpen by remember { mutableStateOf(false) }
+                Box {
+                    TextButton(onClick = { resolutionOpen = true }) { Text("Resolution") }
+                    DropdownMenu(
+                        expanded = resolutionOpen,
+                        onDismissRequest = { resolutionOpen = false },
+                    ) {
+                        if (matchScreen != IntSize.Zero) {
+                            DropdownMenuItem(
+                                text = { Text("Match this screen") },
+                                onClick = {
+                                    resolutionOpen = false
+                                    onResolution(matchScreen.width, matchScreen.height)
+                                },
+                            )
+                        }
+                        RDP_RESOLUTION_CHOICES.forEach { (width, height) ->
+                            DropdownMenuItem(
+                                text = { Text("$width x $height") },
+                                onClick = {
+                                    resolutionOpen = false
+                                    onResolution(width, height)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
             IconButton(onClick = onZoomOut) { Icon(Icons.Default.Remove, "Zoom out") }
             IconButton(onClick = onZoomIn) { Icon(Icons.Default.Add, "Zoom in") }
             IconButton(onClick = onOrientation) {
@@ -492,6 +802,9 @@ private fun ViewerToolbar(
                     else -> Icons.Default.ScreenRotation to "Auto-rotate, tap to lock portrait"
                 }
                 Icon(icon, label)
+            }
+            if (onKeyboard != null) {
+                IconButton(onClick = onKeyboard) { Icon(Icons.Default.Keyboard, "Keyboard") }
             }
             IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Close viewer") }
         }
@@ -558,4 +871,112 @@ private fun PasswordDialog(hostName: String, onSubmit: (String) -> Unit, onDisco
         confirmButton = { TextButton(onClick = { onSubmit(password) }) { Text("Connect") } },
         dismissButton = { TextButton(onClick = onDisconnect) { Text("Disconnect") } },
     )
+}
+
+/**
+ * The RDP sign-in prompt, the counterpart of [PasswordDialog]: the tunnel is parked mid-NLA
+ * until an answer arrives, so this is not a cancellable dialog either - answer or disconnect.
+ *
+ * [prefill] is whatever the viewer already knows - the credential saved on the host, or the one
+ * answered earlier in this viewer's life - so a challenge that arrives anyway starts from there
+ * instead of a blank form. The domain is the one optional field, the same rule the credential
+ * store lives by.
+ */
+@Composable
+private fun RdpCredentialsDialog(
+    hostName: String,
+    prefill: RdpCredentials?,
+    onSubmit: (username: String, domain: String, password: String) -> Unit,
+    onDisconnect: () -> Unit,
+) {
+    var username by remember { mutableStateOf(prefill?.username ?: "") }
+    var domain by remember { mutableStateOf(prefill?.domain ?: "") }
+    var password by remember { mutableStateOf(prefill?.password ?: "") }
+    AlertDialog(
+        onDismissRequest = { /* answer or disconnect - there is no third thing to do */ },
+        title = { Text("RDP sign-in") },
+        text = {
+            Column {
+                Text("$hostName's RDP server asked you to sign in.")
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    singleLine = true,
+                    label = { Text("Username") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = domain,
+                    onValueChange = { domain = it },
+                    singleLine = true,
+                    label = { Text("Domain (optional)") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    singleLine = true,
+                    label = { Text("Password") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            // NLA is all three fields or nothing - the same rule the store lives by - so an
+            // incomplete form cannot be sent to a challenge that would only fail on it.
+            TextButton(
+                enabled = username.isNotBlank() && password.isNotBlank(),
+                onClick = { onSubmit(username.trim(), domain.trim(), password) },
+            ) { Text("Connect") }
+        },
+        dismissButton = { TextButton(onClick = onDisconnect) { Text("Disconnect") } },
+    )
+}
+
+/**
+ * The RDP keyboard: a strip at the bottom of the viewer whose typed characters are typed on the
+ * desktop, one key press per codepoint.
+ *
+ * Appends only, and that is the tunnel's shape, not an oversight: [RdpTunnel.type] speaks
+ * Unicode and has no backspace, so a deletion edits the strip's text and nothing else - the
+ * characters already sent are on the wire. The strip is a finger hazard the same way the
+ * toolbar is, which is why it hides behind a button rather than sitting in the layout.
+ */
+@Composable
+private fun KeyboardStrip(
+    onType: (String) -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var text by remember { mutableStateOf("") }
+    Surface(
+        color = Color.Black.copy(alpha = 0.75f),
+        contentColor = Color.White,
+        shape = MaterialTheme.shapes.large,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { next ->
+                    if (next.length > text.length && next.startsWith(text)) {
+                        onType(next.substring(text.length))
+                    }
+                    text = next
+                },
+                singleLine = true,
+                placeholder = { Text("Type to the desktop") },
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onClose) { Icon(Icons.Default.Close, "Hide keyboard") }
+        }
+    }
 }

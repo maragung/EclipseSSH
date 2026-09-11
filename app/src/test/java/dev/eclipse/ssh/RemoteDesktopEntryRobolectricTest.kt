@@ -16,9 +16,12 @@ import dev.eclipse.ssh.data.credentials.RdpCredentials
 import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
+import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequest
+import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequests
 import java.time.Duration
 import org.junit.After
 import org.junit.Before
@@ -33,17 +36,19 @@ import org.robolectric.shadows.ShadowDialog
 /**
  * The host card's "Remote desktop" item and where it leads, and its RDP sibling "RDP desktop".
  *
- * The item is one menu tap with three outcomes, and the routing is the feature: a host with a
- * saved, enabled VNC target goes straight to the viewer window; a host with nothing saved (or a
+ * Each item is one menu tap with three outcomes, and the routing is the feature: a host with a
+ * saved, enabled target goes straight to the viewer window; a host with nothing saved (or a
  * target parked behind the `#` marker) gets the endpoint dialog first, because the entry point
  * exists so a first use does not have to hunt for a settings screen. The third outcome - what the
  * dialog's Connect commits - is asserted at the view-model boundary, the same split the other
  * dialog tests here make: a Compose dialog never idles under Robolectric, so its buttons cannot
  * be driven, but the save it would make can be called and watched.
  *
- * The RDP item has one outcome, the endpoint dialog, because that is all of RDP that exists
- * pre-viewer: no window opens, and the test asserts the VNC viewer is *not* borrowed for it. Its
- * saves and its stored NLA credential are asserted at the same view-model boundary.
+ * The RDP item has the same three outcomes now that the viewer speaks RDP, plus a fourth thing
+ * only it has: the handoff carries the host's saved NLA credential, so a saved one connects
+ * without asking and the sign-in form starts pre-filled. That handoff is asserted by taking the
+ * one-shot token back out of the store and reading the request it names - the activity is only
+ * peeked at, never started, so the token is still there to take.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = EclipseApp::class, sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
@@ -175,63 +180,127 @@ class RemoteDesktopEntryRobolectricTest {
         pumpUntil(describe = { "the target never reached the host" }) {
             viewModel().uiState.value.hosts.any { it.id == host.id && it.remoteDesktop == "V:5901 view-only" }
         }
-        assertThat(viewModel().vncSessionProvider(host.id)()).isNull()
+        assertThat(viewModel().remoteDesktopSessionProvider(host.id)()).isNull()
     }
 
     // ---------------------------------------------------------------- the RDP item
 
     /**
-     * No R line saved: the item is not offered, unlike the VNC one. The VNC item shows for every
-     * host because it is the first-use entry point for its protocol; the RDP item has no viewer
-     * behind it yet, so a host that has never spoken RDP does not get a menu entry that can only
-     * reopen a form it never filled in.
+     * No R line saved: the item is offered anyway, the VNC item's rule. Both entries are the
+     * first-use story for their protocol now that both viewers exist - the entry point is the
+     * menu item, not a settings screen the user has to find first.
      */
     @Test
-    fun theRdpMenuItemIsAbsentForAHostWithNoRdpTarget() {
+    fun theRdpMenuItemIsOfferedForAHostWithNoRdpTargetAndOpensTheDialog() {
         val host = addHost("Bare RDP host")
+        val before = ShadowDialog.getShownDialogs().size
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pumpUntil(describe = { "the kebab menu never opened" }) {
-            compose.onAllNodesWithText("Remote desktop").fetchSemanticsNodes().isNotEmpty()
-        }
+        openRdpMenu(host)
 
-        assertThat(compose.onAllNodesWithText("RDP desktop").fetchSemanticsNodes()).isEmpty()
-        // Close the menu on something harmless, so the teardown is not parked over an open popup.
-        compose.onNodeWithText("Details").performClick()
-        pump()
+        assertWithMessage("the item did not open the RDP endpoint dialog")
+            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
+        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
+        assertThat(startedRemoteDesktopViewer()).isFalse()
     }
 
     /**
-     * A saved RDP target: the item opens the RDP endpoint dialog, and only that - there is no
-     * viewer window to route to yet, and the item must not borrow the VNC one, which would dial a
-     * VNC handshake at an RDP port. Confirmed at window level through [ShadowDialog], the same
-     * signal the VNC entry's dialog test uses.
+     * A saved, enabled RDP target: one tap, the viewer window, no questions - the same rule the
+     * VNC item lives by, and the routing this class exists to pin.
      */
     @Test
-    fun theRdpMenuItemOpensTheEndpointDialogForASavedTarget() {
+    fun theRdpMenuItemGoesStraightToTheViewerWhenAnRdpTargetIsSaved() {
         val host = addHost("RDP host", remoteDesktop = "R:3389")
         val before = ShadowDialog.getShownDialogs().size
 
         openRdpMenu(host)
 
-        assertWithMessage("the item did not open the RDP endpoint dialog")
-            .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
-        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
-        assertWithMessage("the item must not open the VNC viewer for an RDP target")
-            .that(startedRemoteDesktopViewer()).isFalse()
+        pumpUntil(describe = { "the viewer never started" }) { startedRemoteDesktopViewer() }
+        assertWithMessage("a saved target still asked before opening")
+            .that(ShadowDialog.getShownDialogs().size).isEqualTo(before)
+
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        assertThat(intent?.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)).isNotEmpty()
     }
 
-    /** A parked `#R:` target still shows the item, because the dialog is where it gets re-enabled. */
+    /** A parked `#R:` target is stored but not offered - the dialog is where it gets re-enabled. */
     @Test
-    fun aParkedRdpTargetStillOffersTheItemAndOpensTheDialog() {
+    fun aParkedRdpTargetStillAsksFirst() {
         val host = addHost("Parked RDP host", remoteDesktop = "#R:3389")
         val before = ShadowDialog.getShownDialogs().size
 
         openRdpMenu(host)
 
+        assertWithMessage("the parked target was opened without asking")
+            .that(startedRemoteDesktopViewer()).isFalse()
         assertWithMessage("the item did not open the RDP endpoint dialog")
             .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
         assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
+    }
+
+    // ---------------------------------------------------------------- the RDP handoff
+
+    /**
+     * What the RDP viewer is handed, read back out of the one-shot token store.
+     *
+     * The activity is peeked at rather than started, so the token it was launched with is still
+     * in [RemoteDesktopRequests] - taking it back yields the request itself, which is where the
+     * saved NLA credential has to survive to: the same values the credential round trip above
+     * reads, carried into the window that will answer an NLA challenge with them, with the
+     * completeness flag saying it can.
+     */
+    @Test
+    fun theViewerHandoffCarriesTheSavedRdpCredentials() {
+        val host = addHost("Credential RDP host", remoteDesktop = "R:3389")
+        compose.runOnUiThread {
+            viewModel().saveRdpCredentials(
+                host.id,
+                RdpCredentialUpdate(
+                    username = SecretEdit.Replace("administrator"),
+                    domain = SecretEdit.Replace("CORP"),
+                    password = SecretEdit.Replace("rdp-secret"),
+                ),
+            )
+        }
+        assertThat(awaitRdpCredentials(host.id) { it?.username == "administrator" }).isNotNull()
+
+        openRdpMenu(host)
+        pumpUntil(describe = { "the viewer never started" }) { startedRemoteDesktopViewer() }
+
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        val token = intent.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)
+        assertWithMessage("the viewer was started without a handoff token").that(token).isNotEmpty()
+        val request = RemoteDesktopRequests.take(checkNotNull(token))
+        assertWithMessage("the RDP item handed the viewer a VNC request")
+            .that(request).isInstanceOf(RemoteDesktopRequest.Rdp::class.java)
+        request as RemoteDesktopRequest.Rdp
+        assertThat(request.target).isEqualTo(RemoteDesktopTarget(port = 3389))
+        assertThat(request.credentials?.username).isEqualTo("administrator")
+        assertThat(request.credentials?.domain).isEqualTo("CORP")
+        assertThat(request.credentials?.password).isEqualTo("rdp-secret")
+        assertThat(request.credentialsComplete).isTrue()
+    }
+
+    /**
+     * The same handoff for a host with nothing saved: no credential to pre-fill from and nothing
+     * to answer NLA with, which is exactly what the completeness flag is for - the viewer knows
+     * to expect its sign-in form rather than a silent negotiation.
+     */
+    @Test
+    fun theViewerHandoffReportsWhenNoRdpCredentialsAreSaved() {
+        val host = addHost("Bare credential RDP host", remoteDesktop = "R:3389")
+
+        openRdpMenu(host)
+        pumpUntil(describe = { "the viewer never started" }) { startedRemoteDesktopViewer() }
+
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        val token = intent.getStringExtra(RemoteDesktopActivity.EXTRA_REQUEST_TOKEN)
+        assertWithMessage("the viewer was started without a handoff token").that(token).isNotEmpty()
+        val request = RemoteDesktopRequests.take(checkNotNull(token))
+        assertWithMessage("the RDP item handed the viewer a VNC request")
+            .that(request).isInstanceOf(RemoteDesktopRequest.Rdp::class.java)
+        request as RemoteDesktopRequest.Rdp
+        assertThat(request.credentials).isNull()
+        assertThat(request.credentialsComplete).isFalse()
     }
 
     /**
@@ -241,6 +310,11 @@ class RemoteDesktopEntryRobolectricTest {
      * of an RDP save with the V line untouched and the R line beside it, because the packed-text
      * column is one field that holds both protocols. The defaults land as `R:3389 view-only`, not
      * `R:127.0.0.1:3389 view-only`, the same elision the VNC line makes of the loopback host.
+     *
+     * The read-back goes through [decodeRemoteDesktop] itself - the codec the stopgap R-line
+     * reader stood in for until this branch - because that is the reader the menu item reads on
+     * the very next tap: both targets have to come back from the one column, not just the one
+     * that was just saved.
      */
     @Test
     fun savingAnRdpTargetNormalisesItAndLeavesTheVncLineAlone() {
@@ -256,6 +330,10 @@ class RemoteDesktopEntryRobolectricTest {
         pumpUntil(describe = { "the RDP target never reached the host" }) {
             viewModel().uiState.value.hosts.any { it.id == host.id && it.remoteDesktop == "V:10.0.1.5:5901\nR:3389 view-only" }
         }
+        val column = viewModel().uiState.value.hosts.first { it.id == host.id }.remoteDesktop
+        val decoded = decodeRemoteDesktop(column)
+        assertThat(decoded.vnc).isEqualTo(RemoteDesktopTarget(host = "10.0.1.5", port = 5901))
+        assertThat(decoded.rdp).isEqualTo(RemoteDesktopTarget(port = 3389, viewOnly = true))
     }
 
     /**
