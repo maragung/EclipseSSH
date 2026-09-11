@@ -22,10 +22,13 @@ import org.junit.Test
  * hand-built central directory ([HandZip]) the bounds tests use, for the same reason: no library
  * writer will emit a `..` path, which is exactly the shape the safety layer exists to refuse.
  *
- * What is deliberately NOT here yet: extracting from the TAR family. That lands with the
- * streaming pass, and until it does the engine's answer is an explicit Failed naming the gap -
- * a contract this suite pins, so the interim answer cannot quietly become permanent without a
- * test noticing.
+ * The TAR family is pinned through the same destination and the same fixtures: extraction is one
+ * forward pass over the stream - each wanted payload carried out as it passes, the rest skipped -
+ * so N entries cost one walk, never N. The contract this half of the suite holds down: outcomes
+ * come back in the order the entries were ASKED for (the archive's own order is its business),
+ * and an entry the pass never meets is named as a Failed miss, never silently dropped from the
+ * tally. A hostile `..` path cannot be asked for here because the TAR listing refuses to list one
+ * at all - the ZIP hand-built fixture above stays the safety layer's coverage for both families.
  */
 class ArchiveExtractorTest {
 
@@ -187,9 +190,9 @@ class ArchiveExtractorTest {
     }
 
     @Test
-    fun `a compressed tar reports the honest streaming answer for now`() = runBlocking {
-        // TAR extract lands with the streaming pass; until then the contract is an explicit
-        // Failed that names the gap, never a silent no-op and never a full download.
+    fun `a compressed tar entry extracts to its exact bytes`() = runBlocking {
+        // The streaming pass, pinned from the outside: what comes out of the .tar.gz is exactly
+        // what went into it, and the outcome says how many bytes moved.
         val tar = compress(buildTar(listOf(file("file.txt", "tar content".toByteArray()))), TarCompression.GZIP)
         val source = ByteArrayByteSource(tar)
         val entries = ArchiveReader.list(ArchiveReader.Format.TAR_GZ, source)
@@ -197,8 +200,132 @@ class ArchiveExtractorTest {
 
         val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.TAR_GZ, source, entries, destination)
 
+        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(11L))
+        assertThat(destination.files["file.txt"]!!.decodeToString()).isEqualTo("tar content")
+    }
+
+    @Test
+    fun `a plain tar extracts its entries in the order asked`() = runBlocking {
+        // Uncompressed TAR rides the same one-pass walk, and the outcomes follow the CALLER's
+        // order, not the archive's - so asking in reverse is the honest way to pin that.
+        val tar = buildTar(
+            listOf(
+                file("first.txt", "one".toByteArray()),
+                file("second.txt", "two bytes".toByteArray()),
+            ),
+        )
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR, source)
+        val destination = MemoryDestination()
+
+        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.TAR, source, entries.reversed(), destination)
+
+        assertThat(outcomes).containsExactly(
+            ArchiveExtractor.Outcome.Extracted(9L),
+            ArchiveExtractor.Outcome.Extracted(3L),
+        ).inOrder()
+        assertThat(destination.files["first.txt"]!!.decodeToString()).isEqualTo("one")
+        assertThat(destination.files["second.txt"]!!.decodeToString()).isEqualTo("two bytes")
+    }
+
+    @Test
+    fun `tar extraction is selective - the skipped entry costs a skip, not a copy`() = runBlocking {
+        // The pass walks past every entry either way; the contract is that an unwanted payload is
+        // discarded on the way by, never written to the destination.
+        val tar = compress(
+            buildTar(
+                listOf(
+                    file("wanted.txt", "yes".toByteArray()),
+                    file("skipped.txt", "no".toByteArray()),
+                ),
+            ),
+            TarCompression.GZIP,
+        )
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR_GZ, source)
+        val destination = MemoryDestination()
+
+        val outcomes = ArchiveExtractor.extract(
+            ArchiveReader.Format.TAR_GZ,
+            source,
+            listOf(entries.first { it.path == "wanted.txt" }),
+            destination,
+        )
+
+        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(3L))
+        assertThat(destination.files.keys).containsExactly("wanted.txt")
+    }
+
+    @Test
+    fun `a nested tar entry creates its folder chain`() = runBlocking {
+        val tar = buildTar(listOf(file("a/b/c.txt", "deep".toByteArray())))
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR, source)
+        val destination = MemoryDestination()
+
+        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.TAR, source, entries, destination)
+
+        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(4L))
+        assertThat(destination.files["a/b/c.txt"]!!.decodeToString()).isEqualTo("deep")
+        assertThat(destination.folders).contains("a/b")
+    }
+
+    @Test
+    fun `a directory member in a tar reports extracted without any bytes`() = runBlocking {
+        val tar = buildTar(listOf(dirEntry("dir")))
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR, source)
+        val destination = MemoryDestination()
+
+        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.TAR, source, entries, destination)
+
+        assertThat(outcomes).containsExactly(ArchiveExtractor.Outcome.Extracted(0L))
+        assertThat(destination.folders).contains("dir")
+        assertThat(destination.files).isEmpty()
+    }
+
+    @Test
+    fun `a tar destination that cannot create a file reports destination refused and continues`() = runBlocking {
+        val tar = compress(
+            buildTar(
+                listOf(
+                    file("first.txt", "one".toByteArray()),
+                    file("second.txt", "two".toByteArray()),
+                ),
+            ),
+            TarCompression.GZIP,
+        )
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR_GZ, source)
+        val destination = object : ArchiveExtractor.Destination {
+            override suspend fun ensureFolder(path: String) = true
+            override suspend fun openFile(path: String): OutputStream? =
+                if (path == "first.txt") null else ByteArrayOutputStream()
+        }
+
+        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.TAR_GZ, source, entries, destination)
+
+        assertThat(outcomes[0]).isInstanceOf(ArchiveExtractor.Outcome.DestinationRefused::class.java)
+        assertThat(outcomes[1]).isInstanceOf(ArchiveExtractor.Outcome.Extracted::class.java)
+    }
+
+    @Test
+    fun `an entry the tar pass never meets is reported as failed`() = runBlocking {
+        // Not a hostile archive - a listing that no longer matches the bytes under it. The pass
+        // ends without meeting the path, and the tally still adds up: one Failed naming the miss,
+        // never a silent drop.
+        val tar = compress(buildTar(listOf(file("file.txt", "tar content".toByteArray()))), TarCompression.GZIP)
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR_GZ, source)
+        val ghost = entries.first().copy(path = "ghost.txt")
+        val destination = MemoryDestination()
+
+        val outcomes = ArchiveExtractor.extract(ArchiveReader.Format.TAR_GZ, source, listOf(ghost), destination)
+
         assertThat(outcomes).hasSize(1)
-        assertThat(outcomes[0]).isInstanceOf(ArchiveExtractor.Outcome.Failed::class.java)
+        val failed = outcomes[0]
+        assertThat(failed).isInstanceOf(ArchiveExtractor.Outcome.Failed::class.java)
+        assertThat((failed as ArchiveExtractor.Outcome.Failed).reason).contains("not in the archive")
         assertThat(destination.files).isEmpty()
     }
 
@@ -231,6 +358,13 @@ class ArchiveExtractorTest {
     }
 
     private fun file(name: String, content: ByteArray) = TarEntryFixture(name, content)
+
+    /**
+     * A directory member. The trailing slash is not decoration - it is the only thing that makes
+     * commons-compress's [TarArchiveEntry] String constructor write the link flag that says
+     * "directory", which is what the listing and the extract pass both key on.
+     */
+    private fun dirEntry(name: String) = TarEntryFixture("$name/", ByteArray(0))
 
     private data class TarEntryFixture(val name: String, val content: ByteArray)
 

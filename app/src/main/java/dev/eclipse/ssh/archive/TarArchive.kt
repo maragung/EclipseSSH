@@ -340,6 +340,11 @@ class TarArchive(private val source: ArchiveByteSource) {
                     // hostile name is refused with an outcome while the honest entries around
                     // it still extract - a hostile archive must not be able to abort the pass.
                     val safe = SafeArchivePath.safeDestinationName(entry.path)
+                    // CopyPayload leaves the stream AT the payload's end whether it succeeded
+                    // or failed (it drains its own remainder on failure), so the skip loop
+                    // below must not run after it - re-skipping a consumed payload would land
+                    // the walk in the middle of the next entry's header bytes.
+                    var payloadConsumed = false
                     val outcome = if (safe == null) {
                         ArchiveExtractor.Outcome.Refused(entry.path)
                     } else if (entry.isDirectory) {
@@ -351,13 +356,11 @@ class TarArchive(private val source: ArchiveByteSource) {
                     } else if (!runBlocking { destination.ensureFolder(safe.substringBeforeLast('/', "")) }) {
                         ArchiveExtractor.Outcome.DestinationRefused(safe)
                     } else {
+                        payloadConsumed = true
                         copyPayload(tar, entry, safe, destination)
                     }
                     onEntry(entry, outcome)
-                    // Only an extracted FILE has had its payload carried out already; every
-                    // other wanted entry falls through to the skip loop below, which for
-                    // directories and refusals is a no-op (size 0 or bytes left unread).
-                    if (outcome is ArchiveExtractor.Outcome.Extracted && !entry.isDirectory) {
+                    if (payloadConsumed) {
                         continue
                     }
                 }
