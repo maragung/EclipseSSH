@@ -45,6 +45,7 @@ import org.apache.sshd.client.ClientFactoryManager
 import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.config.hosts.HostConfigEntry
 import org.apache.sshd.common.AttributeRepository
+import org.apache.sshd.common.FactoryManager
 import org.apache.sshd.common.SshConstants
 import org.apache.sshd.common.SshException
 import org.apache.sshd.common.PropertyResolver

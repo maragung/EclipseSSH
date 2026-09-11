@@ -9,6 +9,7 @@ import java.util.AbstractMap.SimpleImmutableEntry
 import java.util.Objects
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.flow.first
 import org.apache.sshd.agent.SshAgent
 import org.apache.sshd.agent.SshAgentKeyConstraint
 import org.apache.sshd.common.SshException
