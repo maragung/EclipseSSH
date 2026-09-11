@@ -902,12 +902,36 @@ data class AppSettings(
      */
     val terminalCursorStyle: String = "block",
     /**
+     * Whether the system bars stay on screen while a terminal session is open.
+     *
+     * Off by default because immersive is what a terminal is for on a phone: every pixel of a small
+     * screen belongs to the shell, and the status and navigation bars are reclaimed for it. Some
+     * users prefer the bars to stay — a gesture-navigation back swipe is easier to trust when the bar
+     * marking its edge is visible, and the clock survives - so this holds the bars on screen instead.
+     * The terminal still composes edge to edge and still fills everything the bars leave it; only
+     * the decision to hide them is overridden.
+     */
+    val terminalKeepSystemBars: Boolean = false,
+    /**
      * Bytes per second cap on SFTP transfers, or 0 for "unlimited".
      * Applied at the [SftpTransferManager] level via a token-bucket
      * limiter (see [dev.eclipse.ssh.feature.bandwidth.RateLimiter]).
      * 0 = no limit; the row in Settings is bounded to 0..50 MiB/s.
      */
     val transferBytesPerSecond: Long = 0L,
+    /**
+     * The file editor's per-user preferences, persisted as one JSON blob rather than one DataStore
+     * key per toggle.
+     *
+     * The editor's options (word wrap, line numbers, tab size, spaces-vs-tabs, auto-save) are
+     * view state, not safety state: a wrong default inconveniences, it does not endanger, and
+     * they change together from one sheet inside the editor. One key keeps the nine-step adding
+     * ceremony (field, key, setter, combine, row, backup round-trip, three tests) off a toggle
+     * that will be flipped a dozen times before anyone adds the next one. The blob decodes
+     * tolerantly — an unknown field is dropped, not fatal, which is what makes it evolvable
+     * without a migration.
+     */
+    val editorPrefsJson: String = "{}",
     /**
      * The SAF tree URI the Local file browser was last pointed at, or null before the user has ever
      * granted a folder.

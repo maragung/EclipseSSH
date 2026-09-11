@@ -96,6 +96,8 @@ class SettingsRepositoryTest {
         assertThat(settings.blockScreenshots).isFalse()
         // Off unless asked for: the default is today's behaviour, a drop redials on its own.
         assertThat(settings.reconnectAskFirst).isFalse()
+        // Off unless asked for: immersive full screen is the behaviour every install already had.
+        assertThat(settings.terminalKeepSystemBars).isFalse()
         assertThat(settings.terminalScrollback).isEqualTo(2_000)
         assertThat(settings.terminalCursorStyle).isEqualTo("block")
         assertThat(settings.transferBytesPerSecond).isEqualTo(0L)
@@ -115,6 +117,7 @@ class SettingsRepositoryTest {
         repo.setTerminalTheme(TerminalTheme.entries.last().name)
         repo.setBlockScreenshots(true)
         repo.setReconnectAskFirst(true)
+        repo.setTerminalKeepSystemBars(true)
         repo.setTerminalScrollback(20_000)
         repo.setTerminalCursorStyle("bar")
         repo.setTransferBytesPerSecond(5L * 1024 * 1024)
@@ -133,6 +136,7 @@ class SettingsRepositoryTest {
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
         assertThat(settings.blockScreenshots).isTrue()
         assertThat(settings.reconnectAskFirst).isTrue()
+        assertThat(settings.terminalKeepSystemBars).isTrue()
         assertThat(settings.terminalScrollback).isEqualTo(20_000)
         assertThat(settings.terminalCursorStyle).isEqualTo("bar")
         assertThat(settings.transferBytesPerSecond).isEqualTo(5L * 1024 * 1024)
