@@ -201,9 +201,14 @@ class CrossHostTransfer @Inject constructor(
         // The folder itself first, so a rename applied to it moves the whole copy. A skip or a
         // failure here is the whole answer - there is no directory to walk into - so it returns
         // with every descendant counted, rather than letting the loop below rediscover that once
-        // per entry.
+        // per entry. The landing counts: [listTree] starts at the root's own children, so nothing
+        // else in the loop below will ever count this directory, and a caller totalling "what
+        // arrived" must not come up one short of the folder the user watched appear.
         val baseDir = when (val outcome = createDirectory(toSftp, topTarget, collision)) {
-            is DirectoryOutcome.Landed -> outcome.path
+            is DirectoryOutcome.Landed -> {
+                copied++
+                outcome.path
+            }
             DirectoryOutcome.Skipped -> {
                 onProgress(0, totalBytes)
                 return Result(0, 1 + tree.size, 0, 0, emptyList())

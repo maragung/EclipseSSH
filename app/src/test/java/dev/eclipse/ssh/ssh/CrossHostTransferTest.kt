@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermissions
 import java.util.Collections
+import java.util.Comparator
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.cancelAndJoin
@@ -24,6 +25,7 @@ import org.apache.sshd.sftp.client.SftpClientFactory
 import org.apache.sshd.sftp.server.SftpSubsystemFactory
 import org.junit.After
 import org.junit.AfterClass
+import org.junit.Before
 import org.junit.BeforeClass
 import org.junit.Test
 
@@ -321,6 +323,28 @@ class CrossHostTransferTest {
     }
 
     // ---------------------------------------------------------------- driving the servers
+
+    /**
+     * Empties the destination before every test.
+     *
+     * One destination directory is shared by the whole class, and several tests assert on the
+     * *complete* listing of "/" - `containsExactly` names everything the jail holds, so a file an
+     * earlier test landed would make the later test fail on entries it never wrote. Invisible
+     * before the transfers actually worked: the suite used to hang long before the listing tests
+     * ever ran.
+     *
+     * The jail root itself is kept - the server's rooted filesystem holds a reference to it, and
+     * the source root is left alone: nothing asserts on its full listing, only on files each test
+     * itself just seeded.
+     */
+    @Before
+    fun emptyDestination() {
+        Files.walk(destRoot).use { paths ->
+            paths.sorted(Comparator.reverseOrder())
+                .filter { it != destRoot }
+                .forEach { runCatching { Files.deleteIfExists(it) } }
+        }
+    }
 
     /**
      * Ends every session this test opened, before the next one starts.
