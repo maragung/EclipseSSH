@@ -2,6 +2,7 @@ package dev.eclipse.ssh.ui.editor
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +24,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.Redo
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.AlertDialog
@@ -33,6 +35,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -46,6 +49,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -67,6 +75,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -91,8 +100,28 @@ private const val UNDO_COALESCE_MS = 700L
 /** How many undo steps are kept before the oldest starts falling off the front. */
 private const val MAX_UNDO_STEPS = 200
 
+/**
+ * The auto-save delays the options sheet offers, as (millis, label) pairs, fastest first. The
+ * codec accepts any delay in its clamp range — a hand-edited blob can carry one this list has
+ * never heard of — so the sheet treats the list as its *choices*, not as the truth: a value
+ * outside it still works, it just displays as "Custom" and either arrow steps from the 2 s
+ * default rather than guessing which side of the list it fell off.
+ */
+private val AUTO_SAVE_DELAY_CHOICES = listOf(
+    500L to "0.5 s",
+    1_000L to "1 s",
+    2_000L to "2 s",
+    5_000L to "5 s",
+    10_000L to "10 s",
+)
+
 @Composable
-fun TextEditorScreen(request: EditorRequest, onClose: () -> Unit) {
+fun TextEditorScreen(
+    request: EditorRequest,
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
+    onClose: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
 
     var loadState by remember { mutableStateOf<EditorLoad>(EditorLoad.Loading) }
@@ -225,6 +254,31 @@ fun TextEditorScreen(request: EditorRequest, onClose: () -> Unit) {
         }
     }
 
+    // ---- Auto-save ----
+    // Fires only on quiet: the effect is keyed on the text itself, so every keystroke tears the
+    // countdown down and starts a fresh one — a save mid-burst would be a network write per
+    // sentence, and on SFTP that is real round-trips. `dirty` is a key too, so a save landing
+    // (auto or manual, which moves savedText) re-arms rather than re-fires; `saving` keeps the
+    // heartbeat from racing its own upload, and the two dialog flags keep it from answering, behind
+    // the user's back, a question ("overwrite?") that is still on screen. Reaching the far side of
+    // the delay means none of those keys moved — the text stayed put, no dialog opened, no save
+    // started — which is exactly "still dirty after the configured quiet".
+    LaunchedEffect(
+        textValue.text,
+        dirty,
+        prefs.autoSaveEnabled,
+        prefs.autoSaveDelayMillis,
+        saving,
+        conflictOpen,
+        discardOpen,
+    ) {
+        if (!prefs.autoSaveEnabled || !dirty || saving || conflictOpen || discardOpen) {
+            return@LaunchedEffect
+        }
+        delay(prefs.autoSaveDelayMillis)
+        if (dirty) save(false)
+    }
+
     // Back: close the find panel first, then guard unsaved work, then leave.
     BackHandler(enabled = true) {
         when {
@@ -273,6 +327,8 @@ fun TextEditorScreen(request: EditorRequest, onClose: () -> Unit) {
             saveError = saveError,
             onSave = { save(false) },
             onClose = { if (dirty) discardOpen = true else onClose() },
+            prefs = prefs,
+            onPrefsChange = onPrefsChange,
             onToggleFind = {
                 findOpen = !findOpen
                 if (!findOpen) matchIndex = 0
@@ -416,6 +472,8 @@ private fun EditorBody(
     saveError: String?,
     onSave: () -> Unit,
     onClose: () -> Unit,
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
     onToggleFind: () -> Unit,
     findOpen: Boolean,
     findQuery: String,
@@ -436,6 +494,12 @@ private fun EditorBody(
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val verticalScroll = rememberScrollState()
     val density = LocalDensity.current
+    // The options sheet's open flag lives here, next to the gear that opens it. Owned here rather
+    // than in the parent because nothing above EditorBody needs to know it is on screen.
+    var optionsOpen by remember { mutableStateOf(false) }
+    // Remembered unconditionally so flipping word wrap never resurrects a stale horizontal
+    // position: turning wrap back on discards it, turning it off starts at the left edge.
+    val horizontalScroll = rememberScrollState()
 
     val textStyle = TextStyle(
         fontFamily = TerminalMonoFontFamily,
@@ -529,6 +593,9 @@ private fun EditorBody(
                 IconButton(onClick = onToggleFind) {
                     Icon(Icons.Filled.Search, contentDescription = "Find and replace")
                 }
+                IconButton(onClick = { optionsOpen = true }) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Editor options")
+                }
                 IconButton(onClick = onSave, enabled = dirty && !saving) {
                     Icon(Icons.Filled.Done, contentDescription = "Save")
                 }
@@ -547,9 +614,14 @@ private fun EditorBody(
         }
 
         // One scroll for both columns: the row scrolls, so the gutter and the field — both measuring
-        // their full content height — move together by construction, not by synchronization.
+        // their full content height — move together by construction, not by synchronization. That
+        // holds with wrap off too: an unwrapped line is simply one very tall-less visual line, so
+        // the gutter's per-logical-line heights (which come from the same layout either way) still
+        // match the field's, one visual line per logical line.
         Row(Modifier.weight(1f).fillMaxWidth().verticalScroll(verticalScroll)) {
-            LineNumberGutter(text = textValue.text, layout = layout, style = gutterStyle)
+            if (prefs.showLineNumbers) {
+                LineNumberGutter(text = textValue.text, layout = layout, style = gutterStyle)
+            }
             BasicTextField(
                 value = textValue,
                 onValueChange = onTextChange,
@@ -563,7 +635,33 @@ private fun EditorBody(
                 },
                 modifier = Modifier
                     .weight(1f)
-                    .padding(start = 8.dp, top = 8.dp, bottom = 32.dp, end = 8.dp),
+                    // Wrap off means the field's width must stop being the fold line. A horizontal
+                    // scroll hands the text unbounded width to lay out in, so long lines extend
+                    // right and the user scrolls to them instead of watching them fold; the field's
+                    // own footprint stays the weighted width either way, so the gutter keeps its
+                    // place at the left edge while the text slides under it.
+                    .then(if (prefs.wordWrap) Modifier else Modifier.horizontalScroll(horizontalScroll))
+                    .padding(start = 8.dp, top = 8.dp, bottom = 32.dp, end = 8.dp)
+                    // Preview, not plain onKeyEvent: the preview phase runs outer-modifier-first,
+                    // before the field's own machinery can consume the key, which is the only
+                    // reliable place to intercept Tab on a focused text field. Returning true ends
+                    // the dispatch — the field never sees the key, so it cannot re-route it.
+                    .onPreviewKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyDown && event.key == Key.Tab) {
+                            val insertion = tabInsertion(prefs)
+                            val start = textValue.selection.min
+                            val end = textValue.selection.max
+                            onTextChange(
+                                textValue.copy(
+                                    text = textValue.text.replaceRange(start, end, insertion),
+                                    selection = TextRange(start + insertion.length),
+                                ),
+                            )
+                            true
+                        } else {
+                            false
+                        }
+                    },
             )
         }
 
@@ -594,6 +692,14 @@ private fun EditorBody(
                 onClose = onToggleFind,
             )
         }
+    }
+
+    if (optionsOpen) {
+        EditorOptionsDialog(
+            prefs = prefs,
+            onPrefsChange = onPrefsChange,
+            onDismiss = { optionsOpen = false },
+        )
     }
 }
 
@@ -747,6 +853,129 @@ private fun GoToLineDialog(lineCount: Int, onDismiss: () -> Unit, onGo: (Int) ->
 }
 
 /**
+ * The editor's options sheet: word wrap, line numbers, tab size, spaces-vs-tabs, and auto-save.
+ *
+ * A window-level [AlertDialog] rather than a bottom sheet because every change applies the moment
+ * it is made — [onPrefsChange] persists each toggle on its own, so there is no "OK" to press and
+ * nothing to cancel: the dismiss button, the back gesture, and tapping outside all mean close.
+ * That immediacy is also why [prefs] is read straight into every row: the sheet never holds a
+ * draft copy that could drift from what was already saved.
+ *
+ * Tab size and delay step through −/+ buttons rather than free entry, which makes an out-of-range
+ * value unrepresentable from here — no validation to write, no error to show.
+ */
+@Composable
+private fun EditorOptionsDialog(
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Editor options") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                OptionsSwitchRow(
+                    label = "Word wrap",
+                    checked = prefs.wordWrap,
+                    onCheckedChange = { onPrefsChange(prefs.copy(wordWrap = it)) },
+                )
+                OptionsSwitchRow(
+                    label = "Line numbers",
+                    checked = prefs.showLineNumbers,
+                    onCheckedChange = { onPrefsChange(prefs.copy(showLineNumbers = it)) },
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Tab size", Modifier.weight(1f))
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(
+                                    tabSize = (prefs.tabSize - 1).coerceIn(
+                                        EditorPrefsCodec.TAB_SIZE_MIN,
+                                        EditorPrefsCodec.TAB_SIZE_MAX,
+                                    ),
+                                ),
+                            )
+                        },
+                        enabled = prefs.tabSize > EditorPrefsCodec.TAB_SIZE_MIN,
+                    ) { Text("−") }
+                    Text(
+                        "${prefs.tabSize}",
+                        Modifier.width(28.dp),
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(
+                                    tabSize = (prefs.tabSize + 1).coerceIn(
+                                        EditorPrefsCodec.TAB_SIZE_MIN,
+                                        EditorPrefsCodec.TAB_SIZE_MAX,
+                                    ),
+                                ),
+                            )
+                        },
+                        enabled = prefs.tabSize < EditorPrefsCodec.TAB_SIZE_MAX,
+                    ) { Text("+") }
+                }
+                OptionsSwitchRow(
+                    label = "Spaces instead of tabs",
+                    checked = prefs.spacesInsteadOfTabs,
+                    onCheckedChange = { onPrefsChange(prefs.copy(spacesInsteadOfTabs = it)) },
+                )
+                OptionsSwitchRow(
+                    label = "Auto-save",
+                    checked = prefs.autoSaveEnabled,
+                    onCheckedChange = { onPrefsChange(prefs.copy(autoSaveEnabled = it)) },
+                )
+                // Stepped through the offered delays only, so the codec's clamp range can never be
+                // reached from here — but the row still shows a custom delay honestly rather than
+                // rounding it to the nearest lie, and the first step lands on the 2 s default.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Auto-save delay", Modifier.weight(1f))
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(autoSaveDelayMillis = stepAutoSaveDelay(prefs.autoSaveDelayMillis, -1)),
+                            )
+                        },
+                        enabled = prefs.autoSaveDelayMillis > AUTO_SAVE_DELAY_CHOICES.first().first,
+                    ) { Text("−") }
+                    Text(
+                        autoSaveDelayLabel(prefs.autoSaveDelayMillis),
+                        Modifier.width(56.dp),
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(autoSaveDelayMillis = stepAutoSaveDelay(prefs.autoSaveDelayMillis, +1)),
+                            )
+                        },
+                        enabled = prefs.autoSaveDelayMillis < AUTO_SAVE_DELAY_CHOICES.last().first,
+                    ) { Text("+") }
+                }
+            }
+        },
+        // Not an "OK": nothing is pending, every row already persisted itself. The button exists
+        // because a dialog only dismissible by tapping outside it is a puzzle, not a sheet.
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
+}
+
+/** One "label — switch" line of the options sheet; the sheet is little but rows of these. */
+@Composable
+private fun OptionsSwitchRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
+}
+
+/**
  * Stepwise undo over snapshots of the field, coalescing typing bursts into single steps.
  *
  * Only *text* changes are recorded: the selection moving on its own (tapping elsewhere, stepping
@@ -849,3 +1078,37 @@ private fun lineStartOffset(text: String, line: Int): Int {
     }
     return offset.coerceAtMost(text.length)
 }
+
+/**
+ * What the Tab key inserts at the cursor for [prefs]: one tab character, or [EditorPrefs.tabSize]
+ * spaces when the user asked for spaces. Extracted because it is the one piece of the Tab-key path
+ * worth pinning in a plain unit test — the key interception itself is Compose machinery that only
+ * a device (or a fragile instrumented test) can exercise.
+ */
+internal fun tabInsertion(prefs: EditorPrefs): String =
+    if (prefs.spacesInsteadOfTabs) " ".repeat(prefs.tabSize) else "\t"
+
+/**
+ * The options sheet's label for a delay: one of the offered choices' labels, or "Custom" for a
+ * value the codec accepted but the sheet has never offered — shown as what it is rather than
+ * rounded to the nearest offered lie, which would silently change the delay on the next save.
+ */
+internal fun autoSaveDelayLabel(millis: Long): String =
+    AUTO_SAVE_DELAY_CHOICES.firstOrNull { it.first == millis }?.second ?: "Custom"
+
+/**
+ * Steps [current] by [direction] (−1 or +1) through the offered delays, clamped to the list's ends.
+ *
+ * A delay from outside the list has no neighbour in it, so either arrow starts from the 2 s
+ * default — the same value a fresh install gets — rather than guessing which side of the list the
+ * value fell off. The clamping makes the buttons' enabled/disabled state and the values they can
+ * produce agree by construction.
+ */
+internal fun stepAutoSaveDelay(current: Long, direction: Int): Long {
+    val currentIndex = AUTO_SAVE_DELAY_CHOICES.indexOfFirst { it.first == current }
+    val from = if (currentIndex >= 0) currentIndex else DEFAULT_DELAY_CHOICE_INDEX
+    return AUTO_SAVE_DELAY_CHOICES[(from + direction).coerceIn(0, AUTO_SAVE_DELAY_CHOICES.lastIndex)].first
+}
+
+/** The index of the 2 s choice in [AUTO_SAVE_DELAY_CHOICES] — the list's default, and custom's anchor. */
+private val DEFAULT_DELAY_CHOICE_INDEX = AUTO_SAVE_DELAY_CHOICES.indexOfFirst { it.first == 2_000L }

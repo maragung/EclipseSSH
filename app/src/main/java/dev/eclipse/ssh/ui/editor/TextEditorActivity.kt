@@ -7,6 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.rememberCoroutineScope
 import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.ui.EclipseTheme
@@ -14,6 +15,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 /**
  * The text editor in its own window, on top of the app.
@@ -53,8 +55,30 @@ class TextEditorActivity : ComponentActivity() {
             val darkTheme by produceState(initialValue = isSystemInDarkTheme()) {
                 value = runCatching { settingsRepository.settings.first().darkTheme }.getOrDefault(true)
             }
+            // Same shape as the theme read above: the options blob is read once, before the first
+            // frame, so no frame ever composes with placeholder prefs. The decode never throws —
+            // a corrupt blob yields defaults rather than a broken editor — but the read itself can
+            // fail, and that failure should not take the window down.
+            val prefs by produceState(initialValue = EditorPrefs()) {
+                value = runCatching {
+                    EditorPrefsCodec.decode(settingsRepository.settings.first().editorPrefsJson)
+                }.getOrDefault(EditorPrefs())
+            }
+            // The sheet persists on every toggle, not on dismiss: a user who flips word wrap and
+            // force-closes the app has still told us what they want, and a preference lost to an
+            // unpressed OK button is a bug wearing a dialog's clothes.
+            val scope = rememberCoroutineScope()
             EclipseTheme(darkTheme = darkTheme) {
-                TextEditorScreen(request) { finish() }
+                TextEditorScreen(
+                    request,
+                    prefs = prefs,
+                    onPrefsChange = { prefs ->
+                        scope.launch {
+                            settingsRepository.setEditorPrefsJson(EditorPrefsCodec.encode(prefs))
+                        }
+                    },
+                    onClose = { finish() },
+                )
             }
         }
     }
