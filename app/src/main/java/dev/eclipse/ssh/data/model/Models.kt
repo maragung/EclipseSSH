@@ -247,6 +247,21 @@ data class HostProfile(
      */
     val remoteDesktop: String = "",
     /**
+     * The MAC address this host's network card can be woken with, or empty when the host has none.
+     *
+     * Stored as the text the user typed — colons, dashes or bare hex, whatever spelling they chose —
+     * and parsed at the moment it is used by `parseMac`, which is the same parser the form validates
+     * with and the vault importer checks against, so the three cannot disagree about what a MAC is.
+     * Not normalised on the way in, because a host edited on another device should read back exactly
+     * the way its owner wrote it.
+     *
+     * Empty rather than null for the same reason [startupCommand] is: "no address" and "never
+     * configured" are the same thing here, so a second way to say it would only give read sites a
+     * null to forget about. The kebab menu's Wake on LAN item is what consumes it, and it needs no
+     * SSH session - the whole point is that the server is asleep.
+     */
+    val wakeOnLanMac: String = "",
+    /**
      * What to do when this host presents a key that is not in known-hosts.
      *
      * A *changed* key is refused under every policy, which is the whole point of pinning: only the
@@ -282,7 +297,8 @@ data class HostProfile(
         // printed. Their *presence* is, because "the startup command did not run" is a real report and
         // an answer of `null` versus `***` is the first thing that narrows it.
         "startupCommand=${redacted(startupCommand)}, environment=${redacted(environment)}, " +
-        "savedForwards=$savedForwards, remoteDesktop=$remoteDesktop, hostKeyPolicy=$hostKeyPolicy)"
+        "savedForwards=$savedForwards, remoteDesktop=$remoteDesktop, wakeOnLanMac=$wakeOnLanMac, " +
+        "hostKeyPolicy=$hostKeyPolicy)"
 
     companion object {
         /**

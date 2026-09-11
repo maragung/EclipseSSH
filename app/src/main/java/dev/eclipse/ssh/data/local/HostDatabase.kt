@@ -87,6 +87,9 @@ data class HostEntity(
     // Added in [Migrations.MIGRATION_14_15]. NOT NULL DEFAULT '' for the same reason the other
     // text columns are: empty already means "no remote-desktop endpoint configured".
     val remoteDesktop: String = "",
+    // Added in [Migrations.MIGRATION_15_16]. NOT NULL DEFAULT '' like the other optional text
+    // columns: empty already means "no Wake-on-LAN address on this host".
+    val wakeOnLanMac: String = "",
 )
 
 class HostConverters {
@@ -117,7 +120,7 @@ interface HostDao {
 // exportSchema is on so `app/schemas` records what each version actually looks like: every
 // migration from here has to be written against a known starting point, and Room's migration
 // test helper reads those files. See the ksp `room.schemaLocation` argument in build.gradle.kts.
-@Database(entities = [HostEntity::class, TransferEntity::class], version = 15, exportSchema = true)
+@Database(entities = [HostEntity::class, TransferEntity::class], version = 16, exportSchema = true)
 @TypeConverters(HostConverters::class)
 abstract class EclipseDatabase : RoomDatabase() {
     abstract fun hostDao(): HostDao
@@ -167,6 +170,7 @@ fun HostEntity.toDomain() = HostProfile(
     environment = environment,
     savedForwards = savedForwards,
     remoteDesktop = remoteDesktop,
+    wakeOnLanMac = wakeOnLanMac,
     // An unrecognised name falls back to asking, the same way [authMethod] and [proxyType] fall back
     // to their safest value: a row written by a newer build, or edited by hand, must not silently
     // become the policy that trusts whatever key turns up.
@@ -216,6 +220,7 @@ fun HostProfile.toEntity() = HostEntity(
     environment = environment,
     savedForwards = savedForwards,
     remoteDesktop = remoteDesktop,
+    wakeOnLanMac = wakeOnLanMac,
     hostKeyPolicy = hostKeyPolicy.name,
 )
 

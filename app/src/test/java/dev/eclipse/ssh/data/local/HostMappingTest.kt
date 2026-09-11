@@ -147,6 +147,10 @@ class HostMappingTest {
             // parsed line by line at connect time.
             environment = "LANG=en_US.UTF-8\nTZ=Europe/Amsterdam",
             savedForwards = "L:8080:intranet.example:80\nD:1080",
+            remoteDesktop = "V:10.0.1.5:5900 view-only",
+            // The spelling as typed, not normalised: the mapping moves text, and every MAC spelling
+            // parseMac accepts is one the column can hold.
+            wakeOnLanMac = "4C-2E-81-1A-02-F7",
             hostKeyPolicy = HostKeyPolicy.STRICT,
         )
 
@@ -191,6 +195,10 @@ class HostMappingTest {
         assertThat(fresh.startupCommand).isEmpty()
         assertThat(fresh.environment).isEmpty()
         assertThat(fresh.savedForwards).isEmpty()
+        assertThat(fresh.remoteDesktop).isEmpty()
+        // Empty for the same reason: "no address to wake" is the only thing a null could add here,
+        // and the kebab item treats blank as its not-configured case.
+        assertThat(fresh.wakeOnLanMac).isEmpty()
 
         val entity = fresh.toEntity()
         assertThat(entity.hostKeyPolicy).isEqualTo("ASK")
@@ -198,6 +206,7 @@ class HostMappingTest {
         assertThat(entity.ciphers).isNull()
         assertThat(entity.startupCommand).isEmpty()
         assertThat(entity.savedForwards).isEmpty()
+        assertThat(entity.wakeOnLanMac).isEmpty()
         assertThat(entity.toDomain()).isEqualTo(fresh)
     }
 
