@@ -93,6 +93,7 @@ object VaultBackup {
             put("terminalTheme", settings.terminalTheme)
             put("blockScreenshots", settings.blockScreenshots)
             put("reconnectAskFirst", settings.reconnectAskFirst)
+            put("terminalKeepSystemBars", settings.terminalKeepSystemBars)
         })
         root.put("hosts", JSONArray().apply {
             hosts.forEach { host -> put(JSONObject().apply {
@@ -201,6 +202,7 @@ object VaultBackup {
             // the default rather than to false-by-accident.
             blockScreenshots = settingsObj.optBoolean("blockScreenshots", defaults.blockScreenshots),
             reconnectAskFirst = settingsObj.optBoolean("reconnectAskFirst", defaults.reconnectAskFirst),
+            terminalKeepSystemBars = settingsObj.optBoolean("terminalKeepSystemBars", defaults.terminalKeepSystemBars),
         )
         val hostsArray = root.optJSONArray("hosts") ?: JSONArray()
         val hosts = ArrayList<HostProfile>(hostsArray.length())

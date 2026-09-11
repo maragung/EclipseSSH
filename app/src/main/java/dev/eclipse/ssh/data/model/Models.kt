@@ -902,6 +902,17 @@ data class AppSettings(
      */
     val terminalCursorStyle: String = "block",
     /**
+     * Whether the system bars stay on screen while a terminal session is open.
+     *
+     * Off by default because immersive is what a terminal is for on a phone: every pixel of a small
+     * screen belongs to the shell, and the status and navigation bars are reclaimed for it. Some
+     * users prefer the bars to stay — a gesture-navigation back swipe is easier to trust when the bar
+     * marking its edge is visible, and the clock survives - so this holds the bars on screen instead.
+     * The terminal still composes edge to edge and still fills everything the bars leave it; only
+     * the decision to hide them is overridden.
+     */
+    val terminalKeepSystemBars: Boolean = false,
+    /**
      * Bytes per second cap on SFTP transfers, or 0 for "unlimited".
      * Applied at the [SftpTransferManager] level via a token-bucket
      * limiter (see [dev.eclipse.ssh.feature.bandwidth.RateLimiter]).

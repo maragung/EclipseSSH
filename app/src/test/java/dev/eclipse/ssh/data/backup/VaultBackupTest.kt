@@ -239,6 +239,9 @@ class VaultBackupTest {
         assertThat(settings.terminalTheme).isEqualTo(defaults.terminalTheme)
         assertThat(settings.blockScreenshots).isEqualTo(defaults.blockScreenshots)
         assertThat(settings.reconnectAskFirst).isEqualTo(defaults.reconnectAskFirst)
+        // Absent from a v1 backup, so it resolves to the default (immersive full screen) rather
+        // than to true-by-accident.
+        assertThat(settings.terminalKeepSystemBars).isEqualTo(defaults.terminalKeepSystemBars)
         // Absent from a v1 backup, so it resolves to the default (re-lock after 5 minutes) rather
         // than to zero (never re-lock) by accident.
         assertThat(settings.vaultAutoLockMinutes).isEqualTo(defaults.vaultAutoLockMinutes)

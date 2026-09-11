@@ -65,6 +65,7 @@ internal object Keys {
     val reconnectAskFirst = booleanPreferencesKey("reconnect_ask_first")
     val terminalScrollback = intPreferencesKey("terminal_scrollback")
     val terminalCursorStyle = stringPreferencesKey("terminal_cursor_style")
+    val terminalKeepSystemBars = booleanPreferencesKey("terminal_keep_system_bars")
     val transferBytesPerSecond = androidx.datastore.preferences.core.longPreferencesKey("transfer_bytes_per_second")
     val localRootUri = stringPreferencesKey("local_root_uri")
 }
@@ -108,6 +109,9 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     terminalScrollback = (prefs[Keys.terminalScrollback] ?: 2_000)
         .coerceIn(SettingsRepository.MIN_SCROLLBACK, SettingsRepository.MAX_SCROLLBACK),
     terminalCursorStyle = prefs[Keys.terminalCursorStyle] ?: "block",
+    // Absent on every install that predates the setting; the default is the immersive behaviour
+    // those installs already had.
+    terminalKeepSystemBars = prefs[Keys.terminalKeepSystemBars] ?: false,
     transferBytesPerSecond = (prefs[Keys.transferBytesPerSecond] ?: 0L)
         .coerceIn(0L, SettingsRepository.MAX_BANDWIDTH_BYTES_PER_SECOND),
     localRootUri = prefs[Keys.localRootUri],
@@ -149,6 +153,7 @@ class SettingsRepository(private val context: Context) {
     suspend fun setBiometricUnlock(enabled: Boolean) = editPrefs { it[Keys.biometricUnlock] = enabled }
     suspend fun setBlockScreenshots(enabled: Boolean) = editPrefs { it[Keys.blockScreenshots] = enabled }
     suspend fun setReconnectAskFirst(enabled: Boolean) = editPrefs { it[Keys.reconnectAskFirst] = enabled }
+    suspend fun setTerminalKeepSystemBars(enabled: Boolean) = editPrefs { it[Keys.terminalKeepSystemBars] = enabled }
     suspend fun setDarkTheme(enabled: Boolean) = editPrefs { it[Keys.darkTheme] = enabled }
     suspend fun setClipboardSeconds(seconds: Int) = editPrefs { it[Keys.clipboardSeconds] = seconds }
     suspend fun setKeepAliveSeconds(seconds: Int) = editPrefs { it[Keys.keepAliveSeconds] = seconds }

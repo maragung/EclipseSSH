@@ -1121,13 +1121,22 @@ private fun EclipseWorkspace(
      * session that is not there - a saved id whose process died takes the user to the list, not to a
      * chrome-less screen with nothing in it.
      */
-    val terminalImmersive = destination == Destination.TERMINAL &&
+    val terminalSessionOpen = destination == Destination.TERMINAL &&
         !(state.settings.pinEnabled && !unlocked) &&
         openSessionId?.let { id -> state.tabs.any { it.id == id } } == true
+    /**
+     * The same moment, minus the system bars, when the user chose to keep them.
+     *
+     * [AppSettings.terminalKeepSystemBars] is the one opt-out from immersive: some users want the
+     * navigation bar's back gesture visibly marked, or the clock to survive a long session. The app's
+     * own chrome still goes - the shell keeps the space either way - but the system's bars stay on
+     * screen, which is what the setting says and all it says.
+     */
+    val terminalImmersive = terminalSessionOpen && !state.settings.terminalKeepSystemBars
     // Back leaves the shell, not the app. A full-screen terminal has no navigation on screen, so
     // without this the only way out of a session is the gesture that closes the whole app - and the
     // session with it.
-    BackHandler(enabled = terminalImmersive) { openSessionId = null }
+    BackHandler(enabled = terminalSessionOpen) { openSessionId = null }
     /**
      * Hides the status and navigation bars while the shell is on screen, and puts them back afterwards.
      *
@@ -1180,9 +1189,9 @@ private fun EclipseWorkspace(
         val isWide = maxWidth >= 700.dp
         if (isWide) {
             Row(Modifier.fillMaxSize()) {
-                // Gone while a shell owns the window - see [terminalImmersive]. Back, or the strip's
-                // own button, brings it straight back.
-                if (!terminalImmersive) NavigationRail(
+                // Gone while a shell owns the window - see [terminalSessionOpen]. Back, or the
+                // strip's own button, brings it straight back.
+                if (!terminalSessionOpen) NavigationRail(
                     modifier = Modifier.fillMaxHeight().padding(start = 12.dp, top = 18.dp, bottom = 18.dp),
                     containerColor = MaterialTheme.colorScheme.surface,
                 ) {
@@ -1223,7 +1232,9 @@ private fun EclipseWorkspace(
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionId = openSessionId,
                     onOpenSession = { openSessionId = it },
-                    immersive = terminalImmersive,
+                    // The session owns the window whatever the bars do; the immersive flag is only
+                    // the system-bars half of full screen.
+                    immersive = terminalSessionOpen,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
                     onSendKey = viewModel::sendKey,
@@ -1332,6 +1343,7 @@ private fun EclipseWorkspace(
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
+                    onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
                     verifyPin = viewModel::verifyPin,
@@ -1360,8 +1372,8 @@ private fun EclipseWorkspace(
                 // is underneath.
                 snackbarHost = { SnackbarHost(snackbarHostState) },
                 bottomBar = {
-                    // Gone while a shell owns the window - see [terminalImmersive].
-                    if (!terminalImmersive) NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                    // Gone while a shell owns the window - see [terminalSessionOpen].
+                    if (!terminalSessionOpen) NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                         Destination.entries.forEach { item ->
                             NavigationBarItem(
                                 selected = destination == item,
@@ -1400,7 +1412,9 @@ private fun EclipseWorkspace(
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionId = openSessionId,
                     onOpenSession = { openSessionId = it },
-                    immersive = terminalImmersive,
+                    // The session owns the window whatever the bars do; the immersive flag is only
+                    // the system-bars half of full screen.
+                    immersive = terminalSessionOpen,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
                     onSendKey = viewModel::sendKey,
@@ -1509,6 +1523,7 @@ private fun EclipseWorkspace(
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
+                    onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
                     verifyPin = viewModel::verifyPin,
@@ -1526,7 +1541,7 @@ private fun EclipseWorkspace(
                     // padding comes from `safeDrawingPadding` inside the terminal, and applying both
                     // would inset the grid twice - once for a navigation bar that is not there and
                     // again for the window - costing rows the pty was told it had.
-                    modifier = if (terminalImmersive) Modifier else Modifier.padding(padding),
+                    modifier = if (terminalSessionOpen) Modifier else Modifier.padding(padding),
                 )
             }
         }
@@ -2228,6 +2243,7 @@ private fun WorkspaceScaffold(
                     onReconnectAskFirst = onReconnectAskFirst,
                     onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
+                    onTerminalKeepSystemBars = onTerminalKeepSystemBars,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
                     verifyPin = verifyPin,
@@ -4706,6 +4722,7 @@ private fun SettingsScreen(
     onReconnectAskFirst: (Boolean) -> Unit = {},
     onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
+    onTerminalKeepSystemBars: (Boolean) -> Unit = {},
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
     verifyPin: suspend (String) -> Boolean,
@@ -4812,6 +4829,13 @@ private fun SettingsScreen(
                 onSelect = { theme -> onTerminalTheme(theme.name) },
             )
         }
+        // Next to the theme because both decide what the terminal screen looks like. The subtitle
+        // states the default so an untouched row explains what the app does on its own.
+        SettingRow(
+            Icons.Default.Terminal,
+            "Keep system bars during sessions",
+            "Off by default: sessions take the whole screen. On, the status and navigation bars stay visible over the terminal",
+        ) { Switch(checked = state.settings.terminalKeepSystemBars, onCheckedChange = onTerminalKeepSystemBars) }
         SettingRow(Icons.Default.Security, "Legacy algorithms", "Also offer CBC, SHA-1 and dh-group1 to reach older servers") { Switch(checked = state.settings.legacyAlgorithms, onCheckedChange = onLegacyAlgorithms) }
         SettingRow(Icons.Default.Lock, "Block screenshots", "Hides this app from screenshots, screen recording and the recents preview") { Switch(checked = state.settings.blockScreenshots, onCheckedChange = onBlockScreenshots) }
     }
