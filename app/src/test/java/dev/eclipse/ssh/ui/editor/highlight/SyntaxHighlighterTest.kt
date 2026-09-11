@@ -488,10 +488,9 @@ class SyntaxHighlighterTest {
     fun `Markdown list markers and bold delimiters are operators`() {
         // The marker `- ` (dash and its space, as the grammar requires) is one OPERATOR span,
         // and `**bold**` puts an operator on each side of the emphasized text - emphasis is
-        // structure, the word between is content. Note the marker span swallows its own
-        // trailing space, so the plain run after it starts with the space before `item`.
+        // structure, the word between is content.
         assertThat(spans("- item", highlight(SyntaxLanguages.MARKDOWN, "- item")))
-            .containsExactly(TokenKind.OPERATOR to "- ", TokenKind.PLAIN to " item")
+            .containsExactly(TokenKind.OPERATOR to "- ", TokenKind.PLAIN to "item")
         assertThat(spans("**bold**", highlight(SyntaxLanguages.MARKDOWN, "**bold**")))
             .containsExactly(
                 TokenKind.OPERATOR to "**",

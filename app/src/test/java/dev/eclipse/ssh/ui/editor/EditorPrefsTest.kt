@@ -3,6 +3,9 @@ package dev.eclipse.ssh.ui.editor
 import com.google.common.truth.Truth.assertThat
 import org.json.JSONObject
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
 /**
  * The codec's contract, which is that the editor always opens with usable options.
@@ -14,7 +17,12 @@ import org.junit.Test
  *
  * [EditorPrefsCodec.encode] is the mirror image: it writes every field, unconditionally, so a
  * round-trip loses nothing — the options sheet's state this run is the sheet's state next run.
+ *
+ * Runs under Robolectric because the codec parses with `org.json`, which is a throwing stub on
+ * the bare host JVM (the same reason VaultBackupTest runs under it).
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
 class EditorPrefsTest {
 
     @Test

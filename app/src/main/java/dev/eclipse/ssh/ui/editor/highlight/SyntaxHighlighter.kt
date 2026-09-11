@@ -268,7 +268,12 @@ class SyntaxHighlighter(private val language: SyntaxLanguage) {
                 i = lexString(source, i, c, builder)
                 continue
             }
-            if (c in language.charQuotes && tryCharLiteral(source, i, c, builder)) {
+            if (c in language.charQuotes) {
+                // tryCharLiteral reports the char AFTER the literal when it matched one, or the
+                // start unchanged when it did not - the caller advances by the difference. A
+                // boolean-only version of this branch (add token, but no offset) re-lexed the
+                // same quote forever, appending duplicate spans until the heap died.
+                i = tryCharLiteral(source, i, c, builder)
                 continue
             }
             if (language.annotations && c == '@' && i + 1 < n && isIdentifierStart(source[i + 1])) {
@@ -341,23 +346,24 @@ class SyntaxHighlighter(private val language: SyntaxLanguage) {
 
     /**
      * A character literal: exactly one char, or one escape sequence (`\n`, `A`), between two
-     * quotes on one line. Returns false (and consumes nothing) when that shape does not hold, so
-     * the caller falls through - a lone `'` then lexes as an operator and what follows as an
-     * identifier, which is precisely what a Rust lifetime (`'a`) and an apostrophe in code need.
-     * The strict shape is what keeps `'a str` from being read as an unterminated char.
+     * quotes on one line. Returns [start] unchanged (and consumes nothing) when that shape does
+     * not hold, so the caller falls through - a lone `'` then lexes as an operator and what
+     * follows as an identifier, which is precisely what a Rust lifetime (`'a`) and an apostrophe
+     * in code need. The strict shape is what keeps `'a str` from being read as an unterminated
+     * char. On success the return value is one past the closing quote, the caller's next offset.
      */
-    private fun tryCharLiteral(source: String, start: Int, quote: Char, builder: TokenList): Boolean {
+    private fun tryCharLiteral(source: String, start: Int, quote: Char, builder: TokenList): Int {
         val lineEnd = source.indexOf('\n', start).let { if (it == -1) source.length else it }
         var j = start + 1
-        if (j >= lineEnd) return false
+        if (j >= lineEnd) return start
         val escape = language.escapeChar
         if (escape != null && source[j] == escape) {
             j++
-            if (j >= lineEnd) return false
+            if (j >= lineEnd) return start
             if (source[j] == 'u') {
                 j++
                 repeat(4) {
-                    if (j < lineEnd && (source[j].isDigit() || isHex(source[j]))) j++ else return false
+                    if (j < lineEnd && (source[j].isDigit() || isHex(source[j]))) j++ else return start
                 }
             } else {
                 j++
@@ -365,9 +371,9 @@ class SyntaxHighlighter(private val language: SyntaxLanguage) {
         } else {
             j++
         }
-        if (j >= lineEnd || source[j] != quote) return false
+        if (j >= lineEnd || source[j] != quote) return start
         builder.add(TokenKind.CHAR, start, j + 1)
-        return true
+        return j + 1
     }
 
     /**
