@@ -53,8 +53,10 @@ import kotlinx.coroutines.withContext
  * reading only that entry's data, never the archive around it.
  *
  * The byte-fetch is bounded twice over: the entry's own size refuses what it cannot hold before
- * anything is read, and the fetch itself is the ZIP range read ([ArchiveReader.readEntry]) that
- * moves exactly the entry's compressed bytes. The rendering reuses the Files preview's shapes —
+ * anything is read, and the fetch itself is the ranged read ([ArchiveReader.readEntry]) that
+ * moves exactly the entry's bytes - the ZIP's compressed payload, or an uncompressed TAR's
+ * data-offset slice. A compressed TAR cannot offer either and says so before the sheet opens.
+ * The rendering reuses the Files preview's shapes —
  * a zoomable image, a monospace text body — because a file inside an archive is still just a
  * file, and this app already knows how to show one.
  *

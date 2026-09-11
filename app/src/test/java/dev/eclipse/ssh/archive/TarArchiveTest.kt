@@ -109,6 +109,44 @@ class TarArchiveTest {
     }
 
     @Test
+    fun `readEntry returns an uncompressed tar member by one ranged read`() = runBlocking {
+        // The preview path's promise for TAR: the offset the listing tracked is a real seek
+        // target, so the file comes back exactly - no second pass over the archive, and the
+        // bytes that moved are the entry's own. This is the contract the UI's "open" gesture
+        // rides for plain tars.
+        val first = "head".toByteArray()
+        val second = "the file the person asked to see".toByteArray()
+        val tar = buildTar(listOf(file("first.txt", first), file("second.txt", second)))
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR, source)
+
+        val bytes = ArchiveReader.readEntry(
+            ArchiveReader.Format.TAR,
+            source,
+            entries.single { it.path == "second.txt" },
+        )
+
+        assertThat(bytes).isEqualTo(second)
+    }
+
+    @Test
+    fun `readEntry refuses to pretend for a compressed tar member`() = runBlocking {
+        // A null answer, not a hidden stream-through: the UI renders "cannot preview, extract
+        // instead" for exactly this case, so the null is a contract the sheet labels honestly.
+        val tar = compress(buildTar(listOf(file("file.txt", "content".toByteArray()))), TarCompression.GZIP)
+        val source = ByteArrayByteSource(tar)
+        val entries = ArchiveReader.list(ArchiveReader.Format.TAR_GZ, source)
+
+        val bytes = ArchiveReader.readEntry(
+            ArchiveReader.Format.TAR_GZ,
+            source,
+            entries.single(),
+        )
+
+        assertThat(bytes).isNull()
+    }
+
+    @Test
     fun `a five megabyte entry followed by a small one both list, with progress advancing through the skip`() {
         val tar = buildTar(
             listOf(file("big.bin", ByteArray(5_000_000)), file("tail.txt", "t".toByteArray())),

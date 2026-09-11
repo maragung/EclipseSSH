@@ -42,13 +42,13 @@ object ArchiveReader {
      * Whether an entry's bytes can be fetched by range - the preview path's promise that opening
      * one 18 KB file inside a 50 GB archive moves 18 KB (plus a local header), not the archive.
      *
-     * ZIP: yes, by [ZipArchive.dataOffsetOf]. Uncompressed TAR: yes in principle, but the TAR
-     * engine does not expose per-entry offsets yet (the streaming scan tracks them; surfacing
-     * them is only worth doing once a preview path exists for TAR - until then the honest answer
-     * is no). Compressed TAR: never - seeking into a gzip stream means re-decompressing from the
-     * start, which is the full download the feature forbids.
+     * ZIP: yes, by [ZipArchive.dataOffsetOf]. Uncompressed TAR: yes - the streaming scan tracks
+     * each entry's data offset from the record-aligned parse, and [readEntry] reads it with one
+     * ranged read. Compressed TAR: never - seeking into a gzip stream means re-decompressing from
+     * the start, which is the full download the feature forbids.
      */
-    fun supportsRandomAccess(format: Format): Boolean = format == Format.ZIP
+    fun supportsRandomAccess(format: Format): Boolean =
+        format == Format.ZIP || format == Format.TAR
 
     /**
      * Lists the archive's entries, dispatching to the engine [format] names.
@@ -88,12 +88,27 @@ object ArchiveReader {
      * way), then decompressed per the entry's method - STORED bytes pass through, DEFLATED ones
      * are inflated to the entry's declared [ArchiveEntry.size] and refused when they do not match,
      * because a mismatch is a corrupt archive, not a preview to render anyway. Anything else the
-     * method field can name is unsupported, honestly rather than guessed. Everything else: null,
-     * telling the caller that this entry needs the streaming path ([TarArchive] re-scans forward);
-     * refusing to pretend is why the UI can label the TAR preview honestly ("reading through the
-     * archive") instead of discovering a hidden full download.
+     * method field can name is unsupported, honestly rather than guessed.
+     *
+     * Uncompressed TAR: a bounded range read at the entry's [ArchiveEntry.dataOffset], which the
+     * record-aligned listing tracked while it scanned. Compressed TAR: null, telling the caller
+     * that this entry needs the streaming pass instead; refusing to pretend is why the UI can
+     * label the compressed-TAR preview honestly ("extract it instead") rather than discovering a
+     * hidden full download.
      */
     suspend fun readEntry(format: Format, source: ArchiveByteSource, entry: ArchiveEntry): ByteArray? {
+        if (format == Format.TAR) {
+            // An uncompressed TAR's entry carries the byte offset its data starts at, tracked by
+            // the record-aligned listing - so one ranged read moves exactly the entry's bytes,
+            // the same promise the ZIP path makes. A null offset (compressed container, or a
+            // listing that could not track it) falls through to the null answer below, which the
+            // UI renders as the honest "cannot preview, extract instead".
+            val offset = entry.dataOffset ?: return null
+            if (entry.size < 0 || entry.size > Int.MAX_VALUE) {
+                throw ArchiveCorruptException("Entry '${entry.path}' spans ${entry.size} byte(s) of data")
+            }
+            return source.readAt(offset, entry.size.toInt())
+        }
         if (!supportsRandomAccess(format)) return null
         // A fresh instance must re-list before dataOffsetOf: the local-header offset bookkeeping
         // lives in the instance that scanned the central directory, so querying an instance that
