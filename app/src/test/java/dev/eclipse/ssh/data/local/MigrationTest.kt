@@ -511,9 +511,11 @@ class MigrationTest {
         // The half the audit kept on purpose (AUDIT-REPORT.md sections 5 and 12.9): a downgrade - a file
         // left by a build one version ahead, e.g. after a Play Store rollback - has no migration path
         // back and never can, so refusing to open it would be a crash loop with no way out from inside
-        // the app. Resetting is the recoverable direction. user_version 17 is that newer build; the row
-        // shape beneath it is irrelevant, because a destructive downgrade drops every table first.
-        seedVersion2(userVersion = 17)
+        // the app. Resetting is the recoverable direction. user_version 19 is that newer build; the row
+        // shape beneath it is irrelevant, because a destructive downgrade drops every table first. One
+        // *ahead* of this build's own 18, not equal to it: a file that claims the current schema has
+        // its rows validated against it, and the v2 table below would not survive that.
+        seedVersion2(userVersion = 19)
 
         val db = openLikeProduction()
 
