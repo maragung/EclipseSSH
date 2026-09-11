@@ -184,6 +184,7 @@ class VaultBackupTest {
             // objects, so a field left at its default would match even if the backup dropped it.
             blockScreenshots = true,
             reconnectAskFirst = true,
+            vaultAutoLockMinutes = 60,
         )
         val knownHosts = mapOf("edge.example.com:2222" to EDGE_FINGERPRINT)
 
@@ -238,6 +239,9 @@ class VaultBackupTest {
         assertThat(settings.terminalTheme).isEqualTo(defaults.terminalTheme)
         assertThat(settings.blockScreenshots).isEqualTo(defaults.blockScreenshots)
         assertThat(settings.reconnectAskFirst).isEqualTo(defaults.reconnectAskFirst)
+        // Absent from a v1 backup, so it resolves to the default (re-lock after 5 minutes) rather
+        // than to zero (never re-lock) by accident.
+        assertThat(settings.vaultAutoLockMinutes).isEqualTo(defaults.vaultAutoLockMinutes)
         assertThat(hosts).hasSize(1)
         assertThat(hosts.single().proxyType).isEqualTo(ProxyType.NONE)
         assertThat(hosts.single().socksPort).isEqualTo(1080)

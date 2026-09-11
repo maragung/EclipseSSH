@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HelpOutline
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -211,7 +212,9 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
+import dev.eclipse.ssh.feature.about.OPEN_SOURCE_LICENSES
 import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
+import dev.eclipse.ssh.feature.vault.shouldRelockVault
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
@@ -1014,21 +1017,46 @@ private fun EclipseWorkspace(
     }
     // Deliberately `remember`, NOT `rememberSaveable`: this is a security gate, so it has to fail
     // closed. rememberSaveable persists into the saved-instance-state Bundle, which survives
-    // system-initiated process death — and the ON_STOP re-lock below cannot clear it in time,
-    // because ProcessLifecycleOwner debounces ON_STOP by 700ms while onSaveInstanceState runs
-    // immediately after onStop on API 28+. The Bundle was therefore written with `true`, and
-    // returning to a background-killed process skipped the lock screen entirely. `remember` still
-    // survives rotation (MainActivity handles those configChanges itself, so it is never
-    // recreated); anything that does recreate the activity now re-locks, which is the safe default.
+    // system-initiated process death — and the ON_START re-lock below cannot undo that, because
+    // the timestamp it needs is exactly as ephemeral: restored to `unlocked = true` with no
+    // backgrounded-at to compare against, a background-killed process would come back unlocked.
+    // `remember` still survives rotation (MainActivity handles those configChanges itself, so it is
+    // never recreated); anything that does recreate the activity now re-locks, which is the safe
+    // default.
     var unlocked by remember { mutableStateOf(false) }
 
-    // Re-lock automatically when the app leaves the foreground, so an unlocked
-    // vault is never left exposed in the background. A file picker (SAF) briefly
-    // stops the activity too, so we skip re-locking while one is in flight.
+    // Re-lock the vault after the app has been in the background past the auto-lock delay, so a
+    // phone left on a desk is not an open vault while an unlocked one stays usable through the
+    // glance-away-and-back that a zero-tolerance rule would punish. The countdown starts at ON_STOP
+    // and the decision — pure, and unit-tested in [shouldRelockVault] — runs at ON_START, the first
+    // moment the elapsed time is known. Clearing `unlocked` here is what makes the re-lock real:
+    // the same `pinEnabled && !unlocked` branch below that gates a cold launch then composes the
+    // same LockScreen, biometric button and all, before anything else is reachable.
+    // A file picker (SAF) briefly stops the activity too, so one in flight suspends the countdown
+    // rather than starting it. With no PIN set there is no lock to re-arm and the setting is inert.
     val pinEnabled by rememberUpdatedState(state.settings.pinEnabled)
+    val vaultAutoLockMinutes by rememberUpdatedState(state.settings.vaultAutoLockMinutes)
+    var backgroundedAtMs by remember { mutableStateOf<Long?>(null) }
     DisposableEffect(Unit) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && pinEnabled && !pickerActive) unlocked = false
+            when (event) {
+                Lifecycle.Event.ON_STOP ->
+                    if (!pickerActive) backgroundedAtMs = System.currentTimeMillis()
+                Lifecycle.Event.ON_START -> {
+                    val wentAwayAtMs = backgroundedAtMs
+                    backgroundedAtMs = null
+                    if (
+                        wentAwayAtMs != null &&
+                        shouldRelockVault(
+                            autoLockMinutes = vaultAutoLockMinutes,
+                            lockConfigured = pinEnabled,
+                            backgroundedAtMs = wentAwayAtMs,
+                            nowMs = System.currentTimeMillis(),
+                        )
+                    ) unlocked = false
+                }
+                else -> Unit
+            }
         }
         ProcessLifecycleOwner.get().lifecycle.addObserver(observer)
         onDispose { ProcessLifecycleOwner.get().lifecycle.removeObserver(observer) }
@@ -1173,6 +1201,21 @@ private fun EclipseWorkspace(
                         pickerActive = true
                         textExportPicker.launch("eclipse-$hostId.log")
                     },
+                    // The raw log comes straight from the view model's per-session transcript -
+                    // keyed by session, so the shell on screen is the one saved - and rides the
+                    // same SAF launcher and pending-bytes slot the diagnostics save uses. Nothing
+                    // is written unless a log exists, which the menu item already ensured.
+                    onSaveSessionLog = { sessionKey, hostName ->
+                        val text = viewModel.sessionLogText(sessionKey)
+                        if (text.isNullOrEmpty()) {
+                            viewModel.reportUiMessage("This session has no output to save yet")
+                        } else {
+                            pendingTextExport = text.toByteArray()
+                            pickerActive = true
+                            textExportPicker.launch("$hostName-session.log")
+                        }
+                    },
+                    onNotifyWhenDone = viewModel::notifyWhenDone,
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1242,6 +1285,7 @@ private fun EclipseWorkspace(
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
+                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1333,6 +1377,21 @@ private fun EclipseWorkspace(
                         pickerActive = true
                         textExportPicker.launch("eclipse-$hostId.log")
                     },
+                    // The raw log comes straight from the view model's per-session transcript -
+                    // keyed by session, so the shell on screen is the one saved - and rides the
+                    // same SAF launcher and pending-bytes slot the diagnostics save uses. Nothing
+                    // is written unless a log exists, which the menu item already ensured.
+                    onSaveSessionLog = { sessionKey, hostName ->
+                        val text = viewModel.sessionLogText(sessionKey)
+                        if (text.isNullOrEmpty()) {
+                            viewModel.reportUiMessage("This session has no output to save yet")
+                        } else {
+                            pendingTextExport = text.toByteArray()
+                            pickerActive = true
+                            textExportPicker.launch("$hostName-session.log")
+                        }
+                    },
+                    onNotifyWhenDone = viewModel::notifyWhenDone,
                     onSaveText = { hostId, text ->
                         pendingTextExport = text.toByteArray()
                         pickerActive = true
@@ -1402,6 +1461,7 @@ private fun EclipseWorkspace(
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
+                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
@@ -1893,6 +1953,10 @@ private fun WorkspaceScaffold(
     onSaveSnippet: (String, String) -> Unit = { _, _ -> },
     onDeleteSnippet: (String) -> Unit = {},
     onSaveLogs: (String, String) -> Unit = { _, _ -> },
+    /** Saves a session's raw output log - session key and the host name to name the file after. */
+    onSaveSessionLog: (String, String) -> Unit = { _, _ -> },
+    /** Arms the finished-command notification for a session key. */
+    onNotifyWhenDone: (String) -> Unit = {},
     onSaveText: (String, String) -> Unit = { _, _ -> },
     onSaveScreen: (String, String) -> Unit = { _, _ -> },
     onClearCompleted: () -> Unit = {},
@@ -1931,6 +1995,7 @@ private fun WorkspaceScaffold(
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
     onReconnectAskFirst: (Boolean) -> Unit = {},
+    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
@@ -1969,6 +2034,8 @@ private fun WorkspaceScaffold(
             onSaveSnippet = onSaveSnippet,
             onDeleteSnippet = onDeleteSnippet,
             onSaveLogs = onSaveLogs,
+            onSaveSessionLog = onSaveSessionLog,
+            onNotifyWhenDone = onNotifyWhenDone,
             onSaveText = onSaveText,
             onSaveScreen = onSaveScreen,
             fontSize = state.settings.terminalFontSize,
@@ -2090,6 +2157,7 @@ private fun WorkspaceScaffold(
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
                     onReconnectAskFirst = onReconnectAskFirst,
+                    onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
@@ -2333,6 +2401,10 @@ private fun TerminalScreen(
     onSaveSnippet: (String, String) -> Unit,
     onDeleteSnippet: (String) -> Unit,
     onSaveLogs: (String, String) -> Unit,
+    /** Saves the raw session log - see MainViewModel.sessionLogText. */
+    onSaveSessionLog: (String, String) -> Unit,
+    /** Arms the finished-command notification - see MainViewModel.notifyWhenDone. */
+    onNotifyWhenDone: (String) -> Unit,
     onSaveText: (String, String) -> Unit,
     onSaveScreen: (String, String) -> Unit,
     /**
@@ -2540,6 +2612,10 @@ private fun TerminalScreen(
             onToggleHistory = { showHistory = !showHistory },
             onSnippets = { showSnippets = true },
             onSaveLogs = { onSaveLogs(activeTab.hostId, terminalText) },
+            // The session's own key, not the host: a host with two shells has two logs, and the
+            // tab's title is the host name the file should be called after.
+            onSaveSessionLog = { onSaveSessionLog(activeTab.id, activeTab.title) },
+            onNotifyWhenDone = { onNotifyWhenDone(activeTab.id) },
             onSaveText = { onSaveText(activeTab.hostId, terminalText) },
             onSaveScreen = { onSaveScreen(activeTab.hostId, terminalText) },
             onCopyAll = { onCopyText(terminalText) },
@@ -3193,6 +3269,10 @@ private fun TerminalTabStrip(
     onToggleHistory: () -> Unit,
     onSnippets: () -> Unit,
     onSaveLogs: () -> Unit,
+    /** Saves the raw session log; the item is hidden until the session has output to save. */
+    onSaveSessionLog: () -> Unit,
+    /** Arms the finished-command notification for the session on screen. */
+    onNotifyWhenDone: () -> Unit,
     onSaveText: () -> Unit,
     onSaveScreen: () -> Unit,
     onCopyAll: () -> Unit,
@@ -3276,6 +3356,15 @@ private fun TerminalTabStrip(
                     text = { Text("Duplicate terminal") },
                     onClick = { menuOpen = false; onDuplicate(activeTab) },
                 )
+                // Only on a live session: the wait is for a command to *finish*, and a session
+                // that has already ended cannot finish anything. The notification the arming
+                // eventually posts is one-shot - the detector disarms itself when it fires.
+                if (activeTab.state.isLive) {
+                    DropdownMenuItem(
+                        text = { Text("Notify when done") },
+                        onClick = { menuOpen = false; onNotifyWhenDone() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text(if (showCommandBar) "Hide command bar" else "Show command bar") },
                     onClick = { menuOpen = false; onToggleCommandBar() },
@@ -3293,6 +3382,13 @@ private fun TerminalTabStrip(
                 DropdownMenuItem(text = { Text("Copy all output") }, onClick = { menuOpen = false; onCopyAll() })
                 DropdownMenuItem(text = { Text("Jump to live output") }, onClick = { menuOpen = false; onScrollToBottom() })
                 DropdownMenuItem(text = { Text("Save logs") }, onClick = { menuOpen = false; onSaveLogs() })
+                // Only once there is something to save: the session log is created with the
+                // session, so on a shell that has not spoken yet the item would offer an empty
+                // file. `terminalText` is the observable proxy for "this session has output" -
+                // it is what the transcript view and the other saves read.
+                if (terminalText.isNotBlank()) {
+                    DropdownMenuItem(text = { Text("Save session log") }, onClick = { menuOpen = false; onSaveSessionLog() })
+                }
                 DropdownMenuItem(text = { Text("Save text") }, onClick = { menuOpen = false; onSaveText() })
                 DropdownMenuItem(text = { Text("Save screen") }, onClick = { menuOpen = false; onSaveScreen() })
                 DropdownMenuItem(text = { Text("Disconnect all") }, onClick = { menuOpen = false; onDisconnectAll() })
@@ -4442,6 +4538,7 @@ private fun SettingsScreen(
     onLegacyAlgorithms: (Boolean) -> Unit,
     onBlockScreenshots: (Boolean) -> Unit,
     onReconnectAskFirst: (Boolean) -> Unit = {},
+    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
@@ -4462,9 +4559,11 @@ private fun SettingsScreen(
     var showFontDialog by remember { mutableStateOf(false) }
     var showWidthDialog by remember { mutableStateOf(false) }
     var showPinDialog by remember { mutableStateOf(false) }
+    var showVaultAutoLockDialog by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
+    var showAbout by remember { mutableStateOf(false) }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -4474,6 +4573,17 @@ private fun SettingsScreen(
         SettingRow(Icons.Default.Lock, "Biometric vault lock", "Protect passwords and private keys") { Switch(checked = state.settings.biometricUnlock, onCheckedChange = onBiometric) }
         SettingRow(Icons.Default.Key, "Generate SSH key pair", "RSA 2048/4096 or ECDSA P-256, exported as PEM") { TextButton(onClick = onGenerateKey) { Text("Generate") } }
         SettingRow(Icons.Default.Lock, "PIN lock", if (state.settings.pinEnabled) "Enabled · PIN fallback at launch" else "Set a PIN for quick unlock") { TextButton(onClick = { showPinDialog = true }) { Text(if (state.settings.pinEnabled) "Change" else "Set") } }
+        // The subtitle says so when there is no lock to re-arm: with no PIN set the vault has no
+        // lock screen at all, so the delay would be a setting over nothing.
+        SettingRow(
+            Icons.Default.Lock,
+            "Auto-lock vault",
+            when {
+                !state.settings.pinEnabled -> "No PIN is set, so there is no lock to re-arm"
+                state.settings.vaultAutoLockMinutes == 0 -> "Never re-locks while the app is in the background"
+                else -> "Re-locks after ${state.settings.vaultAutoLockMinutes} minutes in the background"
+            },
+        ) { TextButton(onClick = { showVaultAutoLockDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Encrypted vault", "AES-256-GCM · Android Keystore") { Text("Protected", color = EclipseSuccess, style = MaterialTheme.typography.labelMedium) }
         SettingRow(Icons.Default.Key, "Known hosts", "${state.knownHosts.size} trusted fingerprint(s)") { TextButton(onClick = { showKnownHosts = true }) { Text("Manage") } }
         SettingRow(
@@ -4592,6 +4702,22 @@ private fun SettingsScreen(
             },
         ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
     }
+    Spacer(Modifier.height(14.dp))
+    SettingsSection("About") {
+        SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
+            // Two "View" buttons sit on this screen once diagnostics is counted, and a screen reader
+            // hears both of them as just "View" — so the button carries the row it belongs to, the
+            // same "setting, action" shape the theme picker's content description uses.
+            TextButton(
+                onClick = { showAbout = true },
+                modifier = Modifier.semantics { contentDescription = "About EclipseSSH" },
+            ) { Text("View") }
+        }
+    }
+
+    if (showAbout) {
+        AboutDialog(onDismiss = { showAbout = false })
+    }
 
     if (showDiagnostics) {
         DiagnosticsDialog(
@@ -4637,6 +4763,13 @@ private fun SettingsScreen(
             options = listOf(0, 15, 30, 60, 120),
             onDismiss = { showClipboardDialog = false },
             onConfirm = { onClipboard(it); showClipboardDialog = false },
+        )
+    }
+    if (showVaultAutoLockDialog) {
+        VaultAutoLockDialog(
+            current = state.settings.vaultAutoLockMinutes,
+            onDismiss = { showVaultAutoLockDialog = false },
+            onConfirm = { onVaultAutoLock(it); showVaultAutoLockDialog = false },
         )
     }
     if (showFontDialog) {
@@ -4841,6 +4974,72 @@ private fun DiagnosticsDialog(
     )
 }
 
+/**
+ * Version, credits and the library list — the screen a licence question or a "what is this app"
+ * question is answered from.
+ *
+ * The version is read from the PackageManager rather than from a generated `BuildConfig` field: the
+ * app builds with no buildConfig fields at all, and this answer is the one Android itself shows in
+ * system settings, so the dialog cannot disagree with it.
+ */
+@Composable
+private fun AboutDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("About EclipseSSH") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.70f))) {
+                Text("EclipseSSH", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Version ${packageInfo.versionName} (${packageInfo.longVersionCode})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "An SSH and SFTP client for Android: a full-screen VT/ANSI terminal, concurrent " +
+                        "sessions in tabs, a two-pane SFTP browser with resumable transfers, port " +
+                        "forwarding and remote desktop, with credentials kept in an Android " +
+                        "Keystore-backed vault.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("Created by Maragung", style = MaterialTheme.typography.titleSmall)
+                // The repo is private, so this link serves the owner and contributors rather than the
+                // public — anyone else lands on GitHub's sign-in, which is still the honest
+                // destination for "where is the source".
+                TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ABOUT_REPO_URL))) }) {
+                    Text("Source code · github.com/maragung/EclipseSSH")
+                }
+                Text("Libraries", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // The one list the repo keeps: the dialog renders OPEN_SOURCE_LICENSES as-is, so
+                // what an About screen says and what the repo claims cannot drift apart.
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(OPEN_SOURCE_LICENSES) { library ->
+                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                Text("${library.name} ${library.version}", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    // Bouncy Castle is the one entry with no purpose line - a
+                                    // transitive dependency nothing calls directly - so its row
+                                    // is the licence alone, not a sentence ending in a dangling dot.
+                                    library.purpose?.let { "${library.license} · $it" } ?: library.license,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+/** Where the source lives. Private repository — see the comment on the dialog's link. */
+private const val ABOUT_REPO_URL = "https://github.com/maragung/EclipseSSH"
+
 @Composable
 private fun KnownHostsDialog(
     hosts: Map<String, String>,
@@ -4896,6 +5095,44 @@ private fun IntervalDialog(title: String, subtitle: String, current: Int, option
                             selected = selected == option,
                             onClick = { selected = option },
                             label = { Text(if (option == 0) "Off" else "$option s") },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Picks how long the app may sit in the background before the vault re-locks. See
+ * [dev.eclipse.ssh.data.model.AppSettings.vaultAutoLockMinutes].
+ *
+ * Its own dialog rather than an [IntervalDialog], only because that one labels every chip in
+ * seconds and this setting is in minutes, with a "Never" choice rather than an "Off" one. The
+ * choices come from the repository that clamps them, so a chip cannot offer a delay that would be
+ * stored as a different number.
+ */
+@Composable
+private fun VaultAutoLockDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+    var selected by remember { mutableIntStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Auto-lock vault") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "How long the app may sit in the background before the PIN is asked for again. " +
+                        "The countdown starts the moment you leave the app.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                    SettingsRepository.VAULT_AUTO_LOCK_CHOICES.forEach { option ->
+                        FilterChip(
+                            selected = selected == option,
+                            onClick = { selected = option },
+                            label = { Text(if (option == 0) "Never" else "$option min") },
                         )
                     }
                 }
