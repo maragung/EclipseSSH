@@ -148,6 +148,11 @@ class MigrationTest {
         // Version 14's column is null for the same reason the algorithm lists are: null is the only
         // value that can mean "no failure is recorded", which is true of every row that predates it.
         assertThat(transfer.errorMessage).isNull()
+        // Version 16's cross-host columns, same reasoning: a transfer that predates them had no
+        // second host and no destination directory, and both stay null until a cross-host copy
+        // writes them.
+        assertThat(transfer.sourceHostId).isNull()
+        assertThat(transfer.destPath).isNull()
     }
 
     @Test
@@ -173,6 +178,11 @@ class MigrationTest {
                 scheduledAt = 1_800_000_000_000L,
                 repeatMinutes = 60L,
                 errorMessage = "Connection reset by peer",
+                // Version 16's columns, through the same door: a host id and a real path with a
+                // space in it, the shape most likely to be mangled by a mis-typed column name or
+                // an affinity that quietly truncates it.
+                sourceHostId = "origin-host",
+                destPath = "/srv/incoming/site backups",
             ),
         )
 
@@ -184,6 +194,8 @@ class MigrationTest {
         // and lowercase is the shape most likely to be mangled by a mis-typed affinity or a NOT NULL
         // default that silently empties it.
         assertThat(stored.errorMessage).isEqualTo("Connection reset by peer")
+        assertThat(stored.sourceHostId).isEqualTo("origin-host")
+        assertThat(stored.destPath).isEqualTo("/srv/incoming/site backups")
     }
 
     @Test
@@ -323,7 +335,10 @@ class MigrationTest {
         assertThat(host.remoteDesktop).isEmpty()
         assertThat(host.wakeOnLanMac).isEmpty()
 
-        // The transfer row and its version-11 columns survive the climb too.
+        // The transfer row and its version-11 columns survive the climb too, and version 16's
+        // cross-host columns arrive null: an eleven-era transfer had no second host and no
+        // destination directory, and null is the only value that says so without inventing a
+        // sentinel path an old row would be read as configuring.
         val transfer = db.transferDao().observeAll().first().single()
         assertThat(transfer.id).isEqualTo("v11-transfer")
         assertThat(transfer.transferredBytes).isEqualTo(4_194_304L)
@@ -331,6 +346,8 @@ class MigrationTest {
         assertThat(transfer.retryCount).isEqualTo(3)
         assertThat(transfer.scheduledAt).isEqualTo(1_750_000_000_001L)
         assertThat(transfer.repeatMinutes).isEqualTo(15L)
+        assertThat(transfer.sourceHostId).isNull()
+        assertThat(transfer.destPath).isNull()
     }
 
     @Test
@@ -451,6 +468,43 @@ class MigrationTest {
     }
 
     @Test
+    fun `a version 16 transfer keeps every configured value across the step to 17`() = runTest {
+        // This release's step, on its own, for the same reason the 15->16 step test above exists:
+        // the v2 and v11 climbs can only ever see the new columns at their null default, which
+        // cannot catch the one failure an ALTER TABLE can commit without failing - rebuilding the
+        // table instead of extending it, and losing everything the user configured. Seeded from
+        // the committed 16.json with a fully configured transfer row, so what survives is what was
+        // chosen. Numbered from 16 rather than 15 because the Wake-on-LAN column took 15->16 on
+        // main while this branch was open.
+        seedVersion16()
+
+        val transfer = openWithMigrations().transferDao().observeAll().first().single()
+
+        // Every version-16 column, read back after the step, none of them at its default.
+        assertThat(transfer.id).isEqualTo("v16-transfer")
+        assertThat(transfer.name).isEqualTo("site-backup")
+        assertThat(transfer.direction).isEqualTo("CROSS_HOST")
+        assertThat(transfer.hostName).isEqualTo("Destination edge")
+        assertThat(transfer.progress).isEqualTo(0.25f)
+        assertThat(transfer.status).isEqualTo("RUNNING")
+        assertThat(transfer.sizeLabel).isEqualTo("1.2 GB")
+        assertThat(transfer.hostId).isEqualTo("dest-host")
+        assertThat(transfer.remotePath).isEqualTo("/srv/incoming/site-backup")
+        assertThat(transfer.localUri).isNull()
+        assertThat(transfer.transferredBytes).isEqualTo(322_122_547L)
+        assertThat(transfer.totalBytes).isEqualTo(1_288_490_188L)
+        assertThat(transfer.retryCount).isEqualTo(1)
+        assertThat(transfer.scheduledAt).isEqualTo(1_750_000_000_003L)
+        assertThat(transfer.repeatMinutes).isNull()
+        assertThat(transfer.errorMessage).isEqualTo("Connection reset by peer")
+
+        // And the two columns this step adds arrive null: null is the absence of a second host and
+        // of a destination directory, which is true of every row written before this release.
+        assertThat(transfer.sourceHostId).isNull()
+        assertThat(transfer.destPath).isNull()
+    }
+
+    @Test
     fun `an upgrade with no migration path fails loudly instead of silently wiping`() = runTest {
         // The reason the production fallback is downgrade-only. No release ever shipped below schema 11,
         // so a version this build has no *upgrade* path for can only come from a developer bumping the
@@ -470,9 +524,11 @@ class MigrationTest {
         // The half the audit kept on purpose (AUDIT-REPORT.md sections 5 and 12.9): a downgrade - a file
         // left by a build one version ahead, e.g. after a Play Store rollback - has no migration path
         // back and never can, so refusing to open it would be a crash loop with no way out from inside
-        // the app. Resetting is the recoverable direction. user_version 17 is that newer build; the row
-        // shape beneath it is irrelevant, because a destructive downgrade drops every table first.
-        seedVersion2(userVersion = 17)
+        // the app. Resetting is the recoverable direction. user_version 18 is that newer build; the row
+        // shape beneath it is irrelevant, because a destructive downgrade drops every table first. One
+        // *ahead* of this build's own 17, not equal to it: a file that claims the current schema has
+        // its rows validated against it, and the v2 table below would not survive that.
+        seedVersion2(userVersion = 18)
 
         val db = openLikeProduction()
 
@@ -489,7 +545,7 @@ class MigrationTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
-                Migrations.MIGRATION_15_16,
+                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17,
             )
             // No destructive fallback: a schema mismatch must fail the test, not wipe data.
             .allowMainThreadQueries()
@@ -510,7 +566,7 @@ class MigrationTest {
                 Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11,
                 Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13,
                 Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15,
-                Migrations.MIGRATION_15_16,
+                Migrations.MIGRATION_15_16, Migrations.MIGRATION_16_17,
             )
             .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
             .allowMainThreadQueries()
@@ -708,6 +764,40 @@ class MigrationTest {
                 "'L:8080:intranet.example:80','V:10.0.1.5:5900 view-only')",
         )
         db.execSQL("PRAGMA user_version = 15")
+        db.close()
+    }
+
+    /**
+     * Writes the version-16 schema from its committed file, with one fully configured transfer row
+     * in it - the starting point of the 16->17 step test, and the last schema before the cross-host
+     * columns.
+     *
+     * Reconstructed from `schemas/16.json` for the same reason [seedVersion14] is: the committed
+     * file is the definition the shipped release validated against, and a hand-copied CREATE
+     * TABLE would be a second one that keeps passing after the first is found to differ. The row
+     * is a cross-host one in waiting - direction CROSS_HOST, no localUri - because that is the
+     * shape the new columns were added for, and the step has to prove it carries that row across
+     * without losing anything already configured.
+     */
+    private fun seedVersion16() {
+        val schema = JSONObject(schemaFile(16).readText()).getJSONObject("database")
+        val file = databaseFile().apply { parentFile?.mkdirs(); delete() }
+        val db = SQLiteDatabase.openOrCreateDatabase(file, null)
+        val entities = schema.getJSONArray("entities")
+        for (index in 0 until entities.length()) {
+            val entity = entities.getJSONObject(index)
+            val table = entity.getString("tableName")
+            db.execSQL(entity.getString("createSql").replace("\${TABLE_NAME}", table))
+        }
+        db.execSQL(
+            "INSERT INTO transfer_queue (id, name, direction, hostName, progress, status, " +
+                "sizeLabel, hostId, remotePath, localUri, transferredBytes, totalBytes, retryCount, " +
+                "scheduledAt, repeatMinutes, errorMessage) " +
+                "VALUES ('v16-transfer','site-backup','CROSS_HOST','Destination edge',0.25,'RUNNING'," +
+                "'1.2 GB','dest-host','/srv/incoming/site-backup',NULL,322122547,1288490188,1," +
+                "1750000000003,NULL,'Connection reset by peer')",
+        )
+        db.execSQL("PRAGMA user_version = 16")
         db.close()
     }
 

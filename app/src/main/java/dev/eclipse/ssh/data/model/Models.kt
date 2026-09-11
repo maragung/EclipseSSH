@@ -746,6 +746,19 @@ data class TransferItem(
     val hostId: String? = null,
     val remotePath: String? = null,
     val localUri: String? = null,
+    /**
+     * For a cross-host transfer, the host the file is coming *from*; [hostId] stays the
+     * destination, so a row describes one leg of one journey and the Transfers list still sorts,
+     * retries and restores by the host it belongs to. Null for every ordinary upload and download,
+     * which have no second host to name.
+     */
+    val sourceHostId: String? = null,
+    /**
+     * For a cross-host transfer, the directory on the destination host the copy lands in - the
+     * path the engine is handed, distinct from [remotePath], which for a single file names the
+     * file itself. Null for transfers whose destination is a local document.
+     */
+    val destPath: String? = null,
     val transferredBytes: Long = 0,
     val totalBytes: Long? = null,
     val retryCount: Int = 0,
@@ -760,7 +773,17 @@ data class TransferItem(
     val errorMessage: String? = null,
 )
 
-enum class TransferDirection(val label: String) { UPLOAD("Upload"), DOWNLOAD("Download") }
+enum class TransferDirection(val label: String) {
+    UPLOAD("Upload"),
+    DOWNLOAD("Download"),
+    /**
+     * Server-to-server: neither half of the transfer touches the device. The label is a sentence
+     * rather than a word because the notification line it lands in ("... finished: name") has to
+     * tell the user which of three things their phone did, and "Cross host" names a screen, not
+     * an action.
+     */
+    CROSS_HOST("Server-to-server transfer"),
+}
 enum class TransferStatus { RUNNING, PAUSED, COMPLETE, FAILED, QUEUED }
 enum class SyncDirection(val label: String) { LOCAL_TO_REMOTE("Local → Remote"), REMOTE_TO_LOCAL("Remote → Local") }
 

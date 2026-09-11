@@ -120,7 +120,7 @@ interface HostDao {
 // exportSchema is on so `app/schemas` records what each version actually looks like: every
 // migration from here has to be written against a known starting point, and Room's migration
 // test helper reads those files. See the ksp `room.schemaLocation` argument in build.gradle.kts.
-@Database(entities = [HostEntity::class, TransferEntity::class], version = 16, exportSchema = true)
+@Database(entities = [HostEntity::class, TransferEntity::class], version = 17, exportSchema = true)
 @TypeConverters(HostConverters::class)
 abstract class EclipseDatabase : RoomDatabase() {
     abstract fun hostDao(): HostDao
