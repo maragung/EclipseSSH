@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -423,10 +424,12 @@ private fun SingleFileEditor(
     }
 
     // Per-tab, unlike the discard dialog: a save conflict is a fact about one file, and two files
-    // could each have one waiting.
+    // could each have one waiting. Four ways out, all labelled: the two destructive ones are peers
+    // of the safe ones on purpose — "dismiss means keep my edits" is a rule the user has to be told,
+    // a "Cancel" button is one they can read.
     if (tab.conflictOpen) {
         AlertDialog(
-            onDismissRequest = { tab.conflictOpen = false },
+            onDismissRequest = { tab.chooseConflictAction(scope, ConflictChoice.Cancel) },
             title = { Text("Changed since it was opened") },
             text = {
                 Text(
@@ -436,18 +439,126 @@ private fun SingleFileEditor(
             },
             confirmButton = {
                 Button(onClick = {
-                    tab.conflictOpen = false
-                    tab.save(scope, overwrite = true)
+                    tab.chooseConflictAction(scope, ConflictChoice.Overwrite)
                 }) { Text("Overwrite") }
             },
             dismissButton = {
-                TextButton(onClick = {
-                    tab.conflictOpen = false
-                    tab.reloadFromDisk(scope)
-                }) { Text("Reload") }
+                // A column, not a row: three full-width choices read as a list of options, not as
+                // a primary with side-conditions — and they stay tappable on a narrow dialog.
+                Column(horizontalAlignment = Alignment.End) {
+                    TextButton(onClick = {
+                        tab.chooseConflictAction(scope, ConflictChoice.Reload)
+                    }) { Text("Reload") }
+                    TextButton(onClick = {
+                        tab.chooseConflictAction(scope, ConflictChoice.Compare)
+                    }) { Text("Compare") }
+                    TextButton(onClick = {
+                        tab.chooseConflictAction(scope, ConflictChoice.Cancel)
+                    }) { Text("Cancel") }
+                }
             },
         )
     }
+
+    // The compare half of the same question. Reachable only through the dialog above, and while it
+    // is up that dialog is closed — one question on screen at a time.
+    tab.compareState?.let { compare ->
+        ConflictCompareDialog(
+            fileName = tab.request.entry.name,
+            localText = tab.textValue.text,
+            compare = compare,
+            onBack = { tab.closeConflictCompare() },
+        )
+    }
+}
+
+/**
+ * The "Compare" choice's answer: the local text beside the on-server text, nothing more.
+ *
+ * A compare VIEW, not a merge tool, on purpose. The question it serves is binary — keep your
+ * version or take the server's — and what the user needs to answer it is to *see* both versions;
+ * per-hunk picks and conflict markers are a different feature with different risks, and half a
+ * merge tool is worse than none (a user who half-merges and then taps "Overwrite" believes their
+ * picks were applied when nothing of the sort happened). So: two columns, labelled, scrollable.
+ */
+@Composable
+private fun ConflictCompareDialog(
+    fileName: String,
+    localText: String,
+    compare: ConflictCompare,
+    onBack: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onBack,
+        title = { Text("$fileName: yours vs on server") },
+        text = {
+            when (compare) {
+                ConflictCompare.Loading -> Box(
+                    Modifier.fillMaxWidth().height(48.dp),
+                    contentAlignment = Alignment.Center,
+                ) { CircularProgressIndicator() }
+
+                is ConflictCompare.Failed ->
+                    // One line, not a stack trace: the fetch failed, the answer to the real
+                    // question ("overwrite or reload?") is still waiting behind the Back button.
+                    Text(compare.message)
+
+                is ConflictCompare.Ready -> {
+                    // One vertical scroll shared by both columns: the user reads the versions
+                    // *against each other*, so line 40 of one must stay put beside line 40 of the
+                    // other. Fresh ScrollStates rather than the tab's own because the editor field
+                    // behind the dialog is still composed with those — two scrollables sharing one
+                    // ScrollState would fight over its position.
+                    val sharedScroll = rememberScrollState()
+                    Column(Modifier.fillMaxWidth()) {
+                        Row(Modifier.fillMaxWidth()) {
+                            Text("Yours", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall)
+                            Text(
+                                "On server",
+                                Modifier.weight(1f),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 360.dp)
+                                .verticalScroll(sharedScroll),
+                        ) {
+                            // No soft wrap: a wrapped line in one column would shift every line
+                            // after it out of row-alignment with the other column. Long lines get
+                            // their own horizontal scroll per column instead.
+                            Text(
+                                localText,
+                                Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                                softWrap = false,
+                                style = TextStyle(
+                                    fontFamily = TerminalMonoFontFamily,
+                                    fontSize = 13.sp,
+                                    lineHeight = 19.sp,
+                                ),
+                            )
+                            Text(
+                                compare.serverText,
+                                Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                                softWrap = false,
+                                style = TextStyle(
+                                    fontFamily = TerminalMonoFontFamily,
+                                    fontSize = 13.sp,
+                                    lineHeight = 19.sp,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            // Back, not OK or Done: the view changed nothing, and the label should say so — the
+            // user is returning to a question, not confirming an action.
+            TextButton(onClick = onBack) { Text("Back") }
+        },
+    )
 }
 
 /**
@@ -459,7 +570,10 @@ private fun SingleFileEditor(
  * (auto or manual, which moves savedText) re-arms rather than re-fires; `saving` keeps the
  * heartbeat from racing its own upload, and the conflict dialog and the coordinator's close
  * question keep it from answering, behind the user's back, a question ("overwrite?", "discard
- * what you typed?") that is still on screen. Reaching the far side of the delay means none of
+ * what you typed?") that is still on screen. The compare view joins the conflict dialog in that
+ * guard: it is the same question wearing different clothes, and an auto-save firing behind it
+ * could re-raise the conflict and stack a second dialog on a decision already being looked at.
+ * Reaching the far side of the delay means none of
  * those keys moved — the text stayed put, no dialog opened, no save started — which is exactly
  * "still dirty after the configured quiet". The save itself launches into [scope], the screen's
  * own, so a key moving mid-save (a keystroke, a tab switch) cancels only the countdown, never
@@ -479,9 +593,12 @@ private fun AutoSaveEffect(
         prefs.autoSaveDelayMillis,
         tab.saving,
         tab.conflictOpen,
+        tab.compareState,
         blocked,
     ) {
-        if (!prefs.autoSaveEnabled || !tab.dirty || tab.saving || tab.conflictOpen || blocked) {
+        if (!prefs.autoSaveEnabled || !tab.dirty || tab.saving || tab.conflictOpen ||
+            tab.compareState != null || blocked
+        ) {
             return@LaunchedEffect
         }
         delay(prefs.autoSaveDelayMillis)
