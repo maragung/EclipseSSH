@@ -95,7 +95,7 @@ class EditorTabStateTest {
         provider: ScriptedFileProvider = ScriptedFileProvider(entry),
         isNewFile: Boolean = false,
         encoding: FileEncoding = FileEncoding.UTF_8,
-    ) = EditorTabState(id = 1L, request = EditorRequest(entry, provider, isNewFile), encoding = encoding)
+    ) = EditorTabState(id = 1L, request = EditorRequest(entry, provider, isNewFile), initialEncoding = encoding)
 
     @Test
     fun `startLoad adopts a readable file's text as both the working copy and the baseline`() = runTest {
