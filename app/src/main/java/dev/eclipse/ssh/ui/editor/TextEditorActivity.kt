@@ -129,5 +129,5 @@ object EditorRequests {
         return token
     }
 
-    fun take(token: String): EditorRequest? = pending.remove(token)
+    fun take(token: String?): EditorRequest? = token?.let { pending.remove(it) }
 }

@@ -160,11 +160,6 @@ fun TextEditorScreen(
         tab.startLoad(scope)
     }
 
-    /** A close is a question while the tab is dirty — the discard dialog answers it — a command otherwise. */
-    fun requestClose(tab: EditorTabState) {
-        if (tab.dirty) pendingCloseTabId = tab.id else closeTab(tab)
-    }
-
     fun closeTab(tab: EditorTabState) {
         val index = tabs.indexOf(tab)
         if (index < 0) return
@@ -179,6 +174,11 @@ fun TextEditorScreen(
         if (selectedTabId == tab.id) {
             selectedTabId = tabs[index.coerceAtMost(tabs.lastIndex)].id
         }
+    }
+
+    /** A close is a question while the tab is dirty — the discard dialog answers it — a command otherwise. */
+    fun requestClose(tab: EditorTabState) {
+        if (tab.dirty) pendingCloseTabId = tab.id else closeTab(tab)
     }
 
     // ---- Opens ----
