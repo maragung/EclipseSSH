@@ -194,6 +194,10 @@ class EditorTabsRobolectricTest {
     private fun countNamed(text: String): Int =
         compose.onAllNodes(hasText(text)).fetchSemanticsNodes().size
 
+    /** The number of nodes carrying [text] anywhere in them — the body, not the labels. */
+    private fun nodesWith(text: String): Int =
+        compose.onAllNodes(hasText(text, substring = true)).fetchSemanticsNodes().size
+
     /** Delivers a live request into the open window, the way a new intent's token would arrive. */
     private fun openTab(name: String, path: String, contents: String) {
         provider.add(path, contents)
@@ -225,6 +229,16 @@ class EditorTabsRobolectricTest {
         // Back to the first: its text must still be there — a switch that loses the body is the
         // one bug a tabbed editor can quietly ship.
         tabLabel(firstName).performClick()
+        pump(60)
+        val switchDiag =
+            "DIAG switch " +
+                "bodyFirst=${nodesWith(firstText)} bodySecond=${nodesWith(secondText)} " +
+                "namedFirst=${countNamed(firstName)} namedSecond=${countNamed(secondName)} " +
+                "editable=${compose.onAllNodes(hasSetTextAction()).fetchSemanticsNodes().size} " +
+                "chipFirst=${compose.onAllNodes(hasClickAction() and hasText(firstName)).fetchSemanticsNodes().size}"
+        // check() rather than throw: the compiler still sees awaitText below as reachable, so the
+        // diagnostic does not trip an unreachable-code warning on its way to being deleted.
+        check(switchDiag.isEmpty()) { switchDiag }
         awaitText(firstText)
         awaitTextGone(secondText)
 
@@ -278,6 +292,17 @@ class EditorTabsRobolectricTest {
         // A clean tab's close is a command, not a question: the toolbar's close is the same
         // request the back gesture makes, and the last tab leaving is the window leaving.
         compose.onNodeWithContentDescription("Close editor").performClick()
+        pump(60)
+        val closeDiag =
+            "DIAG close " +
+                "state=${runCatching { scenarioRule.scenario.state }.getOrNull()} " +
+                "isFinishing=${runCatching { scenarioRule.scenario.onActivity { it.isFinishing } }.getOrNull()} " +
+                "discardQuestion=${nodesWith("Leave the editor")} " +
+                "subtitleUnsaved=${nodesWith("Unsaved changes")} subtitleSaved=${nodesWith("Saved")} " +
+                "bodyFirst=${nodesWith(firstText)} " +
+                "dialogs=${ShadowDialog.getShownDialogs().size}"
+        // check() rather than throw, so the pumpUntil below stays reachable to the compiler.
+        check(closeDiag.isEmpty()) { closeDiag }
 
         // Read through runCatching because a destroyed activity can make the scenario's own state
         // query throw; what has to hold either way is that the window is no longer up.
