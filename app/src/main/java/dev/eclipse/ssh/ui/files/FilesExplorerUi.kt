@@ -505,6 +505,7 @@ fun ExplorerFileActionsSheet(
     onChmod: (() -> Unit)?,
     onTransfer: (() -> Unit)?,
     onSendToHost: (() -> Unit)?,
+    onOpenArchive: (() -> Unit)?,
 ) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.padding(horizontal = 22.dp).padding(bottom = 18.dp)) {
@@ -518,8 +519,15 @@ fun ExplorerFileActionsSheet(
             // because a started selection is the state the whole explorer reorganizes around.
             ActionRow("Select", onSelect)
             ActionRow("Preview", onPreview)
+            if (onOpenArchive != null) {
+                // Above Preview and Edit: for a 50 GB archive this is the only row that can
+                // answer without moving the archive, and it is the reason the row exists.
+                ActionRow("View Archive", onOpenArchive)
+            }
             if (!entry.isDirectory) {
-                ActionRow("Edit", onEdit)
+                // "Edit as text", the preview sheet's own label, so both doors into the editor
+                // promise the same thing in the same words.
+                ActionRow("Edit as text", onEdit)
             }
             ActionRow("Rename", onRename)
             ActionRow("Copy to…", onCopy)

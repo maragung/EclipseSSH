@@ -384,6 +384,14 @@ dependencies {
     implementation(libs.slf4j.api)
     implementation(libs.slf4j.simple)
 
+    // Archive codecs for View Archive: ZIP central-directory reads and TAR streaming from
+    // commons-compress, XZ from tukaani. Runtime scope is enough - nothing these libraries
+    // expose leaks into the app's API surface, they are wrapped behind the archive engine.
+    // The dependency-lockfile check in ci.yml pins the transitive closure; the three commons
+    // children (io, lang3, codec) arrive from commons-compress's own POM.
+    implementation(libs.commons.compress)
+    implementation(libs.xz)
+
     // The RFB (VNC) half of the remote-desktop viewer, spoken over a plain Socket that the
     // VNC engine runs through an ad-hoc SSH local forward. Pinned to a JitPack commit SHA -
     // see the version catalog note. Its only transitive dependency is Bouncy Castle's

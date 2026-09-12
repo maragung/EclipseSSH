@@ -213,7 +213,7 @@ class FilesExplorerLayoutRobolectricTest {
         compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
         // The sheet, not the batch bar: the gesture's first consequence is the menu of everything
         // this entry can do.
-        awaitDisplayed("Edit")
+        awaitDisplayed("Edit as text")
         clickSheetRow("Select")
         awaitDisplayed("1 selected")
         compose.onNode(hasText("Download") and hasClickAction()).assertIsDisplayed()
@@ -242,13 +242,13 @@ class FilesExplorerLayoutRobolectricTest {
         // Drain whatever starts the setup made, so the peek below only ever reports this
         // click's doing — peeking does not consume, so a stale intent would mask the editor's.
         while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
-        clickSheetRow("Edit")
+        clickSheetRow("Edit as text")
 
         // Stage 1: the row's own first act is closing the sheet it lives in, so the sheet
         // leaving the tree is the observable proof that the click ran the app's code rather
         // than stalling in the harness.
         pumpUntil(describe = { "the sheet never closed after its Edit row was tapped: " + diagnose() }) {
-            compose.onAllNodes(hasText("Edit") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+            compose.onAllNodes(hasText("Edit as text") and hasClickAction()).fetchSemanticsNodes().isEmpty()
         }
         // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it,
         // which fires on a later frame. Robolectric records every startActivity

@@ -228,6 +228,19 @@ import dev.eclipse.ssh.presentation.AuthFailurePrompt
 import dev.eclipse.ssh.presentation.ReconnectPrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.archive.ArchiveBrowserState
+import dev.eclipse.ssh.archive.ArchiveEntry
+import dev.eclipse.ssh.archive.ArchiveExtractor
+import dev.eclipse.ssh.archive.ArchiveTarget
+import dev.eclipse.ssh.archive.ArchiveReader
+import dev.eclipse.ssh.archive.ArchiveUiState
+import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
+import dev.eclipse.ssh.ui.archive.ArchivePropertiesDialog
+import dev.eclipse.ssh.ui.archive.ArchiveActions
+import dev.eclipse.ssh.ui.archive.ArchiveBrowserScreen
+import dev.eclipse.ssh.ui.archive.SafArchiveDestination
 import dev.eclipse.ssh.ui.editor.EditorRequest
 import dev.eclipse.ssh.ui.editor.EditorRequests
 import dev.eclipse.ssh.ui.editor.TextEditorActivity
@@ -706,6 +719,65 @@ private fun EclipseWorkspace(
     // deserves a window of its own rather than a layer over whatever the workspace was showing.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
     var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
+    // The View Archive browser target, held here for the same reason as the preview target: the
+    // scan runs against this workspace's provider, and the browser is one archive at a time by
+    // design - opening a second archive closes the first, because each one holds an SFTP channel
+    // for as long as it is open.
+    var archiveTarget by remember { mutableStateOf<ArchiveTarget?>(null) }
+    /**
+     * Opens one remote archive in the View Archive browser — the Files sheet's View Archive row.
+     *
+     * The archive's host is found from the explorer's session rather than the workspace's selected
+     * host, because the sheet can be open on a session the Hosts list never selected; getting the
+     * host wrong here would silently scan the wrong server's file. Format detection is by name
+     * only, before anything is read: it costs nothing and a name that suggests no browsable
+     * container means the row was offered in error — reported, not guessed around.
+     */
+    fun openArchive(entry: FsEntry, provider: FileSystemProvider) {
+        val format = ArchiveReader.formatFor(entry.name)
+            ?: return viewModel.reportUiMessage("\"${entry.name}\" is not an archive View Archive can browse")
+        val explorer = viewModel.filesExplorer.state.value
+        val sessionId = explorer.activeSessionId
+        val size = entry.size
+            ?: return viewModel.reportUiMessage("\"${entry.name}\" has no size to read by range")
+        val source = viewModel.filesExplorer.archiveSourceFor(sessionId, entry.path, size)
+            ?: return viewModel.reportUiMessage("View Archive needs a connected server session")
+        // Opening a second archive closes the first: each browser holds an SFTP channel for as
+        // long as it is open, and two of them is a leak the user never asked for.
+        archiveTarget?.browser?.close()
+        archiveTarget = ArchiveTarget(entry, ArchiveBrowserState(
+            archiveName = entry.name,
+            format = format,
+            source = source,
+            provider = provider,
+            remotePath = entry.path,
+            scope = scope,
+        ))
+    }
+
+    /**
+     * Turns an extract's per-entry outcomes into the one-line report a person can act on, without
+     * a stack trace in sight. The honest summary is tiered: all good says how many and how much;
+     * anything refused or failed says so, because a silent skip is how a hostile member hides.
+     */
+    fun reportExtractOutcome(archiveName: String, outcomes: List<ArchiveExtractor.Outcome>) {
+        val extracted = outcomes.filterIsInstance<ArchiveExtractor.Outcome.Extracted>()
+        if (outcomes.size == extracted.size) {
+            val total = extracted.sumOf { it.bytes }
+            viewModel.reportUiMessage("Extracted ${extracted.size} item(s) from \"$archiveName\" ($total bytes)")
+            return
+        }
+        val refused = outcomes.count { it is ArchiveExtractor.Outcome.Refused }
+        val destinationRefused = outcomes.count { it is ArchiveExtractor.Outcome.DestinationRefused }
+        val failed = outcomes.filterIsInstance<ArchiveExtractor.Outcome.Failed>()
+        val parts = buildList {
+            if (extracted.isNotEmpty()) add("${extracted.size} extracted")
+            if (refused > 0) add("$refused skipped for safety")
+            if (destinationRefused > 0) add("$destinationRefused could not be created")
+            failed.firstOrNull()?.let { add("first failure: ${it.reason}") }
+        }
+        viewModel.reportUiMessage("Extract from \"$archiveName\": ${parts.joinToString("; ")}")
+    }
     // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
     // reason the preview target is: its file actions resolve against this workspace's context,
     // clipboard and overlays, none of which the screen should know about.
@@ -1213,6 +1285,7 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
+                    onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1393,6 +1466,7 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
+                    onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1848,6 +1922,134 @@ private fun EclipseWorkspace(
             },
         )
     }
+    // The View Archive browser, a full-window layer above the workspace for the same reason the
+    // editor is one: browsing an archive is a task of its own, and a sheet over the explorer would
+    // both fight the explorer's own bottom sheets and show one folder's worth of a 1M-entry tree in
+    // a window measured for a file list. The layer reads the browser's state; dismissal is the
+    // close above, which cancels the scan/watcher and releases the channel.
+    // The per-entry sheets live *here*, above the browser, not inside it: they act on this
+    // workspace's clipboard and extract destination, which the browser layer knows nothing about.
+    var archiveEntrySheet by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var archivePreviewEntry by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var archiveEntryProperties by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var showArchiveProperties by remember { mutableStateOf(false) }
+    // The extract that is waiting on the user to pick a destination folder. The entries are held
+    // here - outside the browser, like every other per-entry action target - because the picker
+    // is an activity result that lands in this workspace's scope, not the browser's; when it
+    // returns, the extract runs against the browser's byte source, which is why the target holds
+    // both. Null entry list = nothing pending.
+    var pendingExtract by remember { mutableStateOf<Pair<ArchiveTarget, List<ArchiveEntry>>?>(null) }
+    // The SAF folder picker for extraction. Unlike the explorer's Local root picker, this one
+    // takes no persistable grant and changes no setting: the destination is a one-shot answer to
+    // "where should these files land", and remembering it silently would make the second extract
+    // write somewhere the user forgot they picked weeks ago.
+    val archiveExtractPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        val pending = pendingExtract
+        pendingExtract = null
+        if (uri == null) return@rememberLauncherForActivityResult
+        val (target, entries) = pending ?: return@rememberLauncherForActivityResult
+        val browser = target.browser
+        scope.launch {
+            val destination = runCatching { SafArchiveDestination(context, uri) }
+                .getOrElse {
+                    viewModel.reportUiMessage("The picked folder cannot be written")
+                    return@launch
+                }
+            viewModel.reportUiMessage("Extracting ${entries.size} item(s) from \"${browser.archiveName}\"…")
+            val outcomes = ArchiveExtractor.extract(
+                browser.format,
+                browser.sourceForReading(),
+                entries,
+                destination,
+            )
+            reportExtractOutcome(browser.archiveName, outcomes)
+        }
+    }
+    archiveTarget?.let { target ->
+        val browser = target.browser
+        ArchiveBrowserScreen(
+            archiveName = browser.archiveName,
+            state = browser.state,
+            actions = ArchiveActions(
+                onClose = { browser.close(); archiveTarget = null },
+                onCancelScan = browser::cancelScan,
+                onRetry = browser::retry,
+                onUnlock = browser::unlock,
+                // Opening a file is the preview; only the ZIP format can fetch one entry's bytes
+                // by range, so a TAR entry falls to the action sheet's honest Extract verb rather
+                // than a preview that would secretly stream the whole archive.
+                onOpenEntry = { entry ->
+                    if (ArchiveReader.supportsRandomAccess(browser.format)) {
+                        archivePreviewEntry = entry
+                    } else {
+                        archiveEntrySheet = entry
+                    }
+                },
+                onEntryActions = { entry -> archiveEntrySheet = entry },
+                // The batch extract from the browser's selection bar: the same pendingExtract +
+                // picker the per-entry sheet's Extract row feeds, so there is one extract path,
+                // not two. The browser keeps its selection behind the picker; a cancelled pick
+                // returns to it intact for a retry.
+                onExtractEntries = { entries ->
+                    pendingExtract = target to entries
+                    archiveExtractPicker.launch(null)
+                },
+                onReload = browser::reload,
+                onDismissServerChange = browser::dismissServerChange,
+                onShowProperties = { showArchiveProperties = true },
+            ),
+        )
+        // The entry preview reads through the same ranged source the scan did - one entry's bytes,
+        // never the archive around it (the sheet's own KDoc holds the full reasoning).
+        archivePreviewEntry?.let { entry ->
+            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
+            ArchiveEntryPreviewSheet(
+                entry = entry,
+                readEntry = if (readable) {
+                    { ArchiveReader.readEntry(browser.format, browser.sourceForReading(), entry) }
+                } else null,
+                onDismiss = { archivePreviewEntry = null },
+            )
+        }
+        archiveEntrySheet?.let { entry ->
+            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
+            ArchiveEntryActionsSheet(
+                entry = entry,
+                canReadEntry = readable,
+                onDismiss = { archiveEntrySheet = null },
+                onPreview = if (readable) ({ archiveEntrySheet = null; archivePreviewEntry = entry }) else null,
+                // Extract (and single-entry Download, which is extract of one file by another
+                // name): hand the entries to the destination picker, and the extract itself runs
+                // when the picker answers. The archive stays remote throughout - what moves is
+                // each entry's own bytes.
+                onExtract = {
+                    archiveEntrySheet = null
+                    pendingExtract = target to listOf(entry)
+                    archiveExtractPicker.launch(null)
+                },
+                onCopyPath = {
+                    archiveEntrySheet = null
+                    viewModel.copyToClipboard(entry.path)
+                },
+                onProperties = { archiveEntrySheet = null; archiveEntryProperties = entry },
+            )
+        }
+        archiveEntryProperties?.let { entry ->
+            ArchiveEntryPropertiesDialog(
+                entry = entry,
+                formatLabel = browser.format.label,
+                onDismiss = { archiveEntryProperties = null },
+            )
+        }
+        val readyState = browser.state
+        if (showArchiveProperties && readyState is ArchiveUiState.Ready) {
+            ArchivePropertiesDialog(
+                state = readyState,
+                remotePath = browser.remotePath,
+                onDismiss = { showArchiveProperties = false },
+            )
+        }
+    }
     // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
     // preview and the editor that some rows open are their own windows, and none of them should
     // have to fight this sheet for the bottom of the screen.
@@ -1972,6 +2174,12 @@ private fun WorkspaceScaffold(
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
     onEditFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
+    /**
+     * Opens a remote archive in the View Archive browser - see the overlay state in
+     * [EclipseWorkspace]. Null-when-unsupported is decided by the caller (local session, unknown
+     * extension) so this scaffold and the Files screen below it stay format-agnostic.
+     */
+    onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)? = null,
     onDestination: (Destination) -> Unit,
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
@@ -2210,6 +2418,7 @@ private fun WorkspaceScaffold(
                     filesExplorer,
                     onPreviewFile,
                     onEditFile,
+                    onOpenArchive,
                     onUpload,
                     onDownloadFile,
                     onPickLocalFolder,
@@ -3843,6 +4052,8 @@ private fun ColumnScope.FilesScreen(
     filesExplorer: FilesExplorerController,
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit,
     onEditFile: (FsEntry, FileSystemProvider) -> Unit,
+    /** Null when View Archive cannot serve this entry (local session, unknown extension). */
+    onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)?,
     onUpload: () -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
     onPickLocalFolder: () -> Unit,
@@ -3996,6 +4207,11 @@ private fun ColumnScope.FilesScreen(
                 if (explorer.isLocal) onUploadLocal(entry.toLocalFile()) else onDownloadFile(entry.toRemoteFile())
             },
             onSendToHost = if (!explorer.isLocal) ({ actionEntry = null; sendEntry = entry }) else null,
+            // The row exists only when the session and the name can both be served: a local
+            // document tree has no ranged reads to browse with, and an unknown extension has no
+            // engine to browse with - hiding the verb beats offering it and failing.
+            onOpenArchive = onOpenArchive?.takeIf { !explorer.isLocal && ArchiveReader.formatFor(entry.name) != null }
+                ?.let { open -> { actionEntry = null; provider?.let { open(entry, it) } } },
         )
     }
 
