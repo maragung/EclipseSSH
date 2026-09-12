@@ -1,0 +1,127 @@
+# One test class, on demand. Not a gate and never a merge's evidence - the Fast
+# test (fast-test.yml) and ci.yml decide everything. This exists because the
+# Fast test is the wrong instrument for the loop it is too slow to close: when a
+# single Robolectric class is red, the thing you need to know next is whether a
+# fix to that class worked, and paying for the whole suite to find out turns a
+# five-minute answer into a thirty-minute one. Five classes fixed one at a time
+# is the difference between one afternoon and one evening.
+#
+# Same pins, same caches, same native build as the real gates, deliberately: a
+# focused run that compiles against a different toolchain than the gate would
+# answer a question about a build that does not exist.
+#
+#   gh workflow run focused-test.yml \
+#     -f ref=<branch> -f filter=dev.eclipse.ssh.ui.editor.EditorTabsRobolectricTest
+#
+# A filter that matches nothing FAILS the run rather than passing it vacuously -
+# Gradle's own behaviour with --tests, and the right one: "no tests ran" and "the
+# tests passed" must never look the same.
+name: Focused test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA whose tests to run
+        required: true
+        type: string
+      filter:
+        description: Gradle --tests filter (a class, or a class.method)
+        required: true
+        type: string
+      task:
+        description: Gradle test task to run
+        required: false
+        default: testDebugUnitTest
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '35.0.0'
+  COMPILE_SDK: 'android-35'
+  MIN_SDK: '28'
+  TARGET_SDK: 'android-35'
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
+
+jobs:
+  focused:
+    name: ${{ inputs.filter }}
+    runs-on: ubuntu-24.04
+    # Two classes' worth of headroom over a warm run; a focused run that reaches
+    # this was not focused.
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          cache-read-only: true
+
+      - name: Cache Robolectric runtime jars
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
+
+      - name: Start the isolated OpenSSH sandbox
+        # Started whatever the filter: a class that talks to a server does it
+        # through this sandbox, and "the sandbox was not up" is a failure mode
+        # worth never having to wonder about.
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          tools/local-sshd.sh start
+          test -f .tmp-build/sshd-test/port
+          test -f .tmp-build/sshd-test/port-no-shell
+
+      - name: ${{ inputs.filter }}
+        run: timeout --signal=QUIT --kill-after=60s 30m ./gradlew --stacktrace ${{ inputs.task }} --tests "${{ inputs.filter }}"
+
+      - name: Stop the OpenSSH sandbox
+        if: always()
+        run: tools/local-sshd.sh clean
