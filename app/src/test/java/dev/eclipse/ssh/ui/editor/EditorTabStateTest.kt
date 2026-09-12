@@ -6,6 +6,7 @@ import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
 import dev.eclipse.ssh.data.fs.FsModificationConflictException
 import dev.eclipse.ssh.ui.editor.encoding.FileEncoding
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 
@@ -466,5 +467,142 @@ class EditorTabStateTest {
         assertThat(provider.writes).isEmpty()
         assertThat(tab.textValue.text).isEqualTo("café 🚀")
         assertThat(tab.dirty).isTrue()
+    }
+
+    // ---- The 4-way conflict dialog's decision wiring ----
+    // Every test below starts from the same place: the file changed on the server, a save raised
+    // the question, and the user has just pressed one of the four buttons. What is asserted is
+    // what that press *does* — the dialog is wiring, these methods are the decisions.
+
+    /** Loads, edits, and saves into the conflict: the state every choice below is made from. */
+    private fun TestScope.conflictedTab(provider: ScriptedFileProvider): EditorTabState {
+        val tab = tab(provider)
+        tab.startLoad(this)
+        testScheduler.advanceUntilIdle()
+        tab.applyEdit(TextFieldValue("edited"))
+        tab.save(this)
+        testScheduler.advanceUntilIdle()
+        assertThat(tab.conflictOpen).isTrue()
+        return tab
+    }
+
+    @Test
+    fun `choosing Overwrite re-saves with the guard disarmed`() = runTest {
+        // The provider objects to the first save — that is what raised the dialog — and accepts
+        // the second, because "Overwrite" is the user disarming the guard, not retrying the same
+        // guarded write.
+        val provider = ScriptedFileProvider(
+            entry,
+            writeFailure = FsModificationConflictException(entry.path),
+        )
+        val tab = conflictedTab(provider)
+        provider.writeFailure = null
+
+        tab.chooseConflictAction(this, ConflictChoice.Overwrite)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(tab.conflictOpen).isFalse()
+        // One write in the whole story — the overwrite — sent unguarded (null), so the provider
+        // cannot raise the conflict against it.
+        assertThat(provider.guards.single()).isNull()
+        assertThat(provider.writes.single().decodeToString()).isEqualTo("edited")
+        assertThat(tab.savedText).isEqualTo("edited")
+        assertThat(tab.dirty).isFalse()
+    }
+
+    @Test
+    fun `choosing Reload adopts the server's text without writing`() = runTest {
+        val provider = ScriptedFileProvider(
+            entry,
+            writeFailure = FsModificationConflictException(entry.path),
+        )
+        val tab = conflictedTab(provider)
+        // What the server now holds: known text and a moved clock.
+        provider.bytes = "server wins".toByteArray()
+        provider.modified = 9_999L
+
+        tab.chooseConflictAction(this, ConflictChoice.Reload)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(tab.conflictOpen).isFalse()
+        assertThat(tab.textValue.text).isEqualTo("server wins")
+        assertThat(tab.savedText).isEqualTo("server wins")
+        assertThat(tab.dirty).isFalse()
+        assertThat(tab.loadedModified).isEqualTo(9_999L)
+        // Reload is a read, never a write: the user discarded their edit, they did not publish it.
+        assertThat(provider.writes).isEmpty()
+    }
+
+    @Test
+    fun `choosing Cancel keeps the local edit and asks nothing of the disk`() = runTest {
+        val provider = ScriptedFileProvider(
+            entry,
+            writeFailure = FsModificationConflictException(entry.path),
+        )
+        val tab = conflictedTab(provider)
+
+        tab.chooseConflictAction(this, ConflictChoice.Cancel)
+
+        assertThat(tab.conflictOpen).isFalse()
+        // The safe option is safe by what it leaves alone: the edit, the dirty flag, and the file.
+        assertThat(tab.textValue.text).isEqualTo("edited")
+        assertThat(tab.savedText).isEqualTo("hello")
+        assertThat(tab.dirty).isTrue()
+        assertThat(provider.writes).isEmpty()
+        assertThat(provider.reads).isEqualTo(1)
+    }
+
+    @Test
+    fun `choosing Compare shows the server's text and returns to the question on back`() = runTest {
+        val provider = ScriptedFileProvider(
+            entry,
+            writeFailure = FsModificationConflictException(entry.path),
+        )
+        val tab = conflictedTab(provider)
+        provider.bytes = "server version".toByteArray()
+
+        tab.chooseConflictAction(this, ConflictChoice.Compare)
+        testScheduler.advanceUntilIdle()
+
+        // The question leaves the screen for its evidence — one dialog at a time.
+        assertThat(tab.conflictOpen).isFalse()
+        val state = tab.compareState
+        assertThat(state).isInstanceOf(ConflictCompare.Ready::class.java)
+        assertThat((state as ConflictCompare.Ready).serverText).isEqualTo("server version")
+        // The compare is a read, never a write, and it must not decide anything either: the local
+        // text is exactly what the user typed, still dirty, still unguarded-by-choice.
+        assertThat(provider.writes).isEmpty()
+        assertThat(tab.textValue.text).isEqualTo("edited")
+        assertThat(tab.dirty).isTrue()
+
+        // Back re-asks the question the compare was fetched to answer.
+        tab.closeConflictCompare()
+        assertThat(tab.compareState).isNull()
+        assertThat(tab.conflictOpen).isTrue()
+    }
+
+    @Test
+    fun `a failed compare fetch is one line of text, not a crash`() = runTest {
+        // The connection that reported the conflict can be gone by the time the user asks to see
+        // why — the fetch failing must land as a message, with the edit intact and the question
+        // still answerable behind it.
+        val provider = ScriptedFileProvider(
+            entry,
+            writeFailure = FsModificationConflictException(entry.path),
+        )
+        val tab = conflictedTab(provider)
+        provider.readFailure = IllegalStateException("connection lost")
+
+        tab.chooseConflictAction(this, ConflictChoice.Compare)
+        testScheduler.advanceUntilIdle()
+
+        val state = tab.compareState
+        assertThat(state).isInstanceOf(ConflictCompare.Failed::class.java)
+        assertThat((state as ConflictCompare.Failed).message).isEqualTo("connection lost")
+        assertThat(tab.textValue.text).isEqualTo("edited")
+        assertThat(provider.writes).isEmpty()
+
+        tab.closeConflictCompare()
+        assertThat(tab.conflictOpen).isTrue()
     }
 }

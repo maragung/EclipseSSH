@@ -29,6 +29,19 @@ internal sealed interface EditorLoad {
     data class TooLarge(val bytes: Long) : EditorLoad
 }
 
+/** One button on the 4-way conflict dialog. The dialog itself only wires these to clicks. */
+internal enum class ConflictChoice { Overwrite, Reload, Compare, Cancel }
+
+/**
+ * The compare view's fetch of the on-server text: loading, shown, or explained away. Null (the
+ * tab's [EditorTabState.compareState]) means the compare view is not on screen at all.
+ */
+internal sealed interface ConflictCompare {
+    data object Loading : ConflictCompare
+    data class Ready(val serverText: String) : ConflictCompare
+    data class Failed(val message: String) : ConflictCompare
+}
+
 /**
  * One open file's worth of editor state: the load, the text and everything derived from it.
  *
@@ -51,6 +64,10 @@ internal class EditorTabState(
     var saving by mutableStateOf(false)
     var saveError by mutableStateOf<String?>(null)
     var conflictOpen by mutableStateOf(false)
+    // Null while the compare view is off screen. Lives on the tab, like conflictOpen, because the
+    // text it shows belongs to the same file the question is about — and so it survives the tab
+    // switch that a dialog-remembered value would not.
+    var compareState by mutableStateOf<ConflictCompare?>(null)
     var scrollRequest by mutableStateOf<Int?>(null)
     var layout by mutableStateOf<TextLayoutResult?>(null)
     var goToLineOpen by mutableStateOf(false)
@@ -257,6 +274,67 @@ internal class EditorTabState(
             history.endBurst()
             applyEdit(TextFieldValue(decoded, TextRange(0)))
         }
+    }
+
+    /**
+     * One button press on the 4-way conflict dialog. The semantics live here rather than in the
+     * dialog's onClicks so the choices are testable as plain state moves — and so the dialog is
+     * nothing but wiring, with no decision of its own to get wrong.
+     *
+     * [ConflictChoice.Cancel] just closes the question; today's dismiss already behaved that way,
+     * but as a labelled peer of the other three it is a choice the user makes rather than a way
+     * out they have to discover.
+     */
+    fun chooseConflictAction(scope: CoroutineScope, choice: ConflictChoice) {
+        when (choice) {
+            ConflictChoice.Overwrite -> {
+                conflictOpen = false
+                save(scope, overwrite = true)
+            }
+            ConflictChoice.Reload -> {
+                conflictOpen = false
+                reloadFromDisk(scope)
+            }
+            ConflictChoice.Cancel -> conflictOpen = false
+            ConflictChoice.Compare -> {
+                // The question leaves the screen while its evidence is shown, and comes back when
+                // the compare view closes — one question on screen at a time, never two dialogs.
+                conflictOpen = false
+                fetchServerTextForCompare(scope)
+            }
+        }
+    }
+
+    /**
+     * Reads the on-server text for the compare view. Read-only on purpose: the user is mid-decision
+     * between "overwrite" and "reload", and the compare must not become a third way to move the
+     * file. The read can still fail (the connection that reported the conflict can be gone by the
+     * time the user asks why) — a failure becomes one line of text in [compareState], never an
+     * exception into composition.
+     */
+    private fun fetchServerTextForCompare(scope: CoroutineScope) {
+        compareState = ConflictCompare.Loading
+        scope.launch {
+            try {
+                val fresh = request.provider.read(request.entry.path)
+                // Strict decode under the tab's own encoding, same rule as the load: showing a
+                // binary file as mojibake next to the local text would be a comparison of nonsense
+                // against nonsense.
+                compareState = FileEncodingCodec.decodeStrict(fresh, encoding)
+                    ?.let { ConflictCompare.Ready(it) }
+                    ?: ConflictCompare.Failed("The file on the server is not valid ${encoding.label} text.")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                compareState = ConflictCompare.Failed(error.message ?: "The file could not be read")
+            }
+        }
+    }
+
+    /** Leaves the compare view. The question it served is still unanswered, so the dialog returns. */
+    fun closeConflictCompare() {
+        compareState = null
+        conflictOpen = true
     }
 
     /** The one way the text changes: through the history, so undo sees every edit. */
