@@ -208,10 +208,12 @@ fun TextEditorScreen(
     // tab keeps auto-saving too, deliberately — a file the user edited and switched away from is
     // still their work, and "switch tabs" should not mean "pause saving it". The single dialog slot
     // blocks all of them at once, since a question on screen is a question the whole editor stops
-    // to hear. The effect's own comment carries the quiet-period reasoning.
+    // to hear. A read-only tab blocks its own: save() would refuse the write anyway, so letting
+    // the heartbeat count down towards it would only be a timer that ends in nothing. The effect's
+    // own comment carries the quiet-period reasoning.
     tabs.forEach { tab ->
         key(tab.id) {
-            AutoSaveEffect(tab, scope, prefs, blocked = pendingCloseTabId != null)
+            AutoSaveEffect(tab, scope, prefs, blocked = pendingCloseTabId != null || tab.readOnly)
         }
     }
 
@@ -352,6 +354,7 @@ private fun SingleFileEditor(
 
         is EditorLoad.Ready -> EditorBody(
             request = tab.request,
+            readOnly = tab.readOnly,
             textValue = tab.textValue,
             onTextChange = tab::applyEdit,
             onSnapshot = tab::applySnapshot,
@@ -586,6 +589,7 @@ private fun EditorTabStrip(
 @Composable
 private fun EditorBody(
     request: EditorRequest,
+    readOnly: Boolean,
     textValue: TextFieldValue,
     onTextChange: (TextFieldValue) -> Unit,
     onSnapshot: (TextFieldValue) -> Unit,
@@ -728,7 +732,10 @@ private fun EditorBody(
                 IconButton(onClick = onOpenOptions) {
                     Icon(Icons.Filled.Settings, contentDescription = "Editor options")
                 }
-                IconButton(onClick = onSave, enabled = dirty && !saving) {
+                // Greyed out, not hidden: the icon's absence would read as "nothing to save"
+                // rather than "cannot save", and the status line's READ chip is what explains
+                // which of the two it is.
+                IconButton(onClick = onSave, enabled = dirty && !saving && !readOnly) {
                     Icon(Icons.Filled.Done, contentDescription = "Save")
                 }
             }
@@ -764,6 +771,12 @@ private fun EditorBody(
                 onValueChange = onTextChange,
                 onTextLayout = onLayout,
                 textStyle = textStyle,
+                // The field itself refuses edits, which is what makes read-only a *mode* rather
+                // than a save that always fails: the user can still read, select, copy and search
+                // the file, everything that does not change it. (Replace in the find bar can still
+                // mutate the working copy through applyEdit — the mode's guard is at save, which
+                // then refuses to write; the dirty dot that follows is the honest report of that.)
+                readOnly = readOnly,
                 cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 visualTransformation = if (findOpen && findQuery.isNotEmpty()) {
                     MatchHighlightTransformation(findQuery, findCaseSensitive, matchIndex, otherMatchColor, currentMatchColor)
@@ -811,7 +824,11 @@ private fun EditorBody(
             // already sits, so a non-UTF-8 tab has to say so here — otherwise the only hint a
             // save will write Windows-1252 is a refusal dialog after the fact.
             Text(
-                "Ln $line, Col $column    ${textValue.text.count { it == '\n' } + 1} lines    ${encoding.label}",
+                "Ln $line, Col $column    ${textValue.text.count { it == '\n' } + 1} lines    ${encoding.label}" +
+                    // The mode rides along in the status line — the one place the eye already
+                    // rests for facts about the file — rather than a toolbar icon, because
+                    // read-only is a fact, not an action.
+                    if (readOnly) "    READ" else "",
                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

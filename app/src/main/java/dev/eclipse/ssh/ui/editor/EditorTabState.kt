@@ -7,6 +7,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
+import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FsModificationConflictException
 import dev.eclipse.ssh.ui.editor.encoding.FileEncoding
 import dev.eclipse.ssh.ui.editor.encoding.FileEncodingCodec
@@ -76,6 +77,18 @@ internal class EditorTabState(
     /** The tab's identity: same provider, same path, same tab — re-opening a file selects it. */
     val key get() = "${request.provider.providerId}:${request.entry.path}"
 
+    /**
+     * Whether this file can be written at all, from the mode bits the entry carried.
+     *
+     * Seeded from the request's entry and re-derived from the load's own stat, which is the
+     * freshest word on the mode — the listing the request came from can be seconds or minutes
+     * old, and a file chmod'ed in between must open the way it is now, not the way it was listed.
+     * The re-derivation is the same one-line call, so the two can never disagree about *how* the
+     * answer is computed, only about which snapshot of the file they saw.
+     */
+    var readOnly by mutableStateOf(entryIsReadOnly(request.entry))
+        private set
+
     val dirty get() = textValue.text != savedText
 
     /**
@@ -94,6 +107,9 @@ internal class EditorTabState(
             loadState = EditorLoad.Loading
             try {
                 val entry = request.provider.stat(request.entry.path) ?: request.entry
+                // The mode is re-read with everything else the stat refreshes, so a file whose
+                // write bit was flipped since the listing opens as what it now is.
+                readOnly = entryIsReadOnly(entry)
                 val size = entry.size
                 if (size != null && size > MAX_EDIT_BYTES) {
                     loadState = EditorLoad.TooLarge(size)
@@ -129,6 +145,11 @@ internal class EditorTabState(
     }
 
     fun save(scope: CoroutineScope, overwrite: Boolean = false) {
+        // A read-only file is refused before anything starts — no coroutine, no `saving` flicker,
+        // no error the user would have to dismiss — because there is no answer to give: the mode
+        // says the write cannot land, and even the overwrite path (which exists to answer a
+        // conflict question) is still a write this file cannot accept.
+        if (readOnly) return
         saving = true
         saveError = null
         scope.launch {
@@ -316,3 +337,20 @@ internal class EditorHistory {
 internal fun notValidTextMessage(encoding: FileEncoding): String =
     "This file is not valid ${encoding.label} text. The editor cannot show it without damaging " +
         "it on save; it can still be downloaded, renamed or deleted."
+
+/**
+ * Whether [entry]'s file cannot be written: the provider speaks POSIX modes and the owner-write
+ * bit is off. Kotlin has no octal literal, so the bit is written in binary — 0b010_000_000 is
+ * 0o200, the `w` in `rw-` — the same convention the permission presets in PosixPermissions.kt
+ * use for exactly this reason.
+ *
+ * Null permissions means the backend has no notion of modes (local SAF, whose tree grants carry
+ * nothing POSIX to read), and unknown is not unwritable: such a file opens editable and a save
+ * the backend refuses surfaces as the ordinary save error, which the user can still act on. A
+ * permissions string that does not parse as octal is treated the same way — read as unknown
+ * rather than guessed at.
+ */
+internal fun entryIsReadOnly(entry: FsEntry): Boolean {
+    val mode = entry.permissions?.toIntOrNull(8) ?: return false
+    return (mode and 0b010_000_000) == 0
+}
