@@ -191,6 +191,63 @@ class FileEncodingTest {
         assertThat(decoded.text).isEqualTo("a�")
     }
 
+    @Test
+    fun `decode strict reads bytes as the chosen encoding`() {
+        // 0xE9 is 'é' in ISO-8859-1 and malformed in UTF-8; the same bytes under two choices
+        // must give the two different answers, which is the selector's whole reason to exist.
+        val latin1 = "café".toByteArray(Charsets.ISO_8859_1)
+        assertThat(FileEncodingCodec.decodeStrict(latin1, FileEncoding.ISO_8859_1)).isEqualTo("café")
+        assertThat(FileEncodingCodec.decodeStrict(latin1, FileEncoding.UTF_8)).isNull()
+    }
+
+    @Test
+    fun `decode strict refuses ascii high bytes`() {
+        // The seven-bit line: a single byte past it is enough to say no, and null — not
+        // replacement characters — is what no sounds like.
+        assertThat(FileEncodingCodec.decodeStrict(byteArrayOf(0x61, 0xE9.toByte()), FileEncoding.ASCII)).isNull()
+    }
+
+    @Test
+    fun `decode strict consumes a bom under the bom carrying encodings`() {
+        // The chosen-encoding read owes the same invariant the detection read does: a BOM left
+        // as text would put an invisible U+FEFF in front of everything.
+        val bommed = BOM_UTF8 + "héllo".toByteArray(Charsets.UTF_8)
+        assertThat(FileEncodingCodec.decodeStrict(bommed, FileEncoding.UTF_8_BOM)).isEqualTo("héllo")
+        // A plain UTF-8 read does not strip: a stray BOM is data the user can see and delete.
+        assertThat(FileEncodingCodec.decodeStrict(bommed, FileEncoding.UTF_8)).isEqualTo("\uFEFFhéllo")
+    }
+
+    @Test
+    fun `decode strict round trips every single byte encoding`() {
+        // Each arm must read back what its own encode wrote, BOMs consumed — otherwise the
+        // selector's choices would be write-only.
+        FileEncoding.entries.forEach { encoding ->
+            val text = when (encoding) {
+                FileEncoding.UTF_16_LE, FileEncoding.UTF_16_BE -> "héllo ☃"
+                FileEncoding.ASCII -> "plain ascii 42"
+                // The shared sample is Windows-1252 text: the em dash and curly quotes live in
+                // the 0x80..0x9F window that Latin-1 leaves as control characters, so handing it
+                // to ISO-8859-1 would be refused by the very strictness encode exists to have -
+                // a refusal that has its own test above. Latin-1's sample stays inside the 256
+                // code points the encoding can actually hold.
+                FileEncoding.ISO_8859_1 -> "café £ ± ñ"
+                else -> "café £ — “quoted”"
+            }
+            val bytes = FileEncodingCodec.encode(text, encoding)
+            assertThat(FileEncodingCodec.decodeStrict(bytes, encoding)).isEqualTo(text)
+        }
+    }
+
+    @Test
+    fun `from label resolves offered labels and rejects everything else`() {
+        // The prefs blob stores labels, so this lookup is the door between what was saved and
+        // what the codec speaks; an unknown string must stay null rather than best-matching.
+        assertThat(FileEncoding.fromLabel("Windows-1252")).isEqualTo(FileEncoding.WINDOWS_1252)
+        assertThat(FileEncoding.fromLabel("UTF-8")).isEqualTo(FileEncoding.UTF_8)
+        assertThat(FileEncoding.fromLabel("Latin-1")).isNull()
+        assertThat(FileEncoding.fromLabel("utf-8")).isNull()
+    }
+
     private companion object {
         val BOM_UTF8 = byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte())
         val BOM_UTF16_LE = byteArrayOf(0xFF.toByte(), 0xFE.toByte())

@@ -22,7 +22,19 @@ enum class FileEncoding(val label: String) {
     UTF_16_BE("UTF-16 BE"),
     ASCII("ASCII"),
     ISO_8859_1("ISO-8859-1"),
-    WINDOWS_1252("Windows-1252"),
+    WINDOWS_1252("Windows-1252");
+
+    companion object {
+        /**
+         * The entry the selector labels [label], or null when nothing spells itself that way.
+         *
+         * The editor's prefs blob stores the label (it is what the selector shows and what an
+         * [FileEncodingCodec.encode] refusal names), so this lookup is how a persisted string
+         * becomes an entry again — and how an unknown one is told apart from a known one before
+         * it can reach the codec and crash there instead.
+         */
+        fun fromLabel(label: String): FileEncoding? = entries.firstOrNull { it.label == label }
+    }
 }
 
 /**
@@ -147,6 +159,48 @@ object FileEncodingCodec {
     }
 
     /**
+     * Decodes [bytes] as exactly [encoding] — the chosen-encoding read behind the editor's
+     * selector — strictly, returning null when the bytes are not valid in that encoding.
+     *
+     * This is the counterpart of [encode]'s refusal, and the deliberate opposite of [decode]'s
+     * totality: [decode] only *suggests* (a guess the selector may override), while this *obeys*
+     * (the user has already decided). Because the choice is explicit, the failure is loud: the
+     * editor's load path turns null into a Failed state naming the encoding, rather than opening
+     * replacement characters that the next save would refuse anyway (no single-byte set holds
+     * U+FFFD).
+     *
+     * A BOM matching the encoding is consumed rather than kept as text, for the same reason
+     * [decode] consumes it: a leading U+FEFF would make every "did the text change" comparison
+     * lie. The prefix is stripped only for the entries whose own encode writes one — plain UTF-8
+     * keeps a stray BOM as a visible U+FEFF the user can delete.
+     */
+    fun decodeStrict(bytes: ByteArray, encoding: FileEncoding): String? {
+        val body = when (encoding) {
+            FileEncoding.UTF_8_BOM -> bytes.skipPrefix(UTF8_BOM)
+            FileEncoding.UTF_16_LE -> bytes.skipPrefix(UTF16LE_BOM)
+            FileEncoding.UTF_16_BE -> bytes.skipPrefix(UTF16BE_BOM)
+            else -> bytes
+        }
+        val charset = when (encoding) {
+            FileEncoding.UTF_8, FileEncoding.UTF_8_BOM -> Charsets.UTF_8
+            FileEncoding.UTF_16_LE -> Charsets.UTF_16LE
+            FileEncoding.UTF_16_BE -> Charsets.UTF_16BE
+            FileEncoding.ASCII -> Charsets.US_ASCII
+            FileEncoding.ISO_8859_1 -> Charsets.ISO_8859_1
+            FileEncoding.WINDOWS_1252 -> WINDOWS_1252
+        }
+        return try {
+            charset.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(body))
+                .toString()
+        } catch (error: CharacterCodingException) {
+            null
+        }
+    }
+
+    /**
      * Decodes UTF-8 strictly, returning null when the bytes are not valid UTF-8. REPORT is
      * spelled out for both error kinds even though a fresh decoder already reports malformed
      * input: the probe's meaning must not depend on remembering the platform defaults.
@@ -241,4 +295,8 @@ object FileEncodingCodec {
         }
         return true
     }
+
+    /** [bytes] without a leading [prefix] when it carries one, and unchanged when it does not. */
+    private fun ByteArray.skipPrefix(prefix: ByteArray): ByteArray =
+        if (startsWithAt(0, prefix)) copyOfRange(prefix.size, size) else this
 }
