@@ -815,6 +815,25 @@ class MainViewModel @Inject constructor(
     }
 
     /**
+     * The Reconnect action on a terminal tab: re-dials [sessionKey]'s own session.
+     *
+     * Asked for by session key, not host, because a host can hold several shells and the tab the
+     * user tapped is the one that must come back. This used to arrive as a host id and be resolved
+     * by [connect] to the host's *first* tab, so reconnecting the second terminal of a host
+     * re-dialled the first one and left the tab on screen parked at Disconnected.
+     *
+     * The dial is the ladder's, not a fresh connection's: `resuming` with the session key said
+     * outright, so the attempt accounting and the "Reconnecting · attempt N of M" sentence behave
+     * exactly as they do for the prompt answer, and the credential comes from the store or the
+     * session registry rather than an interrogation — a refusal still raises the retry prompt.
+     */
+    fun reconnectSession(sessionKey: String) {
+        val tab = tabs.value.firstOrNull { it.id == sessionKey } ?: return
+        val host = uiState.value.hosts.firstOrNull { it.id == tab.hostId } ?: return
+        connect(host, resuming = true, sessionKey = sessionKey)
+    }
+
+    /**
      * Answers the reconnect prompt: reconnects on the same path the ladder would have used, or just
      * clears the question.
      *
@@ -845,8 +864,8 @@ class MainViewModel @Inject constructor(
         // Which session this dial speaks for. A session is owned by its *key* — the terminal tab's id —
         // and this is the one place that decides it, before the tab exists:
         //
-        //  - a caller that already knows (the reconnect ladder and the prompt answer, for a specific
-        //    tab) says so outright;
+        //  - a caller that already knows (the reconnect ladder, the prompt answer and a tab's own
+        //    Reconnect action, for a specific tab) says so outright;
         //  - a host with a tab open resolves to that tab, so tapping Connect on the host's card
         //    reconnects the session the user is already watching rather than opening a twin;
         //  - otherwise the host's own id, which is what the first tab of a host claims as its key — and
@@ -871,7 +890,8 @@ class MainViewModel @Inject constructor(
         pendingConnection = PendingConnection(host, password, keyPair, keyBytes, keyPassphrase, resuming)
         // Asking for this session by hand is a fresh start, whatever the last one did: the allowance
         // is only spent by the ladder's own attempts, and a user who has just tapped Connect (or
-        // Reconnect on a tab that gave up) is entitled to all of it. The ladder's own attempt passes
+        // answered the refused-login prompt with new credentials) is entitled to all of it. The
+        // ladder's own attempt - and a tab's Reconnect action, which is the same dial - passes
         // `resuming` and must not reset anything - that is the whole point of counting.
         if (!resuming) reconnectAttempts.remove(key)
         // A fresh manual dial retires any prompt a previous one raised: the user has already acted,
