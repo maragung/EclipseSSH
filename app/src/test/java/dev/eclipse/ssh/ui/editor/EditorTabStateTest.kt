@@ -46,10 +46,10 @@ class EditorTabStateTest {
         override val providerId: String = "test",
         var bytes: ByteArray = "hello".toByteArray(),
         var statSize: Long? = 5L,
+        var readFailure: RuntimeException? = null,
+        var writeFailure: Exception? = null,
     ) : FileSystemProvider {
         var modified = 1_000L
-        var readFailure: RuntimeException? = null
-        var writeFailure: Exception? = null
         val writes = mutableListOf<ByteArray>()
         val guards = mutableListOf<Long?>()
         var reads = 0

@@ -7,8 +7,6 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.AndroidComposeTestRule
-import androidx.compose.ui.test.onAllNodes
-import androidx.compose.ui.test.onNode
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -138,16 +136,18 @@ class EditorTabsRobolectricTest {
      * The rule around the real [TextEditorActivity], launched with a live first request the way
      * the Files sheet launches it — the same extraction `createAndroidComposeRule` itself uses for
      * an `ActivityScenarioRule`, copied rather than reused because it is private in the compose
-     * test library. Later opens go through `onEditorToken` inside the tests, the route a
-     * `singleTop` new-intent delivery takes.
+     * test library. The scenario rule is kept beside the compose wrapper because the compose rule
+     * exposes only `activity` — gone the moment the window finishes — while the scenario still
+     * answers lifecycle questions about a finished window. Later opens go through `onEditorToken`
+     * inside the tests, the route a `singleTop` new-intent delivery takes.
      */
+    private val scenarioRule = ActivityScenarioRule<TextEditorActivity>(
+        Intent(ApplicationProvider.getApplicationContext(), TextEditorActivity::class.java)
+            .putExtra(TextEditorActivity.EXTRA_REQUEST_TOKEN, EditorRequests.put(request(firstName, firstPath, firstText))),
+    )
+
     @get:Rule
-    val compose = AndroidComposeTestRule(
-        ActivityScenarioRule<TextEditorActivity>(
-            Intent(ApplicationProvider.getApplicationContext(), TextEditorActivity::class.java)
-                .putExtra(TextEditorActivity.EXTRA_REQUEST_TOKEN, EditorRequests.put(request(firstName, firstPath, firstText))),
-        ),
-    ) { rule ->
+    val compose = AndroidComposeTestRule(scenarioRule) { rule ->
         var activity: TextEditorActivity? = null
         rule.scenario.onActivity { activity = it }
         checkNotNull(activity)
@@ -198,7 +198,7 @@ class EditorTabsRobolectricTest {
     private fun openTab(name: String, path: String, contents: String) {
         provider.add(path, contents)
         val token = EditorRequests.put(request(name, path, contents))
-        compose.scenario.onActivity { it.onEditorToken(token) }
+        scenarioRule.scenario.onActivity { it.onEditorToken(token) }
     }
 
     /** The tab strip's clickable label for [name] — `hasClickAction` tells it from the toolbar title. */
@@ -251,7 +251,7 @@ class EditorTabsRobolectricTest {
         // title. And the file itself is still the one showing.
         assertThat(countNamed(firstName)).isEqualTo(1)
         awaitText(firstText)
-        assertThat(compose.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+        assertThat(scenarioRule.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
     }
 
     @Test
@@ -262,11 +262,11 @@ class EditorTabsRobolectricTest {
         // a null one (no extra at all): neither may finish the window nor disturb what is open.
         val spent = EditorRequests.put(request(secondName, secondPath, secondText))
         checkNotNull(EditorRequests.take(spent))
-        compose.scenario.onActivity { it.onEditorToken(spent) }
-        compose.scenario.onActivity { it.onEditorToken(null) }
+        scenarioRule.scenario.onActivity { it.onEditorToken(spent) }
+        scenarioRule.scenario.onActivity { it.onEditorToken(null) }
         pump()
 
-        assertThat(compose.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+        assertThat(scenarioRule.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
         assertThat(countNamed(secondName)).isEqualTo(0)
         awaitText(firstText)
     }
@@ -282,7 +282,7 @@ class EditorTabsRobolectricTest {
         // Read through runCatching because a destroyed activity can make the scenario's own state
         // query throw; what has to hold either way is that the window is no longer up.
         pumpUntil(describe = { "the editor window never finished" }) {
-            runCatching { compose.scenario.state }.getOrNull() != Lifecycle.State.RESUMED
+            runCatching { scenarioRule.scenario.state }.getOrNull() != Lifecycle.State.RESUMED
         }
     }
 
@@ -315,13 +315,13 @@ class EditorTabsRobolectricTest {
         }
 
         // Intercepted, not executed: the window is still up with the work still in it.
-        assertThat(compose.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+        assertThat(scenarioRule.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
         awaitText(firstText)
 
         val dialog = requireNotNull(ShadowDialog.getLatestDialog()) { "no discard dialog window" }
         @Suppress("DEPRECATION")
         dialog.onBackPressed()
         pumpUntil(describe = { "the discard dialog never closed" }) { !dialog.isShowing }
-        assertThat(compose.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+        assertThat(scenarioRule.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
     }
 }
