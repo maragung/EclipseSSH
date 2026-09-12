@@ -258,6 +258,25 @@ class SshSessionStore @Inject constructor() {
     fun isLive(sessionKey: String): Boolean = liveSession(sessionKey) != null
 
     /**
+     * Snapshots [sessions]' keys without racing the writers that empty it ([forget] from a tab
+     * closing, [rekey], [closeAll]). A [ConcurrentHashMap] iterator is only weakly consistent: a
+     * traversal can end early or even throw [NoSuchElementException] when the table is emptied
+     * mid-iteration — observed as a flaky crash from [sessionKeysForHost] while a tab was being
+     * closed. Every caller here is already allowed a slightly stale answer, so retrying the
+     * traversal keeps that contract instead of adding a lock, which [install]'s blocking close of
+     * a redundant session would have to be held across and could deadlock on.
+     */
+    private fun sessionKeysSnapshot(): List<String> {
+        while (true) {
+            try {
+                return sessions.keys.toList()
+            } catch (expected: NoSuchElementException) {
+                // The map was emptied mid-traversal; run it again.
+            }
+        }
+    }
+
+    /**
      * Host ids with a usable session. Reads only; the dead are removed by [reap] and [discard].
      *
      * The answer is [hostOf] rather than the keys, because a session owned by a terminal tab is filed
@@ -265,7 +284,7 @@ class SshSessionStore @Inject constructor() {
      * the moment one host could hold more than one terminal.
      */
     fun liveHostIds(): Set<String> =
-        sessions.keys.toList().filter { isLive(it) }.mapNotNullTo(mutableSetOf()) { hostOf[it] }
+        sessionKeysSnapshot().filter { isLive(it) }.mapNotNullTo(mutableSetOf()) { hostOf[it] }
 
     /**
      * Hosts whose session *and* shell are both still alive, so a UI arriving after a rotation or a
@@ -274,7 +293,7 @@ class SshSessionStore @Inject constructor() {
      * terminal: there is nothing to attach a collector to.
      */
     fun adoptableHostIds(): Set<String> =
-        sessions.keys.toList()
+        sessionKeysSnapshot()
             .filter { isLive(it) && channels[it]?.isOpen == true }
             .mapNotNullTo(mutableSetOf()) { hostOf[it] }
 
@@ -286,7 +305,7 @@ class SshSessionStore @Inject constructor() {
      * under it, not just the one that happens to be named after it.
      */
     fun liveForHost(hostId: String): Set<String> =
-        sessions.keys.toList().filterTo(mutableSetOf()) { hostOf[it] == hostId && isLive(it) }
+        sessionKeysSnapshot().filterTo(mutableSetOf()) { hostOf[it] == hostId && isLive(it) }
 
     /**
      * Every key still filed under [hostId], live or not.
@@ -298,7 +317,7 @@ class SshSessionStore @Inject constructor() {
      * command history) is the one that loses the user something.
      */
     fun sessionKeysForHost(hostId: String): Set<String> =
-        sessions.keys.toList().filterTo(mutableSetOf()) { hostOf[it] == hostId }
+        sessionKeysSnapshot().filterTo(mutableSetOf()) { hostOf[it] == hostId }
 
     /**
      * Each live session key with the host it is filed under, for the sweeps that visit every session.
@@ -309,7 +328,7 @@ class SshSessionStore @Inject constructor() {
      * other would never be asked.
      */
     fun liveKeysByHost(): List<Pair<String, String>> =
-        sessions.keys.toList().mapNotNull { key -> hostOf[key]?.takeIf { isLive(key) }?.let { key to it } }
+        sessionKeysSnapshot().mapNotNull { key -> hostOf[key]?.takeIf { isLive(key) }?.let { key to it } }
 
     /**
      * The session host-scoped callers should reach [hostId] through, if the host has a live one.
@@ -458,7 +477,7 @@ class SshSessionStore @Inject constructor() {
 
     /** Closes every session. For "Stop sessions", and for the app being torn down deliberately. */
     fun closeAll() {
-        sessions.keys.toList().forEach(::close)
+        sessionKeysSnapshot().forEach(::close)
     }
 
     /**
