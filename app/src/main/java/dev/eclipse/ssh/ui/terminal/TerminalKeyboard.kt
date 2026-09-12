@@ -103,16 +103,18 @@ fun rememberTerminalLatches(): TerminalLatches =
  * can inspect, autocorrect and delete backwards through. A terminal can offer none of that - the line
  * being edited lives in the remote shell's `readline`, and the app never sees it.
  *
- * The resolution is a one-line field, invisible and permanently reset to [SENTINEL], that is watched
- * for *edits* rather than read for content:
- *  - text longer than the sentinel means characters were inserted, and the insertion is sent;
- *  - text shorter means the IME deleted backwards, and one Backspace is sent per character it removed.
+ * The resolution is a one-line field, invisible, holding a [SENTINEL] the user cannot type and every
+ * keystroke the IME has committed since the last reset, that is watched for *edits* rather than read
+ * for content: an incoming edit is diffed against what the platform held, the insertion is sent, and
+ * the IME's own text is adopted as the new value - so the app never performs a programmatic edit on
+ * the field the IME is composing into, which is the bug this used to have (see
+ * [TerminalInputBridge.resetPendingFrom] and [nextFieldValue]).
  *
- * The sentinel exists for that second case. With a genuinely empty field, Gboard has nothing to
- * delete and reports the Backspace through `deleteSurroundingText` on the input connection instead of
- * as a key event, so the keypress vanished entirely - the most common complaint about every naive
- * Compose terminal. Padding the field with characters the user cannot type gives the IME something to
- * consume, and the *shortfall* is the signal. Zero-width spaces are used because autocorrect and
+ * The sentinel exists for Backspace. With a genuinely empty field, Gboard has nothing to delete and
+ * reports the Backspace through `deleteSurroundingText` on the input connection instead of as a key
+ * event, so the keypress vanished entirely - the most common complaint about every naive Compose
+ * terminal. Padding the field with characters the user cannot type gives the IME something to consume,
+ * and the deletion is read out of the diff. Zero-width spaces are used because autocorrect and
  * suggestion strips leave them alone, and because filtering them out cannot swallow a real keystroke -
  * an ordinary space would be indistinguishable from one the user pressed.
  *
@@ -137,25 +139,51 @@ fun TerminalInputBridge(
     onFocusChanged: (Boolean) -> Unit = {},
 ) {
     var field by remember { mutableStateOf(sentinelValue()) }
+    /**
+     * The field content a reset has not reached yet. Setting [field] back to the sentinel is a
+     * programmatic edit, and Compose pushes those to the platform on the next recomposition - so
+     * until that frame lands, an edit can still arrive that was computed against the *old* content.
+     * This holds that old content, and [pendingResetBase] decides which of the two an incoming
+     * change was computed against. Null in the common case, where nothing is in flight and the
+     * adopted value is exactly what the platform holds.
+     */
+    var resetPendingFrom by remember { mutableStateOf<String?>(null) }
     BasicTextField(
         value = field,
         onValueChange = { change ->
-            val typed = change.text.filter { it != SENTINEL_CHAR }
-            when {
-                typed.isNotEmpty() -> {
-                    val (ctrl, alt, _) = latches.consume()
-                    if (ctrl || alt) {
-                        // A latched modifier applies to one character, which is what Ctrl-C is.
-                        typed.forEach { char -> onChar(char, ctrl, alt) }
-                    } else {
-                        sendCommittedText(typed, onText, onKey)
-                    }
+            // The diff base is what the platform held when the IME computed this edit: normally the
+            // value the field already carries (the last adopted edit, which is exactly what the
+            // platform holds - adoption pushes nothing), but while a reset is in flight the
+            // platform may still hold the pre-reset content for a frame, and diffing against the
+            // wrong one of the two is how a keystroke gets sent twice or not at all.
+            val base = pendingResetBase(resetPendingFrom, field.text, change.text)
+            val edit = diffTerminalEdit(base, change.text)
+            // Deletions first: an edit that both replaces and inserts emulates the replacement as
+            // Backspaces followed by the new text, which is the order a shell would need to see.
+            repeat(edit.deleted) { onKey(TerminalKey.BACKSPACE, false, false, false) }
+            val typed = edit.inserted.filter { it != SENTINEL_CHAR }
+            if (typed.isNotEmpty()) {
+                val (ctrl, alt, _) = latches.consume()
+                if (ctrl || alt) {
+                    // A latched modifier applies to one character, which is what Ctrl-C is.
+                    typed.forEach { char -> onChar(char, ctrl, alt) }
+                } else {
+                    sendCommittedText(typed, onText, onKey)
                 }
-                change.text.length < SENTINEL.length ->
-                    repeat(SENTINEL.length - change.text.length) { onKey(TerminalKey.BACKSPACE, false, false, false) }
             }
-            // Always back to the sentinel: the field is a keystroke courier, never a document.
-            field = sentinelValue()
+            // Adopt what the IME produced rather than clearing it: `change` *is* the platform
+            // field's content, so adopting it keeps the two in lockstep with no programmatic edit
+            // for the IME to trip over. Clearing back to the sentinel here instead - the previous
+            // design - tore the IME's state twice over: a commit that arrived before the reset was
+            // pushed was diffed against stale content and re-sent the previous keystroke with the
+            // new one (symbols doubled), and tearing a pending composition made some keyboards
+            // drop its last character entirely, so Enter ran "hel" for "help". See
+            // [nextFieldValue] for when a reset does happen, and the sentinel's own docs for why
+            // the field is never left empty.
+            val next = nextFieldValue(change)
+            field = next
+            // If that was a reset, the platform still holds what `change` says until the next frame.
+            resetPendingFrom = if (next.text != change.text) change.text else null
         },
         modifier = modifier
             .size(1.dp)
@@ -164,7 +192,23 @@ fun TerminalInputBridge(
             // it, this observes the field itself.
             .onFocusChanged { state -> onFocusChanged(state.isFocused) }
             .semantics { contentDescription = "Terminal input" }
-            .onPreviewKeyEvent { event -> handleKeyEvent(event, latches, onKey, onChar) },
+            .onPreviewKeyEvent { event ->
+                val handled = handleKeyEvent(event, latches, onKey, onChar)
+                // Enter that arrived as a key event is the moment the line is finished and the
+                // buffer's tail becomes history, which is the safe point to clear it: the IME has
+                // finished any composition before sending the key, and the next keystroke is a new
+                // line rather than the same frame. KeyDown only - the up event of the same press
+                // must not clear twice.
+                if (handled && event.type == KeyEventType.KeyDown &&
+                    TERMINAL_NAMED_KEYS[event.key] == TerminalKey.ENTER
+                ) {
+                    if (resetPendingFrom == null && field.text.length > SENTINEL.length) {
+                        resetPendingFrom = field.text
+                        field = sentinelValue()
+                    }
+                }
+                handled
+            },
         // A terminal is not prose: autocorrect would rewrite commands, capitalisation would rewrite
         // paths, and an IME action would insert a newline the shell did not ask for.
         keyboardOptions = KeyboardOptions(
@@ -274,7 +318,111 @@ private val SENTINEL = SENTINEL_CHAR.toString().repeat(SENTINEL_LENGTH)
 /** Long enough that a fast repeated Backspace cannot empty the field between resets. */
 private const val SENTINEL_LENGTH = 8
 
+/**
+ * How much committed text the courier keeps before it resets to the sentinel. Generous on purpose:
+ * a reset is the only programmatic edit this field ever makes, so each one is a moment the IME can
+ * trip over, and the fewer of them there are the better. It only has to be short enough that a
+ * fumbled reset cannot lose a whole command line.
+ */
+private const val FIELD_HARD_CAP = 64
+
 private fun sentinelValue() = TextFieldValue(SENTINEL, TextRange(SENTINEL.length))
+
+/**
+ * One incoming edit, expressed as what the shell needs to be told: how many characters were removed
+ * from the end, and what was inserted after that removal.
+ *
+ * Deletions in the middle cannot happen here - the caret sits at the end, the field is one line, and
+ * the IME has no selection UI over an invisible field - so the diff is a suffix-count, not a general
+ * tree diff. A replace-em-all edit (autocorrect rewriting the tail, or the IME delivering a batched
+ * composition as one change) arrives as deleted > 0 *and* inserted text, and the deletions are sent
+ * first so the shell applies them in the order a user's hands would.
+ *
+ * Deletions that reach into the sentinel count like any other: a held Backspace keeps sending them,
+ * which is the deliberate choice - the alternative, clamping at the padding, is a terminal that
+ * swallows the last few presses of a long hold instead of passing them on.
+ */
+internal data class TerminalEdit(val deleted: Int, val inserted: String)
+
+/**
+ * What changed between the text the platform held and the text it now reports.
+ *
+ * Pure, so the exact worst cases - a commit racing the previous one, a composition landing after a
+ * reset, autocorrect rewriting a tail - are assertions in `TerminalCourierFieldTest` rather than
+ * field reports of doubled symbols and eaten characters.
+ */
+internal fun diffTerminalEdit(base: String, incoming: String): TerminalEdit {
+    // The shared prefix: everything up to where the two texts stop agreeing.
+    var common = 0
+    while (common < base.length && common < incoming.length &&
+        base[common] == incoming[common] && common < SENTINEL_LENGTH + FIELD_HARD_CAP
+    ) common++
+    val deleted = base.length - common
+    val inserted = incoming.substring(common)
+    return TerminalEdit(deleted, inserted)
+}
+
+/**
+ * The content an incoming edit was diffed against.
+ *
+ * Compose pushes a programmatic value change to the platform field at the next recomposition, so
+ * between `field = sentinelValue()` and that frame landing there are two candidates for what the
+ * platform held when the IME computed its edit: the pre-reset text the platform may still hold, or
+ * the reset value the recomposition is installing ([adopted], which is what the field carries).
+ * The discriminator is structural: an edit computed against the pre-reset content worked from its
+ * keystroke tail, so one of the two tails extends the other - an insertion appends past it, a
+ * deletion truncates it - while an edit computed after the reset landed starts a tail of its own
+ * that merely happens to overlap. Tail relation means the old base; anything else means the reset
+ * landed and [adopted] is the truth.
+ *
+ * Both tails must be non-empty for the relation to mean anything: an empty pre-reset tail carries
+ * no evidence (the reset was from a bare sentinel), and an empty incoming tail is the
+ * reset-landed-then-backspace-into-the-padding case, where guessing "raced" would send a handful
+ * of spurious Backspaces for what was one press.
+ */
+internal fun pendingResetBase(resetPendingFrom: String?, adopted: String, incoming: String): String {
+    if (resetPendingFrom == null) return adopted
+    val preResetTail = resetPendingFrom.drop(SENTINEL_LENGTH)
+    val incomingTail = incoming.drop(SENTINEL_LENGTH)
+    val raced = preResetTail.isNotEmpty() && incomingTail.isNotEmpty() &&
+        (incomingTail.startsWith(preResetTail) || preResetTail.startsWith(incomingTail))
+    return if (raced) resetPendingFrom else adopted
+}
+
+/**
+ * The next value for the courier field: adopt the IME's edit, unless it is time to reset.
+ *
+ * Adoption is the rule and the reset is the exception, each for its own reason:
+ *  - **Adopt.** The value `onValueChange` reports *is* the platform field's content, so echoing it
+ *    back as state keeps the two in lockstep with no programmatic edit at all. The previous design
+ *    reset on every keystroke, which meant tearing the field's text twice per character: a commit
+ *    that arrived before the reset's recomposition was diffed against stale content and re-sent the
+ *    previous symbol along with the new one (the doubled `/`), and a keyboard mid-composition could
+ *    lose its pending character to the tear, so Enter ran `hel` for `help`.
+ *  - **Reset, but only when the shell cannot lose anything.** The field cannot grow forever, and it
+ *    must never run empty of sentinel. Both are handled here, and the two moments are chosen for
+ *    safety rather than frequency: right after a newline in the committed text (the line is
+ *    finished), or when the hard cap is reached. At those moments the IME is between words, which
+ *    is when a reset is least able to eat a character.
+ */
+internal fun nextFieldValue(change: TextFieldValue): TextFieldValue {
+    val resetsOnNewline = change.text.any { it == LINE_FEED || it == CARRIAGE_RETURN }
+    if (!resetsOnNewline && change.text.startsWith(SENTINEL) &&
+        change.text.length < SENTINEL_LENGTH + FIELD_HARD_CAP
+    ) {
+        // Plain adoption: what the IME wrote is what the field now holds.
+        return change
+    }
+    // A reset, at one of the two safe moments (a finished line, the hard cap) or because the
+    // sentinel was somehow consumed. The new tail is the keystrokes that survive the reset - none,
+    // when the line is finished - so the shell's next Backspace still has something to eat.
+    val tail = if (resetsOnNewline) {
+        ""
+    } else {
+        change.text.filter { it != SENTINEL_CHAR }.takeLast(FIELD_HARD_CAP - SENTINEL_LENGTH)
+    }
+    return TextFieldValue(SENTINEL + tail, TextRange(SENTINEL.length + tail.length))
+}
 
 /**
  * The row of keys a phone keyboard does not have.

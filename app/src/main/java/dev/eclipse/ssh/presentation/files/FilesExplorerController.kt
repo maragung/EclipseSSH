@@ -1,5 +1,6 @@
 package dev.eclipse.ssh.presentation.files
 
+import dev.eclipse.ssh.archive.SftpArchiveByteSource
 import dev.eclipse.ssh.data.HostRepository
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
@@ -139,6 +140,25 @@ class FilesExplorerController @Inject constructor(
 
     /** The hosts whose sessions were last built from, so [providerFor] can find usernames. */
     private var lastHosts: List<HostProfile> = emptyList()
+
+    /**
+     * The ranged-read view of one remote archive on the session the explorer is browsing.
+     *
+     * The sheet's View Archive row asks for this when it is clicked, not when the sheet opens,
+     * because the factory makes a byte source, not a channel: the channel pair opens on the first
+     * read and is owned until [SftpArchiveByteSource.close] — a cancelled open (sheet closed before
+     * the scan starts, another archive chosen) that never opened the file leaves nothing behind.
+     *
+     * Null when the session is the local one or one this controller never made, for exactly the
+     * reasons [providerFor] gives — View Archive is a remote browsing verb, and pretending a local
+     * URI is an SFTP path would be the one dishonest answer here.
+     */
+    fun archiveSourceFor(sessionId: String, remotePath: String, size: Long): SftpArchiveByteSource? {
+        if (!sessionId.startsWith("sftp:")) return null
+        val hostId = sessionId.removePrefix("sftp:")
+        val host = lastHosts.firstOrNull { it.id == hostId } ?: return null
+        return sftpFactory.archiveSource(host, remotePath, size)
+    }
 
     /** Rebuilds the session list — local first, then every saved host, live or not. */
     fun refreshSessions() {

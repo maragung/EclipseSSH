@@ -98,6 +98,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.BottomAppBar
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -227,6 +228,19 @@ import dev.eclipse.ssh.presentation.AuthFailurePrompt
 import dev.eclipse.ssh.presentation.ReconnectPrompt
 import dev.eclipse.ssh.presentation.MainUiState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.archive.ArchiveBrowserState
+import dev.eclipse.ssh.archive.ArchiveEntry
+import dev.eclipse.ssh.archive.ArchiveExtractor
+import dev.eclipse.ssh.archive.ArchiveTarget
+import dev.eclipse.ssh.archive.ArchiveReader
+import dev.eclipse.ssh.archive.ArchiveUiState
+import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
+import dev.eclipse.ssh.ui.archive.ArchivePropertiesDialog
+import dev.eclipse.ssh.ui.archive.ArchiveActions
+import dev.eclipse.ssh.ui.archive.ArchiveBrowserScreen
+import dev.eclipse.ssh.ui.archive.SafArchiveDestination
 import dev.eclipse.ssh.ui.editor.EditorRequest
 import dev.eclipse.ssh.ui.editor.EditorRequests
 import dev.eclipse.ssh.ui.editor.TextEditorActivity
@@ -705,6 +719,65 @@ private fun EclipseWorkspace(
     // deserves a window of its own rather than a layer over whatever the workspace was showing.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
     var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
+    // The View Archive browser target, held here for the same reason as the preview target: the
+    // scan runs against this workspace's provider, and the browser is one archive at a time by
+    // design - opening a second archive closes the first, because each one holds an SFTP channel
+    // for as long as it is open.
+    var archiveTarget by remember { mutableStateOf<ArchiveTarget?>(null) }
+    /**
+     * Opens one remote archive in the View Archive browser — the Files sheet's View Archive row.
+     *
+     * The archive's host is found from the explorer's session rather than the workspace's selected
+     * host, because the sheet can be open on a session the Hosts list never selected; getting the
+     * host wrong here would silently scan the wrong server's file. Format detection is by name
+     * only, before anything is read: it costs nothing and a name that suggests no browsable
+     * container means the row was offered in error — reported, not guessed around.
+     */
+    fun openArchive(entry: FsEntry, provider: FileSystemProvider) {
+        val format = ArchiveReader.formatFor(entry.name)
+            ?: return viewModel.reportUiMessage("\"${entry.name}\" is not an archive View Archive can browse")
+        val explorer = viewModel.filesExplorer.state.value
+        val sessionId = explorer.activeSessionId
+        val size = entry.size
+            ?: return viewModel.reportUiMessage("\"${entry.name}\" has no size to read by range")
+        val source = viewModel.filesExplorer.archiveSourceFor(sessionId, entry.path, size)
+            ?: return viewModel.reportUiMessage("View Archive needs a connected server session")
+        // Opening a second archive closes the first: each browser holds an SFTP channel for as
+        // long as it is open, and two of them is a leak the user never asked for.
+        archiveTarget?.browser?.close()
+        archiveTarget = ArchiveTarget(entry, ArchiveBrowserState(
+            archiveName = entry.name,
+            format = format,
+            source = source,
+            provider = provider,
+            remotePath = entry.path,
+            scope = scope,
+        ))
+    }
+
+    /**
+     * Turns an extract's per-entry outcomes into the one-line report a person can act on, without
+     * a stack trace in sight. The honest summary is tiered: all good says how many and how much;
+     * anything refused or failed says so, because a silent skip is how a hostile member hides.
+     */
+    fun reportExtractOutcome(archiveName: String, outcomes: List<ArchiveExtractor.Outcome>) {
+        val extracted = outcomes.filterIsInstance<ArchiveExtractor.Outcome.Extracted>()
+        if (outcomes.size == extracted.size) {
+            val total = extracted.sumOf { it.bytes }
+            viewModel.reportUiMessage("Extracted ${extracted.size} item(s) from \"$archiveName\" ($total bytes)")
+            return
+        }
+        val refused = outcomes.count { it is ArchiveExtractor.Outcome.Refused }
+        val destinationRefused = outcomes.count { it is ArchiveExtractor.Outcome.DestinationRefused }
+        val failed = outcomes.filterIsInstance<ArchiveExtractor.Outcome.Failed>()
+        val parts = buildList {
+            if (extracted.isNotEmpty()) add("${extracted.size} extracted")
+            if (refused > 0) add("$refused skipped for safety")
+            if (destinationRefused > 0) add("$destinationRefused could not be created")
+            failed.firstOrNull()?.let { add("first failure: ${it.reason}") }
+        }
+        viewModel.reportUiMessage("Extract from \"$archiveName\": ${parts.joinToString("; ")}")
+    }
     // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
     // reason the preview target is: its file actions resolve against this workspace's context,
     // clipboard and overlays, none of which the screen should know about.
@@ -1120,13 +1193,22 @@ private fun EclipseWorkspace(
      * session that is not there - a saved id whose process died takes the user to the list, not to a
      * chrome-less screen with nothing in it.
      */
-    val terminalImmersive = destination == Destination.TERMINAL &&
+    val terminalSessionOpen = destination == Destination.TERMINAL &&
         !(state.settings.pinEnabled && !unlocked) &&
         openSessionId?.let { id -> state.tabs.any { it.id == id } } == true
+    /**
+     * The same moment, minus the system bars, when the user chose to keep them.
+     *
+     * [AppSettings.terminalKeepSystemBars] is the one opt-out from immersive: some users want the
+     * navigation bar's back gesture visibly marked, or the clock to survive a long session. The app's
+     * own chrome still goes - the shell keeps the space either way - but the system's bars stay on
+     * screen, which is what the setting says and all it says.
+     */
+    val terminalImmersive = terminalSessionOpen && !state.settings.terminalKeepSystemBars
     // Back leaves the shell, not the app. A full-screen terminal has no navigation on screen, so
     // without this the only way out of a session is the gesture that closes the whole app - and the
     // session with it.
-    BackHandler(enabled = terminalImmersive) { openSessionId = null }
+    BackHandler(enabled = terminalSessionOpen) { openSessionId = null }
     /**
      * Hides the status and navigation bars while the shell is on screen, and puts them back afterwards.
      *
@@ -1179,9 +1261,9 @@ private fun EclipseWorkspace(
         val isWide = maxWidth >= 700.dp
         if (isWide) {
             Row(Modifier.fillMaxSize()) {
-                // Gone while a shell owns the window - see [terminalImmersive]. Back, or the strip's
-                // own button, brings it straight back.
-                if (!terminalImmersive) NavigationRail(
+                // Gone while a shell owns the window - see [terminalSessionOpen]. Back, or the
+                // strip's own button, brings it straight back.
+                if (!terminalSessionOpen) NavigationRail(
                     modifier = Modifier.fillMaxHeight().padding(start = 12.dp, top = 18.dp, bottom = 18.dp),
                     containerColor = MaterialTheme.colorScheme.surface,
                 ) {
@@ -1203,6 +1285,7 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
+                    onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1222,7 +1305,9 @@ private fun EclipseWorkspace(
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionId = openSessionId,
                     onOpenSession = { openSessionId = it },
-                    immersive = terminalImmersive,
+                    // The session owns the window whatever the bars do; the immersive flag is only
+                    // the system-bars half of full screen.
+                    immersive = terminalSessionOpen,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
                     onSendKey = viewModel::sendKey,
@@ -1331,6 +1416,7 @@ private fun EclipseWorkspace(
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
+                    onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
                     verifyPin = viewModel::verifyPin,
@@ -1359,8 +1445,8 @@ private fun EclipseWorkspace(
                 // is underneath.
                 snackbarHost = { SnackbarHost(snackbarHostState) },
                 bottomBar = {
-                    // Gone while a shell owns the window - see [terminalImmersive].
-                    if (!terminalImmersive) NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+                    // Gone while a shell owns the window - see [terminalSessionOpen].
+                    if (!terminalSessionOpen) NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
                         Destination.entries.forEach { item ->
                             NavigationBarItem(
                                 selected = destination == item,
@@ -1380,6 +1466,7 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
+                    onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
@@ -1399,7 +1486,9 @@ private fun EclipseWorkspace(
                     onDisconnectAll = viewModel::disconnectAll,
                     openSessionId = openSessionId,
                     onOpenSession = { openSessionId = it },
-                    immersive = terminalImmersive,
+                    // The session owns the window whatever the bars do; the immersive flag is only
+                    // the system-bars half of full screen.
+                    immersive = terminalSessionOpen,
                     onSendInput = viewModel::sendInput,
                     onSendText = viewModel::sendText,
                     onSendKey = viewModel::sendKey,
@@ -1508,6 +1597,7 @@ private fun EclipseWorkspace(
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
+                    onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
                     verifyPin = viewModel::verifyPin,
@@ -1525,7 +1615,7 @@ private fun EclipseWorkspace(
                     // padding comes from `safeDrawingPadding` inside the terminal, and applying both
                     // would inset the grid twice - once for a navigation bar that is not there and
                     // again for the window - costing rows the pty was told it had.
-                    modifier = if (terminalImmersive) Modifier else Modifier.padding(padding),
+                    modifier = if (terminalSessionOpen) Modifier else Modifier.padding(padding),
                 )
             }
         }
@@ -1832,6 +1922,134 @@ private fun EclipseWorkspace(
             },
         )
     }
+    // The View Archive browser, a full-window layer above the workspace for the same reason the
+    // editor is one: browsing an archive is a task of its own, and a sheet over the explorer would
+    // both fight the explorer's own bottom sheets and show one folder's worth of a 1M-entry tree in
+    // a window measured for a file list. The layer reads the browser's state; dismissal is the
+    // close above, which cancels the scan/watcher and releases the channel.
+    // The per-entry sheets live *here*, above the browser, not inside it: they act on this
+    // workspace's clipboard and extract destination, which the browser layer knows nothing about.
+    var archiveEntrySheet by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var archivePreviewEntry by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var archiveEntryProperties by remember { mutableStateOf<ArchiveEntry?>(null) }
+    var showArchiveProperties by remember { mutableStateOf(false) }
+    // The extract that is waiting on the user to pick a destination folder. The entries are held
+    // here - outside the browser, like every other per-entry action target - because the picker
+    // is an activity result that lands in this workspace's scope, not the browser's; when it
+    // returns, the extract runs against the browser's byte source, which is why the target holds
+    // both. Null entry list = nothing pending.
+    var pendingExtract by remember { mutableStateOf<Pair<ArchiveTarget, List<ArchiveEntry>>?>(null) }
+    // The SAF folder picker for extraction. Unlike the explorer's Local root picker, this one
+    // takes no persistable grant and changes no setting: the destination is a one-shot answer to
+    // "where should these files land", and remembering it silently would make the second extract
+    // write somewhere the user forgot they picked weeks ago.
+    val archiveExtractPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        val pending = pendingExtract
+        pendingExtract = null
+        if (uri == null) return@rememberLauncherForActivityResult
+        val (target, entries) = pending ?: return@rememberLauncherForActivityResult
+        val browser = target.browser
+        scope.launch {
+            val destination = runCatching { SafArchiveDestination(context, uri) }
+                .getOrElse {
+                    viewModel.reportUiMessage("The picked folder cannot be written")
+                    return@launch
+                }
+            viewModel.reportUiMessage("Extracting ${entries.size} item(s) from \"${browser.archiveName}\"…")
+            val outcomes = ArchiveExtractor.extract(
+                browser.format,
+                browser.sourceForReading(),
+                entries,
+                destination,
+            )
+            reportExtractOutcome(browser.archiveName, outcomes)
+        }
+    }
+    archiveTarget?.let { target ->
+        val browser = target.browser
+        ArchiveBrowserScreen(
+            archiveName = browser.archiveName,
+            state = browser.state,
+            actions = ArchiveActions(
+                onClose = { browser.close(); archiveTarget = null },
+                onCancelScan = browser::cancelScan,
+                onRetry = browser::retry,
+                onUnlock = browser::unlock,
+                // Opening a file is the preview; only the ZIP format can fetch one entry's bytes
+                // by range, so a TAR entry falls to the action sheet's honest Extract verb rather
+                // than a preview that would secretly stream the whole archive.
+                onOpenEntry = { entry ->
+                    if (ArchiveReader.supportsRandomAccess(browser.format)) {
+                        archivePreviewEntry = entry
+                    } else {
+                        archiveEntrySheet = entry
+                    }
+                },
+                onEntryActions = { entry -> archiveEntrySheet = entry },
+                // The batch extract from the browser's selection bar: the same pendingExtract +
+                // picker the per-entry sheet's Extract row feeds, so there is one extract path,
+                // not two. The browser keeps its selection behind the picker; a cancelled pick
+                // returns to it intact for a retry.
+                onExtractEntries = { entries ->
+                    pendingExtract = target to entries
+                    archiveExtractPicker.launch(null)
+                },
+                onReload = browser::reload,
+                onDismissServerChange = browser::dismissServerChange,
+                onShowProperties = { showArchiveProperties = true },
+            ),
+        )
+        // The entry preview reads through the same ranged source the scan did - one entry's bytes,
+        // never the archive around it (the sheet's own KDoc holds the full reasoning).
+        archivePreviewEntry?.let { entry ->
+            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
+            ArchiveEntryPreviewSheet(
+                entry = entry,
+                readEntry = if (readable) {
+                    { ArchiveReader.readEntry(browser.format, browser.sourceForReading(), entry) }
+                } else null,
+                onDismiss = { archivePreviewEntry = null },
+            )
+        }
+        archiveEntrySheet?.let { entry ->
+            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
+            ArchiveEntryActionsSheet(
+                entry = entry,
+                canReadEntry = readable,
+                onDismiss = { archiveEntrySheet = null },
+                onPreview = if (readable) ({ archiveEntrySheet = null; archivePreviewEntry = entry }) else null,
+                // Extract (and single-entry Download, which is extract of one file by another
+                // name): hand the entries to the destination picker, and the extract itself runs
+                // when the picker answers. The archive stays remote throughout - what moves is
+                // each entry's own bytes.
+                onExtract = {
+                    archiveEntrySheet = null
+                    pendingExtract = target to listOf(entry)
+                    archiveExtractPicker.launch(null)
+                },
+                onCopyPath = {
+                    archiveEntrySheet = null
+                    viewModel.copyToClipboard(entry.path)
+                },
+                onProperties = { archiveEntrySheet = null; archiveEntryProperties = entry },
+            )
+        }
+        archiveEntryProperties?.let { entry ->
+            ArchiveEntryPropertiesDialog(
+                entry = entry,
+                formatLabel = browser.format.label,
+                onDismiss = { archiveEntryProperties = null },
+            )
+        }
+        val readyState = browser.state
+        if (showArchiveProperties && readyState is ArchiveUiState.Ready) {
+            ArchivePropertiesDialog(
+                state = readyState,
+                remotePath = browser.remotePath,
+                onDismiss = { showArchiveProperties = false },
+            )
+        }
+    }
     // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
     // preview and the editor that some rows open are their own windows, and none of them should
     // have to fight this sheet for the bottom of the screen.
@@ -1956,6 +2174,12 @@ private fun WorkspaceScaffold(
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
     onEditFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
+    /**
+     * Opens a remote archive in the View Archive browser - see the overlay state in
+     * [EclipseWorkspace]. Null-when-unsupported is decided by the caller (local session, unknown
+     * extension) so this scaffold and the Files screen below it stay format-agnostic.
+     */
+    onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)? = null,
     onDestination: (Destination) -> Unit,
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
@@ -2065,6 +2289,9 @@ private fun WorkspaceScaffold(
     onReconnectAskFirst: (Boolean) -> Unit = {},
     onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
+    // The keep-system-bars switch was wired into SettingsScreen and both scaffold call sites, but
+    // never into the scaffold's own parameter list, so all three references failed to resolve.
+    onTerminalKeepSystemBars: (Boolean) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
     verifyPin: suspend (String) -> Boolean = { false },
@@ -2191,6 +2418,7 @@ private fun WorkspaceScaffold(
                     filesExplorer,
                     onPreviewFile,
                     onEditFile,
+                    onOpenArchive,
                     onUpload,
                     onDownloadFile,
                     onPickLocalFolder,
@@ -2227,6 +2455,7 @@ private fun WorkspaceScaffold(
                     onReconnectAskFirst = onReconnectAskFirst,
                     onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
+                    onTerminalKeepSystemBars = onTerminalKeepSystemBars,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
                     verifyPin = verifyPin,
@@ -2713,6 +2942,10 @@ private fun TerminalScreen(
             // one host another host's trace. See [sessionDiagnostics].
             trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[activeTab.hostId]),
             onCopyTrace = onCopyTrace,
+            // The strip draws on the terminal's own background; these two are where every chrome
+            // colour on it is derived from. See TerminalTabStrip's parameter docs.
+            termBg = termBg,
+            termFg = termFg,
         )
         // The terminal takes every pixel that is left, and it is the only thing in this Column that
         // does. That is what makes it a screen rather than a card: the weight is why a full-screen
@@ -3368,9 +3601,22 @@ private fun TerminalTabStrip(
     terminalText: String,
     trace: List<SessionDiagnosticEvent>,
     onCopyTrace: (String) -> Unit,
+    /**
+     * The terminal's own background and foreground, the pair the strip sits on. Every chrome colour
+     * here is derived from these rather than from the app theme because the strip is drawn on top of
+     * [termBg]: an icon that follows the app theme is invisible on any terminal whose brightness
+     * disagrees with it - the app's dark scheme over the Light terminal theme is white icons on a
+     * near-white bar.
+     */
+    termBg: Color,
+    termFg: Color,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var showWhy by remember { mutableStateOf(false) }
+    // The tab whose X was tapped, while the confirmation below is on screen. Closing a session kills
+    // a live shell, and the X sits a thumb-width from the chip a user is aiming for - the same reason
+    // Remove on a host card asks first.
+    var confirmClose by remember { mutableStateOf<SessionTab?>(null) }
     Row(
         Modifier.fillMaxWidth().padding(start = 2.dp, end = 4.dp, top = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -3378,7 +3624,7 @@ private fun TerminalTabStrip(
         // The way back to the list of sessions, and the only visible one: a full-screen shell has no
         // navigation bar behind it. The system back gesture does the same thing.
         IconButton(onClick = onLeaveSession) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Show sessions")
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, "Show sessions", tint = termFg)
         }
         Row(
             Modifier.weight(1f).horizontalScroll(rememberScrollState()),
@@ -3396,7 +3642,14 @@ private fun TerminalTabStrip(
                         onLongClick = { onDuplicate(tab) },
                     ),
                     shape = RoundedCornerShape(12.dp),
-                    color = if (tab == activeTab) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                    // Terminal-derived, like everything else on this strip: the app theme's
+                    // primaryContainer is a fixed mid-blue that vanishes on both a black terminal
+                    // (the High-contrast theme) and a pale one (Light, Solarized light). The active
+                    // chip is a blend of the terminal's own pair - distinct from the background on
+                    // every theme because it leans on the foreground, which the theme chose for
+                    // exactly that - and an inactive chip is a whisper of the foreground over the
+                    // background.
+                    color = if (tab == activeTab) blend(termBg, termFg, 0.22f) else blend(termBg, termFg, 0.08f),
                 ) {
                     Row(Modifier.padding(start = 12.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box(
@@ -3418,19 +3671,22 @@ private fun TerminalTabStrip(
                             if (tab == activeTab && !frame.title.isNullOrBlank()) frame.title!! else tab.title,
                             modifier = Modifier.widthIn(min = 48.dp, max = 168.dp),
                             style = MaterialTheme.typography.labelLarge,
+                            // The chip's own text follows the terminal pair too - see the Surface
+                            // colour above for why the app theme cannot decide this.
+                            color = termFg,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
-                        IconButton(onClick = { onCloseTab(tab) }, modifier = Modifier.size(48.dp)) {
-                            Icon(Icons.Default.Close, contentDescription = "Close ${tab.title} session", modifier = Modifier.size(16.dp))
+                        IconButton(onClick = { confirmClose = tab }, modifier = Modifier.size(48.dp)) {
+                            Icon(Icons.Default.Close, contentDescription = "Close ${tab.title} session", tint = termFg, modifier = Modifier.size(16.dp))
                         }
                     }
                 }
             }
         }
-        IconButton(onClick = onToggleSearch) { Icon(Icons.Default.Search, "Search terminal") }
+        IconButton(onClick = onToggleSearch) { Icon(Icons.Default.Search, "Search terminal", tint = termFg) }
         Box {
-            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Terminal actions") }
+            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Default.MoreVert, "Terminal actions", tint = termFg) }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
                     text = { Text("Duplicate terminal") },
@@ -3529,8 +3785,12 @@ private fun TerminalTabStrip(
         // scrollback on the way. It goes through the same authentication sheet as any other connection,
         // so a host whose password was never saved asks for it again rather than failing silently.
         if (activeTab.state.isEnded) {
-            TextButton(onClick = onReconnect, contentPadding = PaddingValues(horizontal = 8.dp)) {
-                Icon(Icons.Default.Wifi, null, modifier = Modifier.size(15.dp))
+            TextButton(
+                onClick = onReconnect,
+                contentPadding = PaddingValues(horizontal = 8.dp),
+                colors = ButtonDefaults.textButtonColors(contentColor = termFg),
+            ) {
+                Icon(Icons.Default.Wifi, null, tint = termFg, modifier = Modifier.size(15.dp))
                 Spacer(Modifier.width(4.dp))
                 Text("Reconnect", style = MaterialTheme.typography.labelMedium)
             }
@@ -3543,6 +3803,7 @@ private fun TerminalTabStrip(
             TextButton(
                 onClick = { showWhy = true },
                 contentPadding = PaddingValues(horizontal = 8.dp),
+                colors = ButtonDefaults.textButtonColors(contentColor = termFg),
                 modifier = Modifier.semantics { contentDescription = "Why this session is ${activeTab.state.name}" },
             ) {
                 Text("Why?", style = MaterialTheme.typography.labelMedium)
@@ -3552,7 +3813,9 @@ private fun TerminalTabStrip(
             Text(
                 "${frame.columns}x${frame.rows}",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // The terminal pair, dimmed, not the app theme's onSurfaceVariant - this sits on
+                // [termBg] like everything else in the strip.
+                color = termFg.copy(alpha = 0.7f),
             )
         }
     }
@@ -3563,6 +3826,18 @@ private fun TerminalTabStrip(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
             placeholder = { Text("Search terminal output") },
             singleLine = true,
+            // Drawn on the terminal's own background like the rest of the strip: the app theme's
+            // field colours assume the app surface and produce a pale field on a black terminal or
+            // an invisible outline on a light one.
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = termFg,
+                unfocusedTextColor = termFg,
+                cursorColor = termFg,
+                focusedBorderColor = termFg,
+                unfocusedBorderColor = termFg.copy(alpha = 0.5f),
+                focusedPlaceholderColor = termFg.copy(alpha = 0.6f),
+                unfocusedPlaceholderColor = termFg.copy(alpha = 0.6f),
+            ),
         )
         if (searchQuery.isNotBlank()) {
             // Splitting a 2 000-line scrollback on every keystroke is not free, and this recomposes
@@ -3573,7 +3848,7 @@ private fun TerminalTabStrip(
             Text(
                 "$matches matches",
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                color = termFg,
                 modifier = Modifier.padding(horizontal = 12.dp),
             )
         }
@@ -3584,6 +3859,30 @@ private fun TerminalTabStrip(
             trace = trace,
             onCopy = onCopyTrace,
             onDismiss = { showWhy = false },
+        )
+    }
+    confirmClose?.let { tab ->
+        // App-themed on purpose, unlike everything else on the strip: an AlertDialog is a modal
+        // surface with its own scrim, not a control drawn on the terminal's background, so it
+        // follows the palette every other dialog in the app follows.
+        AlertDialog(
+            onDismissRequest = { confirmClose = null },
+            title = { Text("Close \"${tab.title}\"?") },
+            text = {
+                Text(
+                    if (tab.state.isLive) {
+                        "The session is still running. Closing it ends the shell on the server; nothing is saved on the way out."
+                    } else {
+                        "Close this session's tab?"
+                    }
+                )
+            },
+            confirmButton = {
+                Button(onClick = { confirmClose = null; onCloseTab(tab) }) { Text("Close session") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClose = null }) { Text("Cancel") }
+            },
         )
     }
 }
@@ -3603,6 +3902,21 @@ private fun TerminalTabStrip(
  * same amount, so the guarantee survives.
  */
 private val TERMINAL_STATUS_ROW_MIN_HEIGHT = 48.dp
+
+/**
+ * [base] leaned [fraction] towards [toward]: the colour a terminal-derived chrome element uses when
+ * it needs to sit on the terminal's background yet differ from it, on every terminal theme.
+ *
+ * The terminal themes are pairs the theme chose for maximum mutual contrast, so any blend of the two
+ * is legible against both ends - which is what makes this safer than the app palette, whose fixed
+ * values cannot know whether they landed on a black or a pale terminal.
+ */
+private fun blend(base: Color, toward: Color, fraction: Float): Color = Color(
+    red = base.red + (toward.red - base.red) * fraction,
+    green = base.green + (toward.green - base.green) * fraction,
+    blue = base.blue + (toward.blue - base.blue) * fraction,
+    alpha = 1f,
+)
 
 /**
  * Whether there is anything worth explaining about this state.
@@ -3738,6 +4052,8 @@ private fun ColumnScope.FilesScreen(
     filesExplorer: FilesExplorerController,
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit,
     onEditFile: (FsEntry, FileSystemProvider) -> Unit,
+    /** Null when View Archive cannot serve this entry (local session, unknown extension). */
+    onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)?,
     onUpload: () -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
     onPickLocalFolder: () -> Unit,
@@ -3891,6 +4207,11 @@ private fun ColumnScope.FilesScreen(
                 if (explorer.isLocal) onUploadLocal(entry.toLocalFile()) else onDownloadFile(entry.toRemoteFile())
             },
             onSendToHost = if (!explorer.isLocal) ({ actionEntry = null; sendEntry = entry }) else null,
+            // The row exists only when the session and the name can both be served: a local
+            // document tree has no ranged reads to browse with, and an unknown extension has no
+            // engine to browse with - hiding the verb beats offering it and failing.
+            onOpenArchive = onOpenArchive?.takeIf { !explorer.isLocal && ArchiveReader.formatFor(entry.name) != null }
+                ?.let { open -> { actionEntry = null; provider?.let { open(entry, it) } } },
         )
     }
 
@@ -4620,6 +4941,7 @@ private fun SettingsScreen(
     onReconnectAskFirst: (Boolean) -> Unit = {},
     onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
+    onTerminalKeepSystemBars: (Boolean) -> Unit = {},
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
     verifyPin: suspend (String) -> Boolean,
@@ -4726,6 +5048,13 @@ private fun SettingsScreen(
                 onSelect = { theme -> onTerminalTheme(theme.name) },
             )
         }
+        // Next to the theme because both decide what the terminal screen looks like. The subtitle
+        // states the default so an untouched row explains what the app does on its own.
+        SettingRow(
+            Icons.Default.Terminal,
+            "Keep system bars during sessions",
+            "Off by default: sessions take the whole screen. On, the status and navigation bars stay visible over the terminal",
+        ) { Switch(checked = state.settings.terminalKeepSystemBars, onCheckedChange = onTerminalKeepSystemBars) }
         SettingRow(Icons.Default.Security, "Legacy algorithms", "Also offer CBC, SHA-1 and dh-group1 to reach older servers") { Switch(checked = state.settings.legacyAlgorithms, onCheckedChange = onLegacyAlgorithms) }
         SettingRow(Icons.Default.Lock, "Block screenshots", "Hides this app from screenshots, screen recording and the recents preview") { Switch(checked = state.settings.blockScreenshots, onCheckedChange = onBlockScreenshots) }
     }

@@ -93,6 +93,7 @@ object VaultBackup {
             put("terminalTheme", settings.terminalTheme)
             put("blockScreenshots", settings.blockScreenshots)
             put("reconnectAskFirst", settings.reconnectAskFirst)
+            put("terminalKeepSystemBars", settings.terminalKeepSystemBars)
             // Opt-keyed and length-capped like every untrusted string the vault round-trips: an
             // absent key is "old backup" (reader defaults the field), never a parse failure. The
             // blob's own codec decodes tolerantly, so a mangled value becomes defaults, not a
@@ -207,6 +208,7 @@ object VaultBackup {
             // the default rather than to false-by-accident.
             blockScreenshots = settingsObj.optBoolean("blockScreenshots", defaults.blockScreenshots),
             reconnectAskFirst = settingsObj.optBoolean("reconnectAskFirst", defaults.reconnectAskFirst),
+            terminalKeepSystemBars = settingsObj.optBoolean("terminalKeepSystemBars", defaults.terminalKeepSystemBars),
             // The blob is decoded by EditorPrefsCodec, which never throws — a hand-edited or
             // truncated value becomes the editor's defaults rather than a failed import. Capped
             // on the way in for the same reason every vault string is: a backup is untrusted.

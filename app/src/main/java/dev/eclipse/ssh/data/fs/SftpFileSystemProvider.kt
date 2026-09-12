@@ -1,5 +1,6 @@
 package dev.eclipse.ssh.data.fs
 
+import dev.eclipse.ssh.archive.SftpArchiveByteSource
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.SshConnectionManager
@@ -291,4 +292,21 @@ class SftpProviderFactory @Inject constructor(
         connectionManager = connectionManager,
         directoryService = directoryService,
     )
+
+    /**
+     * The ranged-read view of one remote archive for the View Archive browser.
+     *
+     * Same factory, same reasoning as [forHost]: the byte source is a thin view over the live
+     * session (it re-resolves nothing, but it opens its own channel pair on first read and owns
+     * them until closed), so making one per archive is cheap and stale ones simply close.
+     */
+    fun archiveSource(host: HostProfile, remotePath: String, size: Long): SftpArchiveByteSource =
+        SftpArchiveByteSource(
+            connectionManager = connectionManager,
+            sessionStore = sessionStore,
+            hostId = host.id,
+            hostName = host.name,
+            remotePath = remotePath,
+            size = size,
+        )
 }
