@@ -88,4 +88,24 @@ class TextEditorActivityRobolectricTest {
             assertThat(settled).isNotEqualTo(Lifecycle.State.RESUMED)
         }
     }
+
+    /**
+     * A second file opened while the editor is already up routes into the live window as a new
+     * tab, the way `singleTop` + new-intent delivery promise. What only this level can pin is the
+     * window half of that contract: the activity is neither finished nor recreated — RESUMED
+     * throughout — and the second request's token is spent exactly like the first's. The tab
+     * strip itself and the second file's content have their own suite (EditorTabsRobolectricTest).
+     */
+    @Test
+    fun aSecondLiveTokenRoutesIntoTheSameWindowWithoutRecreatingIt() {
+        val token = EditorRequests.put(request("first"))
+        val second = EditorRequests.put(request("second"))
+        ActivityScenario.launch<TextEditorActivity>(launchIntent(token)).use { scenario ->
+            assertThat(scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+            scenario.onActivity { activity -> activity.onEditorToken(second) }
+            // The routing must not have cost the window anything: the same instance, still up.
+            assertThat(scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+        }
+        assertThat(EditorRequests.take(second)).isNull()
+    }
 }

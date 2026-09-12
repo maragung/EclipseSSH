@@ -6,6 +6,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import dagger.hilt.android.AndroidEntryPoint
@@ -30,12 +31,26 @@ import kotlinx.coroutines.launch
  * [EditorRequest] carries a live [dev.eclipse.ssh.data.fs.FileSystemProvider] — an object reference,
  * not something an intent can parcel. Both activities live in one process, so the handoff is a
  * process-wide token exchange; the token is consumed on arrival, so a stale intent (a recents
- * screen re-delivery, a crash and relaunch) finds nothing to reopen and the activity finishes.
+ * screen re-delivery, a crash and relaunch) finds nothing to reopen. At launch that finishes the
+ * window; while files are already open it is simply ignored, and the editor keeps showing them.
  */
 @AndroidEntryPoint
 class TextEditorActivity : ComponentActivity() {
 
     @Inject lateinit var settingsRepository: SettingsRepository
+
+    // A snapshot list rather than a plain one: later opens arrive while the composition is already
+    // showing earlier files, and an append nobody observes is an append the UI never sees.
+    private val openRequests = mutableStateListOf<EditorRequest>()
+
+    /**
+     * Opens whatever a request token still holds. A null or already-spent token is silently ignored
+     * rather than finishing the window — the files already open are still worth editing even when
+     * the intent that arrived is stale.
+     */
+    internal fun onEditorToken(token: String?) {
+        EditorRequests.take(token)?.let { openRequests += it }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,6 +63,14 @@ class TextEditorActivity : ComponentActivity() {
         if (request == null) {
             finish()
             return
+        }
+        openRequests += request
+        // The manifest gives this activity launchMode="singleTop", so opening a second file while
+        // the editor is on screen routes here as onNewIntent instead of stacking a second editor
+        // window — the user sees the new file as a tab of the editor they are already in. The
+        // listener is registered before setContent so no delivery can slip in ahead of it.
+        addOnNewIntentListener { incoming ->
+            onEditorToken(incoming.getStringExtra(EXTRA_REQUEST_TOKEN))
         }
         setContent {
             // The app's own dark-theme setting rather than the system's, so the editor does not flip
@@ -70,7 +93,7 @@ class TextEditorActivity : ComponentActivity() {
             val scope = rememberCoroutineScope()
             EclipseTheme(darkTheme = darkTheme) {
                 TextEditorScreen(
-                    request,
+                    openRequests,
                     prefs = prefs,
                     onPrefsChange = { updated ->
                         scope.launch {
