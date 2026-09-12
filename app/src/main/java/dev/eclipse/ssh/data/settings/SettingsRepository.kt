@@ -212,6 +212,15 @@ class SettingsRepository(private val context: Context) {
     suspend fun setLocalRootUri(uri: String?) = editPrefs {
         if (uri == null) it.remove(Keys.localRootUri) else it[Keys.localRootUri] = uri
     }
+
+    /**
+     * Persist the editor's preferences blob, whole. The editor screen is the only writer: it
+     * re-encodes every field on every change (see [EditorPrefsCodec.encode]), so this never
+     * merges partial state — a write is either the new complete blob or the old one.
+     */
+    suspend fun setEditorPrefsJson(json: String) = editPrefs {
+        it[Keys.editorPrefsJson] = json
+    }
     /**
      * The terminal's text size in sp, clamped to what the app is willing to draw.
      *

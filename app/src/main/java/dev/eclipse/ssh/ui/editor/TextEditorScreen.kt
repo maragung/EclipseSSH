@@ -1,7 +1,10 @@
 package dev.eclipse.ssh.ui.editor
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,9 +15,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -23,6 +29,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.Redo
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.AlertDialog
@@ -33,19 +40,28 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -57,17 +73,17 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.eclipse.ssh.data.fs.FsEntry
-import dev.eclipse.ssh.data.fs.FsModificationConflictException
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.ui.editor.highlight.SyntaxColors
+import dev.eclipse.ssh.ui.editor.highlight.syntaxTransformationFor
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
-import java.nio.ByteBuffer
-import java.nio.charset.CharacterCodingException
 import java.util.Locale
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 
 /**
  * A request to open the full-screen text editor on one file, local or remote.
@@ -83,158 +99,211 @@ data class EditorRequest(
 )
 
 /** The most a file may weigh to be opened here; larger ones are refused with a message, not opened. */
-private const val MAX_EDIT_BYTES = 512 * 1024
+internal const val MAX_EDIT_BYTES = 512 * 1024
 
-/** How close together two keystrokes must land to count as one undo step. */
-private const val UNDO_COALESCE_MS = 700L
-
-/** How many undo steps are kept before the oldest starts falling off the front. */
-private const val MAX_UNDO_STEPS = 200
+/**
+ * The auto-save delays the options sheet offers, as (millis, label) pairs, fastest first. The
+ * codec accepts any delay in its clamp range — a hand-edited blob can carry one this list has
+ * never heard of — so the sheet treats the list as its *choices*, not as the truth: a value
+ * outside it still works, it just displays as "Custom" and either arrow steps from the 2 s
+ * default rather than guessing which side of the list it fell off.
+ */
+private val AUTO_SAVE_DELAY_CHOICES = listOf(
+    500L to "0.5 s",
+    1_000L to "1 s",
+    2_000L to "2 s",
+    5_000L to "5 s",
+    10_000L to "10 s",
+)
 
 @Composable
-fun TextEditorScreen(request: EditorRequest, onClose: () -> Unit) {
+fun TextEditorScreen(
+    requests: SnapshotStateList<EditorRequest>,
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
+    onClose: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
 
-    var loadState by remember { mutableStateOf<EditorLoad>(EditorLoad.Loading) }
-    var savedText by remember { mutableStateOf("") }
-    var loadedModified by remember { mutableStateOf<Long?>(null) }
-    var textValue by remember { mutableStateOf(TextFieldValue("")) }
-    val history = remember { EditorHistory() }
+    // The tabs themselves. Remembered rather than activity-owned because they are screen-shaped
+    // state — undo histories, scroll positions, load outcomes — not requests, which is all the
+    // activity knows about.
+    val tabs = remember { mutableStateListOf<EditorTabState>() }
+    var selectedTabId by remember { mutableStateOf<Long?>(null) }
+    var nextTabId by remember { mutableStateOf(0L) }
+    var consumedRequests by remember { mutableStateOf(0) }
 
-    // Find & replace. Owned here so both the toolbar toggle and the bar itself speak to one state.
+    // Find & replace. Owned here so both the toolbar toggle and the bar itself speak to one state,
+    // and shared across tabs: switching files keeps the query, which is what searching "the same
+    // thing" in a second file means.
     var findOpen by remember { mutableStateOf(false) }
     var findQuery by remember { mutableStateOf("") }
     var findReplacement by remember { mutableStateOf("") }
     var findCaseSensitive by remember { mutableStateOf(false) }
     var matchIndex by remember { mutableStateOf(0) }
 
-    // Dialogs, save, and the one outstanding "bring this offset into view" request.
-    var goToLineOpen by remember { mutableStateOf(false) }
-    var saveError by remember { mutableStateOf<String?>(null) }
-    var conflictOpen by remember { mutableStateOf(false) }
-    var discardOpen by remember { mutableStateOf(false) }
-    var saving by remember { mutableStateOf(false) }
-    var scrollRequest by remember { mutableStateOf<Int?>(null) }
+    // The tab whose discard-changes dialog is up, if any. A single slot rather than a per-tab
+    // flag: only one dialog can be on screen, and while one is, auto-save stands down everywhere.
+    var pendingCloseTabId by remember { mutableStateOf<Long?>(null) }
 
-    val dirty = textValue.text != savedText
+    val active = tabs.firstOrNull { it.id == selectedTabId }
 
-    /** The one way the text changes: through the history, so undo sees every edit. */
-    fun applyEdit(new: TextFieldValue) {
-        history.record(textValue, new)
-        textValue = new
+    /** Opens a file — in the tab it is already open in when it is, and in a new one when it is not. */
+    fun openTab(request: EditorRequest) {
+        val requestKey = "${request.provider.providerId}:${request.entry.path}"
+        tabs.firstOrNull { it.key == requestKey }?.let { existing ->
+            selectedTabId = existing.id
+            return
+        }
+        val tab = EditorTabState(nextTabId++, request)
+        tabs += tab
+        selectedTabId = tab.id
+        tab.startLoad(scope)
     }
 
-    /** Undo and redo land here instead — they *are* the history moving, not new edits in it. */
-    fun applySnapshot(snapshot: TextFieldValue) {
-        textValue = snapshot
-    }
-
-    fun save(overwrite: Boolean = false) {
-        val bytes = textValue.text.encodeToByteArray()
-        saving = true
-        saveError = null
-        scope.launch {
-            try {
-                request.provider.write(
-                    request.entry.path,
-                    bytes,
-                    // The guard is armed with the modification time seen at load, and disarmed only
-                    // when the user has just answered "overwrite" to the conflict it raised.
-                    loadedModified.takeIf { !overwrite },
-                )
-                savedText = textValue.text
-                // Re-stat so the *next* save is guarded by the time this one produced, not the one
-                // from before it — otherwise saving twice in a row would raise its own conflict.
-                loadedModified = runCatching {
-                    request.provider.stat(request.entry.path)?.modifiedEpochMillis
-                }.getOrNull() ?: System.currentTimeMillis()
-            } catch (conflict: FsModificationConflictException) {
-                conflictOpen = true
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                saveError = error.message ?: "The file could not be saved"
-            } finally {
-                saving = false
-            }
+    fun closeTab(tab: EditorTabState) {
+        val index = tabs.indexOf(tab)
+        if (index < 0) return
+        tabs.removeAt(index)
+        pendingCloseTabId = null
+        if (tabs.isEmpty()) {
+            onClose()
+            return
+        }
+        // Closing the selected tab hands the selection to the neighbour the closed one occupied the
+        // place of — the file that was visually next in line, or the new last one when it was at the end.
+        if (selectedTabId == tab.id) {
+            selectedTabId = tabs[index.coerceAtMost(tabs.lastIndex)].id
         }
     }
 
-    fun reloadFromDisk() {
-        scope.launch {
-            try {
-                val fresh = request.provider.read(request.entry.path)
-                val decoded = decodeStrictUtf8(fresh) ?: return@launch
-                savedText = decoded
-                loadedModified = request.provider.stat(request.entry.path)?.modifiedEpochMillis
-                    ?: System.currentTimeMillis()
-                textValue = TextFieldValue(decoded, TextRange(0))
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                saveError = error.message ?: "The file could not be reloaded"
-            }
+    /** A close is a question while the tab is dirty — the discard dialog answers it — a command otherwise. */
+    fun requestClose(tab: EditorTabState) {
+        if (tab.dirty) pendingCloseTabId = tab.id else closeTab(tab)
+    }
+
+    // ---- Opens ----
+    // The activity appends to `requests` as new intents arrive; consuming from the front opens each
+    // request exactly once, in order, without reopening anything on recomposition. Keyed on size so
+    // a burst of opens lands as one pass, and each append restarts it for the next.
+    LaunchedEffect(requests.size) {
+        while (consumedRequests < requests.size) {
+            openTab(requests[consumedRequests++])
         }
     }
 
-    fun selectMatch(range: TextRange) {
-        textValue = textValue.copy(selection = range)
-        scrollRequest = range.start
-    }
-
-    // ---- Load ----
-    LaunchedEffect(request.entry.path, request.provider.providerId) {
-        if (request.isNewFile) {
-            savedText = ""
-            loadedModified = request.entry.modifiedEpochMillis
-            textValue = TextFieldValue("")
-            loadState = EditorLoad.Ready
-            return@LaunchedEffect
-        }
-        loadState = EditorLoad.Loading
-        try {
-            val entry = request.provider.stat(request.entry.path) ?: request.entry
-            val size = entry.size
-            if (size != null && size > MAX_EDIT_BYTES) {
-                loadState = EditorLoad.TooLarge(size)
-                return@LaunchedEffect
-            }
-            val bytes = request.provider.read(request.entry.path)
-            if (bytes.size > MAX_EDIT_BYTES) {
-                loadState = EditorLoad.TooLarge(bytes.size.toLong())
-                return@LaunchedEffect
-            }
-            // Strict, because a permissive decode would open a binary file as mojibake and then
-            // save that mojibake back over the original — a silent corruption dressed as a feature.
-            val decoded = decodeStrictUtf8(bytes)
-            if (decoded == null) {
-                loadState = EditorLoad.Failed(
-                    "This file is not valid UTF-8 text. The editor cannot show it without damaging " +
-                        "it on save; it can still be downloaded, renamed or deleted.",
-                )
-                return@LaunchedEffect
-            }
-            savedText = decoded
-            loadedModified = entry.modifiedEpochMillis
-            textValue = TextFieldValue(decoded, TextRange(0))
-            loadState = EditorLoad.Ready
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            loadState = EditorLoad.Failed(error.message ?: "The file could not be read")
+    // ---- Auto-save ----
+    // One AutoSaveEffect per tab, keyed by the tab's id so the effect follows the tab through any
+    // reshuffle of the list, and composed for *every* tab, not just the active one: a background
+    // tab keeps auto-saving too, deliberately — a file the user edited and switched away from is
+    // still their work, and "switch tabs" should not mean "pause saving it". The single dialog slot
+    // blocks all of them at once, since a question on screen is a question the whole editor stops
+    // to hear. The effect's own comment carries the quiet-period reasoning.
+    tabs.forEach { tab ->
+        key(tab.id) {
+            AutoSaveEffect(tab, scope, prefs, blocked = pendingCloseTabId != null)
         }
     }
 
-    // Back: close the find panel first, then guard unsaved work, then leave.
+    // Back: close the find panel first, then guard the active tab's unsaved work, then close that
+    // tab — and when the last tab closes, closeTab falls through to onClose, so back out of the
+    // final tab leaves the editor itself, as back always did.
     BackHandler(enabled = true) {
         when {
             findOpen -> findOpen = false
-            dirty -> discardOpen = true
-            else -> onClose()
+            active != null && active.dirty -> pendingCloseTabId = active.id
+            active != null -> closeTab(active)
         }
     }
 
-    when (val state = loadState) {
+    active?.let { tab ->
+        SingleFileEditor(
+            tab = tab,
+            scope = scope,
+            prefs = prefs,
+            onPrefsChange = onPrefsChange,
+            findOpen = findOpen,
+            findQuery = findQuery,
+            findReplacement = findReplacement,
+            findCaseSensitive = findCaseSensitive,
+            matchIndex = matchIndex,
+            onToggleFind = {
+                findOpen = !findOpen
+                if (!findOpen) matchIndex = 0
+            },
+            onQuery = { findQuery = it; matchIndex = 0 },
+            onReplacement = { findReplacement = it },
+            onCaseToggle = { findCaseSensitive = !findCaseSensitive; matchIndex = 0 },
+            onMatchIndex = { matchIndex = it },
+            onRequestClose = { requestClose(tab) },
+            tabStrip = {
+                // The strip exists only once there is a choice to make: one file needs no tabs.
+                if (tabs.size > 1) {
+                    EditorTabStrip(
+                        tabs = tabs,
+                        selectedTabId = selectedTabId,
+                        onSelect = { selectedTabId = it.id },
+                        onCloseTab = { requestClose(it) },
+                    )
+                }
+            },
+        )
+    }
+
+    // The discard dialog, hoisted out of the tabs: only one such question can be on screen at a
+    // time, and it is the coordinator that knows which tab a "yes" is about. `blocked` above keys
+    // every auto-save on this same slot, so no tab saves its way out from under the question.
+    pendingCloseTabId?.let { pendingId ->
+        tabs.firstOrNull { it.id == pendingId }?.let { tab ->
+            AlertDialog(
+                onDismissRequest = { pendingCloseTabId = null },
+                title = { Text("Unsaved changes") },
+                text = { Text("Leave the editor and discard what you typed in ${tab.request.entry.name}?") },
+                confirmButton = {
+                    Button(onClick = { closeTab(tab) }) { Text("Discard") }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = {
+                            // Save does not close — the same semantics the single-file editor had:
+                            // it saves and leaves the user in the file, and the close has to be
+                            // asked for again if they still want it.
+                            pendingCloseTabId = null
+                            tab.save(scope, false)
+                        }) { Text("Save") }
+                        TextButton(onClick = { pendingCloseTabId = null }) { Text("Keep editing") }
+                    }
+                },
+            )
+        }
+    }
+}
+
+/**
+ * One tab's face: the load outcome, the dialogs that belong to this file (go-to-line, the save
+ * conflict), and — once loaded — the body. Everything file-shaped is read from [tab]; everything
+ * the user shares across tabs (find & replace, the options sheet's prefs) arrives as parameters.
+ */
+@Composable
+private fun SingleFileEditor(
+    tab: EditorTabState,
+    scope: CoroutineScope,
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
+    findOpen: Boolean,
+    findQuery: String,
+    findReplacement: String,
+    findCaseSensitive: Boolean,
+    matchIndex: Int,
+    onToggleFind: () -> Unit,
+    onQuery: (String) -> Unit,
+    onReplacement: (String) -> Unit,
+    onCaseToggle: () -> Unit,
+    onMatchIndex: (Int) -> Unit,
+    onRequestClose: () -> Unit,
+    tabStrip: @Composable () -> Unit,
+) {
+    when (val state = tab.loadState) {
         is EditorLoad.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator()
         }
@@ -243,71 +312,70 @@ fun TextEditorScreen(request: EditorRequest, onClose: () -> Unit) {
             Modifier.fillMaxSize().padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
         ) {
-            Text(request.entry.name, style = MaterialTheme.typography.titleMedium)
+            Text(tab.request.entry.name, style = MaterialTheme.typography.titleMedium)
             Text(state.message, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = onClose) { Text("Close") }
+            TextButton(onClick = onRequestClose) { Text("Close") }
         }
 
         is EditorLoad.TooLarge -> Column(
             Modifier.fillMaxSize().padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
         ) {
-            Text(request.entry.name, style = MaterialTheme.typography.titleMedium)
+            Text(tab.request.entry.name, style = MaterialTheme.typography.titleMedium)
             Text(
                 "This file is ${"%.1f".format(state.bytes / (1024.0 * 1024.0))} MB. The editor opens " +
                     "files up to ${MAX_EDIT_BYTES / (1024 * 1024)} MB so the device does not run out " +
                     "of memory holding it; it can still be downloaded, renamed or deleted.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            TextButton(onClick = onClose) { Text("Close") }
+            TextButton(onClick = onRequestClose) { Text("Close") }
         }
 
         is EditorLoad.Ready -> EditorBody(
-            request = request,
-            textValue = textValue,
-            onTextChange = ::applyEdit,
-            onSnapshot = ::applySnapshot,
-            history = history,
-            dirty = dirty,
-            saving = saving,
-            saveError = saveError,
-            onSave = { save(false) },
-            onClose = { if (dirty) discardOpen = true else onClose() },
-            onToggleFind = {
-                findOpen = !findOpen
-                if (!findOpen) matchIndex = 0
-            },
+            request = tab.request,
+            textValue = tab.textValue,
+            onTextChange = tab::applyEdit,
+            onSnapshot = tab::applySnapshot,
+            history = tab.history,
+            dirty = tab.dirty,
+            saving = tab.saving,
+            saveError = tab.saveError,
+            onSave = { tab.save(scope, false) },
+            onClose = onRequestClose,
+            prefs = prefs,
+            onPrefsChange = onPrefsChange,
+            onToggleFind = onToggleFind,
             findOpen = findOpen,
             findQuery = findQuery,
             findReplacement = findReplacement,
             findCaseSensitive = findCaseSensitive,
             matchIndex = matchIndex,
-            onQuery = { findQuery = it; matchIndex = 0 },
-            onReplacement = { findReplacement = it },
-            onCaseToggle = { findCaseSensitive = !findCaseSensitive; matchIndex = 0 },
+            onQuery = onQuery,
+            onReplacement = onReplacement,
+            onCaseToggle = onCaseToggle,
             onPrevious = {
-                val matches = findAllMatches(textValue.text, findQuery, findCaseSensitive)
+                val matches = findAllMatches(tab.textValue.text, findQuery, findCaseSensitive)
                 if (matches.isNotEmpty()) {
                     val next = (((matchIndex - 1) % matches.size) + matches.size) % matches.size
-                    matchIndex = next
-                    selectMatch(matches[next])
+                    onMatchIndex(next)
+                    tab.selectMatch(matches[next])
                 }
             },
             onNext = {
-                val matches = findAllMatches(textValue.text, findQuery, findCaseSensitive)
+                val matches = findAllMatches(tab.textValue.text, findQuery, findCaseSensitive)
                 if (matches.isNotEmpty()) {
                     val next = (matchIndex + 1) % matches.size
-                    matchIndex = next
-                    selectMatch(matches[next])
+                    onMatchIndex(next)
+                    tab.selectMatch(matches[next])
                 }
             },
             onReplace = {
-                val matches = findAllMatches(textValue.text, findQuery, findCaseSensitive)
+                val matches = findAllMatches(tab.textValue.text, findQuery, findCaseSensitive)
                 if (matches.isNotEmpty()) {
                     val current = matches[matchIndex.coerceIn(0, matches.size - 1)]
-                    applyEdit(
-                        textValue.copy(
-                            text = textValue.text.replaceRange(current.start, current.end, findReplacement),
+                    tab.applyEdit(
+                        tab.textValue.copy(
+                            text = tab.textValue.text.replaceRange(current.start, current.end, findReplacement),
                             selection = TextRange(current.start + findReplacement.length),
                         ),
                     )
@@ -315,94 +383,181 @@ fun TextEditorScreen(request: EditorRequest, onClose: () -> Unit) {
             },
             onReplaceAll = {
                 if (findQuery.isNotEmpty()) {
-                    applyEdit(
-                        textValue.copy(
-                            text = replaceAllMatches(textValue.text, findQuery, findReplacement, findCaseSensitive),
+                    tab.applyEdit(
+                        tab.textValue.copy(
+                            text = replaceAllMatches(tab.textValue.text, findQuery, findReplacement, findCaseSensitive),
                             selection = TextRange(0),
                         ),
                     )
                 }
             },
-            scrollRequest = scrollRequest,
-            onScrollHandled = { scrollRequest = null },
-            onGoToLine = { goToLineOpen = true },
+            scrollRequest = tab.scrollRequest,
+            onScrollHandled = { tab.scrollRequest = null },
+            onGoToLine = { tab.goToLineOpen = true },
+            verticalScroll = tab.verticalScroll,
+            horizontalScroll = tab.horizontalScroll,
+            layout = tab.layout,
+            onLayout = { tab.layout = it },
+            tabStrip = tabStrip,
         )
     }
 
-    if (goToLineOpen) {
+    if (tab.goToLineOpen) {
         GoToLineDialog(
-            lineCount = textValue.text.count { it == '\n' } + 1,
-            onDismiss = { goToLineOpen = false },
+            lineCount = tab.textValue.text.count { it == '\n' } + 1,
+            onDismiss = { tab.goToLineOpen = false },
             onGo = { line ->
-                goToLineOpen = false
-                val offset = lineStartOffset(textValue.text, line)
-                textValue = textValue.copy(selection = TextRange(offset))
-                scrollRequest = offset
+                tab.goToLineOpen = false
+                val offset = lineStartOffset(tab.textValue.text, line)
+                tab.textValue = tab.textValue.copy(selection = TextRange(offset))
+                tab.scrollRequest = offset
             },
         )
     }
 
-    if (conflictOpen) {
+    // Per-tab, unlike the discard dialog: a save conflict is a fact about one file, and two files
+    // could each have one waiting.
+    if (tab.conflictOpen) {
         AlertDialog(
-            onDismissRequest = { conflictOpen = false },
+            onDismissRequest = { tab.conflictOpen = false },
             title = { Text("Changed since it was opened") },
             text = {
                 Text(
-                    "${request.entry.name} was modified after the editor opened it. Saving now would " +
+                    "${tab.request.entry.name} was modified after the editor opened it. Saving now would " +
                         "overwrite those changes; reloading would discard what you typed.",
                 )
             },
             confirmButton = {
                 Button(onClick = {
-                    conflictOpen = false
-                    save(overwrite = true)
+                    tab.conflictOpen = false
+                    tab.save(scope, overwrite = true)
                 }) { Text("Overwrite") }
             },
             dismissButton = {
                 TextButton(onClick = {
-                    conflictOpen = false
-                    reloadFromDisk()
+                    tab.conflictOpen = false
+                    tab.reloadFromDisk(scope)
                 }) { Text("Reload") }
             },
         )
     }
-
-    if (discardOpen) {
-        AlertDialog(
-            onDismissRequest = { discardOpen = false },
-            title = { Text("Unsaved changes") },
-            text = { Text("Leave the editor and discard what you typed in ${request.entry.name}?") },
-            confirmButton = {
-                Button(onClick = {
-                    discardOpen = false
-                    onClose()
-                }) { Text("Discard") }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(onClick = {
-                        discardOpen = false
-                        save(false)
-                    }) { Text("Save") }
-                    TextButton(onClick = { discardOpen = false }) { Text("Keep editing") }
-                }
-            },
-        )
-    }
-}
-
-/** The editor's load outcome. Only [Ready] shows the body; every other state explains itself. */
-private sealed interface EditorLoad {
-    data object Loading : EditorLoad
-    data object Ready : EditorLoad
-    data class Failed(val message: String) : EditorLoad
-    data class TooLarge(val bytes: Long) : EditorLoad
 }
 
 /**
- * The editable body: toolbar, line-number gutter, the field, a status line, and the find & replace
- * strip. Everything mutates through the callbacks the parent owns, so undo, save and dirty tracking
- * live in exactly one place.
+ * One tab's auto-save heartbeat.
+ *
+ * Fires only on quiet: the effect is keyed on the text itself, so every keystroke tears the
+ * countdown down and starts a fresh one — a save mid-burst would be a network write per
+ * sentence, and on SFTP that is real round-trips. `dirty` is a key too, so a save landing
+ * (auto or manual, which moves savedText) re-arms rather than re-fires; `saving` keeps the
+ * heartbeat from racing its own upload, and the conflict dialog and the coordinator's close
+ * question keep it from answering, behind the user's back, a question ("overwrite?", "discard
+ * what you typed?") that is still on screen. Reaching the far side of the delay means none of
+ * those keys moved — the text stayed put, no dialog opened, no save started — which is exactly
+ * "still dirty after the configured quiet". The save itself launches into [scope], the screen's
+ * own, so a key moving mid-save (a keystroke, a tab switch) cancels only the countdown, never
+ * the write it already started.
+ */
+@Composable
+private fun AutoSaveEffect(
+    tab: EditorTabState,
+    scope: CoroutineScope,
+    prefs: EditorPrefs,
+    blocked: Boolean,
+) {
+    LaunchedEffect(
+        tab.textValue.text,
+        tab.dirty,
+        prefs.autoSaveEnabled,
+        prefs.autoSaveDelayMillis,
+        tab.saving,
+        tab.conflictOpen,
+        blocked,
+    ) {
+        if (!prefs.autoSaveEnabled || !tab.dirty || tab.saving || tab.conflictOpen || blocked) {
+            return@LaunchedEffect
+        }
+        delay(prefs.autoSaveDelayMillis)
+        if (tab.dirty) tab.save(scope, false)
+    }
+}
+
+/**
+ * The strip of open tabs. Scrolled rather than squeezed: file names are the one label the editor
+ * cannot abbreviate for the user, so the strip keeps them whole and gives up width instead.
+ */
+@Composable
+private fun EditorTabStrip(
+    tabs: List<EditorTabState>,
+    selectedTabId: Long?,
+    onSelect: (EditorTabState) -> Unit,
+    onCloseTab: (EditorTabState) -> Unit,
+) {
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+        tabs.forEach { tab ->
+            Surface(
+                modifier = Modifier
+                    .padding(top = 4.dp, start = 4.dp)
+                    .clickable(onClick = { onSelect(tab) }),
+                shape = MaterialTheme.shapes.small,
+                color = if (tab.id == selectedTabId) MaterialTheme.colorScheme.secondaryContainer
+                else MaterialTheme.colorScheme.surface,
+                tonalElevation = 2.dp,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        tab.request.entry.name,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier
+                            .padding(start = 10.dp)
+                            // The label reserves a width of its own so the close button cannot eat
+                            // the chip's tap. Material expands any interactive component's *touch
+                            // target* to 48dp whatever its visual size, so the close button's 40dp
+                            // state layer reaches 4dp past its own edges on each side — far enough
+                            // left, on a chip whose name is short, to cover the middle of the chip.
+                            // Measured on this strip: with a label of L dp the close target starts
+                            // at L+6 and the chip's centre — the point a tap on the tab lands on —
+                            // sits at (L+50)/2, so any name narrower than 38dp sent a switch tap
+                            // into the close button and closed the tab instead. "notes.txt" is
+                            // short enough to have done exactly that. The terminal strip learned
+                            // this first (TerminalTabStrip in MainActivity); a 64dp minimum label
+                            // puts the centre 13dp clear of the close target, and a minimum is a
+                            // layout constraint, so no name and no font can shrink it back under.
+                            // The max and the ellipsis are the other end of the same problem: an
+                            // unbounded name made a single chip wider than the strip.
+                            .widthIn(min = 64.dp, max = 140.dp),
+                    )
+                    if (tab.dirty) {
+                        // The same dot-language the toolbar subtitle already speaks: a dot means
+                        // "this file has words in it that are not on disk yet".
+                        Box(
+                            Modifier
+                                .padding(horizontal = 6.dp)
+                                .size(6.dp)
+                                .background(MaterialTheme.colorScheme.tertiary, CircleShape),
+                        )
+                    }
+                    IconButton(onClick = { onCloseTab(tab) }) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Close tab",
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The editable body: toolbar, the caller's tab strip, line-number gutter, the field, a status
+ * line, and the find & replace strip. Everything mutates through the callbacks the parent owns,
+ * so undo, save and dirty tracking live in exactly one place. The scroll states, the text
+ * layout, and the tab strip arrive as parameters — they are the tab's, not the body's, so
+ * switching tabs swaps them in and out with the rest of the file instead of being reset.
  */
 @Composable
 private fun EditorBody(
@@ -416,6 +571,8 @@ private fun EditorBody(
     saveError: String?,
     onSave: () -> Unit,
     onClose: () -> Unit,
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
     onToggleFind: () -> Unit,
     findOpen: Boolean,
     findQuery: String,
@@ -432,10 +589,16 @@ private fun EditorBody(
     scrollRequest: Int?,
     onScrollHandled: () -> Unit,
     onGoToLine: () -> Unit,
+    verticalScroll: ScrollState,
+    horizontalScroll: ScrollState,
+    layout: TextLayoutResult?,
+    onLayout: (TextLayoutResult) -> Unit,
+    tabStrip: @Composable () -> Unit,
 ) {
-    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-    val verticalScroll = rememberScrollState()
     val density = LocalDensity.current
+    // The options sheet's open flag lives here, next to the gear that opens it. Owned here rather
+    // than in the parent because nothing above EditorBody needs to know it is on screen.
+    var optionsOpen by remember { mutableStateOf(false) }
 
     val textStyle = TextStyle(
         fontFamily = TerminalMonoFontFamily,
@@ -453,6 +616,15 @@ private fun EditorBody(
     // Read here in composition and handed to the transformation, which itself cannot ask the theme.
     val otherMatchColor = MaterialTheme.colorScheme.secondaryContainer
     val currentMatchColor = MaterialTheme.colorScheme.primaryContainer
+    // Syntax coloring, resolved once per file: the palette follows the theme, the language follows
+    // the name, and neither can change without a recomposition that rebuilds this anyway. The
+    // field's own text color stays SyntaxColors.plain (see fromScheme) so uncolored runs and the
+    // status bar keep agreeing; find-matches swap in over it because a match highlight must win
+    // over grammar coloring while the bar is open.
+    val syntaxTransformation = syntaxTransformationFor(
+        request.entry.name,
+        SyntaxColors.fromScheme(MaterialTheme.colorScheme),
+    )
 
     // Bring the requested offset into view — from go-to-line or from stepping through matches.
     LaunchedEffect(scrollRequest) {
@@ -529,11 +701,19 @@ private fun EditorBody(
                 IconButton(onClick = onToggleFind) {
                     Icon(Icons.Filled.Search, contentDescription = "Find and replace")
                 }
+                IconButton(onClick = { optionsOpen = true }) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Editor options")
+                }
                 IconButton(onClick = onSave, enabled = dirty && !saving) {
                     Icon(Icons.Filled.Done, contentDescription = "Save")
                 }
             }
         }
+
+        // The caller's slot: the tab strip when there is more than one file, nothing when there
+        // is not. Directly below the toolbar Surface, in the same tonal band, so the strip reads
+        // as part of the header rather than as content that drifted upward.
+        tabStrip()
 
         saveError?.let { message ->
             Surface(color = MaterialTheme.colorScheme.errorContainer) {
@@ -547,23 +727,57 @@ private fun EditorBody(
         }
 
         // One scroll for both columns: the row scrolls, so the gutter and the field — both measuring
-        // their full content height — move together by construction, not by synchronization.
+        // their full content height — move together by construction, not by synchronization. That
+        // holds with wrap off too: an unwrapped line is simply one very tall-less visual line, so
+        // the gutter's per-logical-line heights (which come from the same layout either way) still
+        // match the field's, one visual line per logical line.
         Row(Modifier.weight(1f).fillMaxWidth().verticalScroll(verticalScroll)) {
-            LineNumberGutter(text = textValue.text, layout = layout, style = gutterStyle)
+            if (prefs.showLineNumbers) {
+                LineNumberGutter(text = textValue.text, layout = layout, style = gutterStyle)
+            }
             BasicTextField(
                 value = textValue,
                 onValueChange = onTextChange,
-                onTextLayout = { layout = it },
+                onTextLayout = onLayout,
                 textStyle = textStyle,
                 cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                 visualTransformation = if (findOpen && findQuery.isNotEmpty()) {
                     MatchHighlightTransformation(findQuery, findCaseSensitive, matchIndex, otherMatchColor, currentMatchColor)
                 } else {
-                    VisualTransformation.None
+                    syntaxTransformation
                 },
                 modifier = Modifier
                     .weight(1f)
-                    .padding(start = 8.dp, top = 8.dp, bottom = 32.dp, end = 8.dp),
+                    // Wrap off means the field's width must stop being the fold line. A horizontal
+                    // scroll hands the text unbounded width to lay out in, so long lines extend
+                    // right and the user scrolls to them instead of watching them fold; the field's
+                    // own footprint stays the weighted width either way, so the gutter keeps its
+                    // place at the left edge while the text slides under it. The scroll state is
+                    // the tab's and exists either way, so flipping word wrap never resurrects a
+                    // stale horizontal position: wrap back on discards it, wrap off starts at the
+                    // left edge.
+                    .then(if (prefs.wordWrap) Modifier else Modifier.horizontalScroll(horizontalScroll))
+                    .padding(start = 8.dp, top = 8.dp, bottom = 32.dp, end = 8.dp)
+                    // Preview, not plain onKeyEvent: the preview phase runs outer-modifier-first,
+                    // before the field's own machinery can consume the key, which is the only
+                    // reliable place to intercept Tab on a focused text field. Returning true ends
+                    // the dispatch — the field never sees the key, so it cannot re-route it.
+                    .onPreviewKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyDown && event.key == Key.Tab) {
+                            val insertion = tabInsertion(prefs)
+                            val start = textValue.selection.min
+                            val end = textValue.selection.max
+                            onTextChange(
+                                textValue.copy(
+                                    text = textValue.text.replaceRange(start, end, insertion),
+                                    selection = TextRange(start + insertion.length),
+                                ),
+                            )
+                            true
+                        } else {
+                            false
+                        }
+                    },
             )
         }
 
@@ -594,6 +808,14 @@ private fun EditorBody(
                 onClose = onToggleFind,
             )
         }
+    }
+
+    if (optionsOpen) {
+        EditorOptionsDialog(
+            prefs = prefs,
+            onPrefsChange = onPrefsChange,
+            onDismiss = { optionsOpen = false },
+        )
     }
 }
 
@@ -747,57 +969,126 @@ private fun GoToLineDialog(lineCount: Int, onDismiss: () -> Unit, onGo: (Int) ->
 }
 
 /**
- * Stepwise undo over snapshots of the field, coalescing typing bursts into single steps.
+ * The editor's options sheet: word wrap, line numbers, tab size, spaces-vs-tabs, and auto-save.
  *
- * Only *text* changes are recorded: the selection moving on its own (tapping elsewhere, stepping
- * through find matches) is not an edit, and polluting the stack with it would make one undo press
- * do nothing but move the cursor back.
+ * A window-level [AlertDialog] rather than a bottom sheet because every change applies the moment
+ * it is made — [onPrefsChange] persists each toggle on its own, so there is no "OK" to press and
+ * nothing to cancel: the dismiss button, the back gesture, and tapping outside all mean close.
+ * That immediacy is also why [prefs] is read straight into every row: the sheet never holds a
+ * draft copy that could drift from what was already saved.
+ *
+ * Tab size and delay step through −/+ buttons rather than free entry, which makes an out-of-range
+ * value unrepresentable from here — no validation to write, no error to show.
  */
-private class EditorHistory {
-    private val past = ArrayDeque<TextFieldValue>()
-    private val future = ArrayDeque<TextFieldValue>()
-    private var lastEditAt = 0L
-
-    val canUndo: Boolean get() = past.isNotEmpty()
-    val canRedo: Boolean get() = future.isNotEmpty()
-
-    fun record(old: TextFieldValue, new: TextFieldValue) {
-        if (old.text == new.text) return
-        val now = System.currentTimeMillis()
-        // The first edit of a burst pushes the state it replaced; the rest of the burst changes
-        // nothing in the past, so one undo undoes the whole burst.
-        if (now - lastEditAt > UNDO_COALESCE_MS) {
-            past.addLast(old)
-            if (past.size > MAX_UNDO_STEPS) past.removeFirst()
-        }
-        future.clear()
-        lastEditAt = now
-    }
-
-    fun undo(current: TextFieldValue): TextFieldValue? {
-        val previous = past.removeLastOrNull() ?: return null
-        future.addLast(current)
-        lastEditAt = 0L
-        return previous
-    }
-
-    fun redo(current: TextFieldValue): TextFieldValue? {
-        val next = future.removeLastOrNull() ?: return null
-        past.addLast(current)
-        lastEditAt = 0L
-        return next
-    }
+@Composable
+private fun EditorOptionsDialog(
+    prefs: EditorPrefs,
+    onPrefsChange: (EditorPrefs) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Editor options") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                OptionsSwitchRow(
+                    label = "Word wrap",
+                    checked = prefs.wordWrap,
+                    onCheckedChange = { onPrefsChange(prefs.copy(wordWrap = it)) },
+                )
+                OptionsSwitchRow(
+                    label = "Line numbers",
+                    checked = prefs.showLineNumbers,
+                    onCheckedChange = { onPrefsChange(prefs.copy(showLineNumbers = it)) },
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Tab size", Modifier.weight(1f))
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(
+                                    tabSize = (prefs.tabSize - 1).coerceIn(
+                                        EditorPrefsCodec.TAB_SIZE_MIN,
+                                        EditorPrefsCodec.TAB_SIZE_MAX,
+                                    ),
+                                ),
+                            )
+                        },
+                        enabled = prefs.tabSize > EditorPrefsCodec.TAB_SIZE_MIN,
+                    ) { Text("−") }
+                    Text(
+                        "${prefs.tabSize}",
+                        Modifier.width(28.dp),
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(
+                                    tabSize = (prefs.tabSize + 1).coerceIn(
+                                        EditorPrefsCodec.TAB_SIZE_MIN,
+                                        EditorPrefsCodec.TAB_SIZE_MAX,
+                                    ),
+                                ),
+                            )
+                        },
+                        enabled = prefs.tabSize < EditorPrefsCodec.TAB_SIZE_MAX,
+                    ) { Text("+") }
+                }
+                OptionsSwitchRow(
+                    label = "Spaces instead of tabs",
+                    checked = prefs.spacesInsteadOfTabs,
+                    onCheckedChange = { onPrefsChange(prefs.copy(spacesInsteadOfTabs = it)) },
+                )
+                OptionsSwitchRow(
+                    label = "Auto-save",
+                    checked = prefs.autoSaveEnabled,
+                    onCheckedChange = { onPrefsChange(prefs.copy(autoSaveEnabled = it)) },
+                )
+                // Stepped through the offered delays only, so the codec's clamp range can never be
+                // reached from here — but the row still shows a custom delay honestly rather than
+                // rounding it to the nearest lie, and the first step lands on the 2 s default.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Auto-save delay", Modifier.weight(1f))
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(autoSaveDelayMillis = stepAutoSaveDelay(prefs.autoSaveDelayMillis, -1)),
+                            )
+                        },
+                        enabled = prefs.autoSaveDelayMillis > AUTO_SAVE_DELAY_CHOICES.first().first,
+                    ) { Text("−") }
+                    Text(
+                        autoSaveDelayLabel(prefs.autoSaveDelayMillis),
+                        Modifier.width(56.dp),
+                        textAlign = TextAlign.Center,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    TextButton(
+                        onClick = {
+                            onPrefsChange(
+                                prefs.copy(autoSaveDelayMillis = stepAutoSaveDelay(prefs.autoSaveDelayMillis, +1)),
+                            )
+                        },
+                        enabled = prefs.autoSaveDelayMillis < AUTO_SAVE_DELAY_CHOICES.last().first,
+                    ) { Text("+") }
+                }
+            }
+        },
+        // Not an "OK": nothing is pending, every row already persisted itself. The button exists
+        // because a dialog only dismissible by tapping outside it is a puzzle, not a sheet.
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
 }
 
-/** Decodes UTF-8 strictly, returning null when the bytes are not valid UTF-8. */
-private fun decodeStrictUtf8(bytes: ByteArray): String? = try {
-    Charsets.UTF_8.newDecoder()
-        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-        .decode(ByteBuffer.wrap(bytes))
-        .toString()
-} catch (error: CharacterCodingException) {
-    null
+/** One "label — switch" line of the options sheet; the sheet is little but rows of these. */
+@Composable
+private fun OptionsSwitchRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
 }
 
 private fun findAllMatches(text: String, query: String, caseSensitive: Boolean): List<TextRange> {
@@ -849,3 +1140,37 @@ private fun lineStartOffset(text: String, line: Int): Int {
     }
     return offset.coerceAtMost(text.length)
 }
+
+/**
+ * What the Tab key inserts at the cursor for [prefs]: one tab character, or [EditorPrefs.tabSize]
+ * spaces when the user asked for spaces. Extracted because it is the one piece of the Tab-key path
+ * worth pinning in a plain unit test — the key interception itself is Compose machinery that only
+ * a device (or a fragile instrumented test) can exercise.
+ */
+internal fun tabInsertion(prefs: EditorPrefs): String =
+    if (prefs.spacesInsteadOfTabs) " ".repeat(prefs.tabSize) else "\t"
+
+/**
+ * The options sheet's label for a delay: one of the offered choices' labels, or "Custom" for a
+ * value the codec accepted but the sheet has never offered — shown as what it is rather than
+ * rounded to the nearest offered lie, which would silently change the delay on the next save.
+ */
+internal fun autoSaveDelayLabel(millis: Long): String =
+    AUTO_SAVE_DELAY_CHOICES.firstOrNull { it.first == millis }?.second ?: "Custom"
+
+/**
+ * Steps [current] by [direction] (−1 or +1) through the offered delays, clamped to the list's ends.
+ *
+ * A delay from outside the list has no neighbour in it, so either arrow starts from the 2 s
+ * default — the same value a fresh install gets — rather than guessing which side of the list the
+ * value fell off. The clamping makes the buttons' enabled/disabled state and the values they can
+ * produce agree by construction.
+ */
+internal fun stepAutoSaveDelay(current: Long, direction: Int): Long {
+    val currentIndex = AUTO_SAVE_DELAY_CHOICES.indexOfFirst { it.first == current }
+    val from = if (currentIndex >= 0) currentIndex else DEFAULT_DELAY_CHOICE_INDEX
+    return AUTO_SAVE_DELAY_CHOICES[(from + direction).coerceIn(0, AUTO_SAVE_DELAY_CHOICES.lastIndex)].first
+}
+
+/** The index of the 2 s choice in [AUTO_SAVE_DELAY_CHOICES] — the list's default, and custom's anchor. */
+private val DEFAULT_DELAY_CHOICE_INDEX = AUTO_SAVE_DELAY_CHOICES.indexOfFirst { it.first == 2_000L }

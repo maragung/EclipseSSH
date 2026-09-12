@@ -4338,6 +4338,9 @@ class MainViewModel @Inject constructor(
             settingsRepository.setBlockScreenshots(settings.blockScreenshots)
             settingsRepository.setReconnectAskFirst(settings.reconnectAskFirst)
             settingsRepository.setVaultAutoLockMinutes(settings.vaultAutoLockMinutes)
+            // The blob is one key, so one call restores all six editor options at once. Its
+            // codec decodes tolerantly, so a mangled import degrades to defaults, never a lockout.
+            settingsRepository.setEditorPrefsJson(settings.editorPrefsJson)
             report("Imported ${hosts.size} host(s)")
         }
     }
@@ -4436,6 +4439,7 @@ class MainViewModel @Inject constructor(
     fun setTerminalKeyRowVisible(visible: Boolean) = writeSetting("the shortcut bar") { settingsRepository.setTerminalKeyRowVisible(visible) }
     fun setLegacyAlgorithms(enabled: Boolean) = writeSetting("the legacy algorithm setting") { settingsRepository.setLegacyAlgorithms(enabled) }
     fun setTerminalTheme(name: String) = writeSetting("the terminal theme") { settingsRepository.setTerminalTheme(name) }
+    fun setEditorPrefsJson(json: String) = writeSetting("the editor preferences") { settingsRepository.setEditorPrefsJson(json) }
     fun setPin(pin: String) = writeSetting("the app PIN") { settingsRepository.setPin(pin) }
     fun clearPin() = writeSetting("the app PIN") { settingsRepository.clearPin() }
     suspend fun verifyPin(pin: String): Boolean = settingsRepository.verifyPin(pin)

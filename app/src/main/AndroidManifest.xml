@@ -88,6 +88,7 @@
             android:name=".ui.editor.TextEditorActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
             android:exported="false"
+            android:launchMode="singleTop"
             android:parentActivityName=".MainActivity"
             android:windowSoftInputMode="adjustResize" />
 

@@ -94,6 +94,12 @@ object VaultBackup {
             put("blockScreenshots", settings.blockScreenshots)
             put("reconnectAskFirst", settings.reconnectAskFirst)
             put("terminalKeepSystemBars", settings.terminalKeepSystemBars)
+            // Opt-keyed and length-capped like every untrusted string the vault round-trips: an
+            // absent key is "old backup" (reader defaults the field), never a parse failure. The
+            // blob's own codec decodes tolerantly, so a mangled value becomes defaults, not a
+            // lockout — the same never-lockout posture as the rest of the settings block.
+            settings.editorPrefsJson.take(MAX_EDITOR_PREFS_JSON)
+                .takeIf { json -> json.isNotBlank() }?.let { put("editorPrefsJson", it) }
         })
         root.put("hosts", JSONArray().apply {
             hosts.forEach { host -> put(JSONObject().apply {
@@ -203,6 +209,11 @@ object VaultBackup {
             blockScreenshots = settingsObj.optBoolean("blockScreenshots", defaults.blockScreenshots),
             reconnectAskFirst = settingsObj.optBoolean("reconnectAskFirst", defaults.reconnectAskFirst),
             terminalKeepSystemBars = settingsObj.optBoolean("terminalKeepSystemBars", defaults.terminalKeepSystemBars),
+            // The blob is decoded by EditorPrefsCodec, which never throws — a hand-edited or
+            // truncated value becomes the editor's defaults rather than a failed import. Capped
+            // on the way in for the same reason every vault string is: a backup is untrusted.
+            editorPrefsJson = settingsObj.optString("editorPrefsJson", defaults.editorPrefsJson)
+                .take(MAX_EDITOR_PREFS_JSON).takeIf { json -> json.isNotBlank() } ?: "{}",
         )
         val hostsArray = root.optJSONArray("hosts") ?: JSONArray()
         val hosts = ArrayList<HostProfile>(hostsArray.length())
@@ -433,6 +444,14 @@ object VaultBackup {
      * from the file straight into the credential store.
      */
     private const val MAX_ACCOUNT_CREDENTIAL_LENGTH = 4096
+
+    /**
+     * Bound on the editor preferences blob's length inside a vault. The blob this app writes is
+     * under 200 bytes; the bound exists only against a hand-edited file, so a padded blob cannot
+     * ride into DataStore wholesale. Truncation past the codec's tolerance resolves to defaults
+     * on decode, never to a failed import.
+     */
+    private const val MAX_EDITOR_PREFS_JSON = 4096
 }
 
 /** Raised when a backup payload cannot be read: wrong passphrase, truncation, or bad JSON. */
