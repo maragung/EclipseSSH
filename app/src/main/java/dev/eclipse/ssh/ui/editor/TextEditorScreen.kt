@@ -59,12 +59,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.altKey
-import androidx.compose.ui.input.key.ctrlKey
+import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.metaKey
 import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.shiftKey
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -765,7 +765,8 @@ private fun EditorBody(
                         if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                         // Exact Ctrl: no Shift/Alt/Meta riding along, or it is a different
                         // shortcut than the one these branches implement.
-                        val ctrl = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey
+                        val ctrl = event.isCtrlPressed && !event.isShiftPressed &&
+                            !event.isAltPressed && !event.isMetaPressed
                         when {
                             ctrl && event.key == Key.S && dirty && !saving -> {
                                 onSave()
@@ -794,8 +795,8 @@ private fun EditorBody(
                             }
                             // The other redo spelling; Ctrl is checked, Shift required — the
                             // exact mirror of the plain-Ctrl branches above.
-                            event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey &&
-                                event.key == Key.Z && history.canRedo -> {
+                            event.isCtrlPressed && event.isShiftPressed && !event.isAltPressed &&
+                                !event.isMetaPressed && event.key == Key.Z && history.canRedo -> {
                                 history.redo(textValue)?.let(onSnapshot)
                                 true
                             }
