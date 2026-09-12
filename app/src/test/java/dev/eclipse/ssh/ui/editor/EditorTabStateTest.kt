@@ -154,6 +154,59 @@ class EditorTabStateTest {
     }
 
     @Test
+    fun `a file with no owner-write bit opens read-only and its save is a no-op`() = runTest {
+        // 0o444: everyone may read, nobody may write. The mode arrives as the octal string the
+        // providers report, and the stat that startLoad performs carries it through.
+        val provider = ScriptedFileProvider(entry.copy(permissions = "444"))
+        val tab = tab(provider)
+        tab.startLoad(this)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(tab.loadState).isEqualTo(EditorLoad.Ready)
+        assertThat(tab.readOnly).isTrue()
+
+        // The working copy is not the guard — the field's own readOnly is — so an edit that lands
+        // anyway (find-and-replace goes through applyEdit) still turns the tab dirty. Honest: it
+        // really is unsaved, and what must not happen is the *write*.
+        tab.applyEdit(TextFieldValue("edited"))
+        assertThat(tab.dirty).isTrue()
+
+        tab.save(this)
+        testScheduler.advanceUntilIdle()
+
+        // No write, no saving flicker, no error — as though save had never been asked, which is
+        // the only answer a file that cannot be written can honestly give.
+        assertThat(provider.writes).isEmpty()
+        assertThat(tab.savedText).isEqualTo("hello")
+        assertThat(tab.saving).isFalse()
+        assertThat(tab.saveError).isNull()
+        assertThat(tab.dirty).isTrue()
+    }
+
+    @Test
+    fun `a file whose owner may write opens editable`() = runTest {
+        // 0o644: owner rw-, so the write bit is present and the editor is a normal one.
+        val provider = ScriptedFileProvider(entry.copy(permissions = "644"))
+        val tab = tab(provider)
+        tab.startLoad(this)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(tab.readOnly).isFalse()
+    }
+
+    @Test
+    fun `a file whose permissions are unknown opens editable`() = runTest {
+        // Null is the local backend's honest "no notion of modes": unknown is not unwritable, so
+        // the file opens editable and a save the backend refuses shows the ordinary save error.
+        val provider = ScriptedFileProvider(entry.copy(permissions = null))
+        val tab = tab(provider)
+        tab.startLoad(this)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(tab.readOnly).isFalse()
+    }
+
+    @Test
     fun `a successful save writes the bytes, clears the dirty flag, and re-arms the guard`() = runTest {
         val provider = ScriptedFileProvider(entry)
         val tab = tab(provider)
