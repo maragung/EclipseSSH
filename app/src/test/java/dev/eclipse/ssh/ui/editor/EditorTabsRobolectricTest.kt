@@ -279,11 +279,25 @@ class EditorTabsRobolectricTest {
         // request the back gesture makes, and the last tab leaving is the window leaving.
         compose.onNodeWithContentDescription("Close editor").performClick()
 
-        // Read through runCatching because a destroyed activity can make the scenario's own state
-        // query throw; what has to hold either way is that the window is no longer up.
+        // Two signals, because neither alone holds here. Robolectric's ShadowActivity.finish() sets
+        // the finishing flag and does nothing else — it never runs onDestroy — so a window that has
+        // genuinely been told to go away still reports RESUMED, and a wait on the scenario's state
+        // alone could never go green however well the close worked. The flag is what the platform's
+        // own finish() raises one call below this composable, so it is the same signal a device
+        // acts on; the state stays as the other half because that is what says the window is gone
+        // once it is, and reading it through runCatching keeps a destroyed activity's throwing
+        // query from deciding the answer.
         pumpUntil(describe = { "the editor window never finished" }) {
-            runCatching { scenarioRule.scenario.state }.getOrNull() != Lifecycle.State.RESUMED
+            runCatching { compose.activity.isFinishing }.getOrDefault(false) ||
+                runCatching { scenarioRule.scenario.state }.getOrNull() != Lifecycle.State.RESUMED
         }
+
+        // And the tab really is gone rather than merely asked to go: the coordinator closes the last
+        // one before it asks the window to leave, so the window is left with nothing to show. Read
+        // through runCatching for the same reason as the state above — a destroyed activity has no
+        // compose roots to count in, and "there is no window to count nodes in" is that same answer
+        // reached by another road.
+        assertThat(runCatching { countNamed(firstName) }.getOrDefault(0)).isEqualTo(0)
     }
 
     /**

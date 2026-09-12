@@ -269,11 +269,26 @@ class SyntaxHighlighter(private val language: SyntaxLanguage) {
                 continue
             }
             if (c in language.charQuotes) {
-                // tryCharLiteral reports the char AFTER the literal when it matched one, or the
-                // start unchanged when it did not - the caller advances by the difference. A
-                // boolean-only version of this branch (add token, but no offset) re-lexed the
-                // same quote forever, appending duplicate spans until the heap died.
-                i = tryCharLiteral(source, i, c, builder)
+                // tryCharLiteral reports the char AFTER the literal when it matched one, and the
+                // start unchanged when it did not - and that second case has to be answered here,
+                // not continued past, because the loop would otherwise read the same quote again
+                // on its next turn, forever. A boolean-only version of this branch re-lexed the
+                // same quote forever and appended duplicate spans until the heap died, which is
+                // what #73 saw; moving to an offset stopped the appending but left the spinning,
+                // and the spinning is the harder of the two to find: nothing is appended, so the
+                // heap never fills, nothing is logged, and `highlight` is a plain call with no
+                // deadline for a test timeout to catch. The JVM simply spins at 100% CPU until
+                // something outside kills it - which is how a Rust file's first lifetime (`'a`)
+                // took the suite silent to the step cap. A declined quote is an operator and the
+                // name after it lexes on its own, which is what `'a` and a stray apostrophe need.
+                // The advance below is unconditional, so this branch cannot fail to move.
+                val charEnd = tryCharLiteral(source, i, c, builder)
+                if (charEnd > i) {
+                    i = charEnd
+                } else {
+                    builder.add(TokenKind.OPERATOR, i, i + 1)
+                    i++
+                }
                 continue
             }
             if (language.annotations && c == '@' && i + 1 < n && isIdentifierStart(source[i + 1])) {
@@ -347,8 +362,8 @@ class SyntaxHighlighter(private val language: SyntaxLanguage) {
     /**
      * A character literal: exactly one char, or one escape sequence (`\n`, `A`), between two
      * quotes on one line. Returns [start] unchanged (and consumes nothing) when that shape does
-     * not hold, so the caller falls through - a lone `'` then lexes as an operator and what
-     * follows as an identifier, which is precisely what a Rust lifetime (`'a`) and an apostrophe
+     * not hold, and the caller answers that by lexing the quote itself as an operator, with what
+     * follows as an identifier - which is precisely what a Rust lifetime (`'a`) and an apostrophe
      * in code need. The strict shape is what keeps `'a str` from being read as an unterminated
      * char. On success the return value is one past the closing quote, the caller's next offset.
      */

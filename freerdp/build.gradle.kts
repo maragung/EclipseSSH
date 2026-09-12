@@ -155,6 +155,7 @@ val fetchFreerdpSource =
         val tarball = freerdpTarball
         val srcDir = freerdpSrcDir
         val bridgeCMakeDir = freerdpBridgeCMakeDir
+        val sourceRoot = freerdpSourceRoot
         outputs.file(tarball)
         outputs.dir(freerdpSourceRoot)
         doLast {
@@ -241,6 +242,19 @@ val fetchFreerdpSource =
                     "-C",
                     srcDir.absolutePath,
                 )
+            }
+
+            // Pin FreeRDP's version detection: GetProjectVersion.cmake prefers a
+            // .source_tag file over git, and without one `git describe --tags`
+            // walks up out of the source tree into THIS repo's .git - on a tag
+            // checkout (refs/tags/v1.1.12) it parsed the app's tag as FreeRDP
+            // version 1.1.12, producing libfreerdp1 sonames and include/freerdp1
+            // headers, which broke the JNI bridge compile. Written every run,
+            // not just after extraction, so cache-restored source trees are
+            // pinned too.
+            val sourceTag = File(sourceRoot, ".source_tag")
+            if (!sourceTag.isFile || sourceTag.readText().trim() != version) {
+                sourceTag.writeText(version)
             }
         }
     }
