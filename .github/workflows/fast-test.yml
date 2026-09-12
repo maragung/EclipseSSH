@@ -1,20 +1,26 @@
-# Fast iteration gate. Lint and unit tests only, on demand or for branches
-# that opt in - the full CI gate (ci.yml) stays the only thing a merge waits
-# for, and this workflow never blocks it.
+# Fast merge gate. Lint and unit tests, in two parallel jobs, dispatched for the
+# branches being landed.
+#
+# This is the gate a merge waits for. The full ci.yml run - verify, APK/AAB, the
+# signing check - follows on main afterwards as the safety net, so a green here
+# means "this is worth landing now" and the heavier gate still gets its say, on
+# main, instead of holding the branch hostage for an hour first.
+#
+# Two jobs rather than one, each with its own budget, because of what the single
+# job got wrong: it ran lint and then the tests under one 45-minute cap, so a
+# branch whose suite needed longer than that could never go green - the run was
+# killed at the cap every time, and a gate cannot tell a kill from a failure.
+# Splitting them also runs the two halves at the same time instead of in a
+# queue, and keeps every runner comfortably under the 60-minute ceiling.
 #
 # The 45-60 minute verify suite is the price of "everything is verified in CI";
 # this is the cheaper loop for the pushes in between: the same pinned toolchain
 # and the same Robolectric cache as ci.yml, but it stops after the unit tests.
-# No APK, no AAB, no signing material, no dependency-lockfile check - a red X
-# from here means "fix before you ask for the full run", never "the build is
-# broken" on its own.
+# No APK, no AAB, no signing material, no dependency-lockfile check.
 #
-# Deliberately NOT triggered by pull_request: a PR's mergeability is defined by
-# the full gate, and a second, faster check on the same commits would be either
-# redundant (green means little) or misleading (red on a suite the merge does
-# not consult). Trigger it from the CLI with:
-#   gh workflow run fast-test.yml --ref <branch>
-# or push to a branch named fast-test/*.
+# Deliberately NOT triggered by pull_request: the branches being landed dispatch
+# it explicitly (see the merge helpers in this repo), so a PR does not pay for a
+# second full run on commits that already have one.
 name: Fast test
 
 on:
@@ -26,8 +32,9 @@ permissions:
   contents: read
 
 concurrency:
-  # One fast-test run per ref; a newer push replaces the older run, which is
-  # safe here precisely because nothing gates on this workflow's result.
+  # One fast-test run per ref; a newer dispatch replaces the older run, which is
+  # what a re-dispatch after a fix wants - the superseded run has nothing left
+  # to say about the commits that replaced it.
   group: fast-test-${{ github.ref }}
   cancel-in-progress: true
 
@@ -43,10 +50,34 @@ env:
   FREERDP_CMAKE_VERSION: '4.1.2'
 
 jobs:
-  fast-test:
-    name: Lint and unit tests
+  verify:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Per-shard, because the two halves are not the same size: the test suite is
+    # the long pole and needs the room the lint half does not. Both stay under
+    # the ceiling, and the shell-level cap in the task step fires first so a
+    # wedged run leaves evidence behind rather than a bare job kill.
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # Both shards report, always: if the tests hang the lint result is still
+      # worth having, and one cycle should answer both questions.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Lint (release variant)
+            timeout: 45
+            cap: 40m
+            task: lintRelease
+            # Strings, and compared as strings below: a matrix boolean arrives
+            # in an expression as the text "false", which is truthy, and a gate
+            # that starts an SSH sandbox for a lint run is a confusing way to
+            # find that out.
+            sshd: 'false'
+          - name: Unit and integration tests
+            timeout: 55
+            cap: 50m
+            task: testDebugUnitTest
+            sshd: 'true'
 
     steps:
       - name: Check out
@@ -71,9 +102,11 @@ jobs:
           cache-packages: true
 
       - name: Install pinned CMake and Ninja
-        # Kept even though this workflow does not assemble APKs: lint compiles
-        # :freerdp, and the native build drives CMake directly (same reasoning
-        # as ci.yml's step of the same name).
+        # Needed by both shards, not just an APK build: lint compiles :freerdp
+        # and the tests link it, and the native build drives CMake directly
+        # (same reasoning as ci.yml's step of the same name). The two shards
+        # each pay for it; the shared build-tree cache below is what keeps that
+        # cheap.
         run: |
           set -euo pipefail
           python3 -m pip install --disable-pip-version-check \
@@ -90,21 +123,21 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
         with:
-          # Read-only here unconditionally: this workflow never runs on main,
-          # and its caches must not write into the branch's read-only posture.
+          # Read-only here unconditionally: the shards run concurrently and must
+          # not race each other for the same cache entries, and a gate's caches
+          # have no business writing into the branch's read-only posture.
           cache-read-only: true
 
       - name: Cache Robolectric runtime jars
+        if: matrix.sshd == 'true'
         uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
           restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
 
-      - name: Lint (release variant)
-        run: ./gradlew --stacktrace lintRelease
-
       - name: Start the isolated OpenSSH sandbox
+        if: matrix.sshd == 'true'
         run: |
           set -euo pipefail
           if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
@@ -115,9 +148,16 @@ jobs:
           test -f .tmp-build/sshd-test/port
           test -f .tmp-build/sshd-test/port-no-shell
 
-      - name: Unit and integration tests
-        run: ./gradlew --stacktrace testDebugUnitTest
+      - name: ${{ matrix.name }}
+        # Wrapped in a hard cap of its own, five minutes under the job's, because
+        # the failure this gate kept hitting was invisible: a test that never
+        # returns leaves the log silent for half an hour and then the job is
+        # killed, and there is nothing in that log to read. SIGQUIT first, which
+        # makes the JVM print every thread's stack, so the next wedge names its
+        # own culprit instead of costing another day of guessing. The cap firing
+        # is itself the finding: a run that reaches it is stuck, not slow.
+        run: timeout --signal=QUIT --kill-after=60s ${{ matrix.cap }} ./gradlew --stacktrace ${{ matrix.task }}
 
       - name: Stop the OpenSSH sandbox
-        if: always()
+        if: always() && matrix.sshd == 'true'
         run: tools/local-sshd.sh clean

@@ -906,6 +906,16 @@ private fun EclipseWorkspace(
         destination = Destination.TERMINAL
     }
     /**
+     * A tab's own Reconnect action. The dial speaks for that tab's session - see
+     * [MainViewModel.reconnectSession] - and the tab it was asked from is the one opened, where a
+     * reconnect used to land on the host's first tab for the same host-routed reason the dial did.
+     */
+    fun reconnectAndOpen(sessionKey: String) {
+        viewModel.reconnectSession(sessionKey)
+        openSessionId = sessionKey
+        destination = Destination.TERMINAL
+    }
+    /**
      * Saves what the refused-login dialog collected, so the next connect is one tap again.
      *
      * The key is probed off the main thread because an encrypted OpenSSH key derives its wrapping
@@ -1290,6 +1300,7 @@ private fun EclipseWorkspace(
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
                     onConnect = { host -> showAuthHost = host },
+                    onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
@@ -1471,6 +1482,7 @@ private fun EclipseWorkspace(
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
                     onConnect = { host -> showAuthHost = host },
+                    onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
                     onRemoveHost = { pendingDeleteHost = it },
@@ -2184,6 +2196,13 @@ private fun WorkspaceScaffold(
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
+    /**
+     * Re-dials one session, by its key. The Reconnect action on a terminal tab and on a session
+     * row - the two callers that already know which session they mean, where resolving by host
+     * would land the dial on the host's *first* tab. [onConnect] is the host card and the host
+     * list's kebab menu, which have no tab of their own and keep the first-tab resolution.
+     */
+    onReconnectSession: (String) -> Unit,
     onShowDetails: (HostProfile) -> Unit,
     onEditHost: (HostProfile) -> Unit,
     onRemoveHost: (HostProfile) -> Unit,
@@ -2312,9 +2331,11 @@ private fun WorkspaceScaffold(
             frames = frames,
             onCloseTab = onCloseTab,
             onDisconnectAll = onDisconnectAll,
-            // The same authentication sheet any other connection opens: a reconnect is a
-            // connection, and it should ask for whatever a connection asks for.
-            onReconnect = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onConnect) },
+            // The tab's own key, straight to the dial rather than through the host: a host with two
+            // shells resolves a host-routed reconnect to its *first* tab, which re-dialled the
+            // wrong session and left the tab on screen parked at Disconnected. The dial asks for
+            // whatever a resuming connection asks for, and a refusal still raises the retry prompt.
+            onReconnectSession = onReconnectSession,
             onSendInput = onSendInput,
             onSendText = onSendText,
             onSendKey = onSendKey,
@@ -2387,9 +2408,9 @@ private fun WorkspaceScaffold(
                     onOpenSession = { onOpenSession(it.id) },
                     onCloseTab = onCloseTab,
                     onDisconnectAll = onDisconnectAll,
-                    // The same authentication sheet the Hosts list opens, deliberately: a reconnect is
-                    // a connection, and it should ask for whatever a connection asks for.
-                    onReconnect = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onConnect) },
+                    // The row's own session key, for the same reason the shell above routes by tab:
+                    // the row tapped is the session that must come back, not the host's first one.
+                    onReconnectSession = onReconnectSession,
                     // The session row knows its host's id; the manager above this scaffold wants the
                     // profile, which only the hosts flow can answer for.
                     onManageForwards = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onManageForwards) },
@@ -2695,7 +2716,8 @@ private fun TerminalScreen(
     frames: StateFlow<Map<String, TerminalFrame>>,
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
-    onReconnect: (String) -> Unit,
+    /** Re-dials one session - the key is a tab id, never a host id. */
+    onReconnectSession: (String) -> Unit,
     onSendInput: (String, String) -> Unit,
     onSendText: (String, String) -> Unit,
     onSendKey: (String, TerminalKey, Boolean, Boolean, Boolean) -> Unit,
@@ -2915,7 +2937,9 @@ private fun TerminalScreen(
             onLeaveSession = onLeaveSession,
             onCloseTab = onCloseTab,
             onDisconnectAll = onDisconnectAll,
-            onReconnect = { onReconnect(activeTab.hostId) },
+            // The session's own key, not its host's: with two shells on one host, the tab on screen
+            // is the one that must come back, and a host id would resolve to the host's first tab.
+            onReconnect = { onReconnectSession(activeTab.id) },
             onToggleSearch = { showSearch = !showSearch },
             onToggleCommandBar = { showCommandBar = !showCommandBar },
             onToggleHistory = { showHistory = !showHistory },
@@ -3162,7 +3186,8 @@ private fun TerminalSessionsScreen(
     onOpenSession: (SessionTab) -> Unit,
     onCloseTab: (SessionTab) -> Unit,
     onDisconnectAll: () -> Unit,
-    onReconnect: (String) -> Unit,
+    /** Re-dials one session - the key is a tab id, never a host id. */
+    onReconnectSession: (String) -> Unit,
     /** Opens this session's host's port-forwarding manager - the forward note on its row. */
     onManageForwards: (String) -> Unit,
     onCopyTrace: (String) -> Unit,
@@ -3217,7 +3242,8 @@ private fun TerminalSessionsScreen(
                     // sheet is open and reading it.
                     trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[tab.hostId]),
                     onOpen = { onOpenSession(tab) },
-                    onReconnect = { onReconnect(tab.hostId) },
+                    // The row's own session key, for the same reason the shell above routes by tab.
+                    onReconnect = { onReconnectSession(tab.id) },
                     onManageForwards = { onManageForwards(tab.hostId) },
                     onCopyTrace = onCopyTrace,
                     onClose = { onCloseTab(tab) },
