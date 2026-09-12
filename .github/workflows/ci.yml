@@ -43,13 +43,20 @@ env:
   FREERDP_CMAKE_VERSION: '4.1.2'
 
 jobs:
-  verify:
-    name: Lint, tests, APKs and AAB
+  # One native build feeds every consumer. `native` compiles the four-ABI
+  # FreeRDP tree and saves the freerdp/build cache; lint, test and assemble
+  # restore that same tree, so every Gradle task wired into preBuild finds the
+  # native outputs and goes UP-TO-DATE instead of rebuilding. Wall clock is
+  # roughly native + the longest consumer, not the serial sum of everything
+  # the old single job did. Branch protection must require the four check
+  # names below; the old combined "Lint, tests, APKs and AAB" check is gone.
+  native:
+    name: FreeRDP native (4 ABIs)
     runs-on: ubuntu-24.04
     # Generous because the first run after any freerdp/build.gradle.kts change
-    # pays a cold, uncached four-ABI native build (~30 min) on top of the
-    # usual suite; warm runs stay well inside the previous budget.
-    timeout-minutes: 120
+    # pays a cold, uncached four-ABI native build (~30 min); warm runs are a
+    # CMake no-op well inside this budget.
+    timeout-minutes: 60
 
     steps:
       - name: Check out
@@ -99,6 +106,189 @@ jobs:
         # them must produce a different cache entry. Restored before any Gradle
         # step: the first Gradle invocation (lint) already compiles :freerdp,
         # which builds the native libraries.
+        #
+        # This job is the only writer of this cache. lint, test and assemble
+        # restore the same key after needs:native, by which point this job's
+        # post-step save is already visible to them in the same run.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          # Read-only off main so a pull request cannot poison the cache the
+          # default branch reads.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Build and verify the :freerdp native module
+        # Every :freerdp compilation depends on the native build task, so the
+        # libraries exist by the time lint got here; this step still runs the
+        # module's own packaging and asserts the product: all eight .so files
+        # per ABI, and the bridge .so is an ELF binary for the architecture it
+        # is filed under. A wrong-ABI library is exactly the failure packaging
+        # would otherwise hide until install time - the same check the FreeRDP
+        # spike used.
+        run: |
+          set -euo pipefail
+          ./gradlew --stacktrace :freerdp:assembleDebug
+          declare -A ELF_SIGNATURE=(
+            [arm64-v8a]='ARM aarch64'
+            [armeabi-v7a]='ARM, EABI5'
+            [x86_64]='x86-64'
+            [x86]='Intel 80386'
+          )
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            for LIB in libfreerdp-android libfreerdp3 libfreerdp-client3 libwinpr3 \
+                       libcrypto libssl libcjson liburiparser; do
+              SO="freerdp/build/native/jniLibs/${ABI}/${LIB}.so"
+              test -f "${SO}" || { echo "missing ${SO}"; exit 1; }
+            done
+            file "freerdp/build/native/jniLibs/${ABI}/libfreerdp-android.so" \
+              | grep -F "${ELF_SIGNATURE[${ABI}]}"
+            echo "verified ${ABI}: ${ELF_SIGNATURE[${ABI}]}"
+          done
+
+  lint:
+    name: Lint (release variant)
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          # check-latest=false forces the action to use the requested 17.0.13
+          # rather than "the latest Temurin 17", which would silently drift.
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          # cmdline-tools 13.0 is the LTS line that ships platform-tools and
+          # supports platforms;android-37.0 + build-tools;36.0.0.
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+          # ANDROID_HOME / ANDROID_SDK_ROOT are exported automatically.
+
+      - name: Install pinned CMake and Ninja
+        # The :freerdp native build drives CMake directly (see
+        # freerdp/build.gradle.kts for why it does not use AGP's
+        # externalNativeBuild). The SDK manager does not carry the CMake line
+        # that build needs; PyPI does. Same pin the spike verified with.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        # freerdp/build holds the extracted tarball, the per-ABI superbuild
+        # trees (OpenSSL + FreeRDP + friends) and the packaged jniLibs. A cold
+        # native build is roughly half an hour for four ABIs; a warm one is a
+        # CMake no-op. The key carries the module's build script because that
+        # is where the tarball, NDK and feature-set pins live - changing any of
+        # them must produce a different cache entry. Restored before any Gradle
+        # step: the first Gradle invocation (lint) already compiles :freerdp,
+        # which builds the native libraries.
+        #
+        # Restored, not written, on the normal path: needs:native guarantees
+        # the native job's post-step save of this exact key is already visible
+        # to this job in the same run, so the preBuild-wired native tasks find
+        # their declared outputs and go UP-TO-DATE - this job pays a tarball
+        # extract, never a rebuild. No restore-keys on purpose: a fuzzy restore
+        # can pair stale cmake trees with fresh source (the PR #20/#22/#23
+        # failure class the wipe guard exists for).
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          # Read-only off main so a pull request cannot poison the cache the
+          # default branch reads.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Lint (release variant)
+        run: ./gradlew --stacktrace lintRelease
+
+  test:
+    name: Unit and integration tests
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          # check-latest=false forces the action to use the requested 17.0.13
+          # rather than "the latest Temurin 17", which would silently drift.
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          # cmdline-tools 13.0 is the LTS line that ships platform-tools and
+          # supports platforms;android-37.0 + build-tools;36.0.0.
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+          # ANDROID_HOME / ANDROID_SDK_ROOT are exported automatically.
+
+      - name: Install pinned CMake and Ninja
+        # The :freerdp native build drives CMake directly (see
+        # freerdp/build.gradle.kts for why it does not use AGP's
+        # externalNativeBuild). The SDK manager does not carry the CMake line
+        # that build needs; PyPI does. Same pin the spike verified with.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        # freerdp/build holds the extracted tarball, the per-ABI superbuild
+        # trees (OpenSSL + FreeRDP + friends) and the packaged jniLibs. A cold
+        # native build is roughly half an hour for four ABIs; a warm one is a
+        # CMake no-op. The key carries the module's build script because that
+        # is where the tarball, NDK and feature-set pins live - changing any of
+        # them must produce a different cache entry. Restored before any Gradle
+        # step: the first Gradle invocation (lint) already compiles :freerdp,
+        # which builds the native libraries.
+        #
+        # Restored, not written, on the normal path: needs:native guarantees
+        # the native job's post-step save of this exact key is already visible
+        # to this job in the same run, so the preBuild-wired native tasks find
+        # their declared outputs and go UP-TO-DATE - this job pays a tarball
+        # extract, never a rebuild. No restore-keys on purpose: a fuzzy restore
+        # can pair stale cmake trees with fresh source (the PR #20/#22/#23
+        # failure class the wipe guard exists for).
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: freerdp/build
@@ -120,6 +310,119 @@ jobs:
           # whitespace-only change in app/build.gradle.kts is not.
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
           restore-keys: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-
+
+      - name: Start the isolated OpenSSH sandbox
+        # See tools/local-sshd.sh. The matrix needs a real sshd, not a MINA
+        # server, because interop bugs live in the gap the in-JVM server
+        # cannot reproduce.
+        run: |
+          set -euo pipefail
+          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server
+          fi
+          tools/local-sshd.sh start
+          # Asserted rather than assumed. A missing sandbox turns into a
+          # silently-skipped test otherwise.
+          test -f .tmp-build/sshd-test/port
+          test -f .tmp-build/sshd-test/port-no-shell
+
+      - name: Unit and integration tests
+        # Debug variant only: AGP 9 removed the release unit-test variant
+        # (`testReleaseUnitTest` no longer exists), and the AndroidX/Robolectric
+        # suites here are variant-independent — the release side keeps its own
+        # coverage through lintRelease and the assembled release artifacts.
+        run: ./gradlew --stacktrace testDebugUnitTest
+
+      - name: Stop the OpenSSH sandbox
+        if: always()
+        run: tools/local-sshd.sh clean
+
+      - name: Upload test and lint reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reports
+          path: |
+            app/build/reports/**
+            app/build/test-results/**
+          if-no-files-found: warn
+          retention-days: 14
+
+  assemble:
+    name: APKs, AAB and signatures
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          # check-latest=false forces the action to use the requested 17.0.13
+          # rather than "the latest Temurin 17", which would silently drift.
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          # cmdline-tools 13.0 is the LTS line that ships platform-tools and
+          # supports platforms;android-37.0 + build-tools;36.0.0.
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+          # ANDROID_HOME / ANDROID_SDK_ROOT are exported automatically.
+
+      - name: Install pinned CMake and Ninja
+        # The :freerdp native build drives CMake directly (see
+        # freerdp/build.gradle.kts for why it does not use AGP's
+        # externalNativeBuild). The SDK manager does not carry the CMake line
+        # that build needs; PyPI does. Same pin the spike verified with.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        # freerdp/build holds the extracted tarball, the per-ABI superbuild
+        # trees (OpenSSL + FreeRDP + friends) and the packaged jniLibs. A cold
+        # native build is roughly half an hour for four ABIs; a warm one is a
+        # CMake no-op. The key carries the module's build script because that
+        # is where the tarball, NDK and feature-set pins live - changing any of
+        # them must produce a different cache entry. Restored before any Gradle
+        # step: the first Gradle invocation (lint) already compiles :freerdp,
+        # which builds the native libraries.
+        #
+        # Restored, not written, on the normal path: needs:native guarantees
+        # the native job's post-step save of this exact key is already visible
+        # to this job in the same run, so the preBuild-wired native tasks find
+        # their declared outputs and go UP-TO-DATE - this job pays a tarball
+        # extract, never a rebuild. No restore-keys on purpose: a fuzzy restore
+        # can pair stale cmake trees with fresh source (the PR #20/#22/#23
+        # failure class the wipe guard exists for).
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          # Read-only off main so a pull request cannot poison the cache the
+          # default branch reads.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Restore release signing material
         id: signing
@@ -151,64 +454,6 @@ jobs:
             exit 1
           fi
           echo "androidTest sources: $COUNT"
-
-      - name: Lint (release variant)
-        run: ./gradlew --stacktrace lintRelease
-
-      - name: Start the isolated OpenSSH sandbox
-        # See tools/local-sshd.sh. The matrix needs a real sshd, not a MINA
-        # server, because interop bugs live in the gap the in-JVM server
-        # cannot reproduce.
-        run: |
-          set -euo pipefail
-          if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq openssh-server
-          fi
-          tools/local-sshd.sh start
-          # Asserted rather than assumed. A missing sandbox turns into a
-          # silently-skipped test otherwise.
-          test -f .tmp-build/sshd-test/port
-          test -f .tmp-build/sshd-test/port-no-shell
-
-      - name: Unit and integration tests
-        # Debug variant only: AGP 9 removed the release unit-test variant
-        # (`testReleaseUnitTest` no longer exists), and the AndroidX/Robolectric
-        # suites here are variant-independent — the release side keeps its own
-        # coverage through lintRelease and the assembled release artifacts below.
-        run: ./gradlew --stacktrace testDebugUnitTest
-
-      - name: Stop the OpenSSH sandbox
-        if: always()
-        run: tools/local-sshd.sh clean
-
-      - name: Build and verify the :freerdp native module
-        # Every :freerdp compilation depends on the native build task, so the
-        # libraries exist by the time lint got here; this step still runs the
-        # module's own packaging and asserts the product: all eight .so files
-        # per ABI, and the bridge .so is an ELF binary for the architecture it
-        # is filed under. A wrong-ABI library is exactly the failure packaging
-        # would otherwise hide until install time - the same check the FreeRDP
-        # spike used.
-        run: |
-          set -euo pipefail
-          ./gradlew --stacktrace :freerdp:assembleDebug
-          declare -A ELF_SIGNATURE=(
-            [arm64-v8a]='ARM aarch64'
-            [armeabi-v7a]='ARM, EABI5'
-            [x86_64]='x86-64'
-            [x86]='Intel 80386'
-          )
-          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
-            for LIB in libfreerdp-android libfreerdp3 libfreerdp-client3 libwinpr3 \
-                       libcrypto libssl libcjson liburiparser; do
-              SO="freerdp/build/native/jniLibs/${ABI}/${LIB}.so"
-              test -f "${SO}" || { echo "missing ${SO}"; exit 1; }
-            done
-            file "freerdp/build/native/jniLibs/${ABI}/libfreerdp-android.so" \
-              | grep -F "${ELF_SIGNATURE[${ABI}]}"
-            echo "verified ${ABI}: ${ELF_SIGNATURE[${ABI}]}"
-          done
 
       - name: Compile instrumentation tests
         # The instrumentation sources cannot run here (the runner has no KVM
@@ -301,18 +546,6 @@ jobs:
           path: app/build/outputs/bundle/release/*.aab
           if-no-files-found: error
 
-      - name: Upload test and lint reports
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: reports
-          path: |
-            app/build/reports/**
-            app/build/test-results/**
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Shred signing material
         if: always()
         run: |
@@ -343,11 +576,16 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
+          # Same NDK pin the verify job installs: the stress job's build runs
+          # :freerdp:buildFreerdpNative like every other build, and that task
+          # resolves the toolchain from the SDK - without the pin the job fails
+          # before the idle test it exists to run has started.
           cmdline-tools-version: '11479570'
           packages: >-
             platform-tools
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
           cache-packages: true
 
       - name: Set up Gradle
