@@ -59,8 +59,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.altKey
+import androidx.compose.ui.input.key.ctrlKey
 import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.metaKey
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.shiftKey
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -743,22 +747,71 @@ private fun EditorBody(
                     .padding(start = 8.dp, top = 8.dp, bottom = 32.dp, end = 8.dp)
                     // Preview, not plain onKeyEvent: the preview phase runs outer-modifier-first,
                     // before the field's own machinery can consume the key, which is the only
-                    // reliable place to intercept Tab on a focused text field. Returning true ends
-                    // the dispatch — the field never sees the key, so it cannot re-route it.
+                    // reliable place to intercept keys on a focused text field — Tab below, and
+                    // the desktop-style Ctrl shortcuts this is an SSH client for (hardware and
+                    // Bluetooth keyboards are a real input method here, not a desktopism).
+                    // Returning true ends the dispatch — the field never sees the key, so it
+                    // cannot re-route it.
+                    //
+                    // Shortcuts fire on KeyDown only: KeyUp would run every action twice, and
+                    // holding a key re-fires KeyDown as a repeat, which is wanted for undo but
+                    // must not re-open anything — so the dialog-openers are idempotent calls and
+                    // save is gated on the same dirty/!saving guard as the toolbar button.
+                    // Everything else returns false so the field (and its own Ctrl handling, if
+                    // any) still works; modifiers are matched exactly — Ctrl+S with Shift held
+                    // is not "save" — and Tab keeps its unconditional slot below so plain
+                    // insertion does not regress.
                     .onPreviewKeyEvent { event ->
-                        if (event.type == KeyEventType.KeyDown && event.key == Key.Tab) {
-                            val insertion = tabInsertion(prefs)
-                            val start = textValue.selection.min
-                            val end = textValue.selection.max
-                            onTextChange(
-                                textValue.copy(
-                                    text = textValue.text.replaceRange(start, end, insertion),
-                                    selection = TextRange(start + insertion.length),
-                                ),
-                            )
-                            true
-                        } else {
-                            false
+                        if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                        // Exact Ctrl: no Shift/Alt/Meta riding along, or it is a different
+                        // shortcut than the one these branches implement.
+                        val ctrl = event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey
+                        when {
+                            ctrl && event.key == Key.S && dirty && !saving -> {
+                                onSave()
+                                true
+                            }
+                            // Open only: toggling would close a bar the user is reading, and the
+                            // desktop gesture they are repeating is "focus find", which the bar
+                            // being open already approximates.
+                            ctrl && event.key == Key.F && !findOpen -> {
+                                onToggleFind()
+                                true
+                            }
+                            ctrl && event.key == Key.G -> {
+                                onGoToLine()
+                                true
+                            }
+                            // Same guards as the toolbar buttons: a history that cannot move
+                            // falls through (false) rather than swallowing the key.
+                            ctrl && event.key == Key.Z && history.canUndo -> {
+                                history.undo(textValue)?.let(onSnapshot)
+                                true
+                            }
+                            ctrl && event.key == Key.Y && history.canRedo -> {
+                                history.redo(textValue)?.let(onSnapshot)
+                                true
+                            }
+                            // The other redo spelling; Ctrl is checked, Shift required — the
+                            // exact mirror of the plain-Ctrl branches above.
+                            event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey &&
+                                event.key == Key.Z && history.canRedo -> {
+                                history.redo(textValue)?.let(onSnapshot)
+                                true
+                            }
+                            event.key == Key.Tab -> {
+                                val insertion = tabInsertion(prefs)
+                                val start = textValue.selection.min
+                                val end = textValue.selection.max
+                                onTextChange(
+                                    textValue.copy(
+                                        text = textValue.text.replaceRange(start, end, insertion),
+                                        selection = TextRange(start + insertion.length),
+                                    ),
+                                )
+                                true
+                            }
+                            else -> false
                         }
                     },
             )
