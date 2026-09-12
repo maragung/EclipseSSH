@@ -77,6 +77,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.eclipse.ssh.data.fs.FsEntry
@@ -511,10 +512,26 @@ private fun EditorTabStrip(
                     Text(
                         tab.request.entry.name,
                         maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier
                             .padding(start = 10.dp)
-                            .widthIn(max = 140.dp),
+                            // The label reserves a width of its own so the close button cannot eat
+                            // the chip's tap. Material expands any interactive component's *touch
+                            // target* to 48dp whatever its visual size, so the close button's 40dp
+                            // state layer reaches 4dp past its own edges on each side — far enough
+                            // left, on a chip whose name is short, to cover the middle of the chip.
+                            // Measured on this strip: with a label of L dp the close target starts
+                            // at L+6 and the chip's centre — the point a tap on the tab lands on —
+                            // sits at (L+50)/2, so any name narrower than 38dp sent a switch tap
+                            // into the close button and closed the tab instead. "notes.txt" is
+                            // short enough to have done exactly that. The terminal strip learned
+                            // this first (TerminalTabStrip in MainActivity); a 64dp minimum label
+                            // puts the centre 13dp clear of the close target, and a minimum is a
+                            // layout constraint, so no name and no font can shrink it back under.
+                            // The max and the ellipsis are the other end of the same problem: an
+                            // unbounded name made a single chip wider than the strip.
+                            .widthIn(min = 64.dp, max = 140.dp),
                     )
                     if (tab.dirty) {
                         // The same dot-language the toolbar subtitle already speaks: a dot means
