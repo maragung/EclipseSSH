@@ -225,6 +225,12 @@ class FileEncodingTest {
             val text = when (encoding) {
                 FileEncoding.UTF_16_LE, FileEncoding.UTF_16_BE -> "héllo ☃"
                 FileEncoding.ASCII -> "plain ascii 42"
+                // The shared sample is Windows-1252 text: the em dash and curly quotes live in
+                // the 0x80..0x9F window that Latin-1 leaves as control characters, so handing it
+                // to ISO-8859-1 would be refused by the very strictness encode exists to have -
+                // a refusal that has its own test above. Latin-1's sample stays inside the 256
+                // code points the encoding can actually hold.
+                FileEncoding.ISO_8859_1 -> "café £ ± ñ"
                 else -> "café £ — “quoted”"
             }
             val bytes = FileEncodingCodec.encode(text, encoding)
