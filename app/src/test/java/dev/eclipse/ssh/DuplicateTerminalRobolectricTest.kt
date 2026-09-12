@@ -3,6 +3,9 @@ package dev.eclipse.ssh
 import android.os.Looper
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
@@ -13,6 +16,7 @@ import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SessionTab
+import dev.eclipse.ssh.data.model.isEnded
 import dev.eclipse.ssh.presentation.MainViewModel
 import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.ssh.SshSessionStore
@@ -202,6 +206,71 @@ class DuplicateTerminalRobolectricTest {
         assertThat(store.liveSession(host.id)).isNull()
     }
 
+    /**
+     * The Reconnect action on the second of two shells redials *that* session, not the host's first.
+     *
+     * The button used to route by host, and a host-routed dial resolves to the host's first tab -
+     * so the shell the user was looking at stayed dead while a sibling tab they were not watching
+     * was quietly re-dialled underneath them. The reconnect is asked for the only way a user can
+     * ask for it, by tapping the button on the ended tab, and the proof is per-session: the second
+     * tab comes back with a fresh shell of its own and the first is still its own live, echoing
+     * session afterwards - the same "two shells, not one session shown twice" fact the rest of this
+     * class is about, seen from the reconnect direction.
+     */
+    @Test
+    fun reconnectingTheSecondShellRedialsThatTabAndLeavesTheFirstAlone() {
+        val host = connectOneShell()
+        val viewModel = viewModel()
+        compose.runOnUiThread { viewModel.duplicateSession(checkNotNull(tabFor(host.id))) }
+        val tabs = pumpUntilTabs(host.id, count = 2)
+        awaitAllConnected(host.id)
+        val first = tabs[0].id
+        val second = tabs[1].id
+
+        // End only the second shell, from inside it: a shell exiting is the one ending the ladder
+        // deliberately does not answer, so the tab parks at an ended state with its Reconnect
+        // action offered and nothing dials it back before the tap this test exists to make.
+        compose.runOnUiThread { viewModel.sendText(second, DIE + "\n") }
+        pumpUntil(describe = { "the second shell never exited. " + diagnose(host.id) }) {
+            tabById(second)?.state?.isEnded == true
+        }
+        // The second tab took the screen when it appeared, so its status row is where the Reconnect
+        // button lives. Waited for rather than assumed, like every other UI fact in this class.
+        pumpUntil(describe = { "no Reconnect action was offered for the ended shell" }) {
+            compose.onAllNodesWithText("Reconnect").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        compose.onNodeWithText("Reconnect").performClick()
+
+        // The second session comes back: a fresh login and a fresh shell on the server, the tab
+        // CONNECTED again. This wait is the assertion the host-routed button used to fail - the
+        // dial went to the first tab instead, which was still live and so was merely adopted,
+        // leaving the tab on screen parked at Disconnected forever.
+        pumpUntil(describe = { "the second shell never came back. " + diagnose(host.id) }) {
+            tabById(second)?.state == SessionConnectionState.CONNECTED
+        }
+        awaitCount(authAttempts, 3, "passwords offered to the server")
+        awaitCount(shellsStarted, 3, "shells the server started")
+
+        // And the first tab was left exactly as it was: still connected, still its own session, and
+        // still hearing only its own shell - a dial that had resolved to the host's first tab would
+        // have reconnected this one instead, which is the bug in one sentence.
+        val store = injected(viewModel, "sessionStore", SshSessionStore::class.java)
+        assertThat(tabById(first)?.state).isEqualTo(SessionConnectionState.CONNECTED)
+        assertThat(store.isLive(first)).isTrue()
+        compose.runOnUiThread {
+            viewModel.sendText(first, "still-first\n")
+            viewModel.sendText(second, "fresh-second\n")
+        }
+        pumpUntil(describe = { "neither shell echoed after the reconnect: " + diagnose(host.id) }) {
+            viewModel.uiState.value.terminalOutput[first].orEmpty().contains("echo: still-first") &&
+                viewModel.uiState.value.terminalOutput[second].orEmpty().contains("echo: fresh-second")
+        }
+        assertWithMessage("the first shell's transcript carries the second shell's line")
+            .that(viewModel.uiState.value.terminalOutput[first].orEmpty())
+            .doesNotContain("echo: fresh-second")
+    }
+
     // ---------------------------------------------------------------- driving the app
 
     /** Connects the shared host with a saved password and waits for the first shell. */
@@ -261,6 +330,10 @@ class DuplicateTerminalRobolectricTest {
     /** The host's first tab - the single-session identity every duplicate starts from. */
     private fun tabFor(hostId: String): SessionTab? =
         viewModel().uiState.value.tabs.firstOrNull { it.hostId == hostId }
+
+    /** One tab by its session key, unlike [tabFor] which is by host and so only sees the first. */
+    private fun tabById(sessionKey: String): SessionTab? =
+        viewModel().uiState.value.tabs.firstOrNull { it.id == sessionKey }
 
     private fun tabsFor(hostId: String): List<SessionTab> =
         viewModel().uiState.value.tabs.filter { it.hostId == hostId }
@@ -338,6 +411,8 @@ class DuplicateTerminalRobolectricTest {
         const val USER = "testuser"
         const val PASSWORD = "testpass123"
         const val HOST_NAME = "duphost"
+        /** The line that makes [EchoShell] exit - see the shell's own comment for why it exists. */
+        const val DIE = "die"
         const val SETTLE_ROUNDS = 20
         const val SETTLE_PAUSE_MS = 10L
 
@@ -418,6 +493,11 @@ class DuplicateTerminalRobolectricTest {
                         val byte = source.read()
                         if (byte < 0) break
                         if (byte == '\n'.code || byte == '\r'.code) {
+                            // The one scripted act this shell performs: exiting on demand, so a test
+                            // can end exactly one of a host's shells without touching its sibling's
+                            // transport (a killed transport is an outage, and the ladder would answer
+                            // it before the test could ask for a reconnect by hand).
+                            if (line.toString() == DIE) break
                             sink.write("echo: $line\r\n$ ".toByteArray())
                             sink.flush()
                             line.setLength(0)
