@@ -17,6 +17,7 @@ import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.EclipseApp
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.data.fs.FsModificationConflictException
 import java.time.Duration
 import org.junit.Rule
 import org.junit.Test
@@ -63,6 +64,13 @@ class EditorTabsRobolectricTest {
             files[path] = Held(contents.toByteArray(), 1_000L)
         }
 
+        /** The server moves under the editor: new bytes and a newer clock, without a local write. */
+        fun changeUnderneath(path: String, contents: String) {
+            val held = checkNotNull(files[path]) { "no such file: $path" }
+            held.bytes = contents.toByteArray()
+            held.modified += 1_000
+        }
+
         private fun name(path: String) = path.substringAfterLast('/')
 
         override suspend fun homePath(): String? = null
@@ -84,6 +92,12 @@ class EditorTabsRobolectricTest {
             files[path]?.bytes ?: error("no such file: $path")
 
         override suspend fun write(path: String, data: ByteArray, onlyIfUnmodifiedSince: Long?) {
+            // The real providers raise the conflict when the guard no longer matches the file's
+            // clock; the fake owes the editor the same honesty, or the conflict dialog could never
+            // be raised from outside. An unguarded write (the user chose Overwrite) always passes.
+            if (onlyIfUnmodifiedSince != null && files[path]?.modified != onlyIfUnmodifiedSince) {
+                throw FsModificationConflictException(path)
+            }
             writes += path
             files.getOrPut(path) { Held(data, 1_000L) }.let {
                 it.bytes = data
@@ -322,6 +336,55 @@ class EditorTabsRobolectricTest {
         @Suppress("DEPRECATION")
         dialog.onBackPressed()
         pumpUntil(describe = { "the discard dialog never closed" }) { !dialog.isShowing }
+        assertThat(scenarioRule.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
+    }
+
+    /**
+     * A conflicting save raises the four-way question, and all four ways out are on it.
+     *
+     * Same window-level rules as the discard test above: the dialog's presence is proven through
+     * [ShadowDialog] and its labels through hand-pumped semantics lookups, never `waitForIdle`,
+     * and it is dismissed through the dialog's own back dispatcher — which here *is* the Cancel
+     * choice, so the test also pins that dismissing keeps the local edit. The choice wiring
+     * itself (what each button does) lives in EditorTabStateTest, against a scripted provider.
+     */
+    @Test
+    fun aConflictingSaveRaisesTheFourWayQuestion() {
+        awaitText(firstText)
+
+        // The file moves on the server after the load, then the user types and saves: the guard
+        // the save carries no longer matches the server's clock, which is the conflict.
+        provider.changeUnderneath(firstPath, "changed on server")
+        compose.onAllNodes(hasSetTextAction())[0].performTextInput(" typed")
+        pumpUntil(describe = { "the edit never marked the tab dirty" }) {
+            compose.onAllNodes(hasText("Unsaved changes")).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithContentDescription("Save").performClick()
+
+        val before = ShadowDialog.getShownDialogs().size
+        pumpUntil(describe = { "the conflicting save never raised the question" }) {
+            ShadowDialog.getShownDialogs().size > before &&
+                ShadowDialog.getLatestDialog()?.isShowing == true &&
+                compose.onAllNodes(hasText("Changed since it was opened")).fetchSemanticsNodes()
+                    .isNotEmpty()
+        }
+
+        // The upgrade this branch is for: Overwrite and Reload are now two of four labelled ways
+        // out, not two of two — the safe options are choices the user can see, not a back gesture
+        // they have to guess at.
+        listOf("Overwrite", "Reload", "Compare", "Cancel").forEach { label ->
+            pumpUntil(describe = { "\"$label\" never composed in the conflict dialog" }) {
+                compose.onAllNodes(hasText(label)).fetchSemanticsNodes().isNotEmpty()
+            }
+        }
+
+        // Back out of the dialog is the Cancel choice: nothing written, nothing discarded.
+        val dialog = requireNotNull(ShadowDialog.getLatestDialog()) { "no conflict dialog window" }
+        @Suppress("DEPRECATION")
+        dialog.onBackPressed()
+        pumpUntil(describe = { "the conflict dialog never closed" }) { !dialog.isShowing }
+        assertThat(provider.writes).isEmpty()
+        awaitText(" typed")
         assertThat(scenarioRule.scenario.state).isEqualTo(Lifecycle.State.RESUMED)
     }
 }
