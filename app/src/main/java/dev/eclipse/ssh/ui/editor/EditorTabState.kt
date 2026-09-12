@@ -8,8 +8,8 @@ import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import dev.eclipse.ssh.data.fs.FsModificationConflictException
-import java.nio.ByteBuffer
-import java.nio.charset.CharacterCodingException
+import dev.eclipse.ssh.ui.editor.encoding.FileEncoding
+import dev.eclipse.ssh.ui.editor.encoding.FileEncodingCodec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -38,7 +38,11 @@ internal sealed interface EditorLoad {
  * screen's scope and a save survives a mid-flight tab switch (and the tab switch itself is not
  * what cancels one).
  */
-internal class EditorTabState(val id: Long, val request: EditorRequest) {
+internal class EditorTabState(
+    val id: Long,
+    val request: EditorRequest,
+    initialEncoding: FileEncoding = FileEncoding.UTF_8,
+) {
     var loadState by mutableStateOf<EditorLoad>(EditorLoad.Loading)
     var savedText by mutableStateOf("")
     var loadedModified by mutableStateOf<Long?>(null)
@@ -49,6 +53,21 @@ internal class EditorTabState(val id: Long, val request: EditorRequest) {
     var scrollRequest by mutableStateOf<Int?>(null)
     var layout by mutableStateOf<TextLayoutResult?>(null)
     var goToLineOpen by mutableStateOf(false)
+
+    /**
+     * The charset this tab reads and writes its file as. Starts from the prefs' encoding (a
+     * sticky default, not a per-file memory) and is then the tab's own: the options sheet's
+     * encoding row changes it here, never in a sibling tab.
+     */
+    var encoding by mutableStateOf(initialEncoding)
+
+    /**
+     * The file's bytes as last read from disk. Held so the encoding row can re-decode without a
+     * fresh read — the bytes are the truth the text is only a view of. A plain field, not
+     * snapshot state: nothing composes off it, and a ByteArray in a snapshot would be compared
+     * by identity on every write.
+     */
+    private var fileBytes: ByteArray? = null
 
     val history = EditorHistory()
     val verticalScroll = ScrollState(0)
@@ -85,18 +104,20 @@ internal class EditorTabState(val id: Long, val request: EditorRequest) {
                     loadState = EditorLoad.TooLarge(bytes.size.toLong())
                     return@launch
                 }
-                // Strict, because a permissive decode would open a binary file as mojibake and then
-                // save that mojibake back over the original — a silent corruption dressed as a feature.
-                val decoded = decodeStrictUtf8(bytes)
+                fileBytes = bytes
+                // Armed before the decode, not after it: a tab whose load fails can still be
+                // re-read under another encoding from the options sheet, and that re-read's
+                // first save must be guarded by the same clock every other load's is.
+                loadedModified = entry.modifiedEpochMillis
+                // Strict, because a permissive decode would open a binary file as mojibake and
+                // then save that mojibake back over the original — a silent corruption dressed
+                // as a feature. The charset is the tab's own, so the failure names it.
+                val decoded = FileEncodingCodec.decodeStrict(bytes, encoding)
                 if (decoded == null) {
-                    loadState = EditorLoad.Failed(
-                        "This file is not valid UTF-8 text. The editor cannot show it without damaging " +
-                            "it on save; it can still be downloaded, renamed or deleted.",
-                    )
+                    loadState = EditorLoad.Failed(notValidTextMessage(encoding))
                     return@launch
                 }
                 savedText = decoded
-                loadedModified = entry.modifiedEpochMillis
                 textValue = TextFieldValue(decoded, TextRange(0))
                 loadState = EditorLoad.Ready
             } catch (cancelled: CancellationException) {
@@ -108,11 +129,16 @@ internal class EditorTabState(val id: Long, val request: EditorRequest) {
     }
 
     fun save(scope: CoroutineScope, overwrite: Boolean = false) {
-        val bytes = textValue.text.encodeToByteArray()
         saving = true
         saveError = null
         scope.launch {
             try {
+                // Encoded inside the guard — and from the text as it stood when the save began —
+                // so a single-byte encoding's refusal (a character it cannot hold) lands in
+                // saveError with its message instead of crashing the button press that started
+                // this, and so the baseline below cannot claim a save of text it never wrote.
+                val text = textValue.text
+                val bytes = FileEncodingCodec.encode(text, encoding)
                 request.provider.write(
                     request.entry.path,
                     bytes,
@@ -120,7 +146,7 @@ internal class EditorTabState(val id: Long, val request: EditorRequest) {
                     // when the user has just answered "overwrite" to the conflict it raised.
                     loadedModified.takeIf { !overwrite },
                 )
-                savedText = textValue.text
+                savedText = text
                 // Re-stat so the *next* save is guarded by the time this one produced, not the one
                 // from before it — otherwise saving twice in a row would raise its own conflict.
                 loadedModified = runCatching {
@@ -142,7 +168,11 @@ internal class EditorTabState(val id: Long, val request: EditorRequest) {
         scope.launch {
             try {
                 val fresh = request.provider.read(request.entry.path)
-                val decoded = decodeStrictUtf8(fresh) ?: return@launch
+                fileBytes = fresh
+                // A reload under an encoding the fresh bytes do not fit keeps the text on
+                // screen: throwing the user's view away on a charset mismatch is the load's
+                // job (a Failed state), not the reload's.
+                val decoded = FileEncodingCodec.decodeStrict(fresh, encoding) ?: return@launch
                 savedText = decoded
                 loadedModified = request.provider.stat(request.entry.path)?.modifiedEpochMillis
                     ?: System.currentTimeMillis()
@@ -152,6 +182,59 @@ internal class EditorTabState(val id: Long, val request: EditorRequest) {
             } catch (error: Throwable) {
                 saveError = error.message ?: "The file could not be reloaded"
             }
+        }
+    }
+
+    /**
+     * Re-reads the bytes this tab was loaded from as [newEncoding] — the options sheet's encoding
+     * row.
+     *
+     * The re-decode works from the bytes as loaded, never from the text on screen: text is what
+     * the *old* encoding made of the file, and decoding that again would be a transcode, not a
+     * re-read. In the Ready state the swap goes through [applyEdit] like any edit, so undo gets
+     * the previous text back, and the saved baseline is left alone — the tab goes dirty exactly
+     * when the re-decode changed what is on screen, and a save writes the file under the new
+     * encoding only because the user asked for it.
+     *
+     * A tab still sitting in [EditorLoad.Failed] is a fresh open in disguise: the load refused
+     * under the old encoding, and this is the second chance the failure screen's options sheet
+     * offers. There the decoded text becomes both the working copy and the baseline, clean, the
+     * same deal a first successful load gives.
+     *
+     * A strict failure refuses the switch outright — the encoding stays what it was and the
+     * refusal names the charset — rather than half-applying a new encoding over text the old
+     * one produced.
+     */
+    fun redecode(newEncoding: FileEncoding) {
+        val bytes = fileBytes
+        if (bytes == null) {
+            // A brand-new file has never been read from disk, so there is nothing to re-decode;
+            // the choice only changes what the first save writes.
+            encoding = newEncoding
+            return
+        }
+        val decoded = FileEncodingCodec.decodeStrict(bytes, newEncoding)
+        if (decoded == null) {
+            if (loadState is EditorLoad.Failed) {
+                // Still on the failure screen, so the refusal replaces the message the user is
+                // already reading rather than a save-error bar they cannot see.
+                loadState = EditorLoad.Failed(notValidTextMessage(newEncoding))
+            } else {
+                saveError =
+                    "This file is not valid ${newEncoding.label} text; it was left as ${encoding.label}."
+            }
+            return
+        }
+        encoding = newEncoding
+        if (loadState is EditorLoad.Failed) {
+            savedText = decoded
+            textValue = TextFieldValue(decoded, TextRange(0))
+            loadState = EditorLoad.Ready
+        } else {
+            // A burst of typing ends here: the swap is not part of it, and undo must be able to
+            // take the old text back without taking the typing with it.
+            history.endBurst()
+            applyEdit(TextFieldValue(decoded, TextRange(0)))
         }
     }
 
@@ -200,6 +283,15 @@ internal class EditorHistory {
         lastEditAt = now
     }
 
+    /**
+     * Ends any typing burst still open, so the next [record] pushes its own undo step. For the
+     * one caller that needs it — a re-decode replacing the whole text — folding the swap into a
+     * burst of typing would let one undo press skip over it and the typing both.
+     */
+    fun endBurst() {
+        lastEditAt = 0L
+    }
+
     fun undo(current: TextFieldValue): TextFieldValue? {
         val previous = past.removeLastOrNull() ?: return null
         future.addLast(current)
@@ -215,13 +307,12 @@ internal class EditorHistory {
     }
 }
 
-/** Decodes UTF-8 strictly, returning null when the bytes are not valid UTF-8. */
-internal fun decodeStrictUtf8(bytes: ByteArray): String? = try {
-    Charsets.UTF_8.newDecoder()
-        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-        .decode(ByteBuffer.wrap(bytes))
-        .toString()
-} catch (error: CharacterCodingException) {
-    null
-}
+/**
+ * The Failed message for bytes [encoding] cannot read. Spelled once because both roads to it —
+ * the load and the encoding row's refusal — must say the same thing: which charset refused, that
+ * showing the file anyway would damage it on save, and that the file is still a file (download,
+ * rename, delete all still work — or pick another encoding and try again).
+ */
+internal fun notValidTextMessage(encoding: FileEncoding): String =
+    "This file is not valid ${encoding.label} text. The editor cannot show it without damaging " +
+        "it on save; it can still be downloaded, renamed or deleted."

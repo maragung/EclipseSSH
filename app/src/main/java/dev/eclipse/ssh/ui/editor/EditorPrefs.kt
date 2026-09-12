@@ -1,19 +1,25 @@
 package dev.eclipse.ssh.ui.editor
 
+import dev.eclipse.ssh.ui.editor.encoding.FileEncoding
 import org.json.JSONException
 import org.json.JSONObject
 
 /**
- * The editor's options sheet, as one value: what the six toggles and numbers were last set to.
+ * The editor's options sheet, as one value: what the toggles, numbers, and encoding were last set
+ * to.
  *
  * This is the model behind the `editorPrefsJson` blob ([dev.eclipse.ssh.data.settings.SettingsRepository]
  * persists it as a JSON string under a single DataStore key) — word wrap, line numbers, tab size,
- * spaces-vs-tabs, and the auto-save pair. The defaults are the values a first-time reader wants:
- * line numbers on, wrap off (a wrapped line lies about what the file actually contains), a tab
- * every 4 columns, real tabs, and auto-save after 2 s of quiet.
+ * spaces-vs-tabs, the auto-save pair, and the encoding new files open as. The defaults are the
+ * values a first-time reader wants: line numbers on, wrap off (a wrapped line lies about what the
+ * file actually contains), a tab every 4 columns, real tabs, auto-save after 2 s of quiet, and
+ * UTF-8 (the one encoding whose save path can never refuse).
  *
  * View state, not safety state, exactly as the blob's own doc argues: nothing here can lose data
- * on its own, so the codec below optimises for "always usable", not for "always intact".
+ * on its own, so the codec below optimises for "always usable", not for "always intact". The
+ * encoding is the one field with a toe over that line — it decides what the next save writes —
+ * but it is still only a *default for files opened later*; each open tab owns its own encoding,
+ * and the file codec refuses a save into a charset that cannot hold the text.
  */
 data class EditorPrefs(
     /** Whether long lines fold at the screen edge instead of scrolling horizontally. */
@@ -29,6 +35,9 @@ data class EditorPrefs(
     /** How long the text must stay quiet before auto-save fires; clamped to
      * [EditorPrefsCodec.AUTO_SAVE_DELAY_MIN_MILLIS]..[EditorPrefsCodec.AUTO_SAVE_DELAY_MAX_MILLIS]. */
     val autoSaveDelayMillis: Long = 2_000L,
+    /** The encoding a newly opened file is read as: the label of a [FileEncoding], which is what
+     * the selector shows and what the blob's reader validates against. */
+    val encoding: String = "UTF-8",
 )
 
 /**
@@ -87,6 +96,7 @@ object EditorPrefsCodec {
             autoSaveDelayMillis = root.longIn(
                 "autoSaveDelayMillis", 2_000L, AUTO_SAVE_DELAY_MIN_MILLIS, AUTO_SAVE_DELAY_MAX_MILLIS,
             ),
+            encoding = root.encodingOr("encoding", "UTF-8"),
         )
     } catch (error: JSONException) {
         // Not an object, or not parseable at all. Both mean "we never agreed on what this was",
@@ -95,12 +105,12 @@ object EditorPrefsCodec {
     }
 
     /**
-     * Encodes [prefs] as the persisted blob, writing all six fields.
+     * Encodes [prefs] as the persisted blob, writing all seven fields.
      *
      * Field order is fixed and matches the class, which keeps an eyeballed blob readable and
-     * makes diffs of successive saves line up. [JSONObject.put] with Boolean/Int/Long values
-     * cannot fail and cannot lose precision, so there is no failure mode to handle — the one
-     * asymmetry with [decode] is deliberate and documented there.
+     * makes diffs of successive saves line up. [JSONObject.put] with Boolean/Int/Long/String
+     * values cannot fail and cannot lose precision, so there is no failure mode to handle — the
+     * one asymmetry with [decode] is deliberate and documented there.
      */
     fun encode(prefs: EditorPrefs): String = JSONObject()
         .put("wordWrap", prefs.wordWrap)
@@ -109,6 +119,7 @@ object EditorPrefsCodec {
         .put("spacesInsteadOfTabs", prefs.spacesInsteadOfTabs)
         .put("autoSaveEnabled", prefs.autoSaveEnabled)
         .put("autoSaveDelayMillis", prefs.autoSaveDelayMillis)
+        .put("encoding", prefs.encoding)
         .toString()
 
     /**
@@ -152,5 +163,17 @@ object EditorPrefsCodec {
         is Int -> raw.toLong()
         is Long -> raw
         else -> null
+    }
+
+    /**
+     * Reads the encoding field, or [fallback] when absent, not a string, or not a label the file
+     * codec knows. Validation is against [FileEncoding.fromLabel] rather than a spelling rule
+     * because the value's whole job is to reach the codec later: an unknown label that survived
+     * the read would crash the first save made under it. The fallback is also the reason a blob
+     * written by an older version — no `encoding` key at all — still decodes.
+     */
+    private fun JSONObject.encodingOr(key: String, fallback: String): String {
+        val raw = opt(key)
+        return if (raw is String && FileEncoding.fromLabel(raw) != null) raw else fallback
     }
 }

@@ -64,13 +64,14 @@ class EditorPrefsTest {
             spacesInsteadOfTabs = true,
             autoSaveEnabled = false,
             autoSaveDelayMillis = 5_000L,
+            encoding = "Windows-1252",
         )
         assertThat(EditorPrefsCodec.decode(EditorPrefsCodec.encode(prefs))).isEqualTo(prefs)
     }
 
     @Test
-    fun `encode writes exactly the six fields`() {
-        // A seventh field is a seventh thing to keep in sync with every future reader; the
+    fun `encode writes exactly the seven fields`() {
+        // An eighth field is an eighth thing to keep in sync with every future reader; the
         // set of keys is the format's identity, so it is pinned, not implied by the round trip.
         val keys = JSONObject(EditorPrefsCodec.encode(EditorPrefs())).keys().asSequence().toList()
         assertThat(keys).containsExactly(
@@ -80,6 +81,7 @@ class EditorPrefsTest {
             "spacesInsteadOfTabs",
             "autoSaveEnabled",
             "autoSaveDelayMillis",
+            "encoding",
         )
     }
 
@@ -154,5 +156,27 @@ class EditorPrefsTest {
         // every hand-written blob falls back to the default.
         assertThat(EditorPrefsCodec.decode("{\"autoSaveDelayMillis\": 300}").autoSaveDelayMillis)
             .isEqualTo(300L)
+    }
+
+    @Test
+    fun `a blob with no encoding key decodes as utf 8`() {
+        // Every blob written before the field existed — the format's whole history — lacks the
+        // key; those readers must see the default, not a fallback error.
+        assertThat(EditorPrefsCodec.decode("{\"wordWrap\": true}").encoding).isEqualTo("UTF-8")
+    }
+
+    @Test
+    fun `an encoding label the file codec does not know falls back to utf 8`() {
+        // The value's whole job is to reach the codec on the first load; an unknown label that
+        // survived the read would crash there instead of here. "Latin-1" is the honest trap:
+        // a real spelling, but not one the selector ever offered.
+        assertThat(EditorPrefsCodec.decode("{\"encoding\": \"Latin-1\"}").encoding).isEqualTo("UTF-8")
+    }
+
+    @Test
+    fun `a wrong typed encoding falls back to utf 8`() {
+        // A number where a label belongs was not written by encode; the default is the only read
+        // that cannot crash the load it is about to seed.
+        assertThat(EditorPrefsCodec.decode("{\"encoding\": 8}").encoding).isEqualTo("UTF-8")
     }
 }

@@ -39,6 +39,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -77,6 +78,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
+import dev.eclipse.ssh.ui.editor.encoding.FileEncoding
 import dev.eclipse.ssh.ui.editor.highlight.SyntaxColors
 import dev.eclipse.ssh.ui.editor.highlight.syntaxTransformationFor
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
@@ -154,7 +156,16 @@ fun TextEditorScreen(
             selectedTabId = existing.id
             return
         }
-        val tab = EditorTabState(nextTabId++, request)
+        // Seeded from the prefs' encoding: a sticky default for files opened from here on. The
+        // tab owns its encoding from this line, so a later choice in one tab never reaches into
+        // another. fromLabel's null is unreachable — the prefs codec only lets known labels
+        // through — but a preference that could crash the load it seeds is not a default worth
+        // trusting, so the belt stays.
+        val tab = EditorTabState(
+            nextTabId++,
+            request,
+            FileEncoding.fromLabel(prefs.encoding) ?: FileEncoding.UTF_8,
+        )
         tabs += tab
         selectedTabId = tab.id
         tab.startLoad(scope)
@@ -302,6 +313,12 @@ private fun SingleFileEditor(
     onRequestClose: () -> Unit,
     tabStrip: @Composable () -> Unit,
 ) {
+    // Hoisted above the load-outcome switch because a Failed tab needs the sheet too: the
+    // encoding row is exactly how a file the load refused gets a second charset, and the failure
+    // screen is where that need is born — a sheet only the Ready state could open would strand
+    // every non-UTF-8 file at the moment it most needs opening.
+    var optionsOpen by remember { mutableStateOf(false) }
+
     when (val state = tab.loadState) {
         is EditorLoad.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator()
@@ -313,6 +330,9 @@ private fun SingleFileEditor(
         ) {
             Text(tab.request.entry.name, style = MaterialTheme.typography.titleMedium)
             Text(state.message, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // The way out the message points at: pick another encoding and the tab re-reads its
+            // bytes, and a charset the file fits opens it on the spot.
+            TextButton(onClick = { optionsOpen = true }) { Text("Editor options") }
             TextButton(onClick = onRequestClose) { Text("Close") }
         }
 
@@ -342,7 +362,8 @@ private fun SingleFileEditor(
             onSave = { tab.save(scope, false) },
             onClose = onRequestClose,
             prefs = prefs,
-            onPrefsChange = onPrefsChange,
+            encoding = tab.encoding,
+            onOpenOptions = { optionsOpen = true },
             onToggleFind = onToggleFind,
             findOpen = findOpen,
             findQuery = findQuery,
@@ -438,6 +459,26 @@ private fun SingleFileEditor(
                     tab.reloadFromDisk(scope)
                 }) { Text("Reload") }
             },
+        )
+    }
+
+    // One sheet for both load outcomes, so the Failed screen's "Editor options" and the gear in
+    // the toolbar open the same rows. The encoding row reads and writes *this tab's* encoding —
+    // the tab starts from the prefs value but is its own from there — while every other row is
+    // the shared sheet state the prefs carry.
+    if (optionsOpen) {
+        EditorOptionsDialog(
+            prefs = prefs,
+            onPrefsChange = onPrefsChange,
+            encoding = tab.encoding,
+            onEncodingChange = { chosen ->
+                // The choice is persisted as the default for files opened later, and applied to
+                // the file in front of the user right now; the write itself still only happens
+                // through save, dirty flag and all.
+                onPrefsChange(prefs.copy(encoding = chosen.label))
+                tab.redecode(chosen)
+            },
+            onDismiss = { optionsOpen = false },
         )
     }
 }
@@ -555,7 +596,8 @@ private fun EditorBody(
     onSave: () -> Unit,
     onClose: () -> Unit,
     prefs: EditorPrefs,
-    onPrefsChange: (EditorPrefs) -> Unit,
+    encoding: FileEncoding,
+    onOpenOptions: () -> Unit,
     onToggleFind: () -> Unit,
     findOpen: Boolean,
     findQuery: String,
@@ -579,9 +621,8 @@ private fun EditorBody(
     tabStrip: @Composable () -> Unit,
 ) {
     val density = LocalDensity.current
-    // The options sheet's open flag lives here, next to the gear that opens it. Owned here rather
-    // than in the parent because nothing above EditorBody needs to know it is on screen.
-    var optionsOpen by remember { mutableStateOf(false) }
+    // The options sheet's open flag lives in SingleFileEditor, hoisted there so a Failed tab can
+    // open the sheet too; the gear here only reports that it was pressed.
 
     val textStyle = TextStyle(
         fontFamily = TerminalMonoFontFamily,
@@ -684,7 +725,7 @@ private fun EditorBody(
                 IconButton(onClick = onToggleFind) {
                     Icon(Icons.Filled.Search, contentDescription = "Find and replace")
                 }
-                IconButton(onClick = { optionsOpen = true }) {
+                IconButton(onClick = onOpenOptions) {
                     Icon(Icons.Filled.Settings, contentDescription = "Editor options")
                 }
                 IconButton(onClick = onSave, enabled = dirty && !saving) {
@@ -766,8 +807,11 @@ private fun EditorBody(
 
         val (line, column) = lineAndColumn(textValue.text, textValue.selection.start)
         Surface(tonalElevation = 2.dp) {
+            // The encoding label, not a hard-coded "UTF-8": the status line is where the eye
+            // already sits, so a non-UTF-8 tab has to say so here — otherwise the only hint a
+            // save will write Windows-1252 is a refusal dialog after the fact.
             Text(
-                "Ln $line, Col $column    ${textValue.text.count { it == '\n' } + 1} lines    UTF-8",
+                "Ln $line, Col $column    ${textValue.text.count { it == '\n' } + 1} lines    ${encoding.label}",
                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -791,14 +835,6 @@ private fun EditorBody(
                 onClose = onToggleFind,
             )
         }
-    }
-
-    if (optionsOpen) {
-        EditorOptionsDialog(
-            prefs = prefs,
-            onPrefsChange = onPrefsChange,
-            onDismiss = { optionsOpen = false },
-        )
     }
 }
 
@@ -952,7 +988,8 @@ private fun GoToLineDialog(lineCount: Int, onDismiss: () -> Unit, onGo: (Int) ->
 }
 
 /**
- * The editor's options sheet: word wrap, line numbers, tab size, spaces-vs-tabs, and auto-save.
+ * The editor's options sheet: word wrap, line numbers, tab size, spaces-vs-tabs, auto-save, and
+ * the open file's encoding.
  *
  * A window-level [AlertDialog] rather than a bottom sheet because every change applies the moment
  * it is made — [onPrefsChange] persists each toggle on its own, so there is no "OK" to press and
@@ -960,15 +997,25 @@ private fun GoToLineDialog(lineCount: Int, onDismiss: () -> Unit, onGo: (Int) ->
  * That immediacy is also why [prefs] is read straight into every row: the sheet never holds a
  * draft copy that could drift from what was already saved.
  *
+ * The encoding row is the exception to "the sheet is prefs": it shows and changes the *tab's*
+ * encoding, which started from the prefs value but lives in [encoding] here. Every other row is
+ * shared state the prefs carry; the encoding is per-file, because files disagree about what they
+ * were written as.
+ *
  * Tab size and delay step through −/+ buttons rather than free entry, which makes an out-of-range
- * value unrepresentable from here — no validation to write, no error to show.
+ * value unrepresentable from here — no validation to write, no error to show. The encoding opens
+ * a picker instead of stepping, because its choices are names, not magnitudes: "UTF-16 LE" is not
+ * two steps from "UTF-8" in any sense a −/+ pair could honour.
  */
 @Composable
 private fun EditorOptionsDialog(
     prefs: EditorPrefs,
     onPrefsChange: (EditorPrefs) -> Unit,
+    encoding: FileEncoding,
+    onEncodingChange: (FileEncoding) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var encodingPickerOpen by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Editor options") },
@@ -1057,11 +1104,65 @@ private fun EditorOptionsDialog(
                         enabled = prefs.autoSaveDelayMillis < AUTO_SAVE_DELAY_CHOICES.last().first,
                     ) { Text("+") }
                 }
+                // The one row about the file rather than the editor: everything above is view
+                // state, while this decides what the next save writes. The label doubles as the
+                // button — a row that already shows the answer should not hide it behind an ellipsis.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Encoding", Modifier.weight(1f))
+                    TextButton(onClick = { encodingPickerOpen = true }) { Text(encoding.label) }
+                }
             }
         },
         // Not an "OK": nothing is pending, every row already persisted itself. The button exists
         // because a dialog only dismissible by tapping outside it is a puzzle, not a sheet.
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
+
+    if (encodingPickerOpen) {
+        EncodingPickerDialog(
+            selected = encoding,
+            onSelect = {
+                encodingPickerOpen = false
+                onEncodingChange(it)
+            },
+            onDismiss = { encodingPickerOpen = false },
+        )
+    }
+}
+
+/**
+ * The encoding picker: one row per charset the file codec supports, the current one checked.
+ *
+ * Every entry of [FileEncoding] is offered — the set the codec can encode is exactly the set the
+ * picker may promise, so an entry the list omitted would be a selector that cannot select. A
+ * pick applies immediately, like every other row of the sheet beneath it.
+ */
+@Composable
+private fun EncodingPickerDialog(
+    selected: FileEncoding,
+    onSelect: (FileEncoding) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("File encoding") },
+        text = {
+            Column {
+                FileEncoding.entries.forEach { candidate ->
+                    // The whole row answers, not just the dot: a radio row that only listened to
+                    // its own button would make the bigger target the one that does nothing.
+                    Row(
+                        Modifier.fillMaxWidth().clickable { onSelect(candidate) },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = candidate == selected, onClick = { onSelect(candidate) })
+                        Text(candidate.label, Modifier.padding(start = 4.dp))
+                    }
+                }
+            }
+        },
+        // Cancel, not Done: picking already applied, so the only thing to dismiss *is* the picker.
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
