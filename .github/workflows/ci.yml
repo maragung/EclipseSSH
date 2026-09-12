@@ -576,11 +576,16 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
+          # Same NDK pin the verify job installs: the stress job's build runs
+          # :freerdp:buildFreerdpNative like every other build, and that task
+          # resolves the toolchain from the SDK - without the pin the job fails
+          # before the idle test it exists to run has started.
           cmdline-tools-version: '11479570'
           packages: >-
             platform-tools
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
           cache-packages: true
 
       - name: Set up Gradle
