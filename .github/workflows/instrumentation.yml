@@ -203,6 +203,27 @@ jobs:
             exit 1
           fi
 
+      - name: Pre-grant the notification permission
+        # MainActivity asks for POST_NOTIFICATIONS the first time it composes
+        # (a runtime permission from API 33, and targetSdk 35). On a fresh AVD
+        # nothing has been granted, so every test launch raised the system
+        # permission dialog on top of the activity under test ~300ms after it
+        # resumed - the activity paused before its first frame completed, and
+        # that single dialog is what the first hosted run's 17 UI failures all
+        # trace back to (15x "No compose hierarchies found in the app" from
+        # queries against an interrupted composition, and the
+        # "Activity never becomes requested state RESUMED" timeouts). The
+        # non-UI suites passed because they never launch the activity.
+        # Installing the app here and granting once puts every test in the
+        # state a real device reaches after the user accepts the prompt; the
+        # reinstall connectedDebugAndroidTest performs afterwards keeps the
+        # grant (only a full uninstall would drop it).
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          ./gradlew :app:installDebug
+          "$ADB" shell pm grant dev.eclipse.ssh.debug android.permission.POST_NOTIFICATIONS
+
       - name: Run connectedAndroidTest
         # The emulator booted above is the only device adb can see, so the
         # default single-device selection is correct. The suite reports into
