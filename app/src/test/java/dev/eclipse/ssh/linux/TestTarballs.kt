@@ -72,6 +72,7 @@ internal object TestTarballs {
         LinuxDistro(
             id = "ubuntu-22.04",
             displayName = "Ubuntu 22.04 LTS",
+            release = "jammy",
             ubuntuArch = "arm64",
             rootfsTarballUrl = url,
             rootfsSha256 = sha256,
