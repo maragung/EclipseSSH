@@ -6,9 +6,11 @@ import androidx.work.Configuration
 import dagger.hilt.android.HiltAndroidApp
 import dev.eclipse.ssh.background.NotificationChannels
 import java.nio.file.Path
+import java.security.Security
 import javax.inject.Inject
 import org.apache.sshd.common.util.io.PathUtils
 import org.apache.sshd.common.util.security.SecurityProviderRegistrar
+import org.bouncycastle.jce.provider.BouncyCastleProvider
 
 @HiltAndroidApp
 class EclipseApp : Application(), Configuration.Provider {
@@ -18,6 +20,7 @@ class EclipseApp : Application(), Configuration.Provider {
     override fun onCreate() {
         // Must run before anything else: see configureSshdUserHome.
         configureSshdUserHome()
+        replacePlatformBouncyCastle()
         scopeSshdSecurityProviders()
         muteSshLoggingInProductionBuilds()
         super.onCreate()
@@ -51,6 +54,46 @@ class EclipseApp : Application(), Configuration.Provider {
     }
 
     /**
+     * Replaces the platform's stripped Bouncy Castle with the full one bundled in the APK.
+     *
+     * Android installs its own repackaged, reduced Bouncy Castle under the provider name `BC`.
+     * That name is also how MINA sshd resolves its crypto: `BouncyCastleSecurityProviderRegistrar`
+     * holds whatever `Security.getProvider("BC")` answers, and the platform's copy ships without
+     * the EC parameter services, so nothing routed through it can service
+     * `AlgorithmParameters.getInstance("EC")`.
+     *
+     * That stopped being a footnote in sshd 2.19.0 (the dependency upgraded in v1.1.12):
+     * `ECCurves` no longer hard-codes its curve parameters but resolves them through exactly
+     * that call, and its static initializer sorts the curves by key size — so the resolution
+     * runs during class initialization, where a failure is an uncatchable
+     * `ExceptionInInitializerError`. The first touch of `KeyPairProvider` (BaseBuilder's
+     * static chain, walked the moment `SshConnectionManager` is constructed) threw
+     * `IllegalArgumentException: No EC params for nistp256` inside the initializer and the
+     * process died during MainActivity's first composition. Every release from v1.1.12
+     * through v1.1.16 crashed on open, on every device — the app could not draw a frame.
+     *
+     * Swapping the platform provider for the bundled full one — at the same position, so the
+     * process-wide JCE preference order is otherwise unchanged — hands the name to an
+     * implementation that has the services. The bundled provider is a superset of the
+     * platform's stripped copy: everything that resolved to the old `BC` keeps resolving, and
+     * the EC parameters sshd now needs start resolving too.
+     *
+     * Where no provider answers to the name — a host JVM without one — there is nothing to
+     * replace and nothing to fix: sshd's registrar then constructs its own instance of the
+     * bundled provider reflectively. The guard makes this a no-op there rather than a change,
+     * which is also why the unit suite never saw the crash: it runs on such a JVM, while the
+     * device — with the platform collision — died. [SshdBouncyCastleSwapTest] installs a
+     * faithful model of the platform's crippled provider and pins the swap against it.
+     *
+     * The same ordering requirement as [configureSshdUserHome]: sshd caches its registrars
+     * and provider instances in static initializers and never looks again, so the swap has to
+     * happen before the first of those runs.
+     */
+    private fun replacePlatformBouncyCastle() {
+        runCatching { swapBundledBouncyCastleIntoProviderRegistry() }
+    }
+
+    /**
      * Keeps Apache MINA SSHD's optional JCE providers out of the process-wide provider registry.
      *
      * sshd ships registrars for Bouncy Castle and for net.i2p.crypto's Ed25519, and by default it
@@ -63,7 +106,9 @@ class EclipseApp : Application(), Configuration.Provider {
      * taken. sshd's registration therefore fails silently and every by-name lookup afterwards
      * resolves to the platform's provider rather than the one sshd built — so the implementation
      * that constructs the app's private keys is chosen by whatever happens to hold the name, which
-     * on some OEM builds is neither sshd's copy nor the one this app was tested against.
+     * on some OEM builds is neither sshd's copy nor the one this app was tested against. Since
+     * [replacePlatformBouncyCastle] runs first, the name is held by the bundled full provider, so
+     * both the name and the instance sshd falls back to are the copy this app ships.
      *
      * The second is the reverse direction: the registration is process-wide, so the app would be
      * publishing an Ed25519 implementation to every other library sharing the VM, which is not its
@@ -144,6 +189,27 @@ class EclipseApp : Application(), Configuration.Provider {
         val SSHD_PROVIDER_SCOPING: Map<String, String> = listOf("BC", "EdDSA").associate { provider ->
             "${SecurityProviderRegistrar.CONFIG_PROP_BASE}.$provider." +
                 SecurityProviderRegistrar.NAMED_PROVIDER_PROPERTY to "false"
+        }
+
+        /**
+         * Puts the bundled full Bouncy Castle into the provider registry under the platform's
+         * `BC` name, in the slot the platform's stripped copy occupied. See
+         * [replacePlatformBouncyCastle] for why that swap has to happen.
+         *
+         * `internal` and static so a unit test can drive exactly this code path against a
+         * simulated platform provider, rather than a re-implementation that could drift.
+         * A no-op when nothing holds the name.
+         */
+        internal fun swapBundledBouncyCastleIntoProviderRegistry() {
+            val name = BouncyCastleProvider.PROVIDER_NAME
+            val slot = Security.getProviders().indexOfFirst { it.name.equals(name, ignoreCase = true) }
+            if (slot < 0) {
+                return
+            }
+            Security.removeProvider(name)
+            // insertProviderAt is 1-based; inserting at slot + 1 lands the replacement exactly
+            // where the removed provider sat, leaving the preference order untouched.
+            Security.insertProviderAt(BouncyCastleProvider(), slot + 1)
         }
 
         /** Off in production, verbose where a developer is watching. */

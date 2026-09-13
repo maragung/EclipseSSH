@@ -12,6 +12,11 @@ hiltExt = "1.4.0"
 datastore = "1.1.4"
 coroutines = "1.11.0"
 sshd = "2.19.0"
+# The full Bouncy Castle provider EclipseApp installs over the platform's stripped copy -
+# see EclipseApp.replacePlatformBouncyCastle. Same version the release lockfile resolves
+# for vernacular-vnc's transitive pull; declared explicitly because the swap is a
+# startup-critical step that must not live on another library's dependency edge.
+bouncycastle = "1.79"
 # Pinned to a JitPack commit, not a tag: vernacular-vnc has no release tags, and the
 # upstream repo's master has moved since the commit this version was verified against.
 # f39cbe2 is the revision whose RFB handshake, pixel format and thread model the
@@ -83,6 +88,7 @@ hilt-ext-compiler = { module = "androidx.hilt:hilt-compiler", version.ref = "hil
 sshd-core = { module = "org.apache.sshd:sshd-core", version.ref = "sshd" }
 sshd-common = { module = "org.apache.sshd:sshd-common", version.ref = "sshd" }
 sshd-sftp = { module = "org.apache.sshd:sshd-sftp", version.ref = "sshd" }
+bouncycastle-prov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
 vernacular-vnc = { module = "com.github.maragung:vernacular-vnc", version.ref = "vernacular-vnc" }
 eddsa = { module = "net.i2p.crypto:eddsa", version.ref = "eddsa" }
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
