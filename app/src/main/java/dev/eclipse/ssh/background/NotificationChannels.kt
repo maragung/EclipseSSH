@@ -27,6 +27,7 @@ internal object NotificationChannels {
     const val SESSIONS = "active_sessions"
     const val TRANSFERS = "transfer_progress"
     const val ALERTS = "alerts"
+    const val LINUX = "linux_userspace"
 
     /** Ongoing foreground-service notification. */
     const val ID_SERVICE = 4101
@@ -36,6 +37,12 @@ internal object NotificationChannels {
 
     /** "Reconnect your sessions" — the platform refused a background service start. */
     const val ID_RESTORE = 4103
+
+    /** The local Ubuntu environment's ongoing "Running" notification. */
+    const val ID_LINUX = 4104
+
+    /** "Ubuntu runs only while the app is open" — the platform refused the promotion to foreground. */
+    const val ID_LINUX_PROMOTION = 4105
 
     fun ensureCreated(context: Context) {
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
@@ -60,6 +67,11 @@ internal object NotificationChannels {
                         context.getString(R.string.channel_alerts),
                         NotificationManager.IMPORTANCE_DEFAULT,
                     ).apply { description = context.getString(R.string.channel_alerts_desc) },
+                    NotificationChannel(
+                        LINUX,
+                        context.getString(R.string.channel_linux),
+                        NotificationManager.IMPORTANCE_LOW,
+                    ).apply { description = context.getString(R.string.channel_linux_desc) },
                 ),
             )
         }

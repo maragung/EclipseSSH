@@ -58,7 +58,11 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
 import dev.eclipse.ssh.feature.wakeonlan.WakeOnLan
 import dev.eclipse.ssh.feature.wakeonlan.parseMac
+import dev.eclipse.ssh.linux.LocalLinuxHost
+import dev.eclipse.ssh.linux.LocalTerminalChannel
+import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.presentation.files.FilesExplorerController
+import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.connectFailureIsFinal
 import dev.eclipse.ssh.ssh.SessionDiagnostics
@@ -161,6 +165,7 @@ class MainViewModel @Inject constructor(
     private val wakeOnLan: WakeOnLan,
     private val transferNotifier: TransferNotifier,
     val filesExplorer: FilesExplorerController,
+    val linuxUserspace: LinuxUserspaceController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     private val query = MutableStateFlow("")
@@ -674,6 +679,26 @@ class MainViewModel @Inject constructor(
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), MainUiState())
 
+    /**
+     * The host list's "Local Ubuntu 22.04" card, or null when it must not be shown.
+     *
+     * Passed as a flow rather than folded into [MainUiState] for the same reason [filesExplorer]'s
+     * state is not: the card is derived from the userspace's own two flows, exists only on a device
+     * that has installed it, and changes far more rarely than any of the five things [MainUiState]
+     * already combines — a dedicated flow lets the host screen collect it alone.
+     *
+     * Null exactly when [LocalLinuxHost.shouldShowCard] says so: not installed, mid-install, being
+     * torn down, broken, or never probed healthy. The card is a promise that tapping it opens a
+     * terminal, so every state that cannot keep that promise hides it — see [LocalLinuxHost].
+     */
+    val localLinuxCard: StateFlow<HostProfile?> =
+        linuxUserspace.graph?.let { graph ->
+            val profile = LocalLinuxHost.hostProfile(graph.distro)
+            combine(graph.manager.state, graph.manager.lastHealth) { state, health ->
+                if (LocalLinuxHost.shouldShowCard(state, health)) profile else null
+            }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+        } ?: MutableStateFlow(null)
+
     init {
         viewModelScope.launch {
             // Room work, so it can fail for reasons that have nothing to do with this app being
@@ -861,6 +886,15 @@ class MainViewModel @Inject constructor(
         sessionKey: String? = null,
         adopt: Boolean = true,
     ) {
+        // The local Ubuntu card is a host card like any other, but its "connect" forks a pty in
+        // this process instead of dialing a server — no credentials, no transport, no retries. The
+        // intercept is the one line that makes the whole feature ride the existing terminal stack:
+        // every caller of connect() (the card, the auth path's callers, a future reconnect) reaches
+        // [connectLocal] without knowing the difference.
+        if (LocalLinuxHost.isLocalHost(host.id)) {
+            connectLocal(host, resuming = resuming, sessionKey = sessionKey)
+            return
+        }
         // Which session this dial speaks for. A session is owned by its *key* — the terminal tab's id —
         // and this is the one place that decides it, before the tab exists:
         //
@@ -1142,6 +1176,116 @@ class MainViewModel @Inject constructor(
         }
         attachTerminal(host, sessionKey, terminal, resolved)
         return true
+    }
+
+    /**
+     * The local Ubuntu session's connect: the same tab, buffer and collector an SSH shell gets,
+     * over a forked proot pty instead of a dial.
+     *
+     * Everything the SSH path needs and this one does not is absent on purpose. No credentials to
+     * resolve — the session is entered by process identity, the app's uid *is* the `ubuntu`
+     * account. No retry loop — a fork either works or it does not, and retrying instantly would
+     * fork again into whatever just failed. No dial gate — there is no transport to serialize over.
+     * What it keeps is the session-key contract: the key is the tab's id, the first terminal
+     * claims [LocalLinuxHost.HOST_ID], and the collector, the channels map and the buffer are the
+     * shared ones — which is what makes a local shell render, scroll, resize and report its ending
+     * through the exact path a remote one does.
+     *
+     * Opening a terminal also starts the userspace when it is stopped. The card is a promise that
+     * tapping it opens a shell, and "go to Settings and press Start first" would be the promise
+     * withdrawn one tap later; [LinuxUserspaceManager.start]'s probe is what catches a broken
+     * environment before a shell is forked into it, and its refusal lands on the tab as the reason.
+     */
+    private fun connectLocal(host: HostProfile, resuming: Boolean, sessionKey: String?) {
+        val graph = linuxUserspace.graph ?: return
+        // The same key resolution as the SSH dial above: a caller that knows says so, a tab that
+        // is already open is the one reconnected, and the first local terminal claims the
+        // synthesized host's own id.
+        val key = sessionKey
+            ?: tabs.value.firstOrNull { it.hostId == host.id }?.id
+            ?: host.id
+        selectedHostId.value = host.id
+        if (!resuming) reconnectAttempts.remove(key)
+        updateTab(key) { existing ->
+            (existing ?: SessionTab(id = key, hostId = host.id, title = host.name)).copy(
+                state = if (resuming) SessionConnectionState.RECONNECTING else SessionConnectionState.CONNECTING,
+                lastError = if (resuming) existing?.lastError else null,
+            )
+        }
+        diagnostics.record(
+            host.id,
+            if (resuming) SessionEvent.RECONNECT_ATTEMPT else SessionEvent.CONNECT_REQUESTED,
+            state = if (resuming) SessionConnectionState.RECONNECTING else SessionConnectionState.CONNECTING,
+        )
+        connectJobs.remove(key)?.cancel()
+        if (!resuming) {
+            reconnectJobs.remove(key)?.let { waiting ->
+                waiting.cancel()
+                diagnostics.record(host.id, SessionEvent.RECONNECT_CANCELLED, detail = "connect requested")
+            }
+        }
+        connectJobs[key] = transportScope.launch {
+            try {
+                val before = graph.manager.state.value
+                if (before is LinuxUserspaceState.NotInstalled || before is LinuxUserspaceState.Installing) {
+                    // Cannot happen through the card — it is hidden in exactly these states — but a
+                    // stale tap or a race with an uninstall must not fork a shell into a rootfs that
+                    // is not there.
+                    throw IOException("the Linux environment is not installed")
+                }
+                if (before is LinuxUserspaceState.Stopped || before is LinuxUserspaceState.NeedsRepair) {
+                    // A refusal is fatal only if the userspace did not come up anyway — two
+                    // connects racing to start it serialize on the manager's own mutex, and the
+                    // loser's start() finds Running and refuses. That refusal is the race resolving
+                    // itself, not a failure to show the user.
+                    val startFailure = runCatching { graph.manager.start() }.exceptionOrNull()
+                    val after = graph.manager.state.value
+                    if (after !is LinuxUserspaceState.Running && after !is LinuxUserspaceState.Starting) {
+                        val detail = (after as? LinuxUserspaceState.NeedsRepair)?.detail
+                            ?: startFailure?.message
+                            ?: "the Linux environment is not running"
+                        throw IOException(detail)
+                    }
+                }
+                val size = ptySizes[key]
+                val process = withContext(Dispatchers.IO) {
+                    graph.runtime.spawnSession(rows = size?.second ?: LOCAL_DEFAULT_ROWS, columns = size?.first ?: LOCAL_DEFAULT_COLUMNS)
+                }
+                val terminal = LocalTerminalChannel(process)
+                graph.processes.register(key, terminal)
+                // The hand-over rules are [attachTerminal]'s, repeated rather than shared because
+                // the shared function also does credential and SFTP work an SSH session needs and
+                // this one has no equivalent for: cancel the outgoing collector first so it never
+                // reports the hand-over as an outage, and never close a channel another dial
+                // installed under this key in the meantime.
+                terminalJobs.remove(key)?.cancelAndJoin()
+                channels.put(key, terminal)?.let { previous ->
+                    if (previous !== terminal) {
+                        previous.markDeliberate()
+                        runCatching { previous.close() }
+                    }
+                }
+                val buffer = terminalBuffers.getOrPut(key) { AnsiTerminalBuffer() }
+                ptySizes[key]?.let { (columns, rows) -> buffer.resize(columns, rows) }
+                terminalJobs[key] = launchTerminalCollector(key, host.id, terminal, buffer)
+                publishTerminalFrame(key, buffer)
+                updateTab(key) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
+                connectedAt[key] = SystemClock.elapsedRealtime()
+                diagnostics.record(
+                    host.id,
+                    SessionEvent.SHELL_OPEN,
+                    state = SessionConnectionState.CONNECTED,
+                    pty = terminal.ptyLabel,
+                    channel = terminal.channelLabel,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                val reason = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
+                updateTab(key) { it?.copy(state = SessionConnectionState.ERROR, lastError = reason) }
+                diagnostics.record(host.id, SessionEvent.ENDED, state = SessionConnectionState.ERROR, detail = reason)
+            }
+        }
     }
 
     /**
@@ -3948,6 +4092,11 @@ class MainViewModel @Inject constructor(
         reconnectAttempts.remove(tab.id)
         reconnectPolicies.remove(tab.id)
         sessionStore.forget(tab.id)
+        // The store's forget above closed the channel and dropped it from the shared channels map;
+        // the userspace's own session table is the one remaining place this local session is
+        // recorded, and leaving it there would count a closed tab in the "N terminal sessions held
+        // open" line and in Stop's close-all sweep.
+        linuxUserspace.graph?.processes?.unregister(tab.id)
         tabs.value = tabs.value.filterNot { it.id == tab.id }
         terminalOutput.update { it - tab.id }
         terminalFrames.update { it - tab.id }
@@ -4706,6 +4855,14 @@ class MainViewModel @Inject constructor(
      */
     internal companion object {
         const val MAX_TERMINAL_CHARS = 100_000
+
+        /**
+         * The pty size a local Ubuntu session is forked at before the terminal composable has
+         * reported its real one. The same 120x40 both channel implementations start at, repeated
+         * here because the constants are private to them and the fork needs concrete numbers.
+         */
+        const val LOCAL_DEFAULT_COLUMNS = 120
+        const val LOCAL_DEFAULT_ROWS = 40
         /**
          * Ceiling on how often the terminal repaints, in milliseconds — about 30 frames a second.
          *

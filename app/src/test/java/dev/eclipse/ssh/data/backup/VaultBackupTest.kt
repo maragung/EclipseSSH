@@ -28,6 +28,8 @@ import dev.eclipse.ssh.data.model.TERMINAL_COLUMNS_RANGE
 import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.decodeForwardRules
+import dev.eclipse.ssh.linux.LinuxDistroCatalog
+import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.ssh.cipherFactoriesFor
 import org.json.JSONObject
 import org.junit.Assert.assertThrows
@@ -220,6 +222,32 @@ class VaultBackupTest {
         assertThat(json).doesNotContain("socksPassword")
         assertThat(json).doesNotContain("credentials")
         assertThat(VaultBackup.fromJson(json).first.single().socksPassword).isNull()
+    }
+
+    @Test
+    fun `the local Ubuntu environment never survives into a vault backup`() {
+        // The synthesized profile is handed a real HostProfile shape so the test proves the id is
+        // what's refused, not some malformed field the writer would trip over anyway.
+        val real = HostProfile(id = "real-edge", name = "Edge", host = "edge.example.com", username = "deploy")
+        val local = LocalLinuxHost.hostProfile(LinuxDistroCatalog.forDevice(listOf("arm64-v8a"))!!)
+
+        val json = VaultBackup.toJson(listOf(local, real), AppSettings(), emptyMap())
+
+        assertThat(json).doesNotContain(LocalLinuxHost.HOST_ID)
+        assertThat(VaultBackup.fromJson(json).first.map { it.id }).containsExactly("real-edge")
+    }
+
+    @Test
+    fun `a backup claiming to be the local Ubuntu environment is dropped on import`() {
+        // A hand-edited or foreign file can carry the reserved id; the importer drops that entry
+        // rather than restoring a "Local Ubuntu" host that dials localhost.
+        val json = """{"hosts":[
+            {"id":"${LocalLinuxHost.HOST_ID}","name":"Local Ubuntu 22.04","host":"localhost","username":"ubuntu"},
+            {"id":"real","name":"Edge","host":"edge.example.com","username":"deploy"}]}"""
+
+        val hosts = VaultBackup.fromJson(json).first
+
+        assertThat(hosts.map { it.id }).containsExactly("real")
     }
 
     @Test

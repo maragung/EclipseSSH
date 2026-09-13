@@ -32,6 +32,7 @@ import dev.eclipse.ssh.data.model.encodeForwardRules
 import dev.eclipse.ssh.data.model.encodeRemoteDesktop
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.feature.wakeonlan.parseMac
+import dev.eclipse.ssh.linux.LocalLinuxHost
 import java.security.SecureRandom
 import java.util.Base64
 import java.util.UUID
@@ -107,7 +108,14 @@ object VaultBackup {
                 .takeIf { json -> json.isNotBlank() }?.let { put("terminalKeyBarJson", it) }
         })
         root.put("hosts", JSONArray().apply {
-            hosts.forEach { host -> put(JSONObject().apply {
+            hosts.forEach { host ->
+                // The local Ubuntu environment's reserved id is synthesized at runtime from the
+                // userspace's state, so it never legitimately reaches this writer — but a profile
+                // with that id surviving into a vault would come back on another device as a
+                // "Local Ubuntu" entry that dials localhost. Refused here rather than trusted to
+                // every caller.
+                if (LocalLinuxHost.isLocalHost(host.id)) return@forEach
+                put(JSONObject().apply {
                 put("id", host.id)
                 put("name", host.name)
                 put("host", host.host)
@@ -228,8 +236,13 @@ object VaultBackup {
         val hosts = ArrayList<HostProfile>(hostsArray.length())
         for (i in 0 until hostsArray.length()) {
             val h = hostsArray.getJSONObject(i)
+            val id = h.optString("id").ifBlank { UUID.randomUUID().toString() }
+            // The mirror of the writer's refusal: a hand-edited or foreign backup carrying the
+            // local Ubuntu environment's reserved id is dropped as one bad entry, not trusted as
+            // a host — the same posture as every other shape check in this loop.
+            if (LocalLinuxHost.isLocalHost(id)) continue
             hosts += HostProfile(
-                id = h.optString("id").ifBlank { UUID.randomUUID().toString() },
+                id = id,
                 name = h.optString("name"),
                 host = h.optString("host"),
                 username = h.optString("username"),

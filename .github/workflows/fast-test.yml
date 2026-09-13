@@ -120,6 +120,15 @@ jobs:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
+      - name: Cache the Linux userspace native build tree
+        # Read-only, like the FreeRDP entry above: the shards rely on main's
+        # ci.yml having saved this key, and a cold build (tarball fetch plus
+        # three quick proot builds) is the fallback on a fresh pin.
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
         with:
