@@ -140,17 +140,17 @@ android {
     }
 
     splits {
-        // Disabled in favour of the AAB's per-ABI splitting at Play
-        // install time. AGP 8.9.1's `PerModuleBundleTask` crashes when
-        // `splits.abi` is enabled alongside the bundle pipeline, so
-        // shipping a single universal APK is the simpler choice. The
-        // universal APK is `isUniversalApk = true` below - it carries
-        // the .so files for all four ABIs. The cost is ~45 KB on a
-        // ~5.7 MB APK, which is the difference documented in the audit
-        // report. Sideloading loses the per-ABI option; the Play Store
-        // path gains per-ABI APKs at install time.
+        // Per-ABI release APKs for the GitHub-release path, where the user picks
+        // the file and the smaller per-ABI APK (a fifth of the universal one's
+        // native payload on a 64-bit phone) is the better download. This was
+        // once disabled because AGP 8.9.1's PerModuleBundleTask crashed when
+        // splits ran alongside the bundle pipeline; that was fixed upstream in
+        // AGP 8.11.0 and this project is on 9.4.0, so the bundle (the Play path,
+        // which splits at install time anyway) and the APK splits coexist.
+        // `isUniversalApk` keeps one fat APK for anyone who cannot tell their
+        // ABI or is on an emulator image that lies about it.
         abi {
-            isEnable = false
+            isEnable = true
             reset()
             include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
             isUniversalApk = true
