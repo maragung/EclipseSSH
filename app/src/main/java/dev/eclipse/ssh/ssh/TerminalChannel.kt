@@ -70,6 +70,12 @@ interface TerminalChannel : Closeable {
     /** When the far end last sent anything, as `System.currentTimeMillis`, or 0 before it has. */
     val lastActivityAtMs: Long
 
+    /**
+     * When the channel was opened, as `System.currentTimeMillis`, or 0 while it has not been. A
+     * session too young to have been asked anything cannot be judged for not answering.
+     */
+    val openedAtMs: Long
+
     /** How long since the far end last sent anything, or null while it has not sent anything yet. */
     fun idleForMs(nowMs: Long = System.currentTimeMillis()): Long?
 
@@ -204,7 +210,7 @@ class SshTerminalChannel(
     private val openedAt = AtomicLong(0)
 
     /** @see openedAt */
-    val openedAtMs: Long get() = openedAt.get()
+    override val openedAtMs: Long get() = openedAt.get()
 
     /**
      * How many output chunks were discarded because nothing drained [output] in time.

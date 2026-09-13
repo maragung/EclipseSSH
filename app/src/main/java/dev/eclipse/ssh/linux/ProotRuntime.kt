@@ -165,7 +165,16 @@ class ProotRuntime(
                 }
                 // After end-of-stream the child has exited; the reap is quick and race-free by
                 // design (see linuxpty.c: awaitExit waits on a child that has already terminated).
-                ProotCommandResult(process.awaitExit(), collected.flatten().toByteArray())
+                // ByteArray has no flatten(): the sizes are summed first so the single copy is
+                // exact, not a grow-as-you-go buffer.
+                val total = collected.sumOf { it.size }
+                val output = ByteArray(total)
+                var offset = 0
+                for (part in collected) {
+                    part.copyInto(output, offset)
+                    offset += part.size
+                }
+                ProotCommandResult(process.awaitExit(), output)
             }
         } catch (t: Throwable) {
             runCatching { process.close() }

@@ -73,7 +73,10 @@ object LinuxUserspaceModule {
             distro = distro,
             runtime = runtime,
             appUid = Process.myUid(),
-            appGid = Process.myGid(),
+            // android.os.Process has no myGid() in the modern SDK, so the gid comes from the
+            // syscall wrapper; on Android an app's primary gid is its own uid, which is the
+            // value the runCatching fallback would land on anyway.
+            appGid = runCatching { android.system.Os.getgid() }.getOrDefault(Process.myUid()),
             dnsServers = liveDnsServers(context),
         )
         val processes = LinuxProcessManager()

@@ -53,6 +53,13 @@ class LocalTerminalChannel(
     private val droppedChunkCount = AtomicLong()
     private val lastActivityAt = AtomicLong(0)
 
+    /**
+     * When the pty was forked, as `System.currentTimeMillis` — the same "too young to judge"
+     * evidence the liveness probe reads off an SSH channel, and the reason it is on the
+     * interface at all.
+     */
+    private val openedAt = System.currentTimeMillis()
+
     private val closed = CompletableDeferred<SessionEnd>()
 
     private val writes = LinkedBlockingQueue<ByteArray>()
@@ -76,6 +83,8 @@ class LocalTerminalChannel(
     override val droppedChunks: Long get() = droppedChunkCount.get()
 
     override val lastActivityAtMs: Long get() = lastActivityAt.get()
+
+    override val openedAtMs: Long get() = openedAt
 
     override fun idleForMs(nowMs: Long): Long? =
         lastActivityAtMs.takeIf { it > 0L }?.let { (nowMs - it).coerceAtLeast(0L) }

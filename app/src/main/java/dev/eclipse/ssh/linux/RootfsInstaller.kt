@@ -7,10 +7,12 @@ import java.net.URL
 import java.security.MessageDigest
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import kotlin.coroutines.coroutineContext
 
 /**
  * Downloads, verifies and extracts a pinned rootfs tarball — the "RootfsManager" of the userspace.
@@ -84,7 +86,7 @@ class RootfsInstaller(
      * @param onProgress invoked on [Dispatchers.IO] with each progress update; must be cheap
      * @throws IOException on any network, verification or extraction failure
      */
-    suspend fun install(onProgress: suspend (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
+    suspend fun install(onProgress: (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
         rootDir.mkdirs()
         download(onProgress)
         onProgress(Progress.Verifying)
@@ -94,19 +96,22 @@ class RootfsInstaller(
         rootfsDir
     }
 
-    private suspend fun download(onProgress: suspend (Progress) -> Unit) {
+    private suspend fun download(onProgress: (Progress) -> Unit) {
         if (tarballFile.isFile && verifyFileSha256(tarballFile, distro.rootfsSha256)) {
             // A previously verified tarball is reused, not re-downloaded: an interrupted install
             // resumes rather than starting its 30 MB download again.
             return
         }
+        // Captured so the downloader's non-suspending chunk callback can still honour
+        // cancellation — a cancelled install must stop mid-download, not after 30 MB more.
+        val job = coroutineContext[Job]
         val temp = File(rootDir, tarballFile.name + ".part")
         try {
             downloader.download(
                 distro.rootfsTarballUrl,
                 temp,
                 onChunk = { received, total ->
-                    ensureActive()
+                    job?.ensureActive()
                     onProgress(Progress.Downloading(received, total))
                 },
             )
@@ -130,7 +135,7 @@ class RootfsInstaller(
      * Extracts the tarball into staging, then swaps staging into place. A rootfs that exists is
      * therefore always complete — see the class doc.
      */
-    private suspend fun extract(onProgress: suspend (Progress) -> Unit) {
+    private suspend fun extract(onProgress: (Progress) -> Unit) {
         onProgress(Progress.Extracting(0))
         stagingDir.deleteRecursively()
         stagingDir.mkdirs()
@@ -160,7 +165,7 @@ class RootfsInstaller(
                         // is the portable equivalent and costs one file.
                         if (source.isFile) source.copyTo(target, overwrite = true)
                     }
-                    TarArchiveEntry.LF_NORMAL, 0 -> {
+                    TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
                         target.parentFile?.mkdirs()
                         target.outputStream().use { output -> tar.copyTo(output) }
                         applyMode(target, entry.mode)
@@ -173,7 +178,7 @@ class RootfsInstaller(
                 }
                 entries++
                 if (entries % PROGRESS_EVERY_ENTRIES == 0) {
-                    ensureActive()
+                    coroutineContext.ensureActive()
                     onProgress(Progress.Extracting(entries))
                 }
             }

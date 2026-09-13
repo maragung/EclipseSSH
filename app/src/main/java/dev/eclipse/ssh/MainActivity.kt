@@ -2509,9 +2509,8 @@ private fun WorkspaceScaffold(
                     onOpenTransferActions,
                 )
                 Destination.SETTINGS -> SettingsScreen(
-                    state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
-                    onImportVault, onKeepAlive, onClipboard, onTerminalFontSize,
-                    linuxUserspace = linuxUserspace,
+                    state, linuxUserspace, onBiometric, onDarkTheme, onAddForward, onStopForward,
+                    onExportVault, onImportVault, onKeepAlive, onClipboard, onTerminalFontSize,
                     onTerminalMinColumns = onTerminalMinColumns,
                     onReconnectBase = onReconnectBase,
                     onLegacyAlgorithms = onLegacyAlgorithms,
@@ -5895,7 +5894,6 @@ private fun ForwardDialog(onDismiss: () -> Unit, onConfirm: (ForwardType, Int, S
     )
 }
 
-@Composable
 /**
  * Settings → Linux Userspace: the whole feature's control panel and, for most users, its front
  * door. The section is derived from [LinuxUserspaceController]'s one state object — every row
@@ -5927,6 +5925,9 @@ private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
         val state = ui.state
 
         when (state) {
+            // supported implies a graph, and a graph always has a state; this branch is the
+            // compiler's proof of that invariant rather than a state any device can reach.
+            null -> Unit
             is LinuxUserspaceState.Installing -> {
                 val (label, fraction) = describeInstallStep(state.step)
                 SettingRow(Icons.Default.CloudDownload, "Installing ${distro.displayName}", label) { }
@@ -6153,6 +6154,7 @@ private fun describeSetupStep(step: SetupStep): String = when (step) {
     SetupStep.VERIFY -> "Verifying"
 }
 
+@Composable
 private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Text(title.uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
     Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), content = content)

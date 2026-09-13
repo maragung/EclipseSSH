@@ -33,7 +33,7 @@ class LinuxWorkspaceManager(
     /** Total size on disk, for the settings screen's storage line. Walks the tree; call off the UI thread. */
     fun sizeBytes(): Long = files().sumOf { it.length() }
 
-    fun fileCount(): Long = files().count()
+    fun fileCount(): Long = files().count().toLong()
 
     private fun files(): Sequence<File> =
         if (workspaceDir.isDirectory) workspaceDir.walkTopDown().filter { it.isFile } else emptySequence()
@@ -97,7 +97,7 @@ class LinuxWorkspaceManager(
                             java.nio.file.Path.of(entry.linkName),
                         )
                     }
-                    TarArchiveEntry.LF_NORMAL, 0 -> {
+                    TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
                         target.parentFile?.mkdirs()
                         target.outputStream().use { output -> tar.copyTo(output) }
                         target.setExecutable((entry.mode and 0b001_001_001) != 0, true)
