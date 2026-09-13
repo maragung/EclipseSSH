@@ -750,7 +750,7 @@ class EclipseSessionService : LifecycleService() {
  * invisible precisely because it lived inside one.
  */
 internal class SessionServiceStopState {
-    enum class Phase { RUNNING, STOPPING_USER, STOPPING_PLATFORM }
+    enum class Phase { RUNNING, STOPPING_USER, STOPPING_PLATFORM, DESTROYED }
 
     private val phase = AtomicReference(Phase.RUNNING)
 
@@ -771,10 +771,16 @@ internal class SessionServiceStopState {
     fun revive(): Boolean = phase.compareAndSet(Phase.STOPPING_PLATFORM, Phase.RUNNING)
 
     /**
-     * [onDestroy]: flips to a terminal phase and answers whether this destruction was
-     * unannounced - no stop path had run, so the system recycled a live service.
+     * [onDestroy]: flips to the terminal [Phase.DESTROYED] and answers whether this destruction
+     * was unannounced - no stop path had run, so the system recycled a live service.
+     *
+     * DESTROYED is its own phase rather than reusing STOPPING_PLATFORM precisely so [revive]
+     * cannot resurrect it: the machine outlives the service only long enough for onDestroy to
+     * read the unannounced flag, and a start intent racing destruction must not flip a dead
+     * service back to RUNNING - which is what a shared phase value would allow, because
+     * revive's compareAndSet cannot tell "stopping" from "stopped".
      */
-    fun destroyed(): Boolean = phase.getAndSet(Phase.STOPPING_PLATFORM) == Phase.RUNNING
+    fun destroyed(): Boolean = phase.getAndSet(Phase.DESTROYED) == Phase.RUNNING
 }
 
 /**
