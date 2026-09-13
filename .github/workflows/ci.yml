@@ -50,8 +50,9 @@ jobs:
   # restore that same tree, so every Gradle task wired into preBuild finds the
   # native outputs and goes UP-TO-DATE instead of rebuilding. Wall clock is
   # roughly native + the longest consumer, not the serial sum of everything
-  # the old single job did. Branch protection must require the four check
-  # names below; the old combined "Lint, tests, APKs and AAB" check is gone.
+  # the old single job did. Branch protection must require the five check
+  # names below (native, lint, test, assemble, smoke); the old combined
+  # "Lint, tests, APKs and AAB" check is gone.
   native:
     name: FreeRDP native (4 ABIs)
     runs-on: ubuntu-24.04
@@ -534,11 +535,11 @@ jobs:
           echo "androidTest sources: $COUNT"
 
       - name: Compile instrumentation tests
-        # The instrumentation sources cannot run here (the runner has no KVM
-        # and the guest kills system_server on boot), so they are compiled
-        # to keep them honest. The actual `connectedAndroidTest` run lives
-        # in .github/workflows/instrumentation.yml, gated behind a
-        # self-hosted runner label.
+        # Kept even though .github/workflows/instrumentation.yml now runs
+        # `connectedAndroidTest` on a hosted emulator: compiling the sources
+        # here keeps this workflow's own build honest about androidTest
+        # breakage instead of waiting for the separate workflow's longer
+        # pipeline to report it.
         run: ./gradlew --stacktrace assembleDebugAndroidTest
 
       - name: Assemble APKs and the AAB (Play upload format)
@@ -631,6 +632,156 @@ jobs:
         run: |
           rm -f keystore.properties
           rm -rf keystore
+
+  # The gate the v1.1.16 crash slipped through. CI proved the APKs compiled
+  # and were signed, and the installed app still died before its first frame
+  # on every device - an ExceptionInInitializerError from a Bouncy Castle
+  # provider collision that the JVM test host cannot reproduce, because the
+  # host JVM has no platform provider to collide with. Only booting the
+  # produced artifact catches that class. GitHub's Linux runners expose
+  # /dev/kvm, so a headless emulator is affordable here: this job installs
+  # the exact APKs the assemble job uploaded and launches each one, and
+  # fails if the process is gone or anything fatal landed in the logcat.
+  #
+  # Both variants, deliberately: the debug build is the plainest possible
+  # "does the app open"; the release build carries R8, whose keep-rule
+  # mistakes are a crash class the debug build can never catch.
+  smoke:
+    name: Boot the built APKs (crash-on-open gate)
+    needs: assemble
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          # Same cmdline-tools pin as the build jobs. No NDK and no Gradle
+          # here: this job only boots an emulator and installs prebuilt APKs,
+          # so it does not need the native toolchain the build jobs pin.
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            emulator
+            system-images;android-35;default;x86_64
+          cache-packages: true
+
+      - name: Enable KVM device permissions
+        # The runner image ships /dev/kvm, but the runner user needs a udev
+        # rule to open it. Without this the emulator falls back to software
+        # emulation, which does not boot API 35 inside any sane timeout.
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+
+      - name: Download the built APKs
+        # The convenience copies the assemble job uploads. Downloading the
+        # artifacts (rather than rebuilding here) is what makes this gate
+        # about the produced bytes: the APK under the emulator is the same
+        # file a user would install.
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: eclipse-ssh-*-apk
+          path: apks
+
+      - name: Create and boot the headless AVD
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+            --force --name ci-smoke \
+            --package 'system-images;android-35;default;x86_64' \
+            --device pixel_6
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci-smoke \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
+          "$ADB" wait-for-device
+          # adb sees the emulator long before the guest OS is up;
+          # sys.boot_completed is the flag the platform itself sets when
+          # the boot intent fires. Five minutes is the generous ceiling:
+          # with KVM this image is up in one to three.
+          BOOT=""
+          for _ in $(seq 1 60); do
+            BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          if [ "$BOOT" != "1" ]; then
+            echo "emulator did not finish booting"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+
+      - name: Launch the debug APK and assert it stays up
+        env:
+          # The debug build carries the .debug applicationId suffix, so both
+          # variants install side by side and neither launch pollutes the
+          # other's logcat window.
+          PACKAGE: dev.eclipse.ssh.debug
+          APK_DIR: apks/eclipse-ssh-debug-apk
+          VARIANT: debug
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          APK="$(find "$APK_DIR" -name '*.apk' | head -1)"
+          test -n "$APK" || { echo "no debug APK under $APK_DIR"; exit 1; }
+          echo "== smoke [$VARIANT]: installing $APK"
+          "$ADB" install -r "$APK"
+          "$ADB" logcat -c
+          "$ADB" shell am start -W -n "$PACKAGE/dev.eclipse.ssh.MainActivity"
+          # Long enough for the first frame, DataStore reads, the provider
+          # registry swap and the session service's notification - the exact
+          # window in which the v1.1.16 crash fired.
+          sleep 45
+          "$ADB" logcat -d > "smoke-$VARIANT.log" || true
+          PID="$("$ADB" shell pidof "$PACKAGE" | tr -d '\r')"
+          test -n "$PID" || { echo "process $PACKAGE is not running 45s after launch"; exit 1; }
+          if grep -Eq 'FATAL EXCEPTION|Fatal signal' "smoke-$VARIANT.log"; then
+            echo "fatal exception while the app was running"
+            grep -A40 -E 'FATAL EXCEPTION|Fatal signal' "smoke-$VARIANT.log" | head -120
+            exit 1
+          fi
+          echo "== smoke [$VARIANT]: alive (pid $PID), no fatal exceptions"
+
+      - name: Launch the release APK and assert it stays up
+        env:
+          PACKAGE: dev.eclipse.ssh
+          APK_DIR: apks/eclipse-ssh-release-apk
+          VARIANT: release
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          APK="$(find "$APK_DIR" -name '*.apk' | head -1)"
+          test -n "$APK" || { echo "no release APK under $APK_DIR"; exit 1; }
+          echo "== smoke [$VARIANT]: installing $APK"
+          "$ADB" install -r "$APK"
+          "$ADB" logcat -c
+          "$ADB" shell am start -W -n "$PACKAGE/dev.eclipse.ssh.MainActivity"
+          sleep 45
+          "$ADB" logcat -d > "smoke-$VARIANT.log" || true
+          PID="$("$ADB" shell pidof "$PACKAGE" | tr -d '\r')"
+          test -n "$PID" || { echo "process $PACKAGE is not running 45s after launch"; exit 1; }
+          if grep -Eq 'FATAL EXCEPTION|Fatal signal' "smoke-$VARIANT.log"; then
+            echo "fatal exception while the app was running"
+            grep -A40 -E 'FATAL EXCEPTION|Fatal signal' "smoke-$VARIANT.log" | head -120
+            exit 1
+          fi
+          echo "== smoke [$VARIANT]: alive (pid $PID), no fatal exceptions"
+
+      - name: Upload the device and emulator logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-device-logs
+          path: |
+            smoke-*.log
+            /tmp/emulator.log
+          if-no-files-found: warn
+          retention-days: 14
 
   # The idle matrix, run only on demand (push-triggered idle tests would
   # burn the runner's metered time). The 30-minute idle test is the one

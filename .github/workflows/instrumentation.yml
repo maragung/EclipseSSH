@@ -1,19 +1,14 @@
 # Instrumentation tests (connectedAndroidTest). Separated from ci.yml
-# because it requires a runner with a working Android emulator or a
-# real device attached.
+# because an emulator boot plus the full instrumented suite is a much
+# longer pipeline than the rest of CI, and deserves its own timeout and
+# its own concurrency group.
 #
-# The brief calls for "Android instrumentation tests on every
-# push/PR", and the README's "compile of the instrumentation sources"
-# wording is the placeholder behaviour that ships until a real runner
-# is available. This workflow is the second half of that promise.
-#
-# Configure the runner in Settings -> Environments -> instrumentation
-# (self-hosted runner with the label `android-emulator`) and on
-# `github.repository` -> Settings -> Actions -> Runners. The
-# `runs-on: [self-hosted, android-emulator]` selector is the way to
-# point at a specific runner pool. If no runner is available, the
-# workflow is silently skipped, which is the right behaviour for a
-# brief that does not have a real-device budget.
+# The brief calls for "Android instrumentation tests on every push/PR".
+# This used to wait for a self-hosted `android-emulator` runner that was
+# never provisioned, so every run sat queued forever and had to be
+# cancelled. GitHub's Linux runners expose /dev/kvm, which is all the
+# emulator needs: the workflow now boots its own headless AVD on the
+# hosted pool and the suite actually runs.
 name: Instrumentation
 
 on:
@@ -42,16 +37,12 @@ env:
   # need the NDK toolchain and a CMake the SDK manager does not carry.
   FREERDP_NDK_VERSION: '29.0.13113456'
   FREERDP_CMAKE_VERSION: '4.1.2'
+  SYSTEM_IMAGE: 'system-images;android-35;default;x86_64'
 
 jobs:
   instrumentation:
     name: connectedAndroidTest
-    # `runs-on: [self-hosted, android-emulator]` is the documented
-    # pattern: the runner label is provisioned by the operator and
-    # the job only runs where the label is present. On a public
-    # runner this job is silently absent, which is the intended
-    # fallback.
-    runs-on: [self-hosted, android-emulator]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
@@ -71,6 +62,8 @@ jobs:
           cmdline-tools-version: '11479570'
           packages: >-
             platform-tools
+            emulator
+            system-images;${{ env.SYSTEM_IMAGE }}
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
             ndk;${{ env.FREERDP_NDK_VERSION }}
@@ -122,12 +115,61 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Enable KVM device permissions
+        # The runner image ships /dev/kvm, but the runner user needs a udev
+        # rule to open it. Without this the emulator falls back to software
+        # emulation, which does not boot API 35 inside any sane timeout.
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+
+      - name: Create and boot the headless AVD
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+            --force --name ci-instrumented \
+            --package "$SYSTEM_IMAGE" \
+            --device pixel_6
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci-instrumented \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
+          "$ADB" wait-for-device
+          # adb sees the emulator long before the guest OS is up;
+          # sys.boot_completed is the flag the platform itself sets when
+          # the boot intent fires.
+          BOOT=""
+          for _ in $(seq 1 60); do
+            BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          if [ "$BOOT" != "1" ]; then
+            echo "emulator did not finish booting"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+
       - name: Run connectedAndroidTest
-        # Emulator must be running and visible to adb. The default
-        # behaviour is to pick a single device; if a Farm or
-        # DeviceFarmer pool is in use, override with
-        # `-Pandroid.injected.testDevice=<serial>`.
+        # The emulator booted above is the only device adb can see, so the
+        # default single-device selection is correct. The suite reports into
+        # the standard connected-test directories uploaded below.
         run: ./gradlew --stacktrace connectedDebugAndroidTest
+
+      - name: Upload the emulator log
+        # The device-side evidence for a failed suite is usually in here:
+        # a crash in setup, an ANR, or the guest rebooting mid-run.
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: emulator-log
+          path: /tmp/emulator.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload instrumentation reports
         if: always()
