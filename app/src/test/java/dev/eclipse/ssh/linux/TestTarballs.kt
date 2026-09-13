@@ -15,7 +15,8 @@ import java.util.zip.GZIPOutputStream
 internal object TestTarballs {
 
     /**
-     * Writes a minimal Ubuntu-Base-shaped tar.gz: `bin/`, `etc/{passwd,group,shadow}`, a
+     * Writes a minimal Ubuntu-Base-shaped tar.gz: `bin/`, `etc/{passwd,group,shadow}`,
+     * `etc/apt/` (a directory Ubuntu Base ships and setup writes `sources.list` into), a
      * `/bin/bash` with the executable bit, and a symlink — everything the installer's entry-type
      * handling and the distribution manager's setup rewrites touch.
      */
@@ -25,6 +26,7 @@ internal object TestTarballs {
             TarArchiveOutputStream(gzip).use { tar ->
                 putDirectory(tar, "bin")
                 putDirectory(tar, "etc")
+                putDirectory(tar, "etc/apt")
                 putDirectory(tar, "usr")
                 putDirectory(tar, "usr/bin")
                 putFile(tar, "bin/bash", "fake shell\n".toByteArray(), mode = 0b111_101_101)
