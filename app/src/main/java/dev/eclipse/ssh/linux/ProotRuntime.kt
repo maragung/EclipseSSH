@@ -145,6 +145,12 @@ class ProotRuntime(
      * path is [LocalTerminalChannel]'s. The pty exists even for scripted commands because the
      * rootfs's tooling assumes a terminal is present, and proot is only ever started through one.
      *
+     * [onOutput], when given, sees each chunk as it arrives instead of only at the end. It exists
+     * for the minutes-long setup commands: an `apt-get update` whose output nobody sees until it
+     * finishes is indistinguishable from a wedged one on the install screen. Called on
+     * [Dispatchers.IO] from the read loop, so it must be cheap — publish to a conflated flow and
+     * return, nothing more.
+     *
      * @param timeoutMs the whole command — output, exit, everything — must finish within this
      * @return the exit code and output, or null when the command did not finish in time
      */
@@ -152,6 +158,7 @@ class ProotRuntime(
         argv: List<String>,
         env: List<String> = baseEnv(),
         timeoutMs: Long = DEFAULT_COMMAND_TIMEOUT_MS,
+        onOutput: ((ByteArray) -> Unit)? = null,
     ): ProotCommandResult? = withContext(Dispatchers.IO) {
         val process = spawner.spawn(argv, env, spawnCwd.absolutePath, rows = 24, columns = 80)
         try {
@@ -161,7 +168,11 @@ class ProotRuntime(
                 while (true) {
                     val read = process.read(chunk, 0, chunk.size)
                     if (read < 0) break
-                    if (read > 0) collected += chunk.copyOf(read)
+                    if (read > 0) {
+                        val part = chunk.copyOf(read)
+                        onOutput?.invoke(part)
+                        collected += part
+                    }
                 }
                 // After end-of-stream the child has exited; the reap is quick and race-free by
                 // design (see linuxpty.c: awaitExit waits on a child that has already terminated).
