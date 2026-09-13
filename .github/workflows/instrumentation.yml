@@ -131,10 +131,26 @@ jobs:
         run: |
           set -euo pipefail
           ADB="$ANDROID_HOME/platform-tools/adb"
+          # avdmanager and the emulator each resolve their own AVD directory
+          # when this is unset (the emulator searches $ANDROID_AVD_HOME,
+          # $ANDROID_SDK_HOME/avd and $HOME/.android/avd, while cmdline-tools'
+          # avdmanager is free to pick differently), and a create that lands
+          # where the emulator never looks is an instant "Unknown AVD name"
+          # death - the startup failure the first hosted run wedged on. Pin
+          # both ends to one directory.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
             --force --name ci-instrumented \
             --package "$SYSTEM_IMAGE" \
             --device pixel_6
+          # Assert the create landed where the emulator will look, with the
+          # directory listing as the diagnosis if it did not.
+          if ! "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx ci-instrumented; then
+            echo "avdmanager reported success but the emulator cannot see ci-instrumented"
+            ls -la "$ANDROID_AVD_HOME" || true
+            exit 1
+          fi
           nohup "$ANDROID_HOME/emulator/emulator" -avd ci-instrumented \
             -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
             -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
