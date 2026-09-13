@@ -128,8 +128,18 @@ jobs:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
-      - name: Assemble release APK and AAB
-        run: ./gradlew --stacktrace assembleRelease bundleRelease
+      - name: Bundle the AAB, then assemble the release APKs
+        # Two separate invocations, in this order, on purpose. AGP (as of 9.4.0)
+        # refuses to build a bundle while ABI splits are on - PerModuleBundleTask
+        # reads the shared shrunk-resources directory expecting one file and
+        # finds five (issuetracker.google.com/402800800) - so splits.abi stands
+        # down whenever a bundle task shares the invocation. Assembling first
+        # would not work either: the per-ABI files it leaves behind would crash
+        # this later bundle task just the same. Bundle first, then assemble: the
+        # AAB and the five APKs (four ABI splits + universal) all leave the job.
+        run: |
+          ./gradlew --stacktrace bundleRelease
+          ./gradlew --stacktrace assembleRelease
 
       - name: Verify the release APK signatures
         run: |
