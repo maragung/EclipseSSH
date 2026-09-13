@@ -152,6 +152,12 @@ class LocalTerminalChannel(
         // Unblocks the writer if it is parked waiting for something that will never come.
         writes.put(ByteArray(0))
         process.close()
+        // Closing the pty wakes the reader with end-of-stream; let it publish whatever it had
+        // already read before the terminator goes in, or the marker lands *ahead* of the shell's
+        // last lines — a terminal closed mid-banner would replay a blank screen. The wait is
+        // bounded, and past it the trade is the one the SSH channel's terminator makes: a lost
+        // line rather than a tab close held up by a collector that stopped draining.
+        reader.join(DRAIN_WAIT_MS)
         finish(SessionEnd.Released)
     }
 
@@ -185,6 +191,14 @@ class LocalTerminalChannel(
                 val read = process.read(chunk, 0, chunk.size)
                 if (read < 0) break
                 if (read > 0) publish(chunk.copyOf(read))
+            }
+            // The deliberate flag is read here because release() waits for this loop to drain
+            // before finishing, so on an app-side close the reader is the one that gets to
+            // finish first — and a shell SIGHUP'd by our own close must not be reported as a
+            // shell death when the honest account is that the app let go.
+            if (deliberate.get()) {
+                finish(SessionEnd.Released)
+                return
             }
             val status = runCatching { process.awaitExit() }.getOrDefault(-1)
             finish(
@@ -275,5 +289,13 @@ class LocalTerminalChannel(
         private const val BUFFERED_CHUNKS = 256
 
         private const val PUBLISH_WAIT_MS = 10_000L
+
+        /**
+         * How long an app-side close waits for the reader to publish its already-read chunks
+         * before putting the terminator in. Normally the reader drains in well under a
+         * millisecond — the pty has just been closed — so this bound only matters when the
+         * collector has stopped draining altogether.
+         */
+        private const val DRAIN_WAIT_MS = 1_000L
     }
 }
