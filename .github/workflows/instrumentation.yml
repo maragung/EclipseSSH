@@ -125,7 +125,24 @@ jobs:
             | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-          test -w /dev/kvm
+          # `udevadm trigger` returns before the udev worker has applied the
+          # new mode - the first hosted run passed this check by timing luck
+          # and the second lost the same race 28ms later. Poll for the node
+          # to settle, and chmod directly if it never does; the rule matters
+          # for persistence across reboots, which a CI runner never does.
+          for _ in $(seq 1 10); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
+          if [ ! -w /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          test -w /dev/kvm || {
+            echo "/dev/kvm is still not openable - this runner cannot run the emulator"
+            ls -l /dev/kvm || true
+            id
+            exit 1
+          }
 
       - name: Create and boot the headless AVD
         run: |
