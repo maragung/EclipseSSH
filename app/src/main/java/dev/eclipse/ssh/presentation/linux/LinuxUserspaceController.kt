@@ -82,9 +82,16 @@ class LinuxUserspaceController @Inject constructor(
 
     private val _error = MutableStateFlow<String?>(null)
     private val _installWarnings = MutableStateFlow<List<String>>(emptyList())
-    private val _storageUsedBytes = MutableStateFlow(0L)
-    private val _workspaceFileCount = MutableStateFlow(0L)
-    private val _hasPendingBackup = MutableStateFlow(false)
+
+    /**
+     * The three storage facts as one value, not three flows. A recompute used to write bytes, file
+     * count and the pending-backup claim as three separate StateFlow writes, and a subscriber
+     * could observe the combination in between — most misleadingly a freshly restored workspace
+     * (one file, bytes on disk) shown beside a backup still claimed as parked, three writes after
+     * the restore consumed it. One write per recompute makes the half-updated state unobservable;
+     * a failed recompute keeps the previous whole value instead of a partial new one.
+     */
+    private val _storageFacts = MutableStateFlow(StorageFacts())
 
     /** The UI state. On an unsupported device this is a constant; nothing beneath it exists. */
     val uiState: StateFlow<LinuxUserspaceUiState>
@@ -99,21 +106,20 @@ class LinuxUserspaceController @Inject constructor(
                 combine(
                     manager.state,
                     manager.lastHealth,
-                    _storageUsedBytes,
-                    _workspaceFileCount,
-                    combine(_error, _installWarnings, manager.sessionCount, _hasPendingBackup) {
-                        error, warnings, sessions, backup ->
-                        Extras(error, warnings, sessions, backup)
+                    _storageFacts,
+                    combine(_error, _installWarnings, manager.sessionCount) {
+                        error, warnings, sessions ->
+                        Extras(error, warnings, sessions)
                     },
-                ) { state, health, storage, files, extras ->
+                ) { state, health, storage, extras ->
                     LinuxUserspaceUiState(
                         supported = true,
                         distro = graph.distro,
                         state = state,
                         health = health,
-                        storageUsedBytes = storage,
-                        workspaceFileCount = files,
-                        hasPendingWorkspaceBackup = extras.pendingBackup,
+                        storageUsedBytes = storage.usedBytes,
+                        workspaceFileCount = storage.workspaceFiles,
+                        hasPendingWorkspaceBackup = storage.hasPendingBackup,
                         sessionCount = extras.sessionCount,
                         error = extras.error,
                         installWarnings = extras.warnings,
@@ -180,14 +186,20 @@ class LinuxUserspaceController @Inject constructor(
     // ------------------------------------------------------------------ internals
 
     /**
-     * The fields that change too often to deserve their own combine slot — grouped so the five-flow
-     * typed overload stays available for the state's main sources.
+     * The fields that change too often to deserve their own combine slot — grouped so the typed
+     * overloads stay available for the state's main sources.
      */
     private data class Extras(
         val error: String?,
         val warnings: List<String>,
         val sessionCount: Int,
-        val pendingBackup: Boolean,
+    )
+
+    /** The storage facts that must move together; see [_storageFacts]. */
+    private data class StorageFacts(
+        val usedBytes: Long = 0L,
+        val workspaceFiles: Long = 0L,
+        val hasPendingBackup: Boolean = false,
     )
 
     /**
@@ -298,12 +310,20 @@ class LinuxUserspaceController @Inject constructor(
 
     private suspend fun refreshStorageNumbers() {
         val manager = manager ?: return
-        withContext(Dispatchers.IO) {
+        // Computed as a whole and published as a whole: the reads happen on the IO dispatcher,
+        // and the one write lands on this controller's context, so a subscriber sees either the
+        // previous facts or the next ones — never a mixture. A failed recompute keeps the
+        // previous whole value; the old code could stop between writes and leave one number
+        // from the new disk state beside two from the old.
+        val facts = withContext(Dispatchers.IO) {
             runCatching {
-                _storageUsedBytes.value = manager.storageUsedBytes()
-                _workspaceFileCount.value = graph?.workspace?.fileCount() ?: 0L
-                _hasPendingBackup.value = manager.hasPendingWorkspaceBackup()
-            }
+                StorageFacts(
+                    usedBytes = manager.storageUsedBytes(),
+                    workspaceFiles = graph?.workspace?.fileCount() ?: 0L,
+                    hasPendingBackup = manager.hasPendingWorkspaceBackup(),
+                )
+            }.getOrDefault(_storageFacts.value)
         }
+        _storageFacts.value = facts
     }
 }
