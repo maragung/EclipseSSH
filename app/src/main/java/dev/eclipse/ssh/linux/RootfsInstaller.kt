@@ -11,7 +11,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -140,7 +139,7 @@ class RootfsInstaller(
         stagingDir.deleteRecursively()
         stagingDir.mkdirs()
         var entries = 0
-        TarArchiveInputStream(tarballFile.inputStream().buffered(DOWNLOAD_BUFFER)).use { tar ->
+        openTarStream(tarballFile, DOWNLOAD_BUFFER).use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
                 val target = resolveInside(stagingDir, entry.name)

@@ -5,7 +5,6 @@ import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
 
 /**
@@ -83,7 +82,10 @@ class LinuxWorkspaceManager(
     suspend fun restoreFrom(archive: File): Unit = withContext(Dispatchers.IO) {
         check(archive.isFile) { "no workspace snapshot at $archive" }
         clear()
-        TarArchiveInputStream(archive.inputStream().buffered()).use { tar ->
+        // Through the shared gzip-aware opener: this snapshot is written gzipped, and a raw
+        // TarArchiveInputStream would read it as empty — after clear(), that is the user's
+        // workspace deleted with nothing restored in its place.
+        openTarStream(archive, 64 * 1024).use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
                 val target = resolveInsideRoot(workspaceDir, entry.name)
