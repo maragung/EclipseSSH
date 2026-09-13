@@ -125,4 +125,17 @@ class SessionServiceStopStateTest {
         assertThat(state.requestUserStop()).isFalse()
         assertThat(state.isStopping).isTrue()
     }
+
+    @Test
+    fun `a destroy after a platform stop is terminal too - revive cannot resurrect it`() {
+        // The regression this pins: destroyed() used to mark terminal by reusing the
+        // STOPPING_PLATFORM phase, so a start intent racing destruction compared-and-swapped
+        // a dead service straight back to RUNNING. Terminal must be a phase of its own.
+        val state = SessionServiceStopState()
+        state.platformStop()
+        state.destroyed()
+
+        assertThat(state.revive()).isFalse()
+        assertThat(state.isStopping).isTrue()
+    }
 }
