@@ -2,6 +2,7 @@ package dev.eclipse.ssh
 
 import com.google.common.truth.Truth.assertThat
 import java.security.AlgorithmParameters
+import java.security.NoSuchAlgorithmException
 import java.security.Provider
 import java.security.Security
 import java.security.spec.ECGenParameterSpec
