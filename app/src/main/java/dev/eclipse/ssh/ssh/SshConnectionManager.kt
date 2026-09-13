@@ -467,7 +467,7 @@ class SshConnectionManager @Inject constructor(
         profile: HostProfile? = null,
     ): TerminalChannel = withContext(Dispatchers.IO) {
         val pty = ptyRequestFor(profile, columns, rows)
-        val channel = TerminalChannel(session.createShellChannel())
+        val channel = SshTerminalChannel(session.createShellChannel())
         channel.open(
             columns = pty.columns ?: channel.ptyColumns,
             rows = pty.rows ?: channel.ptyRows,

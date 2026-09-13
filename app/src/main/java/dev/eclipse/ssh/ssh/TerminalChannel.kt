@@ -23,7 +23,105 @@ import org.apache.sshd.common.session.SessionListener
 
 /**
  * One interactive shell channel: a pty on the remote host, its output as bytes and its input as
- * whatever the keyboard produced.
+ * whatever the keyboard produced — regardless of what is on the other side.
+ *
+ * This is the seam the terminal pipeline is written against, so a shell that arrives over SSH
+ * ([SshTerminalChannel]) and a shell that is forked locally — the Ubuntu Linux userspace's proot
+ * session, `dev.eclipse.ssh.linux.LocalTerminalChannel` — are the same thing to the collector, the
+ * tab and the buffer. The contract that makes them interchangeable:
+ *
+ *  - **Bytes, not text, in both directions.** A terminal is a byte protocol — the escape sequences
+ *    that move the cursor, the C0 controls a key press sends, and the UTF-8 of the text itself all
+ *    share one stream — so nothing here may decode a chunk to a `String` or re-encode it (see
+ *    [dev.eclipse.ssh.terminal.Utf8StreamDecoder] for where decoding belongs).
+ *  - **The stream ends in band**, with [END_OF_OUTPUT] as its last element, because a `SharedFlow`
+ *    delivers asynchronously and an ending reported on another thread is not proof the output has
+ *    all been seen.
+ *  - **[awaitClosed] carries why the session ended**, as a [SessionEnd], and only once.
+ *  - **[markDeliberate] before any close the app performs itself**, so a deliberate close is never
+ *    mistaken for an outage and answered with a reconnect.
+ */
+interface TerminalChannel : Closeable {
+
+    /** Output chunks in arrival order; ends with [END_OF_OUTPUT]. Collectors must not mutate what they receive. */
+    val output: SharedFlow<ByteArray>
+
+    /** Suspends until the channel closes, returning why it did. */
+    suspend fun awaitClosed(): SessionEnd
+
+    /** Whether this channel's ending has already been reported to [awaitClosed]. See [SshTerminalChannel.hasEnded]. */
+    val hasEnded: Boolean
+
+    /**
+     * Whether this shell ended because the app ended it, rather than because the far end went away.
+     *
+     * Read by the session collector to decide what to tell the user and whether to reconnect. A close
+     * the app asked for needs neither.
+     */
+    val endedDeliberately: Boolean
+
+    /**
+     * How many output chunks were discarded because nothing drained [output] in time. Always zero in
+     * a healthy session; exposed so the session that owns this channel can tell the user their
+     * transcript has a hole in it.
+     */
+    val droppedChunks: Long
+
+    /** When the far end last sent anything, as `System.currentTimeMillis`, or 0 before it has. */
+    val lastActivityAtMs: Long
+
+    /** How long since the far end last sent anything, or null while it has not sent anything yet. */
+    fun idleForMs(nowMs: Long = System.currentTimeMillis()): Long?
+
+    /** The pty's current size, as the far side understands it — carried across a reconnect. */
+    val ptyColumns: Int
+    val ptyRows: Int
+
+    /** The pty as the trace records it: its geometry, or `none` on a channel that was given no pty. */
+    val ptyLabel: String
+
+    /** Whether the channel itself is still open, as one word for the trace. */
+    val channelLabel: String
+
+    /** Whether the channel is still open. */
+    val isOpen: Boolean
+
+    /** Queues [bytes] for the shell verbatim — key codes and escape sequences, never round-tripped through text. */
+    fun writeBytes(bytes: ByteArray)
+
+    /** Queues [value] for the shell as UTF-8. Safe to call from any thread. */
+    fun write(value: String)
+
+    /** Resizes the pty. Implementations record the size even when they cannot apply it, so a reconnect carries it forward. */
+    fun resize(columns: Int, rows: Int)
+
+    /**
+     * Declares that what happens to this channel next was the app's decision. Called *before* the
+     * close itself; see [SshTerminalChannel.markDeliberate].
+     */
+    fun markDeliberate()
+
+    /**
+     * Releases a channel whose transport is already gone, without claiming the app meant it to end.
+     * See [SshTerminalChannel.discard].
+     */
+    fun discard(reason: SessionEnd? = null)
+
+    companion object {
+        /**
+         * The last element of [TerminalChannel.output]: the stream is over and nothing follows it.
+         *
+         * Empty, and compared by identity rather than by contents — an implementing channel never
+         * publishes a zero-length chunk, and identity means a shell that somehow produced one still
+         * could not impersonate the end of the session. Lives on the interface so a collector says
+         * `TerminalChannel.END_OF_OUTPUT` regardless of which implementation it is draining.
+         */
+        val END_OF_OUTPUT: ByteArray = ByteArray(0)
+    }
+}
+
+/**
+ * The SSH implementation of [TerminalChannel]: a shell channel over an authenticated MINA session.
  *
  * Bytes, not text, in both directions. A terminal is a byte protocol - the escape sequences that move
  * the cursor, the C0 controls a key press sends, and the UTF-8 of the text itself all share one
@@ -38,10 +136,10 @@ import org.apache.sshd.common.session.SessionListener
  * `String` per network read, and nothing is serialised into or out of a text format on the way to the
  * emulator - the chunk that arrives from the socket is the array the parser reads.
  */
-class TerminalChannel(
+class SshTerminalChannel(
     private val channel: ClientChannel,
     private val charset: Charset = Charsets.UTF_8,
-) : Closeable {
+) : TerminalChannel {
     private val input = ChannelInputStream()
 
     /**
@@ -68,7 +166,7 @@ class TerminalChannel(
      * by contents, so an empty write from the remote side cannot be mistaken for it.
      */
     private val outputEvents = MutableSharedFlow<ByteArray>(replay = REPLAY_CHUNKS, extraBufferCapacity = BUFFERED_CHUNKS)
-    val output: SharedFlow<ByteArray> = outputEvents
+    override val output: SharedFlow<ByteArray> = outputEvents
 
     /** Guards [END_OF_OUTPUT] being emitted once, from whichever of the ending paths gets there first. */
     private val outputEnded = AtomicBoolean(false)
@@ -94,7 +192,7 @@ class TerminalChannel(
     private val lastActivityAt = AtomicLong(0)
 
     /** @see lastActivityAt */
-    val lastActivityAtMs: Long get() = lastActivityAt.get()
+    override val lastActivityAtMs: Long get() = lastActivityAt.get()
 
     /**
      * When [open] completed, as [System.currentTimeMillis], or 0 while it has not.
@@ -115,7 +213,7 @@ class TerminalChannel(
      * user their transcript has a hole in it rather than leaving them to wonder why a line never
      * appeared; see `MainViewModel.launchTerminalCollector`.
      */
-    val droppedChunks: Long get() = droppedChunkCount.get()
+    override val droppedChunks: Long get() = droppedChunkCount.get()
 
     /**
      * Completes when this channel is finished, carrying [SessionEnd]: *why* it finished.
@@ -248,7 +346,7 @@ class TerminalChannel(
      * Read by the session collector to decide what to tell the user and whether to reconnect. A close
      * the app asked for needs neither.
      */
-    val endedDeliberately: Boolean get() = deliberate.get()
+    override val endedDeliberately: Boolean get() = deliberate.get()
 
     /**
      * Declares that what happens to this channel next was the app's decision.
@@ -257,12 +355,12 @@ class TerminalChannel(
      * listener that reports the death can fire inside that call - on another thread, and before the
      * caller resumes. Raising the flag afterwards would be a race whose loser is a spurious reconnect.
      */
-    fun markDeliberate() {
+    override fun markDeliberate() {
         deliberate.set(true)
     }
 
     /** Suspends until the channel closes, returning why it did. */
-    suspend fun awaitClosed(): SessionEnd = closed.await()
+    override suspend fun awaitClosed(): SessionEnd = closed.await()
 
     /**
      * Whether this channel's ending has already been reported to [awaitClosed].
@@ -273,7 +371,7 @@ class TerminalChannel(
      * close future that publishes the reason runs after the channel reports itself shut - and it is the
      * *reason* being published that a reaper must not be allowed to race. See [SshSessionStore.reap].
      */
-    val hasEnded: Boolean get() = closed.isCompleted
+    override val hasEnded: Boolean get() = closed.isCompleted
 
     /**
      * Ends the output stream, then reports [end] to whoever is waiting on [awaitClosed].
@@ -299,7 +397,7 @@ class TerminalChannel(
      */
     private fun endOutput() {
         if (!outputEnded.compareAndSet(false, true)) return
-        outputEvents.tryEmit(END_OF_OUTPUT)
+        outputEvents.tryEmit(TerminalChannel.END_OF_OUTPUT)
     }
 
     @Volatile private var columns = DEFAULT_COLUMNS
@@ -323,8 +421,8 @@ class TerminalChannel(
      * on the UI side had changed, nothing was reported, and a phone-sized terminal spent the rest of
      * its life pretending to be 120 columns wide. Every full-screen program was wrapped wrongly.
      */
-    val ptyColumns: Int get() = columns
-    val ptyRows: Int get() = rows
+    override val ptyColumns: Int get() = columns
+    override val ptyRows: Int get() = rows
 
     /**
      * The pty as the trace records it: its geometry, or `none` on a channel that was given no pty.
@@ -335,10 +433,10 @@ class TerminalChannel(
      * explanation for a whole class of reports: no colours, `top` refusing to start, a shell with no
      * prompt. See [hasPty].
      */
-    val ptyLabel: String get() = if (hasPty) "${columns}x$rows" else "none"
+    override val ptyLabel: String get() = if (hasPty) "${columns}x$rows" else "none"
 
     /** Whether the channel itself is still open, as one word for the trace. See [isOpen]. */
-    val channelLabel: String get() = if (isOpen) "open" else "closed"
+    override val channelLabel: String get() = if (isOpen) "open" else "closed"
 
     /**
      * How long since the far end last sent anything, or null while it has not sent anything yet.
@@ -348,7 +446,7 @@ class TerminalChannel(
      * moment it ended - which points at the transport or at this app - and one that had been silent
      * for minutes, which points at the far end or at whatever sits between. See [lastActivityAtMs].
      */
-    fun idleForMs(nowMs: Long = System.currentTimeMillis()): Long? =
+    override fun idleForMs(nowMs: Long): Long? =
         lastActivityAtMs.takeIf { it > 0L }?.let { (nowMs - it).coerceAtLeast(0L) }
 
     /**
@@ -449,18 +547,18 @@ class TerminalChannel(
      * depends on modes the remote side negotiated. Those are produced as bytes by
      * [dev.eclipse.ssh.terminal.TerminalKeys] and must not make a round trip through a `String`.
      */
-    fun writeBytes(bytes: ByteArray) {
+    override fun writeBytes(bytes: ByteArray) {
         if (bytes.isEmpty()) return
         input.push(bytes)
     }
 
     /** Queues [value] for the remote shell, encoded with [charset]. Safe to call from any thread. */
-    fun write(value: String) {
+    override fun write(value: String) {
         if (value.isEmpty()) return
         writeBytes(value.toByteArray(charset))
     }
 
-    fun resize(columns: Int, rows: Int) {
+    override fun resize(columns: Int, rows: Int) {
         // The display's own limits, not a second set of the channel's — see [TERMINAL_COLUMN_RANGE].
         val safeColumns = columns.coerceIn(TERMINAL_COLUMN_RANGE)
         val safeRows = rows.coerceIn(TERMINAL_ROW_RANGE)
@@ -473,7 +571,7 @@ class TerminalChannel(
         runCatching { (channel as? PtyCapableChannelSession)?.sendWindowChange(safeColumns, safeRows) }
     }
 
-    val isOpen: Boolean get() = channel.isOpen
+    override val isOpen: Boolean get() = channel.isOpen
 
     override fun close() {
         // First, so a listener that fires inside the close below already knows this was deliberate.
@@ -504,7 +602,7 @@ class TerminalChannel(
      * It is recorded only when the transport has said nothing yet, because a first-hand report always
      * outranks the app's conclusion - see [closeReason], which reads them in that order.
      */
-    fun discard(reason: SessionEnd? = null) {
+    override fun discard(reason: SessionEnd?) {
         if (reason != null && transportReason == null) transportReason = reason
         release()
     }
@@ -664,15 +762,6 @@ class TerminalChannel(
     }
 
     companion object {
-        /**
-         * The last element of [output]: the stream is over and nothing follows it.
-         *
-         * Empty, and compared by identity rather than by contents - [EmittingOutputStream] never
-         * publishes a zero-length chunk, but identity means a remote side that somehow produced one
-         * still could not impersonate the end of the session.
-         */
-        val END_OF_OUTPUT: ByteArray = ByteArray(0)
-
         private const val DEFAULT_COLUMNS = 120
         private const val DEFAULT_ROWS = 40
         private const val OPEN_TIMEOUT_MS = 20_000L
