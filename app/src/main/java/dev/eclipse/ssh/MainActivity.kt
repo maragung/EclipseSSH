@@ -227,6 +227,7 @@ import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceUiState
 import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
@@ -1304,13 +1305,19 @@ private fun EclipseWorkspace(
                     frames = viewModel.frames,
                     filesExplorer = viewModel.filesExplorer,
                     linuxUserspace = viewModel.linuxUserspace,
+                    localLinuxCard = viewModel.localLinuxCard,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
-                    onConnect = { host -> showAuthHost = host },
+                    onConnect = { host ->
+                        // The local Ubuntu card never opens the login: there is nothing to
+                        // authenticate (the session is the app's own uid), so the tap goes straight
+                        // to the terminal. Every other host gets the auth dialog as before.
+                        if (LocalLinuxHost.isLocalHost(host.id)) viewModel.connect(host) else showAuthHost = host
+                    },
                     onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
@@ -1488,13 +1495,19 @@ private fun EclipseWorkspace(
                     frames = viewModel.frames,
                     filesExplorer = viewModel.filesExplorer,
                     linuxUserspace = viewModel.linuxUserspace,
+                    localLinuxCard = viewModel.localLinuxCard,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
                     onAddHost = { showAddHost = true },
-                    onConnect = { host -> showAuthHost = host },
+                    onConnect = { host ->
+                        // The local Ubuntu card never opens the login: there is nothing to
+                        // authenticate (the session is the app's own uid), so the tap goes straight
+                        // to the terminal. Every other host gets the auth dialog as before.
+                        if (LocalLinuxHost.isLocalHost(host.id)) viewModel.connect(host) else showAuthHost = host
+                    },
                     onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
                     onEditHost = { showEditHost = it },
@@ -2203,6 +2216,12 @@ private fun WorkspaceScaffold(
      * section only the Settings destination shows.
      */
     linuxUserspace: LinuxUserspaceController,
+    /**
+     * The host list's "Local Ubuntu 22.04" card, as a flow for the same reason [frames] is: it is
+     * null until the userspace is installed and healthy, and reading it here would recompose this
+     * scaffold for a card only the Hosts destination shows.
+     */
+    localLinuxCard: StateFlow<HostProfile?>,
     /** Opens a file in the full-window preview - see the overlay state in [EclipseWorkspace]. */
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
@@ -2478,9 +2497,9 @@ private fun WorkspaceScaffold(
         Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
             when (destination) {
                 Destination.HOSTS -> HostsScreen(
-                    state, onSearch, onAddHost, onConnect, onShowDetails, onEditHost, onRemoveHost,
-                    onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards,
-                    onRemoteDesktop, onWakeOnLan, onRdpDesktop,
+                    state, localLinuxCard, onSearch, onAddHost, onConnect, onShowDetails, onEditHost,
+                    onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost,
+                    onManageForwards, onRemoteDesktop, onWakeOnLan, onRdpDesktop,
                 )
                 // Both handled above, outside the scrolling column, because both are measured.
                 Destination.TERMINAL, Destination.FILES -> Unit
@@ -2522,6 +2541,7 @@ private fun WorkspaceScaffold(
 @Composable
 private fun HostsScreen(
     state: MainUiState,
+    localLinuxCard: StateFlow<HostProfile?>,
     onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
@@ -2559,13 +2579,55 @@ private fun HostsScreen(
     }
     Spacer(Modifier.height(14.dp))
     val visibleHosts = state.filteredHosts.filter { !favoritesOnly || it.isFavorite }
-    if (visibleHosts.isEmpty()) {
+    // The local Ubuntu card, when the userspace is installed and healthy. Collected here rather
+    // than above so the flow's WhileSubscribed window opens exactly when the Hosts destination is
+    // on screen; the flow is null in every state that cannot keep the card's promise (not
+    // installed, mid-install, broken, never probed), so there is no removal code anywhere — the
+    // card is derived, never registered.
+    val localCard by localLinuxCard.collectAsStateWithLifecycle()
+    if (localCard != null) {
+        LocalUbuntuCard(localCard!!, onConnect)
+        Spacer(Modifier.height(12.dp))
+    }
+    if (visibleHosts.isEmpty() && localCard == null) {
         EmptyState("No hosts found", "Try another search or add your first connection.", onAddHost)
     } else {
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             visibleHosts.forEach { host ->
                 HostCard(host, onConnect, onShowDetails, onEditHost, onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost, onManageForwards, onRemoteDesktop, onWakeOnLan, onRdpDesktop)
             }
+        }
+    }
+}
+
+/**
+ * The "Local Ubuntu 22.04" card: the userspace's front door, rendered only while the environment
+ * is installed and healthy (the flow feeding it is null in every other state).
+ *
+ * Shaped exactly like a [HostCard] — the same corner radii, the same paddings, the same one-tap
+ * connect — because the promise is the same: one tap, one terminal. What it deliberately does not
+ * have is the kebab menu; there is nothing to edit or remove here, and the environment's controls
+ * live in Settings → Linux userspace where its whole lifecycle is visible. The trailing play
+ * affordance carries the card's name for the same screen-reader reason every HostCard control
+ * does: "Open terminal" alone describes the action, and the row names the environment.
+ */
+@Composable
+private fun LocalUbuntuCard(host: HostProfile, onConnect: (HostProfile) -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable { onConnect(host) },
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(shape = RoundedCornerShape(14.dp), color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.size(44.dp)) {
+                Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.Terminal, null, tint = MaterialTheme.colorScheme.primary) }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(host.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Ubuntu 22.04 on this device · tap to open a terminal", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Icon(Icons.Default.PlayArrow, "Open terminal on ${host.name}", tint = MaterialTheme.colorScheme.primary)
         }
     }
 }

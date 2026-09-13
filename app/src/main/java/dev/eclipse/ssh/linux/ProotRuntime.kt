@@ -127,6 +127,17 @@ class ProotRuntime(
     val spawnCwd: File get() = rootDir
 
     /**
+     * Forks one interactive session: the argv of [sessionArgv] (no fake root — the user-facing
+     * shell is the `ubuntu` account) and the environment of [baseEnv], on a pty of [rows] x
+     * [columns].
+     *
+     * The caller owns the returned [PtyProcess] — in production it goes straight into
+     * [LocalTerminalChannel], which takes sole ownership of the fd pair.
+     */
+    fun spawnSession(rows: Int, columns: Int): PtyProcess =
+        spawner.spawn(sessionArgv(), baseEnv(), spawnCwd.absolutePath, rows, columns)
+
+    /**
      * Runs one proot command to completion and captures what it printed.
      *
      * The setup pipeline and the health probe both need "did this command work, and what did it

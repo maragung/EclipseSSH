@@ -5,6 +5,7 @@ import dev.eclipse.ssh.data.local.asDomain
 import dev.eclipse.ssh.data.local.toEntity
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.security.SecureVault
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -31,6 +32,14 @@ class RoomHostRepository(
     }
 
     override suspend fun save(host: HostProfile) {
+        // The local Ubuntu environment is synthesized from the userspace's live state, never
+        // stored; a row with its reserved id in the database would shadow the synthesized card
+        // with a dead "Local Ubuntu" entry that dials localhost. No UI path can produce one — the
+        // card has no edit menu — so reaching this guard means a bug, and a loud refusal beats a
+        // row that has to be surgically removed later.
+        check(!LocalLinuxHost.isLocalHost(host.id)) {
+            "The local Ubuntu environment is not a savable host"
+        }
         val encrypted = host.copy(
             socksPassword = host.socksPassword?.takeIf(String::isNotBlank)?.let(vault::encrypt),
         )
