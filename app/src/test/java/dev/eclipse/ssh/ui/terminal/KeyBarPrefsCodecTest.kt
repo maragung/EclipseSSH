@@ -3,11 +3,21 @@ package dev.eclipse.ssh.ui.terminal
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.terminal.TerminalKey
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
 /**
  * The shortcut bar blob's contract, in the shape the editor blob's tests taught: decode never
  * throws, encode never loses, and every way a blob can be wrong costs only what it broke.
+ *
+ * Robolectric because the codec is org.json end to end: on the plain unit-test classpath that
+ * package is the android.jar stub, whose `put` returns null and whose `getString` throws, which
+ * would test the stub, not the codec. The editor blob's test class carries the same runner for
+ * the same reason.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
 class KeyBarPrefsCodecTest {
 
     @Test
