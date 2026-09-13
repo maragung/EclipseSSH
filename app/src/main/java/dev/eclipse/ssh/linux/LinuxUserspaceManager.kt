@@ -86,6 +86,10 @@ class LinuxUserspaceManager(
             installer.install { progress ->
                 _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
             }
+            // The belt under the installer's own promise: an extraction that produced nothing
+            // must fail here — an install failure the UI can name — rather than deep inside
+            // setup, where it surfaces as a missing-file error that reads like corruption.
+            check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
             val report = distribution.setup { step ->
                 _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
             }
@@ -174,6 +178,9 @@ class LinuxUserspaceManager(
                     _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
                 }
             }
+            // Same belt as install(): a repair whose re-extraction still left nothing must fail
+            // as a repair, not as setup's missing-file error.
+            check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
             val report = distribution.setup { step ->
                 _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
             }

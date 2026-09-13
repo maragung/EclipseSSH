@@ -19,8 +19,13 @@ import org.junit.Test
  */
 class LinuxUserspaceManagerTest {
 
-    private class Harness(distro: LinuxDistro) {
-        val rootDir: File = Files.createTempDirectory("linux-userspace").toFile().apply { deleteOnExit() }
+    private class Harness(
+        distro: LinuxDistro,
+        // Overridable because the stale-flag test needs the root to exist - with its state file
+        // already written - before the manager is constructed: initialState() reads the flag at
+        // construction, not on demand.
+        val rootDir: File = Files.createTempDirectory("linux-userspace").toFile().apply { deleteOnExit() },
+    ) {
         val spawner = ScriptedPtySpawner()
         var downloads = 0
         val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
@@ -208,10 +213,14 @@ class LinuxUserspaceManagerTest {
 
         // Crash recovery's dark twin: the state file says installed, the filesystem says otherwise
         // (here: never extracted at all). The manager must not present that as a healthy install -
-        // NeedsRepair is what the settings screen turns into a Repair button.
-        val stale = newHarness()
-        stale.rootDir.mkdirs()
-        stale.rootDir.resolve("state.properties").writeText("installed=true\ndistroId=ubuntu-22.04\n")
+        // NeedsRepair is what the settings screen turns into a Repair button. The root and its
+        // flag exist before the harness, because the classification runs at construction.
+        val staleRoot = Files.createTempDirectory("linux-userspace-stale").toFile().apply { deleteOnExit() }
+        staleRoot.resolve("state.properties").writeText("installed=true\ndistroId=ubuntu-22.04\n")
+        val stale = Harness(
+            TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)),
+            staleRoot,
+        )
         assertThat(stale.manager.state.value).isInstanceOf(LinuxUserspaceState.NeedsRepair::class.java)
     }
 }

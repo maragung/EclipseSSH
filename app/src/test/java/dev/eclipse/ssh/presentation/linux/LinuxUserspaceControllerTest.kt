@@ -138,8 +138,11 @@ class LinuxUserspaceControllerTest {
         // The state machine was untouched by the refusal - nothing half-started.
         assertThat(ui.state).isEqualTo(LinuxUserspaceState.NotInstalled)
 
-        // And the sentence clears when the user has read it.
+        // And the sentence clears when the user has read it. clearError writes the raw flow; the
+        // combine re-emits on the scheduler, so the flush is what makes the cleared state visible
+        // to a synchronous value read (a recomposition would see it on the next frame).
         controller.clearError()
+        testScheduler.advanceUntilIdle()
         assertThat(controller.uiState.value.error).isNull()
     }
 
