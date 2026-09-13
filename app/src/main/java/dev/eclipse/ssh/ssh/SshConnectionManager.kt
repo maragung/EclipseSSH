@@ -16,6 +16,7 @@ import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.isForcedTerminalSize
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.io.Closeable
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.security.KeyPair
 import java.security.MessageDigest
@@ -32,10 +33,13 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.apache.sshd.agent.SshAgent
 import org.apache.sshd.agent.SshAgentFactory
 import org.apache.sshd.agent.SshAgentServer
@@ -367,6 +371,11 @@ class SshConnectionManager @Inject constructor(
                 else -> client.connect(profile.username, profile.host, profile.port, context, null)
             }.verify(timeout, TimeUnit.SECONDS)
                 .session
+            // No manual cancel on a failed verify, and this is deliberate: since sshd 2.13 a
+            // `verify` with no CancelOption behaves as if CANCEL_ON_TIMEOUT and
+            // CANCEL_ON_INTERRUPT were passed - on expiry it cancels the future itself, and the
+            // client's connect listeners close the session and the socket under it. A cancel
+            // added here would be cancelling a future the library has already cancelled.
         } finally {
             // The underlying client owns the socket; this is the only thing this frame owns.
             tunnelled?.let(tunnelledTargets::remove)
@@ -580,13 +589,61 @@ class SshConnectionManager @Inject constructor(
      *
      * Anything with a bounded scope wants [withSftp] instead.
      */
-    suspend fun openSftp(session: ClientSession): SftpClient = withContext(Dispatchers.IO) {
-        SftpClientFactory.instance().createSftpClient(session)
+    suspend fun openSftp(session: ClientSession): SftpClient {
+        // A channel that finished opening is never dropped. `createSftpClient` performs blocking
+        // I/O *and* starts the channel, and a caller cancelled while it runs gets its
+        // CancellationException from `withContext` with the result discarded on the way - a live
+        // SFTP channel left attached to the session, holding an open handle and a server-side
+        // channel slot until the whole session ends, one per cancelled transfer, until the server
+        // starts refusing channels altogether. Same shape as [PortForwardingManager.bindOnIo]:
+        // the var is written inside the block, before cancellation can land on the result, so the
+        // catch closes what was claimed. The close runs on IO under NonCancellable - this catch
+        // is already on the cancelled path, and an SFTP close writes to the socket, which the
+        // main thread must not do (see [withSftp] for what that costs).
+        var opened: SftpClient? = null
+        try {
+            return withContext(Dispatchers.IO) {
+                SftpClientFactory.instance().createSftpClient(session).also { opened = it }
+            }
+        } catch (cancelled: CancellationException) {
+            opened?.let {
+                withContext(NonCancellable + Dispatchers.IO) { runCatching(it::close) }
+            }
+            throw cancelled
+        }
     }
 
-    suspend fun runCommand(session: ClientSession, command: String): String = withContext(Dispatchers.IO) {
-        session.executeRemoteCommand(command).trim()
-    }
+    /**
+     * Runs one command and answers its trimmed output.
+     *
+     * Bounded, because the callers are status queries (`hostname`, `uptime`, `free`, `df`) whose
+     * answers are worth exactly one screen refresh: a server that accepts the channel and never
+     * replies - wedged under load, or a transport that died without an error reaching this side -
+     * parks the stat producer forever otherwise. The bound returns the producer to the UI as
+     * "Unavailable" instead.
+     *
+     * The timeout is translated out of [TimeoutCancellationException] before it leaves: that
+     * class *is* a [CancellationException], and the callers' cancellation branches rethrow those
+     * on sight - a timeout would have silenced the producer instead of reporting, exactly the
+     * bug the caller's own catch exists to avoid. [IOException] keeps it on the ordinary failure
+     * path. The underlying channel stays wedged until its transport notices; the wait is what is
+     * bounded here, not the remote command.
+     *
+     * @param timeoutMs the budget; overridable so a test can make it seconds rather than the
+     *   production default.
+     */
+    suspend fun runCommand(
+        session: ClientSession,
+        command: String,
+        timeoutMs: Long = REMOTE_COMMAND_TIMEOUT_MS,
+    ): String =
+        try {
+            withTimeout(timeoutMs) {
+                withContext(Dispatchers.IO) { session.executeRemoteCommand(command).trim() }
+            }
+        } catch (timedOut: TimeoutCancellationException) {
+            throw IOException("The server did not answer '$command' within ${timeoutMs / 1000}s", timedOut)
+        }
 
     /** Trusts this fingerprint for the profile's host. False when it could not be persisted. */
     fun trustHost(profile: HostProfile, fingerprint: String): Boolean =
@@ -789,6 +846,14 @@ class SshConnectionManager @Inject constructor(
 
         /** Keep-alive interval used when neither the host nor the settings have an opinion. */
         const val DEFAULT_KEEP_ALIVE_SECONDS = 30
+
+        /**
+         * The budget for one [runCommand] status query. Generous rather than tight — these run
+         * against the host's own binaries, and a box slow enough to miss it is reporting
+         * "Unavailable" for a refresh the user asked for, not losing anything - while an unbounded
+         * wait would hold the producer forever on a server that never answers at all.
+         */
+        const val REMOTE_COMMAND_TIMEOUT_MS = 30_000L
     }
 }
 

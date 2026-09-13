@@ -68,7 +68,19 @@ class SftpArchiveByteSource(
                     // why withSftp's use{} is wrong for this shape); here the lifetime is this
                     // source's own, ended in [close].
                     client = connectionManager.openSftp(session)
-                    h = client.open(remotePath, OpenMode.Read)
+                    h = try {
+                        client.open(remotePath, OpenMode.Read)
+                    } catch (error: Throwable) {
+                        // The archive was deleted, replaced or refused between the stat that
+                        // produced [size] and this open - a real race with anything that rewrites
+                        // files on the host. [close] only closes what the fields hold, and this
+                        // client never reaches them, so it is closed here or not at all: a live
+                        // SFTP channel per failed attempt, one more server-side slot gone each
+                        // time the user retries the browse. Already on IO, inside this block's
+                        // withContext - an SFTP close writes to the socket and belongs here.
+                        runCatching(client::close)
+                        throw error
+                    }
                     channel = client
                     handle = h
                 }

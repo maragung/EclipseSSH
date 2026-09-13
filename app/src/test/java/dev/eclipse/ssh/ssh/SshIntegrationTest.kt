@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.ssh
 
 import com.google.common.truth.Truth.assertThat
+import dev.eclipse.ssh.archive.SftpArchiveByteSource
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
 import dev.eclipse.ssh.data.model.DEFAULT_AUTH_TIMEOUT_SECONDS
@@ -11,6 +12,7 @@ import dev.eclipse.ssh.terminal.AnsiTerminalBuffer
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalKeys
 import dev.eclipse.ssh.terminal.Utf8StreamDecoder
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
@@ -31,10 +33,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.sshd.common.cipher.BuiltinCiphers
 import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.common.kex.BuiltinDHFactories
 import org.apache.sshd.common.mac.BuiltinMacs
+import org.apache.sshd.common.session.ConnectionService
 import org.apache.sshd.common.signature.BuiltinSignatures
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
@@ -796,6 +800,108 @@ class SshIntegrationTest {
         }
     }
 
+    /**
+     * A command that never answers fails the caller, rather than parking it forever.
+     *
+     * The bug this pins was an unbounded `executeRemoteCommand`: the stat producer asked `uptime`
+     * and a server that had accepted the channel but gone quiet - wedged under load, or a
+     * transport that died without the error reaching this side - held the producer for as long as
+     * the process lived. The bound is what [SshConnectionManager.REMOTE_COMMAND_TIMEOUT_MS] ships
+     * with; the override exists so this test can make it one second instead of thirty.
+     *
+     * The failure must also arrive as an [IOException], not as the [kotlinx.coroutines.TimeoutCancellationException]
+     * it starts as: that class is a [kotlinx.coroutines.CancellationException], and the producer's
+     * cancellation branch rethrows those on sight - a timeout surfacing as cancellation would
+     * have silenced the stat card instead of marking it "Unavailable", which is the exact bug the
+     * caller's own catch exists to avoid.
+     */
+    @Test(timeout = 120_000)
+    fun `a command that never answers fails the caller instead of hanging it`() {
+        runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = SshConnectionManager(context, SettingsRepository(context))
+        // A server of its own: the shared one answers commands, and the whole point here is one
+        // that takes the channel and never speaks again.
+        val wedged = startRestrictedServer {
+            commandFactory = CommandFactory { _, _ -> WedgedCommand() }
+        }
+        try {
+            val profile = hostProfile().copy(port = wedged.port)
+            trustedConnect(manager, profile, PASSWORD).use { session ->
+                val startedAt = System.currentTimeMillis()
+                val error = runCatching { manager.runCommand(session, "forever", timeoutMs = 1_000) }
+                    .exceptionOrNull()
+
+                assertThat(error).isInstanceOf(IOException::class.java)
+                assertThat(error!!.message).contains("did not answer")
+                // Bounded means bounded: generous over the one-second budget for a loaded CI box,
+                // and far under what JUnit's own 120-second method timeout would have needed to
+                // notice an unbounded wait. Closing the session (use) tears the wedged channel
+                // down with it, releasing the IO thread the abandoned read still occupies.
+                assertThat(System.currentTimeMillis() - startedAt).isLessThan(60_000)
+            }
+        } finally {
+            manager.close()
+            runCatching { wedged.stop() }
+        }
+        }
+    }
+
+    /**
+     * An archive whose open fails must release the SFTP channel that open created.
+     *
+     * The race this pins is real on any host whose files move: something deletes or replaces the
+     * archive between the stat that produced its size and the open that wants its bytes, and
+     * `client.open` throws with the freshly created SFTP channel assigned to nothing - `close()`
+     * only closes what the fields hold. Before the fix, one channel leaked per failed attempt,
+     * and a server has a finite number of channel slots to give.
+     *
+     * Measured on the wire, as the connection service's live channel count, because that is what
+     * the server side experiences - not a field the code under test happens to expose. Three
+     * attempts so a single lucky release cannot pass a leak that only sometimes happens.
+     */
+    @Test(timeout = 120_000)
+    fun `a failed archive open releases the sftp channel it opened`() {
+        runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = SshConnectionManager(context, SettingsRepository(context))
+        val store = SshSessionStore()
+        try {
+            val session = trustedConnect(manager, hostProfile(), PASSWORD)
+            store.install(sessionKey = "it-archive-host", session = session, hostId = "it-archive-host")
+            fun openChannelCount(): Int =
+                session.getService(ConnectionService::class.java).channels.size
+            val baseline = openChannelCount()
+
+            repeat(3) {
+                val source = SftpArchiveByteSource(
+                    connectionManager = manager,
+                    sessionStore = store,
+                    hostId = "it-archive-host",
+                    hostName = "integration",
+                    remotePath = "sftp_test/deleted-between-stat-and-open.zip",
+                    size = 64 * 1024,
+                )
+                val error = runCatching { source.readAt(0, 32) }.exceptionOrNull()
+                assertThat(error).isNotNull()
+
+                // The close runs in the throw path, but the channel leaving the service's list is
+                // MINA's close event, which lands on its own thread: poll for it with a deadline
+                // rather than assert it synchronously, so a leak fails instead of timing out.
+                val released = withTimeoutOrNull(10_000) {
+                    while (openChannelCount() > baseline) delay(100)
+                    true
+                } == true
+                assertThat(released).isTrue()
+            }
+
+            session.close(false)
+        } finally {
+            manager.close()
+        }
+        }
+    }
+
     @Test(timeout = 120_000)
     fun `wrong password fails with a clear error`() {
         runBlocking {
@@ -1094,6 +1200,21 @@ private class UnskippableInputStream(private val delegate: InputStream) : InputS
     override fun skip(n: Long): Long = 0
     override fun available(): Int = delegate.available()
     override fun close() = delegate.close()
+}
+
+/**
+ * A server-side command that accepts its channel and then never speaks and never exits: the
+ * client's `executeRemoteCommand` blocks reading a reply that is never coming. This is the shape
+ * of a server wedged under load - and of a transport that died without the error reaching this
+ * side - which is exactly what [SshConnectionManager.runCommand]'s bound exists for.
+ */
+private class WedgedCommand : Command {
+    override fun setInputStream(input: InputStream) = Unit
+    override fun setOutputStream(output: OutputStream) = Unit
+    override fun setErrorStream(error: OutputStream) = Unit
+    override fun setExitCallback(callback: ExitCallback) = Unit
+    override fun start(channel: ChannelSession, env: Environment) = Unit
+    override fun destroy(channel: ChannelSession) = Unit
 }
 
 /**
