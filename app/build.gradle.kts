@@ -413,9 +413,16 @@ dependencies {
 
     // The RFB (VNC) half of the remote-desktop viewer, spoken over a plain Socket that the
     // VNC engine runs through an ad-hoc SSH local forward. Pinned to a JitPack commit SHA -
-    // see the version catalog note. Its only transitive dependency is Bouncy Castle's
-    // bcprov-jdk18on, which the VNC auth path uses and nothing else in the app pulls in.
+    // see the version catalog note.
     implementation(libs.vernacular.vnc)
+
+    // The full Bouncy Castle provider, which vernacular-vnc also pulls in transitively for
+    // its auth path. Declared here as well because EclipseApp.replacePlatformBouncyCastle
+    // installs it at startup so MINA sshd's curve resolution survives the platform's
+    // stripped same-name provider — see that function for the crash this prevents. An
+    // explicit edge fails the build if the VNC library ever drops its dependency, instead
+    // of quietly removing the provider the whole SSH stack initialises against.
+    implementation(libs.bouncycastle.prov)
 
     // The RDP engine's JNI wrapper and native libraries.
     implementation(project(":freerdp"))

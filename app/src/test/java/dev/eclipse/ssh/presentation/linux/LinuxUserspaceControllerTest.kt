@@ -225,8 +225,9 @@ class LinuxUserspaceControllerTest {
         assertThat(uninstalled.storageUsedBytes).isEqualTo(0)
 
         controller.install()
-        // Both numbers in the predicate, because the recompute sets them as three separate
-        // MutableStateFlow writes and an intermediate emission can carry one without the other.
+        // The whole storage-facts value arrives in one emission: the recompute used to be three
+        // separate StateFlow writes, and an intermediate emission could pair a restored workspace
+        // with a backup still claimed as parked - the exact lie the assert below pins out.
         val reinstalled = controller.uiState.first {
             it.state is LinuxUserspaceState.Stopped &&
                 it.storageUsedBytes > 0 &&
