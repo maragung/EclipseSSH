@@ -100,6 +100,11 @@ object VaultBackup {
             // lockout — the same never-lockout posture as the rest of the settings block.
             settings.editorPrefsJson.take(MAX_EDITOR_PREFS_JSON)
                 .takeIf { json -> json.isNotBlank() }?.let { put("editorPrefsJson", it) }
+            // Opt-keyed and capped exactly like the editor blob above it: the shortcut bar's codec
+            // decodes tolerantly, so a mangled or truncated value becomes the default bar rather
+            // than a failed import.
+            settings.terminalKeyBarJson.take(MAX_KEY_BAR_JSON)
+                .takeIf { json -> json.isNotBlank() }?.let { put("terminalKeyBarJson", it) }
         })
         root.put("hosts", JSONArray().apply {
             hosts.forEach { host -> put(JSONObject().apply {
@@ -214,6 +219,10 @@ object VaultBackup {
             // on the way in for the same reason every vault string is: a backup is untrusted.
             editorPrefsJson = settingsObj.optString("editorPrefsJson", defaults.editorPrefsJson)
                 .take(MAX_EDITOR_PREFS_JSON).takeIf { json -> json.isNotBlank() } ?: "{}",
+            // Absent from backups written before the bar was configurable, which the default "{}"
+            // resolves to "never configured" — the same bar those backups' installs shipped with.
+            terminalKeyBarJson = settingsObj.optString("terminalKeyBarJson", defaults.terminalKeyBarJson)
+                .take(MAX_KEY_BAR_JSON).takeIf { json -> json.isNotBlank() } ?: "{}",
         )
         val hostsArray = root.optJSONArray("hosts") ?: JSONArray()
         val hosts = ArrayList<HostProfile>(hostsArray.length())
@@ -452,6 +461,9 @@ object VaultBackup {
      * on decode, never to a failed import.
      */
     private const val MAX_EDITOR_PREFS_JSON = 4096
+
+    /** Same order of magnitude as the editor blob: 64 caps with labels, comfortably. */
+    private const val MAX_KEY_BAR_JSON = 8192
 }
 
 /** Raised when a backup payload cannot be read: wrong passphrase, truncation, or bad JSON. */

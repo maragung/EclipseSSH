@@ -75,6 +75,7 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
@@ -282,6 +283,8 @@ import androidx.compose.ui.focus.FocusRequester
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalSelection
+import dev.eclipse.ssh.ui.terminal.KeyBarPrefsCodec
+import dev.eclipse.ssh.ui.terminal.ShortcutBarDialog
 import dev.eclipse.ssh.ui.terminal.TerminalInputBridge
 import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
@@ -1428,6 +1431,7 @@ private fun EclipseWorkspace(
                     onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
+                    onTerminalKeyBarJson = viewModel::setTerminalKeyBarJson,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
                     verifyPin = viewModel::verifyPin,
@@ -1610,6 +1614,7 @@ private fun EclipseWorkspace(
                     onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
+                    onTerminalKeyBarJson = viewModel::setTerminalKeyBarJson,
                     onSetPin = viewModel::setPin,
                     onClearPin = viewModel::clearPin,
                     verifyPin = viewModel::verifyPin,
@@ -2311,6 +2316,8 @@ private fun WorkspaceScaffold(
     // The keep-system-bars switch was wired into SettingsScreen and both scaffold call sites, but
     // never into the scaffold's own parameter list, so all three references failed to resolve.
     onTerminalKeepSystemBars: (Boolean) -> Unit = {},
+    // The shortcut bar's whole configuration, encoded - one write per Save in the bar's dialog.
+    onTerminalKeyBarJson: (String) -> Unit = {},
     onSetPin: (String) -> Unit = {},
     onClearPin: () -> Unit = {},
     verifyPin: suspend (String) -> Boolean = { false },
@@ -2477,6 +2484,7 @@ private fun WorkspaceScaffold(
                     onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
                     onTerminalKeepSystemBars = onTerminalKeepSystemBars,
+                    onTerminalKeyBarJson = onTerminalKeyBarJson,
                     onSetPin = onSetPin,
                     onClearPin = onClearPin,
                     verifyPin = verifyPin,
@@ -3070,8 +3078,15 @@ private fun TerminalScreen(
             onToggle = { onKeyRowVisible(!keyRowVisible) },
         )
         if (keyRowVisible) {
+            // Decoded here rather than in the ViewModel so the terminal never waits on a settings
+            // read to know what its bar looks like: the blob is in the UI state, the codec is pure
+            // and never throws, and a damaged blob renders the default bar.
+            val keyBarPrefs = remember(state.settings.terminalKeyBarJson) {
+                KeyBarPrefsCodec.decode(state.settings.terminalKeyBarJson).withMissingStandardCaps()
+            }
             TerminalKeyRow(
                 latches = latches,
+                prefs = keyBarPrefs,
                 onKey = { key, ctrl, alt, shift ->
                     onSendKey(activeTab.id, key, ctrl, alt, shift)
                     // Every cap is a clickable surface, and a clickable surface is focusable: a tap can
@@ -3080,6 +3095,8 @@ private fun TerminalScreen(
                     // A no-op when the field already has focus, which is the usual case.
                     if (!inputFocused) runCatching { focusRequester.requestFocus() }
                 },
+                onText = { text -> onSendText(activeTab.id, text) },
+                onChar = { char, ctrl, alt -> onSendChar(activeTab.id, char, ctrl, alt) },
                 modifier = Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, bottom = 6.dp),
             )
         }
@@ -4968,6 +4985,7 @@ private fun SettingsScreen(
     onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onTerminalKeepSystemBars: (Boolean) -> Unit = {},
+    onTerminalKeyBarJson: (String) -> Unit = {},
     onSetPin: (String) -> Unit,
     onClearPin: () -> Unit,
     verifyPin: suspend (String) -> Boolean,
@@ -4989,6 +5007,7 @@ private fun SettingsScreen(
     var showPinDialog by remember { mutableStateOf(false) }
     var showVaultAutoLockDialog by remember { mutableStateOf(false) }
     var showKnownHosts by remember { mutableStateOf(false) }
+    var showKeyBarDialog by remember { mutableStateOf(false) }
     var confirmForgetCredentials by remember { mutableStateOf(false) }
     var showDiagnostics by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
@@ -5056,6 +5075,13 @@ private fun SettingsScreen(
         SettingRow(Icons.Default.Wifi, "Keep-alive interval", "Every ${state.settings.keepAliveSeconds} seconds") { TextButton(onClick = { showKeepAliveDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Clipboard auto-clear", if (state.settings.clearClipboardAfterSeconds == 0) "Never clear copied secrets automatically" else "Clear secrets after ${state.settings.clearClipboardAfterSeconds} seconds") { TextButton(onClick = { showClipboardDialog = true }) { Text("Change") } }
         SettingRow(Icons.Default.Terminal, "Terminal font size", "${state.settings.terminalFontSize} sp JetBrains Mono") { TextButton(onClick = { showFontDialog = true }) { Text("Change") } }
+        // Next to the font size because both shape the terminal screen. The subtitle names what the
+        // dialog edits rather than listing the caps - the count changes with the user's own setup.
+        SettingRow(
+            Icons.Default.Keyboard,
+            "Shortcut bar",
+            "Choose the keys on the bar, add custom buttons, set the rows",
+        ) { TextButton(onClick = { showKeyBarDialog = true }) { Text("Customize") } }
         SettingRow(
             Icons.Default.Terminal,
             "Terminal width",
@@ -5152,6 +5178,19 @@ private fun SettingsScreen(
 
     if (showAbout) {
         AboutDialog(onDismiss = { showAbout = false })
+    }
+
+    if (showKeyBarDialog) {
+        ShortcutBarDialog(
+            initial = remember(state.settings.terminalKeyBarJson) {
+                KeyBarPrefsCodec.decode(state.settings.terminalKeyBarJson)
+            },
+            onDismiss = { showKeyBarDialog = false },
+            onApply = { json ->
+                showKeyBarDialog = false
+                onTerminalKeyBarJson(json)
+            },
+        )
     }
 
     if (showDiagnostics) {

@@ -68,6 +68,7 @@ internal object Keys {
     val terminalKeepSystemBars = booleanPreferencesKey("terminal_keep_system_bars")
     val transferBytesPerSecond = androidx.datastore.preferences.core.longPreferencesKey("transfer_bytes_per_second")
     val editorPrefsJson = stringPreferencesKey("editor_prefs_json")
+    val terminalKeyBarJson = stringPreferencesKey("terminal_key_bar_json")
     val localRootUri = stringPreferencesKey("local_root_uri")
 }
 
@@ -118,6 +119,9 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     // "{}" rather than null: the blob is only ever rewritten whole by the editor screen, and a
     // missing key means "never configured", which is the same JSON as "every toggle default".
     editorPrefsJson = prefs[Keys.editorPrefsJson] ?: "{}",
+    // Same shape as the editor blob above: the shortcut bar's codec is the only reader, a missing
+    // key means "never configured", and that is the same JSON as the default bar.
+    terminalKeyBarJson = prefs[Keys.terminalKeyBarJson] ?: "{}",
     localRootUri = prefs[Keys.localRootUri],
 )
 
@@ -221,6 +225,16 @@ class SettingsRepository(private val context: Context) {
     suspend fun setEditorPrefsJson(json: String) = editPrefs {
         it[Keys.editorPrefsJson] = json
     }
+
+    /**
+     * Persist the shortcut bar's configuration blob, whole. Same contract as the editor blob: the
+     * settings screen is the only writer, it re-encodes every field on every change (see
+     * [KeyBarPrefsCodec.encode]), so a write is either the new complete blob or the old one.
+     */
+    suspend fun setTerminalKeyBarJson(json: String) = editPrefs {
+        it[Keys.terminalKeyBarJson] = json
+    }
+
     /**
      * The terminal's text size in sp, clamped to what the app is willing to draw.
      *

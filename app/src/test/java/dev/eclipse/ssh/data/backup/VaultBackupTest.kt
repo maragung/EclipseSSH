@@ -188,6 +188,9 @@ class VaultBackupTest {
             // Every field opposite its default for the same reason as blockScreenshots above.
             editorPrefsJson = "{\"wordWrap\":true,\"showLineNumbers\":false,\"tabSize\":2," +
                 "\"spacesInsteadOfTabs\":true,\"autoSaveEnabled\":false,\"autoSaveDelayMillis\":5000}",
+            // The key bar blob rides the same way: opaque here, decoded only by its codec.
+            terminalKeyBarJson = "{\"mode\":\"CUSTOM\",\"size\":\"COMPACT\",\"rows\":2," +
+                "\"caps\":[{\"id\":\"c1\",\"kind\":\"TEXT\",\"row\":0,\"order\":0,\"text\":\"../\"}]}",
         )
         val knownHosts = mapOf("edge.example.com:2222" to EDGE_FINGERPRINT)
 

@@ -4341,6 +4341,8 @@ class MainViewModel @Inject constructor(
             // The blob is one key, so one call restores all six editor options at once. Its
             // codec decodes tolerantly, so a mangled import degrades to defaults, never a lockout.
             settingsRepository.setEditorPrefsJson(settings.editorPrefsJson)
+            // The shortcut bar blob, same contract: one call, tolerant decode, defaults on damage.
+            settingsRepository.setTerminalKeyBarJson(settings.terminalKeyBarJson)
             report("Imported ${hosts.size} host(s)")
         }
     }
@@ -4440,6 +4442,7 @@ class MainViewModel @Inject constructor(
     fun setLegacyAlgorithms(enabled: Boolean) = writeSetting("the legacy algorithm setting") { settingsRepository.setLegacyAlgorithms(enabled) }
     fun setTerminalTheme(name: String) = writeSetting("the terminal theme") { settingsRepository.setTerminalTheme(name) }
     fun setEditorPrefsJson(json: String) = writeSetting("the editor preferences") { settingsRepository.setEditorPrefsJson(json) }
+    fun setTerminalKeyBarJson(json: String) = writeSetting("the shortcut bar layout") { settingsRepository.setTerminalKeyBarJson(json) }
     fun setPin(pin: String) = writeSetting("the app PIN") { settingsRepository.setPin(pin) }
     fun clearPin() = writeSetting("the app PIN") { settingsRepository.clearPin() }
     suspend fun verifyPin(pin: String): Boolean = settingsRepository.verifyPin(pin)

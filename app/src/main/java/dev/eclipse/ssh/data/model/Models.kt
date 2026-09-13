@@ -828,6 +828,18 @@ data class AppSettings(
      */
     val terminalKeyRowVisible: Boolean = true,
     /**
+     * The shortcut bar's whole configuration as one JSON blob — which caps exist, which show, their
+     * row and order, the layout mode and the cap size.
+     *
+     * One key rather than one key per cap for the same reason the editor's options are one blob:
+     * the bar is edited as a unit (reordering one cap rewrites the order of its neighbours), a
+     * per-cap key set would need its own bookkeeping just to count caps, and [KeyBarPrefsCodec]
+     * decodes tolerantly so a corrupt or hand-edited value degrades to the default bar rather than
+     * a lockout. `"{}"` means "never configured", which decodes to the exact bar the app shipped
+     * with before it was configurable — the compatibility contract for every existing install.
+     */
+    val terminalKeyBarJson: String = "{}",
+    /**
      * The narrowest terminal the pty is ever told it has, whatever the screen can show.
      *
      * 80 by default, and that number is not arbitrary: it is the width command-line output has been
