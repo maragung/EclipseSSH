@@ -463,13 +463,15 @@ jobs:
         # self-hosted runner label.
         run: ./gradlew --stacktrace assembleDebugAndroidTest
 
-      - name: Assemble APKs
-        run: ./gradlew --stacktrace assembleDebug assembleRelease
-
-      - name: Assemble AAB (Play upload format)
-        # The Play Store accepts an AAB, not an APK. Built with the same
-        # signing config the APK uses, signed with the same key.
-        run: ./gradlew --stacktrace bundleRelease
+      - name: Assemble APKs and the AAB (Play upload format)
+        # One invocation, deliberately: a bundle task in it stands splits.abi
+        # down (AGP's PerModuleBundleTask cannot read a shrunk-resources
+        # directory holding more than one file - issuetracker.google.com/
+        # 402800800), so CI's APKs are the universal ones. The per-ABI APKs are
+        # the release workflows' product, built there in a bundle-free
+        # invocation. The Play Store accepts an AAB, not an APK; it is built
+        # with the same signing config the APK uses, signed with the same key.
+        run: ./gradlew --stacktrace assembleDebug assembleRelease bundleRelease
 
       - name: Verify the release APK signatures
         run: |
