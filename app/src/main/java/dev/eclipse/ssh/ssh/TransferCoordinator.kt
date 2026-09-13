@@ -15,11 +15,13 @@ import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import android.util.Log
 import org.apache.sshd.sftp.client.SftpClient
 
 @Singleton
@@ -29,14 +31,34 @@ class TransferCoordinator @Inject constructor(
     private val scheduler: TransferScheduler,
     private val notifier: TransferNotifier,
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * The handler is the floor under every write [guarded] cannot cover. Its own first persistence
+     * (the RUNNING row) runs before the `try`, the retry write inside the `catch` can itself fail on
+     * a full disk, and [schedule] writes with no guard at all — each of those used to escape to the
+     * thread's default handler and take the process, live sessions included, down. A transfer row
+     * that cannot be written is a transfer that cannot be tracked, not a reason to close the app.
+     */
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+            Log.e(TAG, "Uncaught error in a transfer coroutine: ${error::class.java.simpleName}: ${error.message}")
+        },
+    )
     private val jobs = ConcurrentHashMap<String, Job>()
 
     fun schedule(item: TransferItem, scheduledAt: Long) {
         scope.launch {
-            val runAt = scheduledAt.coerceAtLeast(System.currentTimeMillis() + 1_000L)
-            repository.save(item.copy(status = TransferStatus.QUEUED, scheduledAt = runAt))
-            scheduler.enqueue(item.id, delaySeconds = ((runAt - System.currentTimeMillis()).coerceAtLeast(0L) / 1_000L))
+            try {
+                val runAt = scheduledAt.coerceAtLeast(System.currentTimeMillis() + 1_000L)
+                repository.save(item.copy(status = TransferStatus.QUEUED, scheduledAt = runAt))
+                scheduler.enqueue(item.id, delaySeconds = ((runAt - System.currentTimeMillis()).coerceAtLeast(0L) / 1_000L))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                // The row could not be written - a full disk is the usual way - which means the
+                // schedule the user just set does not exist. Saying so through the failure
+                // notification is the one channel that works with no UI on screen.
+                notifier.notifyFailed(item.copy(errorMessage = failureReason(error)))
+            }
         }
     }
 
@@ -273,6 +295,8 @@ class TransferCoordinator @Inject constructor(
     private data class ObservedProgress(val bytes: Long, val total: Long?)
 
     private companion object {
+        const val TAG = "TransferCoordinator"
+
         // The retry ladder used to live here too; it is shared with the restorer now, in
         // dev.eclipse.ssh.data.TransferRetryPolicy.
         const val PROGRESS_INTERVAL_MS = 200L

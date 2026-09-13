@@ -291,7 +291,18 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun verifyPin(pin: String): Boolean {
-        val prefs = context.settingsDataStore.data.first()
+        // The read is guarded because of where it runs: the lock screen that gates app startup, in a
+        // `launch` the UI does not wrap. DataStore throws [IOException] for a file it cannot read - a
+        // full disk, direct boot, a write another process corrupted - and before this guard that
+        // exception escaped the caller's coroutine and crashed the unlock screen, on every attempt,
+        // for as long as the file stayed unreadable. Refusing the attempt fails closed: the PIN gate
+        // stays shut, which is the safe direction for a lock, and the next successful write repairs
+        // the file the same way the settings flow's own catch does.
+        val prefs = try {
+            context.settingsDataStore.data.first()
+        } catch (error: IOException) {
+            return false
+        }
         val hash = prefs[Keys.pinHash] ?: return false
         val salt = prefs[Keys.pinSalt]?.let { runCatching { Base64.getDecoder().decode(it) }.getOrNull() } ?: return false
         // Same cost as setPin, and this one is worse: it runs on the lock screen that gates app

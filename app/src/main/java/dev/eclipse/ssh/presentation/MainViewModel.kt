@@ -3023,7 +3023,7 @@ class MainViewModel @Inject constructor(
             localUri = file.uri.toString(),
             totalBytes = file.size.takeIf { it > 0 },
         )
-        transportScope.launch {
+        launchTransportGuarded("Could not start the upload") {
             transferRepository.save(item)
             startUploadJob(host, item, file.uri, target, file.size.takeIf { it > 0 })
         }
@@ -3303,7 +3303,7 @@ class MainViewModel @Inject constructor(
             localUri = localUri.toString(),
             totalBytes = remote.size,
         )
-        transportScope.launch {
+        launchTransportGuarded("Could not start the download") {
             transferRepository.save(item)
             startDownloadJob(host, item, localUri, remote.path)
         }
@@ -3314,12 +3314,12 @@ class MainViewModel @Inject constructor(
             report("Pick a local folder first")
             return
         }
-        transportScope.launch {
+        launchTransportGuarded("Could not start the download") {
             val target = runCatching {
                 DocumentFile.fromTreeUri(context, localDir)?.createFile("application/octet-stream", remote.name)
             }.getOrNull() ?: run {
                 report("Cannot create ${remote.name} in the selected folder")
-                return@launch
+                return@launchTransportGuarded
             }
             val item = TransferItem(
                 name = remote.name,
@@ -3354,7 +3354,7 @@ class MainViewModel @Inject constructor(
             localUri = localUri.toString(),
             totalBytes = size,
         )
-        transportScope.launch {
+        launchTransportGuarded("Could not start the upload") {
             transferRepository.save(item)
             startUploadJob(host, item, localUri, remotePath, size)
         }
@@ -3891,7 +3891,7 @@ class MainViewModel @Inject constructor(
      * list came from would otherwise be a list that changes while it is being iterated.
      */
     fun pauseAllTransfers() {
-        transportScope.launch {
+        launchTransportGuarded("Could not pause the transfers") {
             val running = transferRepository.transfers.first().filter { it.status == TransferStatus.RUNNING }
             running.forEach { transferCoordinator.pause(it.id) }
         }
@@ -3907,7 +3907,7 @@ class MainViewModel @Inject constructor(
      * behind one connection attempt.
      */
     fun resumeAllTransfers() {
-        transportScope.launch {
+        launchTransportGuarded("Could not resume the transfers") {
             transferRepository.transfers.first()
                 .filter { it.status != TransferStatus.COMPLETE && it.scheduledAt == null }
                 .forEach { resumeTransfer(it.id) }
@@ -3935,8 +3935,8 @@ class MainViewModel @Inject constructor(
      * while it is already moving.
      */
     fun runTransferNow(id: String) {
-        transportScope.launch {
-            val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launch
+        launchTransportGuarded("Could not start the transfer") {
+            val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launchTransportGuarded
             transferCoordinator.pause(id)
             transferRepository.save(item.copy(scheduledAt = null, errorMessage = null))
             resumeTransfer(id)
@@ -3951,19 +3951,19 @@ class MainViewModel @Inject constructor(
      * viewModelScope launch with no handler.
      */
     fun resumeTransfer(id: String) {
-        transportScope.launch {
-            val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launch
+        launchTransportGuarded("Could not resume the transfer") {
+            val item = transferRepository.transfers.first().firstOrNull { it.id == id } ?: return@launchTransportGuarded
             // A cross-host transfer has no local file to reopen and no local stream to append into,
             // so the resume ladder below - which is entirely about reopening a SAF document and an
             // SFTP channel - has nothing to say to it. Refused here with a reason, rather than in
             // the `when` arms as a typed stream that cannot exist: restart semantics for these
             // rows arrive with the transfer UI, and until then a sentence is what the card can show.
             if (item.direction == TransferDirection.CROSS_HOST) {
-                return@launch report("${item.name} cannot be resumed: it is a server-to-server transfer with no local file")
+                return@launchTransportGuarded report("${item.name} cannot be resumed: it is a server-to-server transfer with no local file")
             }
             val host = hostRepository.hosts.first().firstOrNull { it.id == item.hostId }
-                ?: return@launch report("The host for ${item.name} no longer exists")
-            val uri = item.localUri?.let(Uri::parse) ?: return@launch report("${item.name} has no local file")
+                ?: return@launchTransportGuarded report("The host for ${item.name} no longer exists")
+            val uri = item.localUri?.let(Uri::parse) ?: return@launchTransportGuarded report("${item.name} has no local file")
             var dialFailure: Throwable? = null
             // The same gate and the same install as [connect], for the same reason: this runs from a
             // notification action, so it can land in the middle of the UI's own dial to the host it
@@ -3992,7 +3992,7 @@ class MainViewModel @Inject constructor(
                 // The dial can also come back null with nothing thrown - another caller holding the
                 // gate installed a session that had already died - so the cause is genuinely optional.
                 val failure = dialFailure
-                return@launch if (failure == null) {
+                return@launchTransportGuarded if (failure == null) {
                     report("Could not reconnect to ${host.name}")
                 } else {
                     report("Could not reconnect to ${host.name}", failure)
@@ -4011,10 +4011,10 @@ class MainViewModel @Inject constructor(
                     // regressed. The null lands in the "Cannot reopen" report below either way.
                     TransferDirection.CROSS_HOST -> null
                 }
-            }.getOrNull() ?: return@launch report("Cannot reopen ${item.name}")
+            }.getOrNull() ?: return@launchTransportGuarded report("Cannot reopen ${item.name}")
             val sftp = runCatching { sshConnectionManager.openSftp(session) }.getOrNull() ?: run {
                 runCatching { stream.close() }
-                return@launch report("Cannot open an SFTP channel on ${host.name}")
+                return@launchTransportGuarded report("Cannot open an SFTP channel on ${host.name}")
             }
             when (item.direction) {
                 TransferDirection.DOWNLOAD -> transferCoordinator.resumeDownload(item, sftp, stream as OutputStream, existingBytes)
@@ -4550,6 +4550,20 @@ class MainViewModel @Inject constructor(
      * because the user pressed something, so there is always somewhere to show the reason.
      */
     private fun launchGuarded(what: String, body: suspend () -> Unit) = viewModelScope.launch {
+        guardBackup(what, body)
+    }
+
+    /**
+     * [launchGuarded] on the transport dispatcher, for the bodies that must not run on the main
+     * thread (see [transportScope]) and could still throw on their way through storage.
+     *
+     * The transfer path was the one part of the view model the guarded-launch fix did not reach:
+     * `transferRepository.save` and the `.first()` reads feeding it are exactly the `SQLiteFullException`
+     * / `SQLiteDiskIOException` calls that fix exists for, and a drag-and-drop onto a full disk took
+     * the process down with every live session in it. Same contract as [launchGuarded] — the reason
+     * is reported, cancellation is not swallowed.
+     */
+    private fun launchTransportGuarded(what: String, body: suspend () -> Unit) = transportScope.launch {
         guardBackup(what, body)
     }
 

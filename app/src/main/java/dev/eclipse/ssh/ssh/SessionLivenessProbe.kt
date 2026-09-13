@@ -1,17 +1,22 @@
 package dev.eclipse.ssh.ssh
 
+import android.util.Log
 import dev.eclipse.ssh.background.NetworkMonitor
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -77,8 +82,18 @@ class SessionLivenessProbe @Inject constructor(
      * The sessions this protects outlive both the Activity and the ViewModel - they live in
      * [SshSessionStore] - so tying the watch to either would leave a rotated or backgrounded app
      * blind to exactly the network change it most needs to notice.
+     *
+     * Carries a [CoroutineExceptionHandler] because nothing else in the app is positioned to catch
+     * what escapes from here: a `SupervisorJob` keeps one dead collector from cancelling its
+     * siblings, but an exception that runs past it still reaches the thread's default handler and
+     * takes the whole process - live terminal sessions included - down. The handler is the floor;
+     * the per-watch restart in [watch] is the actual recovery, and it exists because a watch that
+     * dies silently is its own failure: the app would stop noticing network changes with no
+     * indication anything was wrong.
      */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+        Log.e(TAG, "Uncaught error in the liveness probe (${error::class.java.simpleName}: ${error.message})")
+    })
     private val started = AtomicBoolean(false)
 
     /** One sweep at a time: several interfaces changing at once mean the same one thing. */
@@ -124,17 +139,47 @@ class SessionLivenessProbe @Inject constructor(
     fun start() {
         if (!started.compareAndSet(false, true)) return
         lastAddresses = networkMonitor.localAddresses()
-        scope.launch {
+        watch("migrated") {
             networkMonitor.migrated.collect { onNetworkReplaced() }
         }
-        scope.launch {
+        watch("lost") {
             networkMonitor.lost.collect { holdThroughOutage() }
         }
-        scope.launch {
+        watch("available") {
             // Kept current here rather than only where it is read: an arrival is the one event that
             // guarantees an address set worth remembering, and the next loss or replacement needs the
             // set from *before* it happened.
             networkMonitor.available.collect { lastAddresses = networkMonitor.localAddresses() }
+        }
+    }
+
+    /**
+     * Collects one of [NetworkMonitor]'s flows for the life of the app, restarting the collection
+     * when its body fails.
+     *
+     * The bodies are not bulletproof and cannot be: [onNetworkReplaced] and [holdThroughOutage] end
+     * in [sweep], which probes live transports mid-teardown, and a transport closing under a probe
+     * can raise something the probe's own catch did not anticipate. Before this loop that exception
+     * ended the watch - silently, permanently - and reached the default handler besides. Restarting
+     * after a pause is the honest recovery: the very next network event re-enters the same code, so
+     * a transient failure costs one event and a recurring one costs a bounded restart loop rather
+     * than the app.
+     */
+    private fun watch(name: String, collect: suspend () -> Unit) {
+        scope.launch {
+            while (isActive) {
+                try {
+                    collect()
+                    // Completed rather than failed: the source flow has ended, and there is nothing
+                    // to collect from it again.
+                    return@launch
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    Log.e(TAG, "The $name watch failed, restarting: ${error::class.java.simpleName}: ${error.message}")
+                    delay(WATCH_RESTART_DELAY_MS)
+                }
+            }
         }
     }
 
@@ -323,7 +368,12 @@ class SessionLivenessProbe @Inject constructor(
     }
 
     private companion object {
+        const val TAG = "SessionLivenessProbe"
+
         const val PROBE_ATTEMPTS = 2
+
+        /** Long enough that a recurring failure idles instead of spinning; short enough not to miss the next event. */
+        const val WATCH_RESTART_DELAY_MS = 5_000L
     }
 }
 

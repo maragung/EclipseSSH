@@ -11,10 +11,12 @@ import androidx.datastore.preferences.core.emptyPreferences
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.eclipse.ssh.data.model.Snippet
 import dev.eclipse.ssh.security.SecretCipher
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
@@ -42,7 +44,18 @@ class SnippetRepository @Inject constructor(
 ) {
     private val snippetsKey = stringPreferencesKey("snippets")
 
-    val snippets: Flow<List<Snippet>> = context.snippetsDataStore.data.map { prefs ->
+    /**
+     * The [catch] is the settings store's reasoning applied here, and it is the more important of the
+     * two: this flow is combined into the same `MainUiState` the whole UI renders from, so an
+     * [IOException] that ran through it did not blank the snippet sheet — it terminated the combine,
+     * permanently, and hosts, tabs, transfers and terminal output froze at their initial values with
+     * nothing on screen to say why. DataStore throws [IOException] for an unreadable file (a
+     * half-finished write, a full disk, direct boot), which is recoverable exactly once the flow
+     * survives it; a programming error in the mapping is not an [IOException] and still propagates.
+     */
+    val snippets: Flow<List<Snippet>> = context.snippetsDataStore.data.catch { error ->
+        if (error is IOException) emit(emptyPreferences()) else throw error
+    }.map { prefs ->
         read(prefs[snippetsKey])
     }
 

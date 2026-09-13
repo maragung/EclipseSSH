@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
@@ -31,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.CancellationException
@@ -56,7 +58,27 @@ class EclipseSessionService : LifecycleService() {
     @Inject lateinit var livenessProbe: SessionLivenessProbe
     @Inject lateinit var diagnostics: SessionDiagnostics
 
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * Where an exception escaping any [serviceScope] coroutine lands, instead of the process.
+     *
+     * A `SupervisorJob` stops one child's failure cancelling its siblings — it does not stop the
+     * exception reaching the thread's default handler, which is process death. Everything this
+     * service launches is recoverable-by-someone-else's-standards: a restore pass, a transfer
+     * collector, the registry clear on Stop. None of them is worth the live terminal sessions the
+     * same process is holding. The handler logs the class name rather than crashing; the affected
+     * coroutine is dead either way, which is the honest scope of the damage.
+     *
+     * The message carries only the throwable, never a host or credential: the realistic throwers
+     * here are DataStore and Room IO, whose messages name files and SQL, and both are safe to log.
+     */
+    private val uncaughtInService = CoroutineExceptionHandler { _, error ->
+        // Class name and message only, no stack trace: the realistic throwers are DataStore and Room
+        // IO, whose messages name files and SQL, but a stack trace would drag in whatever frame
+        // values the failure crossed on its way out.
+        Log.e(TAG, "Uncaught error in a session-service coroutine: ${error::class.java.simpleName}: ${error.message}")
+    }
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + uncaughtInService)
     private val restoreMutex = Mutex()
     private var sessionText = ""
     private var transferCount = 0
@@ -476,6 +498,8 @@ class EclipseSessionService : LifecycleService() {
     private fun createNotificationChannels() = NotificationChannels.ensureCreated(this)
 
     companion object {
+        private const val TAG = "EclipseSessionService"
+
         const val ACTION_STOP = "dev.eclipse.ssh.action.STOP"
 
         /**

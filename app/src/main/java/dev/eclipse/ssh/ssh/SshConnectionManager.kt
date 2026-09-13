@@ -16,7 +16,6 @@ import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.isForcedTerminalSize
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.io.Closeable
-import java.io.IOException
 import java.net.InetSocketAddress
 import java.security.KeyPair
 import java.security.MessageDigest
@@ -31,6 +30,7 @@ import android.content.Context
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -528,9 +528,17 @@ class SshConnectionManager @Inject constructor(
             buffer.putBoolean(true)
             session.request(request, buffer, Duration.ofSeconds(timeoutSeconds))
             true
-        } catch (error: IOException) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
             // SocketTimeoutException (no reply in time) and InterruptedIOException are both IOExceptions,
-            // and all of them mean the same thing here: nothing came back.
+            // and all of them mean the same thing here: nothing came back. The catch is wider than
+            // that on purpose, because the probe runs against a transport that may be tearing itself
+            // down at the same moment - MINA raises its own runtime exceptions from a session or a
+            // channel that closed under the request - and every one of those means the same thing an
+            // unanswered timeout does: no reply arrived. The asymmetry the KDoc promises is preserved:
+            // *any* reply is counted above, so widening the negative side cannot kill a session that
+            // answered. Cancellation is rethrown first; it is not an answer about the session.
             false
         }
     }

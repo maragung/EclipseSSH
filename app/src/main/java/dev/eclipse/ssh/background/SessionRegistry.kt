@@ -12,11 +12,13 @@ import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.emptyPreferences
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.eclipse.ssh.security.SecureVault
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
@@ -41,7 +43,16 @@ class SessionRegistry @Inject constructor(
 ) {
     private val activeHostsKey = stringSetPreferencesKey("active_host_ids")
 
-    val activeHostIds: Flow<Set<String>> = context.sessionRegistryDataStore.data.map { it[activeHostsKey].orEmpty() }
+    /**
+     * The [catch] is the settings store's reasoning applied to the store the background service reads
+     * first: an [IOException] from an unreadable file ran through this flow into the restore pass and
+     * aborted it with nothing on screen to say why. Reading it as "no active hosts" is the honest
+     * answer for a file that cannot be opened, and it is recoverable - the next successful write
+     * repairs the file. Not-[IOException] is a programming error and still propagates.
+     */
+    val activeHostIds: Flow<Set<String>> = context.sessionRegistryDataStore.data.catch { error ->
+        if (error is IOException) emit(emptyPreferences()) else throw error
+    }.map { it[activeHostsKey].orEmpty() }
 
     /**
      * Records [hostId] as live and stores whatever credentials came with it, vault-encrypted.
@@ -71,21 +82,35 @@ class SessionRegistry @Inject constructor(
         }
     }
 
-    suspend fun credential(hostId: String): String? = context.sessionRegistryDataStore.data
-        .map { prefs -> prefs[credentialKey(hostId)]?.let { encrypted -> runCatching { vault.decrypt(encrypted) }.getOrNull() } }
-        .first()
+    /**
+     * One read of the store, with an unreadable file answering as "nothing stored" rather than
+     * throwing.
+     *
+     * The accessors below feed dial attempts - a restore pass, a transfer resume - where an
+     * [IOException] from a file DataStore could not open used to escape into the calling coroutine
+     * and abort the whole attempt. A missing credential is a recoverable answer there: the attempt
+     * fails with "asked for a password", which is what an unreadable store honestly amounts to.
+     * Cancellation is not an [IOException] and still propagates.
+     */
+    private suspend fun readOnce(): Preferences? = try {
+        context.sessionRegistryDataStore.data.first()
+    } catch (error: IOException) {
+        null
+    }
 
-    suspend fun keyBytes(hostId: String): ByteArray? = context.sessionRegistryDataStore.data
-        .map { prefs ->
-            prefs[keyKey(hostId)]?.let { encrypted ->
-                runCatching { Base64.decode(vault.decrypt(encrypted), Base64.NO_WRAP) }.getOrNull()
-            }
+    suspend fun credential(hostId: String): String? = readOnce()?.let { prefs ->
+        prefs[credentialKey(hostId)]?.let { encrypted -> runCatching { vault.decrypt(encrypted) }.getOrNull() }
+    }
+
+    suspend fun keyBytes(hostId: String): ByteArray? = readOnce()?.let { prefs ->
+        prefs[keyKey(hostId)]?.let { encrypted ->
+            runCatching { Base64.decode(vault.decrypt(encrypted), Base64.NO_WRAP) }.getOrNull()
         }
-        .first()
+    }
 
-    suspend fun keyPassphrase(hostId: String): String? = context.sessionRegistryDataStore.data
-        .map { prefs -> prefs[passphraseKey(hostId)]?.let { encrypted -> runCatching { vault.decrypt(encrypted) }.getOrNull() } }
-        .first()
+    suspend fun keyPassphrase(hostId: String): String? = readOnce()?.let { prefs ->
+        prefs[passphraseKey(hostId)]?.let { encrypted -> runCatching { vault.decrypt(encrypted) }.getOrNull() }
+    }
 
     suspend fun clear() {
         write { prefs ->
