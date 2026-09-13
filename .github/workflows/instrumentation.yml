@@ -138,12 +138,28 @@ jobs:
           nohup "$ANDROID_HOME/emulator/emulator" -avd ci-instrumented \
             -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
             -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
-          "$ADB" wait-for-device
+          # Bounded: an emulator that died at startup leaves adb with no device
+          # to wait for, and an unbounded `wait-for-device` then hangs until the
+          # job timeout instead of failing fast. That exact hang wedged the
+          # concurrency group for over an hour on the first hosted run.
+          if ! timeout 120 "$ADB" wait-for-device; then
+            echo "adb never saw the emulator - it likely died at startup"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
           # adb sees the emulator long before the guest OS is up;
           # sys.boot_completed is the flag the platform itself sets when
           # the boot intent fires.
           BOOT=""
           for _ in $(seq 1 60); do
+            # A boot poll that outlives the emulator process is polling a
+            # corpse; fail the moment the emulator is gone rather than
+            # burning the remaining polls.
+            if ! pgrep -f "emulator.*ci-instrumented" >/dev/null; then
+              echo "the emulator process died during boot"
+              tail -200 /tmp/emulator.log
+              exit 1
+            fi
             BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
             [ "$BOOT" = "1" ] && break
             sleep 5
