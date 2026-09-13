@@ -1,6 +1,9 @@
 package dev.eclipse.ssh.presentation.linux
 
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
+import dev.eclipse.ssh.background.LinuxUserspaceService
 import dev.eclipse.ssh.di.LinuxUserspaceGraph
 import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxProcessManager
@@ -17,6 +20,10 @@ import java.nio.file.Files
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
 
 /**
  * The controller's contract with the two screens that read it: every lifecycle verb surfaces in
@@ -26,8 +33,16 @@ import org.junit.Test
  * The graph under test is real end to end down to the fork seam — a real rootfs fixture extracted
  * by the real installer, setup and probes answered by the scripted proot — so these tests pin the
  * same pipeline the manager's own tests do, but through the action surface the UI calls.
+ *
+ * Robolectric, not the bare JVM, because the controller owns the foreground-service binding and
+ * needs a real [Context] to build intents with — the binding test reads what it started and
+ * stopped out of Robolectric's shadow application.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
 class LinuxUserspaceControllerTest {
+
+    private val appContext: Context get() = ApplicationProvider.getApplicationContext()
 
     private class Harness(distro: LinuxDistro) {
         val rootDir: File = Files.createTempDirectory("linux-controller").toFile().apply { deleteOnExit() }
@@ -68,7 +83,7 @@ class LinuxUserspaceControllerTest {
 
     @Test
     fun `an unsupported device reports itself with no state to render`() = runTest {
-        val controller = LinuxUserspaceController(graph = null)
+        val controller = LinuxUserspaceController(appContext, graph = null)
 
         val ui = controller.uiState.value
         assertThat(ui.supported).isFalse()
@@ -87,7 +102,7 @@ class LinuxUserspaceControllerTest {
     @Test
     fun `install surfaces in the UI state and refreshes the storage numbers`() = runTest {
         val harness = newHarness()
-        val controller = LinuxUserspaceController(harness.graph)
+        val controller = LinuxUserspaceController(appContext, harness.graph)
 
         controller.install()
         // Wait for the settled state *and* the storage numbers that follow it: the state turns
@@ -112,7 +127,7 @@ class LinuxUserspaceControllerTest {
     @Test
     fun `an impossible action becomes an error sentence, not a crash`() = runTest {
         val harness = newHarness()
-        val controller = LinuxUserspaceController(harness.graph)
+        val controller = LinuxUserspaceController(appContext, harness.graph)
 
         // Start on a not-installed userspace: the manager refuses, the controller relays the
         // refusal as the sentence the settings screen shows under the section.
@@ -129,9 +144,41 @@ class LinuxUserspaceControllerTest {
     }
 
     @Test
+    fun `a running userspace promotes the foreground hold service, and stopping demotes it`() = runTest {
+        val harness = newHarness()
+        val controller = LinuxUserspaceController(appContext, harness.graph)
+        val app = appContext as android.app.Application
+        // The binding's first act is a demotion: the collector's initial read of NotInstalled
+        // stops a service that was never started. The flush runs the collector's start (it may
+        // be queued rather than inline); consumed here so the asserts below see only the
+        // transitions they mean.
+        testScheduler.advanceUntilIdle()
+        assertThat(shadowOf(app).nextStoppedService).isNotNull()
+
+        controller.install()
+        controller.uiState.first { it.state is LinuxUserspaceState.Stopped && it.storageUsedBytes > 0 }
+        controller.start()
+        controller.uiState.first { it.state is LinuxUserspaceState.Running }
+        // The binding collector resumes on the same state emission the first{} above saw; give
+        // the scheduler a flush so the promotion has provably happened before the assert.
+        testScheduler.advanceUntilIdle()
+
+        // Promotion is the state machine's consequence, not a UI action: no screen is involved,
+        // and the intent names the service because nothing else may start it.
+        assertThat(shadowOf(app).nextStartedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+
+        controller.stop()
+        controller.uiState.first { it.state is LinuxUserspaceState.Stopped }
+        testScheduler.advanceUntilIdle()
+        assertThat(shadowOf(app).nextStoppedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+    }
+
+    @Test
     fun `a keep-workspace uninstall parks the backup the next install restores`() = runTest {
         val harness = newHarness()
-        val controller = LinuxUserspaceController(harness.graph)
+        val controller = LinuxUserspaceController(appContext, harness.graph)
 
         controller.install()
         controller.uiState.first { it.state is LinuxUserspaceState.Stopped && it.storageUsedBytes > 0 }

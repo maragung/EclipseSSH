@@ -1,5 +1,15 @@
 package dev.eclipse.ssh.presentation.linux
 
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import androidx.core.content.ContextCompat
+import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.eclipse.ssh.MainActivity
+import dev.eclipse.ssh.R
+import dev.eclipse.ssh.background.LinuxUserspaceService
+import dev.eclipse.ssh.background.NotificationChannels
+import dev.eclipse.ssh.background.postAlert
 import dev.eclipse.ssh.di.LinuxUserspaceGraph
 import dev.eclipse.ssh.linux.HealthReport
 import dev.eclipse.ssh.linux.LinuxDistro
@@ -62,6 +72,7 @@ data class LinuxUserspaceUiState(
  */
 @Singleton
 class LinuxUserspaceController @Inject constructor(
+    @ApplicationContext private val appContext: Context,
     /** The whole graph, or null on an unsupported device; the connect path and the host-list rule read it directly. */
     val graph: LinuxUserspaceGraph?,
 ) {
@@ -128,6 +139,7 @@ class LinuxUserspaceController @Inject constructor(
         if (manager != null) {
             watchSettledStates(manager)
             probeInstalledUserspace(manager)
+            holdProcessWhileRunning(manager)
         }
     }
 
@@ -233,6 +245,54 @@ class LinuxUserspaceController @Inject constructor(
             if (state is LinuxUserspaceState.Stopped || state is LinuxUserspaceState.NeedsRepair) {
                 runCatching { manager.refreshHealth() }
             }
+        }
+    }
+
+    /**
+     * Keeps [LinuxUserspaceService] alive exactly while the state machine is Running.
+     *
+     * Every Ubuntu terminal is a child of this process, so the spec's "backgrounding the app does
+     * not stop Ubuntu" is a process-liveness promise, and the foreground service is how it is
+     * kept. This is the one owner of the binding — every path into Running (Settings' Start, a
+     * terminal opening a stopped userspace, a future Repair that ends running) promotes the
+     * process, and every path out (Stop, an uninstall) demotes it — while the service itself
+     * watches the same state and stops itself if it is ever alive without a Running userspace, so
+     * neither side trusts the other.
+     *
+     * The promotion can be refused on API 31+ when the app is not visible, which today cannot
+     * happen (every entry into Running is a user action), so the refusal branch is defensive: the
+     * userspace keeps running and the alert is the honest "Ubuntu is now only as durable as the
+     * app being open" instead of a silent loss of background protection.
+     */
+    private fun holdProcessWhileRunning(manager: LinuxUserspaceManager) {
+        scope.launch {
+            manager.state
+                .map { it is LinuxUserspaceState.Running }
+                .distinctUntilChanged()
+                .collect { running ->
+                    val intent = Intent(appContext, LinuxUserspaceService::class.java)
+                    if (running) {
+                        val promoted = runCatching {
+                            ContextCompat.startForegroundService(appContext, intent)
+                        }.isSuccess
+                        if (!promoted) {
+                            postAlert(
+                                appContext,
+                                NotificationChannels.ID_LINUX_PROMOTION,
+                                appContext.getString(R.string.notif_linux_promotion_title),
+                                appContext.getString(R.string.notif_linux_promotion_body),
+                                PendingIntent.getActivity(
+                                    appContext,
+                                    0,
+                                    Intent(appContext, MainActivity::class.java),
+                                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                                ),
+                            )
+                        }
+                    } else {
+                        appContext.stopService(intent)
+                    }
+                }
         }
     }
 

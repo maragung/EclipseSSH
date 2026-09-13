@@ -188,6 +188,14 @@ explicit Stop (or the app's process dying, which takes the pty masters — and w
 session — along) returns it to Stopped. While Running, the foreground service keeps the app's
 process alive so backgrounded sessions survive.
 
+That service is `LinuxUserspaceService`, and its existence is derived: the userspace controller
+starts it when the state machine enters Running and stops it when the machine leaves, and the
+service itself watches the same state and stops itself if it is ever alive without a Running
+userspace. Its notification offers the two gestures that matter away from the app — Open (back to
+the terminal) and Stop Ubuntu (the same lifecycle verb as Settings → Stop) — and its Android 15
+six-hour dataSync budget is shared with the SSH session service, which is why both services say
+"background paused" with the same alert when the budget runs out.
+
 Crash recovery is the constructor: the persisted `state.properties` is re-checked against the
 files actually on disk, and a disagreement yields NeedsRepair rather than a state the UI would
 render as healthy. A stale "installed" flag can never present as a working install.

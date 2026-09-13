@@ -123,6 +123,21 @@
             android:stopWithTask="false" />
 
         <!--
+          Process-liveness hold for the local Ubuntu userspace: every
+          forked proot shell is a child of this process, so "background
+          does not stop Ubuntu" is a process-liveness promise. Started and
+          stopped by the userspace state machine via
+          LinuxUserspaceController (never requested directly), dataSync
+          matching the session service's type since the two share one
+          six-hour-per-day budget on Android 15.
+        -->
+        <service
+            android:name=".background.LinuxUserspaceService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
+
+        <!--
           WorkManager is initialised on demand through Hilt
           (EclipseApp implements Configuration.Provider).
         -->

@@ -12,10 +12,20 @@
     <string name="channel_transfers_desc">Progress and results of SFTP uploads and downloads</string>
     <string name="channel_alerts">Alerts</string>
     <string name="channel_alerts_desc">Disconnects, host key changes and failed transfers</string>
+    <string name="channel_linux">Local Linux</string>
+    <string name="channel_linux_desc">The local Ubuntu environment and its terminals</string>
 
     <!-- Notification content -->
     <string name="notif_action_disconnect">Disconnect all</string>
     <string name="notif_action_reconnect">Reconnect</string>
+    <string name="notif_linux_title">Local Ubuntu 22.04</string>
+    <string name="notif_linux_body">Running on this device · %1$d terminal session(s) held open</string>
+    <string name="notif_linux_action_open">Open</string>
+    <string name="notif_linux_action_stop">Stop Ubuntu</string>
+
+    <!-- The platform refused to promote the Ubuntu hold service (Android 12+ forbids background starts) -->
+    <string name="notif_linux_promotion_title">Ubuntu runs only while the app is open</string>
+    <string name="notif_linux_promotion_body">Android would not let Eclipse SSH hold your local Ubuntu environment open in the background. It keeps running while the app is on screen — open Eclipse SSH if you need the terminals held open.</string>
 
     <!-- Foreground-service time limit (Android 15 caps dataSync services at 6h/24h) -->
     <string name="notif_timeout_title">Background sessions paused</string>
