@@ -33,6 +33,17 @@ class SettingsRepositoryTest {
     private val repository get() = SettingsRepository(RuntimeEnvironment.getApplication())
 
     /**
+     * A valid, non-default key bar blob: CUSTOM mode, three rows, a hidden F-key and a custom cap.
+     * The repository treats it as an opaque string (the codec is the only reader), so the round-trip
+     * only needs it to be a real blob the settings screen could have written.
+     */
+    private val KEY_BAR_BLOB =
+        """{"mode":"CUSTOM","size":"LARGE","rows":3,"caps":[""" +
+            """{"id":"CTRL","kind":"LATCH","row":0,"order":0},""" +
+            """{"id":"c1","kind":"TEXT","row":2,"order":0,"text":"../","label":"up"},""" +
+            """{"id":"F5","kind":"KEY","row":1,"order":0,"visible":false}]}"""
+
+    /**
      * Puts every setting this class writes back to its default, so the store it shares with the rest
      * of the suite is pristine on the way out as well as on the way in.
      *
@@ -60,6 +71,7 @@ class SettingsRepositoryTest {
             repo.setReconnectBaseSeconds(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
             repo.setTerminalFontSize(SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE)
             repo.setTerminalKeyRowVisible(true)
+            repo.setTerminalKeyBarJson("{}")
             repo.setTerminalMinColumns(SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS)
             repo.setLegacyAlgorithms(false)
             repo.setTerminalTheme(TerminalTheme.DARK.name)
@@ -122,6 +134,7 @@ class SettingsRepositoryTest {
         repo.setTerminalCursorStyle("bar")
         repo.setTransferBytesPerSecond(5L * 1024 * 1024)
         repo.setVaultAutoLockMinutes(15)
+        repo.setTerminalKeyBarJson(KEY_BAR_BLOB)
 
         val settings = repo.settings.first()
 
@@ -141,6 +154,7 @@ class SettingsRepositoryTest {
         assertThat(settings.terminalCursorStyle).isEqualTo("bar")
         assertThat(settings.transferBytesPerSecond).isEqualTo(5L * 1024 * 1024)
         assertThat(settings.vaultAutoLockMinutes).isEqualTo(15)
+        assertThat(settings.terminalKeyBarJson).isEqualTo(KEY_BAR_BLOB)
     }
 
     @Test

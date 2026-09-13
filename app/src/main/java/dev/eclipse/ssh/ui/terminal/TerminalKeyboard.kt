@@ -3,6 +3,7 @@ package dev.eclipse.ssh.ui.terminal
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -68,6 +69,27 @@ class TerminalLatches(ctrl: Boolean = false, alt: Boolean = false, shift: Boolea
     fun toggleCtrl() { ctrl = !ctrl }
     fun toggleAlt() { alt = !alt }
     fun toggleShift() { shift = !shift }
+
+    /**
+     * Toggle by latch id, for callers holding a [KeyBarCap] rather than a direct reference - the
+     * key bar renders its latches from configuration and knows them as `"CTRL"`/`"ALT"`/`"SHIFT"`.
+     * An unknown id is a no-op rather than an error: the caller is rendering untrusted config.
+     */
+    fun toggle(id: String) {
+        when (id) {
+            "CTRL" -> toggleCtrl()
+            "ALT" -> toggleAlt()
+            "SHIFT" -> toggleShift()
+        }
+    }
+
+    /** Whether [id] is armed, by the same ids [toggle] accepts. */
+    fun armed(id: String): Boolean = when (id) {
+        "CTRL" -> ctrl
+        "ALT" -> alt
+        "SHIFT" -> shift
+        else -> false
+    }
 
     /** Reads the armed modifiers and disarms them, which is what pressing any other key does. */
     fun consume(): Triple<Boolean, Boolean, Boolean> {
@@ -425,30 +447,57 @@ internal fun nextFieldValue(change: TextFieldValue): TextFieldValue {
 }
 
 /**
- * The row of keys a phone keyboard does not have.
+ * The rows of keys a phone keyboard does not have, drawn from the configuration the settings screen
+ * edits.
  *
  * Everything here is reachable no other way on a touch device - there is no Ctrl on Gboard, no Esc,
- * and no Page Up - so this row is not a convenience but the difference between the terminal being
- * usable and being a text box. It scrolls horizontally rather than wrapping, so the leftmost keys
- * stay where the thumb expects them at every screen width.
+ * and no Page Up - so this bar is not a convenience but the difference between the terminal being
+ * usable and being a text box. Each row scrolls horizontally rather than wrapping, so the leftmost
+ * keys stay where the thumb expects them at every screen width. [KeyBarPrefs.rowsForLayout] decides
+ * how many rows there are and what is on each; this composable only draws what it is handed.
  */
 @Composable
 fun TerminalKeyRow(
     latches: TerminalLatches,
+    prefs: KeyBarPrefs,
     onKey: (TerminalKey, Boolean, Boolean, Boolean) -> Unit,
+    onText: (String) -> Unit,
+    /** A single custom character held with Ctrl or Alt, the same path a typed character takes. */
+    onChar: (Char, Boolean, Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Row(
-        modifier.horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        LatchKey("CTRL", latches.ctrl, latches::toggleCtrl)
-        LatchKey("ALT", latches.alt, latches::toggleAlt)
-        LatchKey("SHIFT", latches.shift, latches::toggleShift)
-        NAMED_ROW.forEach { (label, key) ->
-            TerminalKeyCap(label) {
-                val (ctrl, alt, shift) = latches.consume()
-                onKey(key, ctrl, alt, shift)
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        prefs.rowsForLayout().forEach { row ->
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                row.forEach { cap ->
+                    when (cap.kind) {
+                        KeyBarCapKind.LATCH -> LatchKey(cap.id, latches.armed(cap.id), { latches.toggle(cap.id) }, prefs.size)
+                        KeyBarCapKind.KEY -> {
+                            val key = TerminalKey.entries.firstOrNull { it.name == cap.id } ?: return@forEach
+                            TerminalKeyCap(cap.label ?: KeyBarCatalog.defaultLabel(key), size = prefs.size) {
+                                val (ctrl, alt, shift) = latches.consume()
+                                onKey(key, ctrl, alt, shift)
+                            }
+                        }
+                        KeyBarCapKind.TEXT -> {
+                            val text = cap.text.orEmpty()
+                            TerminalKeyCap(cap.label ?: text, size = prefs.size) {
+                                // The latches apply to a custom cap the way they apply to a typed
+                                // character: Ctrl-/ is a real binding (it sends US), and treating a
+                                // custom cap as "just text" would silently ignore an armed latch.
+                                val (ctrl, alt, _) = latches.consume()
+                                if (ctrl || alt) {
+                                    text.forEach { char -> onChar(char, ctrl, alt) }
+                                } else {
+                                    onText(text)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -478,10 +527,11 @@ internal val NAMED_ROW: List<Pair<String, TerminalKey>> = listOf(
 )
 
 @Composable
-private fun LatchKey(label: String, armed: Boolean, onToggle: () -> Unit) {
+private fun LatchKey(label: String, armed: Boolean, onToggle: () -> Unit, size: KeyBarSize) {
     TerminalKeyCap(
         label = label,
         armed = armed,
+        size = size,
         // Announced rather than only coloured: an armed latch changes what the next key does, which a
         // screen reader user has no other way to discover.
         description = if (armed) "$label on" else "$label off",
@@ -494,6 +544,7 @@ private fun TerminalKeyCap(
     label: String,
     armed: Boolean = false,
     description: String? = null,
+    size: KeyBarSize = KeyBarSize.NORMAL,
     onClick: () -> Unit,
 ) {
     Surface(
@@ -507,11 +558,16 @@ private fun TerminalKeyCap(
             label,
             color = if (armed) MaterialTheme.colorScheme.onPrimary else KEY_FOREGROUND,
             style = MaterialTheme.typography.labelLarge,
+            // Long custom labels must not stretch the row or the cap: they soften-wrap and the cap
+            // keeps its height, so a `sudo` button and a `/` button read as the same control.
+            softWrap = false,
+            maxLines = 1,
             modifier = Modifier
-                .padding(horizontal = 12.dp, vertical = 10.dp)
-                // A thumb misses; 44dp is the smallest cap that stays easy to hit, and every cap the
-                // same height is what makes the row read as one firm, even strip.
-                .heightIn(min = 24.dp),
+                .padding(horizontal = 12.dp, vertical = size.verticalPaddingDp.dp)
+                // A thumb misses; the size's minimum height is the floor that keeps even a compact
+                // cap easy to hit, and every cap in a row the same height is what makes the row read
+                // as one firm, even strip.
+                .heightIn(min = size.minHeightDp.dp),
         )
     }
 }
