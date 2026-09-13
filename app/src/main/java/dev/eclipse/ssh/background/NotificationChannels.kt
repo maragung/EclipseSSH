@@ -32,8 +32,18 @@ internal object NotificationChannels {
     /** Ongoing foreground-service notification. */
     const val ID_SERVICE = 4101
 
-    /** "Background sessions paused" — the Android 15 foreground-service time limit was hit. */
-    const val ID_TIMEOUT = 4102
+    /**
+     * "Background sessions paused" — the Android 15 foreground-service time limit was hit.
+     *
+     * Per service, not shared: the session service and the Linux userspace service run on the
+     * one `dataSync` budget, so when it runs out they both time out, and a single shared id
+     * made the second alert silently overwrite the first - the user learned about one of the
+     * two services that had just stopped protecting their work.
+     */
+    const val ID_TIMEOUT_SESSIONS = 4102
+
+    /** "Ubuntu runs only while the app is open" — the userspace service hit the same limit. */
+    const val ID_TIMEOUT_LINUX = 4106
 
     /** "Reconnect your sessions" — the platform refused a background service start. */
     const val ID_RESTORE = 4103

@@ -126,10 +126,19 @@ class LinuxUserspaceService : LifecycleService() {
      * implementation there is a no-op anyway.
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
-        stopSelf()
+        // Stopping is the deadline's only deliverable, so it happens before the alert - the
+        // alert is three binder calls (permission check, PendingIntent build, notify) that the
+        // "few seconds" of grace should not be spent on. The posting still runs: destruction is
+        // queued on the main looper behind the current message, so the service cannot die
+        // between the stopSelf and the notify.
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf(startId)
         postAlert(
             this,
-            NotificationChannels.ID_TIMEOUT,
+            // Its own id, not the session service's: both services share the one dataSync
+            // budget, so when it runs out they both land here, and a shared id made this
+            // alert overwrite the session service's - one notification about two services.
+            NotificationChannels.ID_TIMEOUT_LINUX,
             getString(R.string.notif_timeout_title),
             getString(R.string.notif_timeout_body),
             PendingIntent.getActivity(
