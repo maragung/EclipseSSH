@@ -67,7 +67,7 @@ class LinuxUserspaceManagerTest {
         val observer = launch { harness.manager.state.collect { states += it } }
 
         val report = harness.manager.install()
-        advanceUntilIdle()
+        testScheduler.advanceUntilIdle()
 
         assertThat(harness.manager.state.value).isEqualTo(LinuxUserspaceState.Stopped)
         assertThat(report.warnings).isEmpty()
