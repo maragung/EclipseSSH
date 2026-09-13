@@ -296,11 +296,12 @@ val buildLinuxNative =
                 vararg command: String,
             ) {
                 logger.lifecycle("exec: ${command.joinToString(" ")}")
-                val process =
-                    ProcessBuilder(*command)
-                        .redirectErrorStream(true)
-                        .start()
-                process.environment().putAll(env)
+                // The environment belongs to the builder: `environment()` is
+                // a ProcessBuilder method, and setting it after start() would
+                // be too late for the child either way.
+                val builder = ProcessBuilder(*command).redirectErrorStream(true)
+                builder.environment().putAll(env)
+                val process = builder.start()
                 process.inputStream.bufferedReader().forEachLine { line -> println(line) }
                 val exitCode = process.waitFor()
                 check(exitCode == 0) {
