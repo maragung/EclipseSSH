@@ -63,7 +63,7 @@ jobs:
           packages: >-
             platform-tools
             emulator
-            system-images;${{ env.SYSTEM_IMAGE }}
+            ${{ env.SYSTEM_IMAGE }}
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
             ndk;${{ env.FREERDP_NDK_VERSION }}
