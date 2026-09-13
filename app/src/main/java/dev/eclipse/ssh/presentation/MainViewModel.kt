@@ -58,7 +58,9 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
 import dev.eclipse.ssh.feature.wakeonlan.WakeOnLan
 import dev.eclipse.ssh.feature.wakeonlan.parseMac
+import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.presentation.files.FilesExplorerController
+import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.ssh.SftpDirectoryService
 import dev.eclipse.ssh.ssh.connectFailureIsFinal
 import dev.eclipse.ssh.ssh.SessionDiagnostics
@@ -161,6 +163,7 @@ class MainViewModel @Inject constructor(
     private val wakeOnLan: WakeOnLan,
     private val transferNotifier: TransferNotifier,
     val filesExplorer: FilesExplorerController,
+    val linuxUserspace: LinuxUserspaceController,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     private val query = MutableStateFlow("")
@@ -673,6 +676,26 @@ class MainViewModel @Inject constructor(
             localDirUri = local.dirUri,
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), MainUiState())
+
+    /**
+     * The host list's "Local Ubuntu 22.04" card, or null when it must not be shown.
+     *
+     * Passed as a flow rather than folded into [MainUiState] for the same reason [filesExplorer]'s
+     * state is not: the card is derived from the userspace's own two flows, exists only on a device
+     * that has installed it, and changes far more rarely than any of the five things [MainUiState]
+     * already combines — a dedicated flow lets the host screen collect it alone.
+     *
+     * Null exactly when [LocalLinuxHost.shouldShowCard] says so: not installed, mid-install, being
+     * torn down, broken, or never probed healthy. The card is a promise that tapping it opens a
+     * terminal, so every state that cannot keep that promise hides it — see [LocalLinuxHost].
+     */
+    val localLinuxCard: StateFlow<HostProfile?> =
+        linuxUserspace.graph?.let { graph ->
+            val profile = LocalLinuxHost.hostProfile(graph.distro)
+            combine(graph.manager.state, graph.manager.lastHealth) { state, health ->
+                if (LocalLinuxHost.shouldShowCard(state, health)) profile else null
+            }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+        } ?: MutableStateFlow(null)
 
     init {
         viewModelScope.launch {

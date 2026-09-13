@@ -90,6 +90,8 @@ import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Upload
@@ -221,6 +223,11 @@ import dev.eclipse.ssh.presentation.AdvancedHostOptions
 import dev.eclipse.ssh.presentation.HostFormDraft
 import dev.eclipse.ssh.presentation.MAX_LISTED_ENTRIES
 import dev.eclipse.ssh.presentation.files.FilesExplorerController
+import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
+import dev.eclipse.ssh.presentation.linux.LinuxUserspaceUiState
+import dev.eclipse.ssh.linux.LinuxInstallStep
+import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
@@ -1296,6 +1303,7 @@ private fun EclipseWorkspace(
                     state = state,
                     frames = viewModel.frames,
                     filesExplorer = viewModel.filesExplorer,
+                    linuxUserspace = viewModel.linuxUserspace,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onOpenArchive = ::openArchive,
@@ -1479,6 +1487,7 @@ private fun EclipseWorkspace(
                     state = state,
                     frames = viewModel.frames,
                     filesExplorer = viewModel.filesExplorer,
+                    linuxUserspace = viewModel.linuxUserspace,
                     onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onOpenArchive = ::openArchive,
@@ -2187,6 +2196,13 @@ private fun WorkspaceScaffold(
      * here would recompose this scaffold for the sake of a destination that is not on screen.
      */
     filesExplorer: FilesExplorerController,
+    /**
+     * The Linux userspace's own state and actions, for the Settings section and the host-list card.
+     * Passed whole for the same reason [filesExplorer] is: its state changes on every install step
+     * and every lifecycle verb, and reading it here would recompose this scaffold for the sake of a
+     * section only the Settings destination shows.
+     */
+    linuxUserspace: LinuxUserspaceController,
     /** Opens a file in the full-window preview - see the overlay state in [EclipseWorkspace]. */
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
@@ -2476,6 +2492,7 @@ private fun WorkspaceScaffold(
                 Destination.SETTINGS -> SettingsScreen(
                     state, onBiometric, onDarkTheme, onAddForward, onStopForward, onExportVault,
                     onImportVault, onKeepAlive, onClipboard, onTerminalFontSize,
+                    linuxUserspace = linuxUserspace,
                     onTerminalMinColumns = onTerminalMinColumns,
                     onReconnectBase = onReconnectBase,
                     onLegacyAlgorithms = onLegacyAlgorithms,
@@ -4966,6 +4983,7 @@ private fun TransferActionRow(label: String, destructive: Boolean = false, onCli
 @Composable
 private fun SettingsScreen(
     state: MainUiState,
+    linuxUserspace: LinuxUserspaceController,
     onBiometric: (Boolean) -> Unit,
     onDarkTheme: (Boolean) -> Unit,
     onAddForward: (ForwardType, Int, String?, Int?) -> Unit,
@@ -5163,6 +5181,8 @@ private fun SettingsScreen(
             },
         ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
     }
+    Spacer(Modifier.height(14.dp))
+    LinuxUserspaceSection(linuxUserspace)
     Spacer(Modifier.height(14.dp))
     SettingsSection("About") {
         SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
@@ -5814,6 +5834,263 @@ private fun ForwardDialog(onDismiss: () -> Unit, onConfirm: (ForwardType, Int, S
 }
 
 @Composable
+/**
+ * Settings → Linux Userspace: the whole feature's control panel and, for most users, its front
+ * door. The section is derived from [LinuxUserspaceController]'s one state object — every row
+ * below reads from it, so the settings screen can never disagree with the host-list card about
+ * whether the environment is installed, and no row is shown for a state that cannot answer it.
+ *
+ * One rule shapes the layout: an operation in flight hides every button. A mid-install screen
+ * with a working Install button would restart the pipeline underneath itself, and a mid-stop
+ * screen with Stop still armed would be a lie about what is already happening.
+ */
+@Composable
+private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
+    val ui by linuxUserspace.uiState.collectAsStateWithLifecycle()
+    var confirmInstall by remember { mutableStateOf(false) }
+    var confirmUninstall by remember { mutableStateOf(false) }
+
+    SettingsSection("Linux userspace") {
+        if (!ui.supported) {
+            // One row, no button: an unsupported device cannot be offered an install that cannot
+            // finish, but it also should not look like a feature that went missing.
+            SettingRow(
+                Icons.Default.Computer,
+                "Ubuntu on this device",
+                "Not supported on this device's processor",
+            ) { }
+            return@SettingsSection
+        }
+        val distro = ui.distro ?: return@SettingsSection
+        val state = ui.state
+
+        when (state) {
+            is LinuxUserspaceState.Installing -> {
+                val (label, fraction) = describeInstallStep(state.step)
+                SettingRow(Icons.Default.CloudDownload, "Installing ${distro.displayName}", label) { }
+                if (fraction != null) {
+                    LinearProgressIndicator(
+                        progress = { fraction },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
+                    )
+                }
+            }
+            is LinuxUserspaceState.NotInstalled -> SettingRow(
+                Icons.Default.Computer,
+                "Ubuntu on this device",
+                if (ui.hasPendingWorkspaceBackup) {
+                    "Not installed · a saved workspace will be restored"
+                } else {
+                    "Not installed · real bash, apt, Node.js and Python, on the device"
+                },
+            ) { }
+            is LinuxUserspaceState.Stopped -> SettingRow(
+                Icons.Default.Terminal,
+                "Ubuntu on this device",
+                "Installed and verified · stopped",
+            ) { }
+            is LinuxUserspaceState.Starting -> SettingRow(Icons.Default.Terminal, "Ubuntu on this device", "Starting…") { }
+            is LinuxUserspaceState.Running -> SettingRow(
+                Icons.Default.Terminal,
+                "Ubuntu on this device",
+                // Held open, not merely alive: closing the last terminal does not end this, and
+                // the count is what tells the user there are shells to come back to.
+                "Running · ${ui.sessionCount} terminal session(s) held open",
+            ) { }
+            is LinuxUserspaceState.Stopping -> SettingRow(Icons.Default.Terminal, "Ubuntu on this device", "Stopping…") { }
+            is LinuxUserspaceState.NeedsRepair -> SettingRow(
+                Icons.Default.Warning,
+                "Ubuntu on this device",
+                "Needs repair · ${state.detail}",
+            ) { }
+        }
+
+        // The facts that only an installed userspace can answer, absent while it is not — a
+        // "0 B used" line on a fresh install screen would be a status pretending to exist.
+        if (state is LinuxUserspaceState.Stopped ||
+            state is LinuxUserspaceState.Starting ||
+            state is LinuxUserspaceState.Running ||
+            state is LinuxUserspaceState.Stopping ||
+            state is LinuxUserspaceState.NeedsRepair
+        ) {
+            SettingRow(
+                Icons.Default.Storage,
+                "Storage used",
+                formatTransferBytes(ui.storageUsedBytes),
+            ) { }
+            SettingRow(
+                Icons.Default.Folder,
+                "Workspace",
+                "/home/ubuntu/workspace · ${ui.workspaceFileCount} file(s) · kept by Stop and Restart",
+            ) { }
+            SettingRow(
+                Icons.Default.CheckCircle,
+                "Health check",
+                ui.health?.describe() ?: "Not checked yet",
+            ) {
+                TextButton(onClick = { linuxUserspace.refreshHealth() }) { Text("Verify") }
+            }
+        }
+
+        // The action row. Kept out of SettingRow's width-capped trailing slot on purpose: Start,
+        // Restart and Uninstall are three coequal controls and capping the third to fit a label
+        // column would demote whichever action the layout happened to squeeze.
+        if (state != null &&
+            state !is LinuxUserspaceState.Installing &&
+            state !is LinuxUserspaceState.Starting &&
+            state !is LinuxUserspaceState.Stopping
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                when (state) {
+                    is LinuxUserspaceState.NotInstalled ->
+                        TextButton(onClick = { confirmInstall = true }) {
+                            Icon(Icons.Default.CloudDownload, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Install")
+                        }
+                    is LinuxUserspaceState.Stopped -> {
+                        TextButton(onClick = { linuxUserspace.start() }) {
+                            Icon(Icons.Default.PlayArrow, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Start")
+                        }
+                        TextButton(onClick = { linuxUserspace.restart() }) { Text("Restart") }
+                    }
+                    is LinuxUserspaceState.Running -> {
+                        TextButton(onClick = { linuxUserspace.stop() }) {
+                            Icon(Icons.Default.Stop, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Stop")
+                        }
+                        TextButton(onClick = { linuxUserspace.restart() }) { Text("Restart") }
+                    }
+                    is LinuxUserspaceState.NeedsRepair ->
+                        TextButton(onClick = { linuxUserspace.repair() }) {
+                            Icon(Icons.Default.Refresh, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Repair")
+                        }
+                    else -> Unit
+                }
+                Spacer(Modifier.weight(1f))
+                if (state !is LinuxUserspaceState.NotInstalled) {
+                    TextButton(onClick = { confirmUninstall = true }) {
+                        Text("Uninstall", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
+        }
+
+        // The last operation's failure, verbatim, with a way to clear it — an error line that
+        // could not be dismissed would outlive the fix it described.
+        if (ui.error != null) {
+            SettingRow(
+                Icons.Default.Warning,
+                "Last operation",
+                ui.error ?: "",
+            ) { TextButton(onClick = { linuxUserspace.clearError() }) { Text("OK") } }
+        }
+        if (ui.installWarnings.isNotEmpty()) {
+            SettingRow(
+                Icons.Default.Warning,
+                "Installed with warnings",
+                ui.installWarnings.joinToString("; "),
+            ) { TextButton(onClick = { linuxUserspace.clearInstallWarnings() }) { Text("OK") } }
+        }
+    }
+
+    if (confirmInstall) {
+        AlertDialog(
+            onDismissRequest = { confirmInstall = false },
+            title = { Text("Install ${distroTitle(ui)}?") },
+            text = {
+                Text(
+                    "A verified ${distroTitle(ui)} root filesystem (~30 MB) is downloaded and the " +
+                        "toolchain — bash, git, Python, Node.js — is installed through apt itself, " +
+                        "which needs a few hundred MB over your network. Nothing runs as root, and the " +
+                        "workspace at /home/ubuntu/workspace survives Stop and Restart." +
+                        if (ui.hasPendingWorkspaceBackup) {
+                            " Your saved workspace is restored after the install."
+                        } else {
+                            ""
+                        },
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { confirmInstall = false; linuxUserspace.install() }) { Text("Install") }
+            },
+            dismissButton = { TextButton(onClick = { confirmInstall = false }) { Text("Cancel") } },
+        )
+    }
+    if (confirmUninstall) {
+        AlertDialog(
+            onDismissRequest = { confirmUninstall = false },
+            title = { Text("Uninstall ${distroTitle(ui)}?") },
+            text = {
+                Text(
+                    "The root filesystem and every installed package are deleted" +
+                        if (ui.workspaceFileCount > 0) {
+                            ". The workspace holds ${ui.workspaceFileCount} file(s): keep them (restored " +
+                                "by the next install) or delete them with the rest."
+                        } else {
+                            ", together with the empty workspace."
+                        },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmUninstall = false; linuxUserspace.uninstall(keepWorkspace = false) },
+                ) { Text("Delete everything", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                Row {
+                    if (ui.workspaceFileCount > 0) {
+                        TextButton(onClick = { confirmUninstall = false; linuxUserspace.uninstall(keepWorkspace = true) }) {
+                            Text("Keep workspace")
+                        }
+                    }
+                    TextButton(onClick = { confirmUninstall = false }) { Text("Cancel") }
+                }
+            },
+        )
+    }
+}
+
+/** The distro's display name, or a neutral title on a device where none is supported. */
+private fun distroTitle(ui: LinuxUserspaceUiState): String =
+    ui.distro?.displayName ?: "Ubuntu"
+
+/**
+ * One install phase as the progress line renders it: the label, and the download's fraction when
+ * the phase has one (only the download does — verification, extraction and setup are steps whose
+ * length the pipeline honestly cannot know, and a fake progress bar is worse than none).
+ */
+private fun describeInstallStep(step: LinuxInstallStep): Pair<String, Float?> = when (step) {
+    is LinuxInstallStep.Downloading -> {
+        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}" to
+            (step.received.toFloat() / step.total.toFloat().coerceAtLeast(1f))
+    }
+    LinuxInstallStep.Verifying -> "Verifying the download" to null
+    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files" to null
+    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step) to null
+    LinuxInstallStep.VerifyingHealth -> "Running the health check" to null
+}
+
+private fun describeSetupStep(step: SetupStep): String = when (step) {
+    SetupStep.REGISTER_USER -> "Creating the ubuntu account"
+    SetupStep.PREPARE_WORKSPACE -> "Preparing the workspace"
+    SetupStep.CONFIGURE_DNS -> "Configuring DNS"
+    SetupStep.CONFIGURE_APT -> "Configuring package sources"
+    SetupStep.UPDATE_PACKAGES -> "Updating package lists"
+    SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
+    SetupStep.INSTALL_NODEJS -> "Installing Node.js"
+    SetupStep.INSTALL_GLOBAL_TOOLS -> "Installing pnpm and the OpenCode CLI"
+    SetupStep.VERIFY -> "Verifying"
+}
+
 private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Text(title.uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
     Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), content = content)
