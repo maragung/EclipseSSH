@@ -142,15 +142,24 @@ android {
     splits {
         // Per-ABI release APKs for the GitHub-release path, where the user picks
         // the file and the smaller per-ABI APK (a fifth of the universal one's
-        // native payload on a 64-bit phone) is the better download. This was
-        // once disabled because AGP 8.9.1's PerModuleBundleTask crashed when
-        // splits ran alongside the bundle pipeline; that was fixed upstream in
-        // AGP 8.11.0 and this project is on 9.4.0, so the bundle (the Play path,
-        // which splits at install time anyway) and the APK splits coexist.
-        // `isUniversalApk` keeps one fat APK for anyone who cannot tell their
-        // ABI or is on an emulator image that lies about it.
+        // native payload on a 64-bit phone) is the better download. They cannot
+        // simply be on, though: AGP - still, as of 9.4.0 - refuses to build a
+        // bundle while splits are enabled, because PerModuleBundleTask reads the
+        // shared shrunk-resources directory expecting exactly one file and finds
+        // five (issuetracker.google.com/402800800). So splits engage only for an
+        // invocation that explicitly assembles release APKs and names no bundle
+        // task; anything else - a combined `assembleRelease bundleRelease`, a
+        // lint, a test, a debug assemble for instrumentation - gets the
+        // universal behavior instead of a crashed bundle. The release workflows
+        // run the bundle first and the APKs second, in that order, because the
+        // leftover per-ABI files would crash a *later* bundle task just the
+        // same. `isUniversalApk` keeps one fat APK for anyone who cannot tell
+        // their ABI or is on an emulator image that lies about it.
         abi {
-            isEnable = true
+            val tasksLower = gradle.startParameter.taskNames.map { it.lowercase() }
+            val bundleInInvocation = tasksLower.any { it.contains("bundle") }
+            val assemblingReleaseApks = tasksLower.any { it.contains("assemblerelease") }
+            isEnable = assemblingReleaseApks && !bundleInInvocation
             reset()
             include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
             isUniversalApk = true
