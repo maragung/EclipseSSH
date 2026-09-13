@@ -90,9 +90,20 @@ class LinuxUserspaceManager(
             // must fail here — an install failure the UI can name — rather than deep inside
             // setup, where it surfaces as a missing-file error that reads like corruption.
             check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
-            val report = distribution.setup { step ->
-                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
-            }
+            // The step the progress line belongs to: onStep and onProgress arrive as separate
+            // callbacks, and the emitted state must carry both.
+            var currentSetupStep = SetupStep.REGISTER_USER
+            val report = distribution.setup(
+                onStep = { step ->
+                    currentSetupStep = step
+                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
+                },
+                onProgress = { line ->
+                    // Conflated by the StateFlow: a burst of apt lines collapses to the newest,
+                    // which is exactly the line a watcher wants to see.
+                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
+                },
+            )
             _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
             val health = distribution.healthProbe()
             _lastHealth.value = health
@@ -181,9 +192,16 @@ class LinuxUserspaceManager(
             // Same belt as install(): a repair whose re-extraction still left nothing must fail
             // as a repair, not as setup's missing-file error.
             check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
-            val report = distribution.setup { step ->
-                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
-            }
+            var currentSetupStep = SetupStep.REGISTER_USER
+            val report = distribution.setup(
+                onStep = { step ->
+                    currentSetupStep = step
+                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
+                },
+                onProgress = { line ->
+                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
+                },
+            )
             _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
             val health = distribution.healthProbe()
             _lastHealth.value = health
@@ -339,7 +357,12 @@ sealed interface LinuxInstallStep {
 
     data class Extracting(val entries: Int) : LinuxInstallStep
 
-    data class SettingUp(val step: SetupStep) : LinuxInstallStep
+    /**
+     * A setup step is running. [detail], when present, is the newest output line of the command
+     * behind the step — a slow-but-alive `apt-get update` shows "Get: 47 …" moving instead of a
+     * label that could be wedged for all the user can tell.
+     */
+    data class SettingUp(val step: SetupStep, val detail: String? = null) : LinuxInstallStep
 
     data object VerifyingHealth : LinuxInstallStep
 }
