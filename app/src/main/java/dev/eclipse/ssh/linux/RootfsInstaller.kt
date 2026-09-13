@@ -11,7 +11,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-import org.apache.commons.compress.utils.IOUtils
 
 /**
  * Downloads, verifies and extracts a pinned rootfs tarball — the "RootfsManager" of the userspace.
@@ -88,6 +87,7 @@ class RootfsInstaller(
     suspend fun install(onProgress: suspend (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
         rootDir.mkdirs()
         download(onProgress)
+        onProgress(Progress.Verifying)
         verify()
         extract(onProgress)
         moveIntoPlace()
@@ -139,7 +139,9 @@ class RootfsInstaller(
             while (true) {
                 val entry = tar.nextTarEntry ?: break
                 val target = resolveInside(stagingDir, entry.name)
-                when (entry.typeFlag.toInt()) {
+                // 0 is LF_OLDNORM - NUL is the pre-POSIX encoding of "regular file" and real
+                // tarballs (Ubuntu Base included) still emit it for early entries.
+                when (entry.linkFlag) {
                     TarArchiveEntry.LF_DIR -> {
                         target.mkdirs()
                     }
@@ -160,7 +162,7 @@ class RootfsInstaller(
                     }
                     TarArchiveEntry.LF_NORMAL, 0 -> {
                         target.parentFile?.mkdirs()
-                        target.outputStream().use { output -> IOUtils.copy(tar, output) }
+                        target.outputStream().use { output -> tar.copyTo(output) }
                         applyMode(target, entry.mode)
                     }
                     else -> {
@@ -191,19 +193,10 @@ class RootfsInstaller(
     }
 
     /**
-     * Resolves [name] inside [root], refusing anything that escapes it.
-     *
-     * `name` here arrives from a hash-pinned tarball, so this is defense in depth rather than the
-     * only line — but it is the line that stays true even if the pin is ever loosened.
+     * Resolves [name] inside [root], refusing anything that escapes it — the shared guard in
+     * [resolveInsideRoot], whose doc explains why extraction and checking live apart.
      */
-    private fun resolveInside(root: File, name: String): File {
-        val cleaned = name.removePrefix("./")
-        val resolved = File(root, cleaned).canonicalFile
-        if (!resolved.path.startsWith(root.canonicalPath + File.separator)) {
-            throw IOException("Tar entry escapes the rootfs directory: $name")
-        }
-        return resolved
-    }
+    private fun resolveInside(root: File, name: String): File = resolveInsideRoot(root, name)
 
     /**
      * Applies the mode bits that matter under Android: the executable bit from the tar entry, read
