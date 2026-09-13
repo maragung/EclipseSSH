@@ -29,6 +29,7 @@ import dev.eclipse.ssh.ssh.SshConnectionManager
 import dev.eclipse.ssh.ssh.SshKeyLoader
 import dev.eclipse.ssh.ssh.SshSessionStore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineScope
@@ -39,6 +40,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -80,11 +82,63 @@ class EclipseSessionService : LifecycleService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + uncaughtInService)
     private val restoreMutex = Mutex()
+
+    /**
+     * The stop-path state machine, so "stopping" stops being indistinguishable from "stopped".
+     *
+     * The defect this replaces: ACTION_STOP ran its cleanup outside [restoreMutex], so a restore
+     * pass could still be mid-dial when the user disconnected - the dial finished its
+     * `install` *after* the stop's `closeAll`, leaving an authenticated SSH session alive with no
+     * registry entry, no tab and no notification until process death. Every stop consumer (the
+     * restore loop, [dial], [onTimeout], [onDestroy]) now asks this object first; see the class
+     * KDoc below for the transition rules.
+     */
+    private val stopState = SessionServiceStopState()
+
+    /**
+     * True while one restore pass is queued or running, whatever triggered it.
+     *
+     * The entry points (onCreate, every network callback, every manual refresh, the sticky
+     * restart) each used to launch their own coroutine and queue on [restoreMutex]; a flapping
+     * network stacked one full dial sweep per `onAvailable`, each queued pass draining the
+     * conflated wake signal the running pass needed, then waiting out the whole backoff anyway.
+     * One pass at a time is the whole fix: the running pass already responds to new information
+     * through [reconnectWake], so a second launch had nothing to add but queue pressure.
+     */
+    private val restorePassActive = AtomicBoolean(false)
+
+    /**
+     * Schedules one restore pass, unless one is already queued or running (see
+     * [restorePassActive]) or the service is stopping (see [stopState]) - a pass launched during
+     * a stop would exit at its first state check anyway, but not launching it at all keeps the
+     * stop from waiting behind a coroutine that has nothing to do.
+     */
+    private fun requestRestore(reason: String) {
+        if (stopState.isStopping) return
+        if (!restorePassActive.compareAndSet(false, true)) return
+        serviceScope.launch {
+            try {
+                restoreSessions(reason)
+            } finally {
+                restorePassActive.set(false)
+            }
+        }
+    }
+
     private var sessionText = ""
     private var transferCount = 0
     private var transferPercent = 0
     private var reconnectAttempts = 0
     private lateinit var connectivityManager: ConnectivityManager
+
+    /**
+     * Whether this instance ever completed a `startForeground` call. Once it has not, the
+     * service exists only to drain its pending start command and leave: it holds no foreground
+     * notification, and a sticky restart of it would attempt the promotion again, fail against
+     * the same exhausted `dataSync` budget, and ping-pong for as long as something kept starting
+     * it. [onStartCommand] reads this to answer `START_NOT_STICKY` on exactly that path.
+     */
+    private var promotedToForeground = false
 
     /**
      * Cuts a reconnect backoff short when the platform reports a usable network.
@@ -127,7 +181,7 @@ class EclipseSessionService : LifecycleService() {
             // for news that had not happened. Only the network that was already default is skipped,
             // and only once - see [initialDefaultNetwork] for the case where there was none.
             if (startupNetworkCallbackPending.getAndSet(false) && network == initialDefaultNetwork) return
-            serviceScope.launch { restoreSessions("Network available") }
+            requestRestore("Network available")
         }
 
         override fun onLost(network: Network) {
@@ -165,9 +219,21 @@ class EclipseSessionService : LifecycleService() {
             )
         }.isSuccess
         if (!promoted) {
+            // Said out loud rather than swallowed: the usual cause is the six-hour `dataSync`
+            // budget being exhausted, and the silence used to cost the user every session they
+            // minimised the app to keep. Same id and copy as the restore alert, so repeated
+            // start attempts replace the notification instead of stacking.
+            postAlert(
+                context = this,
+                id = NotificationChannels.ID_RESTORE,
+                title = getString(R.string.notif_restore_title),
+                body = getString(R.string.notif_restore_body),
+                contentIntent = restoreActivityIntent(this),
+            )
             stopSelf()
             return
         }
+        promotedToForeground = true
         connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         // Read before registering, so the replay that arrives during registration can be recognised.
         initialDefaultNetwork = runCatching { connectivityManager.activeNetwork }.getOrNull()
@@ -181,7 +247,7 @@ class EclipseSessionService : LifecycleService() {
         // service. It is no longer the second dialler it used to be - the dial gate serialises it with
         // the UI's own attempt, and [MainViewModel.adoptStoredSession] can now use whichever session it
         // finds, with or without a shell on it.
-        serviceScope.launch { restoreSessions("Service active") }
+        requestRestore("Service active")
         serviceScope.launch {
             transferRepository.transfers.collect { transfers ->
                 val running = transfers.filter { it.status == TransferStatus.RUNNING }
@@ -194,24 +260,63 @@ class EclipseSessionService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
+        // The sticky answer the platform acts on. While promoted, the sticky restart after a
+        // process death is how sessions come back. Once promotion failed (the six-hour `dataSync`
+        // budget is exhausted, or a background start was refused), sticky is a ping-pong: every
+        // restart would attempt `startForeground` again, fail against the same wall, and be
+        // re-created for nothing. An unpromoted instance drains this one start command and is not
+        // restarted.
+        if (!promotedToForeground) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
-            ACTION_STOP -> serviceScope.launch {
-                sessionRegistry.clear()
-                closeSessions()
-                stopSelf()
+            ACTION_STOP -> if (stopState.requestUserStop()) {
+                // The state flips *here*, before the coroutine, so a restore pass mid-dial at
+                // this instant already sees a stop in progress - the pass exits at its next
+                // check, and [dial] discards rather than installs a session that finishes
+                // connecting after this point.
+                serviceScope.launch {
+                    try {
+                        // Bounded on purpose. The clear is a NonCancellable DataStore
+                        // read-modify-write serialised through the store's single actor: queued
+                        // behind any other write (a transfer's progress, a settings edit), there
+                        // is no inherent bound on how long it can take. The timeout abandons the
+                        // *wait*, not the write - the edit itself is NonCancellable and finishes
+                        // on its own - because the service stopping must never be hostage to
+                        // storage being slow. This is the stop path that
+                        // `ForegroundServiceDidNotStopInTimeException` is made of.
+                        runCatching { withTimeoutOrNull(STOP_CLEAR_TIMEOUT_MS) { sessionRegistry.clear() } }
+                        closeSessions()
+                    } finally {
+                        // Last, but guaranteed: cleanup may be slow or broken, and neither may
+                        // delay or skip the service's destruction.
+                        stopSelf()
+                    }
+                }
             }
-            ACTION_REFRESH, ACTION_RESTORE -> serviceScope.launch { restoreSessions("Manual reconnect") }
+            // A wake before the launch, because the manual gesture means "try now": a pass
+            // already running and sleeping out a backoff picks the signal up and retries at
+            // once, which is what the notification's Reconnect button promises.
+            ACTION_REFRESH, ACTION_RESTORE -> {
+                stopState.revive()
+                reconnectWake.trySend(Unit)
+                requestRestore("Manual reconnect")
+            }
             // "Keep running, the UI has a session now." Deliberately does nothing else: the UI dials
             // its own session and puts it in the shared store, so a restore pass here would only be a
             // second dialler racing it. That is what tapping Connect used to launch — the intent
             // carried no action, and a null action means the process was killed and restarted (see
             // below), so every single Connect tap ran a full restore pass alongside the UI's own
             // handshake. The dial gate makes that harmless now, and this makes it not happen.
-            ACTION_TRACK -> Unit
+            // The revive matters when the platform had already begun stopping this service (the
+            // dataSync timeout): the UI connecting a session is the one event that says the
+            // service still has work.
+            ACTION_TRACK -> stopState.revive()
             // A null intent means START_STICKY re-created the service after the process was
             // killed, so the sessions genuinely need restoring rather than a text refresh
             // that would overwrite the live reconnect status.
-            null -> serviceScope.launch { restoreSessions("Service restarted") }
+            null -> requestRestore("Service restarted")
             else -> Unit
         }
         return START_STICKY
@@ -228,8 +333,10 @@ class EclipseSessionService : LifecycleService() {
         reconnectWake.tryReceive()
         var attemptReason = reason
         // Loop instead of recursing so endless reconnect attempts (e.g. a host that
-        // stays unreachable for days) can never grow the coroutine call stack.
-        while (coroutineContext.isActive) {
+        // stays unreachable for days) can never grow the coroutine call stack. The stop
+        // check rides the same condition: a pass that wakes from its backoff into a stopping
+        // service ends here rather than dialling anything.
+        while (coroutineContext.isActive && !stopState.isStopping) {
             val activeIds = sessionRegistry.activeHostIds.first()
             val hosts = hostRepository.hosts.first()
             // [SshSessionStore.isLive] answers for the whole app, not just for this service, and that
@@ -264,6 +371,10 @@ class EclipseSessionService : LifecycleService() {
             // backoff below needs to tell those apart.
             var busy = 0
             pending.forEach { host ->
+                // Re-checked per host, not just per sweep: a stop can arrive while an earlier
+                // host's dial ladder is still running, and the whole point of the state machine
+                // is that nothing past this line installs a session the stop then misses.
+                if (stopState.isStopping) return@withLock
                 // Under the host's dial gate, which is the other half of the fix for a session that
                 // said *Reconnecting…* seconds after login. `pending` was computed from an `isLive`
                 // check that cannot see a handshake the UI has started and not yet finished, and
@@ -362,7 +473,26 @@ class EclipseSessionService : LifecycleService() {
             detail = "background restore",
             network = networkMonitor.describe(),
         )
-        sessionStore.install(host.id, sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host)), host.id)
+        val session = sshConnectionManager.connect(host, sessionRegistry.credential(host.id), keyPairFor(host))
+        if (stopState.isStopping) {
+            // The dial raced a stop: the handshake finished after the user disconnected (or the
+            // dataSync budget expired), and the stop's closeAll has already run or is about to.
+            // Installing this session is the exact orphan the state machine exists to prevent -
+            // live, authenticated, no registry entry, no tab, no notification until process
+            // death - so it is closed here instead, the same way [SshSessionStore.install]
+            // rejects a session it cannot use. A stop reported by the diagnostics stream is the
+            // honest record of why.
+            diagnostics.record(
+                host.id,
+                SessionEvent.CONNECT_FAILED,
+                detail = "background restore: stopped mid-dial",
+                network = networkMonitor.describe(),
+            )
+            runCatching { session.close(false) }
+            null
+        } else {
+            sessionStore.install(host.id, session, host.id)
+        }
     } catch (cancelled: CancellationException) {
         // The service is going away. Without this the cancellation was swallowed into a null session
         // and the loop went on to dial every remaining host on an already dead context — pointless
@@ -400,21 +530,45 @@ class EclipseSessionService : LifecycleService() {
     private fun closeSessions() = sessionStore.closeAll()
 
     override fun onDestroy() {
+        // Whether this destruction was announced by anyone: a user stop (ACTION_STOP) and a
+        // platform stop (onTimeout) both told the user what they were doing; a `RUNNING` phase
+        // here means the system recycled the service with live sessions still in the store -
+        // the orphan state that used to end in silence.
+        val recycledWithSessionsOpen = stopState.destroyed()
+        // Cancel the scope first: its cancellation is what ends a sleeping backoff and the
+        // transfer collector, so the binder call below unregisters callbacks that have nothing
+        // left to notify. The unregister used to come first, delaying that cancellation behind
+        // a synchronous trip to system_server for no benefit to anything already cancelled.
+        serviceScope.cancel()
         if (::connectivityManager.isInitialized) {
             runCatching { connectivityManager.unregisterNetworkCallback(networkCallback) }
         }
-        serviceScope.coroutineContext.cancel()
         // After the scope, so the cancellation is what ends a sleeping backoff rather than a closed
         // channel; awaitReconnectWindow treats the latter as "wait the whole window".
         reconnectWake.close()
+        // Explicit rather than left to destruction: removing the foreground notification here
+        // also covers the stop paths that demoted but had not yet been destroyed, and makes the
+        // "no notification, no service, sessions still live" state below impossible to reach
+        // silently.
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         // Deliberately closes nothing. The SshClient is an application-scoped singleton shared with
         // the UI, so stopping it here tore down every interactive terminal and SFTP session the moment
         // the service was recycled — and now that sessions live in [SshSessionStore] rather than in a
         // map owned by this service, closing "its own" sessions would do exactly the same damage: the
         // session the user is typing into is the same object. A session ends when the user closes its
         // tab or taps Stop, or when the process dies and the kernel closes the socket. The service
-        // being recycled is none of those.
-        runCatching { (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID) }
+        // being recycled is none of those. What the recycled case *does* owe the user is one line
+        // saying the sessions now survive only as long as the app stays open — which is what the
+        // timeout alert already says for the six-hour case, and this says for every other one.
+        if (recycledWithSessionsOpen && sessionStore.liveHostIds().isNotEmpty()) {
+            postAlert(
+                context = this,
+                id = NotificationChannels.ID_TIMEOUT_SESSIONS,
+                title = getString(R.string.notif_detached_title),
+                body = getString(R.string.notif_detached_body),
+                contentIntent = restoreActivityIntent(this),
+            )
+        }
         super.onDestroy()
     }
 
@@ -485,20 +639,39 @@ class EclipseSessionService : LifecycleService() {
      * implementation there is a no-op anyway.
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
+        // The state first: a restore pass mid-dial at this instant must not install a session
+        // behind the stop.
+        stopState.platformStop()
+        // Stopping is the deadline's only deliverable, so it happens before anything that talks
+        // to another process. This used to post the alert first - a permission check, a
+        // PendingIntent build and a notify, three binder round trips - and spent the "few
+        // seconds" of grace on them; a busy main thread turned that into
+        // `ForegroundServiceDidNotStopInTimeException`. The alert still runs, but on the same
+        // main thread after the stop is merely bookkeeping: destruction is queued behind the
+        // current message, so the posting cannot be pre-empted by the service dying.
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelf(startId)
         postAlert(
             context = this,
-            id = NotificationChannels.ID_TIMEOUT,
+            id = NotificationChannels.ID_TIMEOUT_SESSIONS,
             title = getString(R.string.notif_timeout_title),
             body = getString(R.string.notif_timeout_body),
             contentIntent = restoreActivityIntent(this),
         )
-        stopSelf()
     }
 
     private fun createNotificationChannels() = NotificationChannels.ensureCreated(this)
 
     companion object {
         private const val TAG = "EclipseSessionService"
+
+        /**
+         * How long ACTION_STOP waits for the registry clear before stopping anyway. The write is
+         * NonCancellable, so the timeout abandons the wait, not the write. Three seconds is
+         * roughly a thousand normal DataStore edits; anything slower is storage in trouble, and
+         * the service stopping must not wait for it.
+         */
+        private const val STOP_CLEAR_TIMEOUT_MS = 3_000L
 
         const val ACTION_STOP = "dev.eclipse.ssh.action.STOP"
 
@@ -542,6 +715,72 @@ class EclipseSessionService : LifecycleService() {
         // Request codes 0..2 belong to the ongoing notification's open/stop/refresh intents.
         private const val REQUEST_RESTORE = 3
     }
+}
+
+/**
+ * The stop-path state machine for [EclipseSessionService].
+ *
+ * A `Service` has no built-in notion of "stopping": `stopSelf()` is a request, destruction is
+ * asynchronous, and between the two the object still receives start commands and its coroutines
+ * still run. This class is the one atomic answer to "is this service on its way out", which the
+ * service used to lack entirely - ACTION_STOP's cleanup ran outside the restore mutex, so a
+ * restore pass could install a live session *after* the stop's closeAll, and the start-vs-stop
+ * race had no arbiter at all.
+ *
+ * The transitions:
+ *
+ * - `requestUserStop()` - ACTION_STOP, the notification's Disconnect. Accepted once; a second
+ *   tap while a stop is in flight changes nothing. A user stop is final: nothing revives it,
+ *   because the user just said "close my sessions" and a session connected moments later is
+ *   still under that instruction.
+ * - `platformStop()` - the dataSync timeout ([Service.onTimeout]). Also final, but differently:
+ *   the *service* is going, and whether its work should continue is not the platform's call.
+ * - `revive()` - a start intent (TRACK/REFRESH/RESTORE) that arrived while a platform stop was
+ *   pending. The UI connecting a session is the one event that says this service still has
+ *   work, so the restore machinery is allowed to continue until destruction actually lands.
+ *   It does not resurrect the foreground promotion - that is the budget's call.
+ * - `destroyed()` - [Service.onDestroy]. Returns whether the destruction was *unannounced*
+ *   (phase was still RUNNING): the system recycled the service with no stop path involved,
+ *   which is the state that owes the user a "your sessions lost their background protection"
+ *   alert.
+ *
+ * A free class rather than service internals for the same reason [hostsNeedingRestore] is a
+ * free function: the transition rules are the part with decisions in them, and a `Service` is
+ * close to untestable in a JVM suite - the install-after-stop race this exists for was
+ * invisible precisely because it lived inside one.
+ */
+internal class SessionServiceStopState {
+    enum class Phase { RUNNING, STOPPING_USER, STOPPING_PLATFORM, DESTROYED }
+
+    private val phase = AtomicReference(Phase.RUNNING)
+
+    val isStopping: Boolean get() = phase.get() != Phase.RUNNING
+
+    /** ACTION_STOP. False when a stop is already in flight, so cleanup runs exactly once. */
+    fun requestUserStop(): Boolean = phase.compareAndSet(Phase.RUNNING, Phase.STOPPING_USER)
+
+    /** The platform called [android.app.Service.onTimeout]: the service is going, now. */
+    fun platformStop() {
+        phase.set(Phase.STOPPING_PLATFORM)
+    }
+
+    /**
+     * A start intent arrived. Only a pending *platform* stop can be cancelled: a user stop is
+     * the user's instruction and stands. False means nothing changed.
+     */
+    fun revive(): Boolean = phase.compareAndSet(Phase.STOPPING_PLATFORM, Phase.RUNNING)
+
+    /**
+     * [onDestroy]: flips to the terminal [Phase.DESTROYED] and answers whether this destruction
+     * was unannounced - no stop path had run, so the system recycled a live service.
+     *
+     * DESTROYED is its own phase rather than reusing STOPPING_PLATFORM precisely so [revive]
+     * cannot resurrect it: the machine outlives the service only long enough for onDestroy to
+     * read the unannounced flag, and a start intent racing destruction must not flip a dead
+     * service back to RUNNING - which is what a shared phase value would allow, because
+     * revive's compareAndSet cannot tell "stopping" from "stopped".
+     */
+    fun destroyed(): Boolean = phase.getAndSet(Phase.DESTROYED) == Phase.RUNNING
 }
 
 /**

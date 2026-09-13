@@ -31,6 +31,10 @@
     <string name="notif_timeout_title">Background sessions paused</string>
     <string name="notif_timeout_body">Android limits background syncing to six hours a day, so Eclipse SSH can no longer hold your sessions open in the background. They keep working while the app is on screen — open it now if you need them, or they may be dropped once Android reclaims the app.</string>
 
+    <!-- The session service was recycled with sessions still live: they lost background protection, not their connection -->
+    <string name="notif_detached_title">Sessions without background protection</string>
+    <string name="notif_detached_body">Android stopped the background service, so your sessions keep working only while Eclipse SSH is on screen. Open the app now if you need them held open.</string>
+
     <!-- Restore-after-restart prompt (Android 12+ forbids starting this service from the background) -->
     <string name="notif_restore_title">Reconnect your sessions</string>
     <string name="notif_restore_body">Eclipse SSH cannot reconnect on its own after a restart. Tap to restore your sessions and resume transfers.</string>
