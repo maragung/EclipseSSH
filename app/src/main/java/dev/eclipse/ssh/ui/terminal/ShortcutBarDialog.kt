@@ -74,8 +74,9 @@ fun ShortcutBarDialog(
     var pendingPreset by remember { mutableStateOf<(() -> KeyBarPrefs)?>(null) }
 
     if (editing != null) {
+        val capBeingEdited = editing
         CustomCapDialog(
-            cap = editing,
+            cap = capBeingEdited,
             onDismiss = { editing = null },
             onSave = { saved ->
                 prefs = prefs.copy(caps =
@@ -125,6 +126,7 @@ fun ShortcutBarDialog(
                     onChange = { prefs = it },
                     onEdit = { editing = it },
                     onAdd = { editing = KeyBarCap(prefs.nextCustomId(), KeyBarCapKind.TEXT, text = "") },
+                    onPreset = { preset -> pendingPreset = preset },
                 )
             }
         },
@@ -206,6 +208,7 @@ private fun CapsSection(
     onChange: (KeyBarPrefs) -> Unit,
     onEdit: (KeyBarCap) -> Unit,
     onAdd: () -> Unit,
+    onPreset: (() -> KeyBarPrefs) -> Unit,
 ) {
     val custom = prefs.mode == KeyBarLayoutMode.CUSTOM
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -224,10 +227,9 @@ private fun CapsSection(
                 CapRow(cap, custom, prefs, onChange, onEdit)
             }
         }
-        PresetSection(onPick = { preset -> pendingPreset = preset })
+        PresetSection(onPick = onPreset)
     }
 }
-
 @Composable
 private fun CapRow(
     cap: KeyBarCap,
@@ -325,7 +327,10 @@ internal fun move(prefs: KeyBarPrefs, cap: KeyBarCap, delta: Int): KeyBarPrefs {
     val target = index + delta
     if (target < 0 || target >= sorted.size) return prefs
     if (sorted[target].row != sorted[index].row) return prefs
-    val swapped = sorted.toMutableList().also { it[index] = it[target].also { it[target] = it[index] } }
+    val swapped = sorted.toMutableList()
+    val held = swapped[index]
+    swapped[index] = swapped[target]
+    swapped[target] = held
     return prefs.copy(caps = renumber(swapped))
 }
 
