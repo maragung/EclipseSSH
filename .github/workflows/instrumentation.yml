@@ -207,7 +207,37 @@ jobs:
         # The emulator booted above is the only device adb can see, so the
         # default single-device selection is correct. The suite reports into
         # the standard connected-test directories uploaded below.
-        run: ./gradlew --stacktrace connectedDebugAndroidTest
+        # logcat is cleared right before the suite: Gradle's connected-test
+        # output does not include the device log, and without a fresh buffer
+        # the only evidence for a device-side crash is buried in minutes of
+        # boot noise. "No compose hierarchies found in the app" failures
+        # need the AndroidRuntime lines this captures to diagnose at all.
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" logcat -c
+          ./gradlew --stacktrace connectedDebugAndroidTest
+
+      - name: Capture the device log
+        # Dumped on any outcome: a suite that fails leaves the crash here, and
+        # a suite that passes costs one artifact upload of a mostly-empty log.
+        if: always()
+        run: |
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          if "$ADB" get-state >/dev/null 2>&1; then
+            "$ADB" logcat -d > /tmp/logcat.txt
+          else
+            echo "device is gone - nothing to dump" > /tmp/logcat.txt
+          fi
+
+      - name: Upload the device log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logcat
+          path: /tmp/logcat.txt
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload the emulator log
         # The device-side evidence for a failed suite is usually in here:
