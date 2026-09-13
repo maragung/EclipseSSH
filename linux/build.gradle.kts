@@ -351,7 +351,9 @@ val buildLinuxNative =
                     "${file.name} is not an ELF file"
                 }
                 val is64 = bytes[4].toLong() == 2L
-                val phoff = if (is64) readLe(bytes, 16, 8) else readLe(bytes, 28, 4)
+                // e_phoff sits at offset 32 in ELF64 but offset 28 in ELF32 - the
+                // 32-bit layout is *not* the 64-bit one with narrower fields.
+                val phoff = if (is64) readLe(bytes, 32, 8) else readLe(bytes, 28, 4)
                 val phentsize = readLe(bytes, if (is64) 54 else 42, 2).toInt()
                 val phnum = readLe(bytes, if (is64) 56 else 44, 2).toInt()
                 check(phentsize > 0 && phnum in 1..64) {
