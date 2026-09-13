@@ -70,6 +70,11 @@ class LinuxUserspaceManagerTest {
         // value a fresh collector receives is the current one, which is NotInstalled here.
         val states = mutableListOf<LinuxUserspaceState>()
         val observer = launch { harness.manager.state.collect { states += it } }
+        // Run the observer to its first suspension before install() starts. install suspends on
+        // real IO, and the work runner starts queued coroutines while the body waits there - so
+        // without this flush the observer's first dispatch happens after the state has already
+        // advanced to Installing, and it never sees the NotInstalled it exists to pin.
+        testScheduler.runCurrent()
 
         val report = harness.manager.install()
         testScheduler.advanceUntilIdle()

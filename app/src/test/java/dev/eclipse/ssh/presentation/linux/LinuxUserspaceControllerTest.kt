@@ -17,8 +17,12 @@ import dev.eclipse.ssh.linux.TestTarballs
 import dev.eclipse.ssh.linux.UbuntuDistributionManager
 import java.io.File
 import java.nio.file.Files
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import org.junit.After
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -81,6 +85,21 @@ class LinuxUserspaceControllerTest {
             Harness(TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)))
     }
 
+    /**
+     * The controller's scope is Dispatchers.Main.immediate, and Robolectric's main looper is
+     * paused - nothing queued on it ever runs, so every act() would hang its first{} wait.
+     * Point Main at the test's own scheduler so the controller runs on the virtual time the
+     * assertions advance, and restore the real main looper afterwards for the rest of the suite.
+     */
+    @After
+    fun restoreMainDispatcher() {
+        Dispatchers.resetMain()
+    }
+
+    private fun TestScope.mainOnTheTestScheduler() {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+    }
+
     @Test
     fun `an unsupported device reports itself with no state to render`() = runTest {
         val controller = LinuxUserspaceController(appContext, graph = null)
@@ -101,6 +120,7 @@ class LinuxUserspaceControllerTest {
 
     @Test
     fun `install surfaces in the UI state and refreshes the storage numbers`() = runTest {
+        mainOnTheTestScheduler()
         val harness = newHarness()
         val controller = LinuxUserspaceController(appContext, harness.graph)
 
@@ -126,6 +146,7 @@ class LinuxUserspaceControllerTest {
 
     @Test
     fun `an impossible action becomes an error sentence, not a crash`() = runTest {
+        mainOnTheTestScheduler()
         val harness = newHarness()
         val controller = LinuxUserspaceController(appContext, harness.graph)
 
@@ -149,6 +170,7 @@ class LinuxUserspaceControllerTest {
 
     @Test
     fun `a running userspace promotes the foreground hold service, and stopping demotes it`() = runTest {
+        mainOnTheTestScheduler()
         val harness = newHarness()
         val controller = LinuxUserspaceController(appContext, harness.graph)
         val app = appContext as android.app.Application
@@ -181,6 +203,7 @@ class LinuxUserspaceControllerTest {
 
     @Test
     fun `a keep-workspace uninstall parks the backup the next install restores`() = runTest {
+        mainOnTheTestScheduler()
         val harness = newHarness()
         val controller = LinuxUserspaceController(appContext, harness.graph)
 
