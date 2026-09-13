@@ -73,8 +73,10 @@ fun ShortcutBarDialog(
     /** The preset (or reset) whose destructive apply is awaiting confirmation, if any. */
     var pendingPreset by remember { mutableStateOf<(() -> KeyBarPrefs)?>(null) }
 
-    if (editing != null) {
-        val capBeingEdited = editing
+    // A local copy of the state, not the delegated property itself: only a val the compiler can see
+    // checked here smart-casts to non-null for the dialog below.
+    val capBeingEdited = editing
+    if (capBeingEdited != null) {
         CustomCapDialog(
             cap = capBeingEdited,
             onDismiss = { editing = null },
