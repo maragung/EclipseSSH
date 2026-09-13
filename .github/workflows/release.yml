@@ -28,7 +28,7 @@ env:
   COMPILE_SDK: 'android-37.0'
   TARGET_SDK: 'android-35'
   # Same pins as ci.yml; the root-invoked assemble/bundle tasks compile the
-  # :freerdp module, whose native build needs them.
+  # :freerdp and :linux modules, whose native builds need them.
   FREERDP_NDK_VERSION: '29.0.13113456'
   FREERDP_CMAKE_VERSION: '4.1.2'
 
@@ -87,6 +87,14 @@ jobs:
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        # Same entry ci.yml restores, for the same reason: the release APK
+        # ships the userspace, built from exactly the tree CI verified.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0

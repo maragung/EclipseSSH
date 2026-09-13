@@ -119,6 +119,16 @@ android {
     }
 
     packaging {
+        // The Linux userspace execs proot and its loader directly out of
+        // nativeLibraryDir, the one directory the system labels executable
+        // (apk_data_file) for a targetSdk 29+ app. Without legacy packaging
+        // the .so files stay inside the APK zip and are only mmap-able - there
+        // would be no on-disk file to execve, and every userspace start would
+        // die with EACCES. The cost is disk: the libs are extracted at install
+        // instead of loaded from the APK.
+        jniLibs {
+            useLegacyPackaging = true
+        }
         resources {
             excludes += setOf(
                 "/META-INF/{AL2.0,LGPL2.1}",
@@ -409,6 +419,11 @@ dependencies {
 
     // The RDP engine's JNI wrapper and native libraries.
     implementation(project(":freerdp"))
+
+    // The Ubuntu Linux userspace: the PTY bridge JNI wrapper plus the
+    // proot/loader artifacts the runtime execs out of nativeLibraryDir
+    // (see linux/build.gradle.kts).
+    implementation(project(":linux"))
 
     testImplementation(libs.junit)
     testImplementation(libs.truth)

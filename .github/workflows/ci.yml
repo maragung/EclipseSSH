@@ -36,9 +36,11 @@ env:
   COMPILE_SDK: 'android-37.0'
   MIN_SDK: '28'
   TARGET_SDK: 'android-35'
-  # The NDK and CMake the :freerdp module's native build is pinned to
-  # (freerdp/build.gradle.kts). Same pins the FreeRDP spike proved the build
-  # with. The SDK manager does not carry CMake 4.x, hence the PyPI install.
+  # The NDK and CMake the :freerdp and :linux modules' native builds are
+  # pinned to (freerdp/build.gradle.kts, linux/build.gradle.kts - the two
+  # deliberately share the NDK pin). Same pins the FreeRDP spike proved the
+  # build with. The SDK manager does not carry CMake 4.x, hence the PyPI
+  # install.
   FREERDP_NDK_VERSION: '29.0.13113456'
   FREERDP_CMAKE_VERSION: '4.1.2'
 
@@ -150,6 +152,49 @@ jobs:
             echo "verified ${ABI}: ${ELF_SIGNATURE[${ABI}]}"
           done
 
+      - name: Cache the Linux userspace native build tree
+        # linux/build holds the fetched proot-fork and talloc tarballs, the
+        # per-ABI work trees and the packaged jniLibs. Same shape as the
+        # FreeRDP cache beside it: this job is the only writer, and the key
+        # carries the module's build script because that is where the
+        # tarball, NDK and ABI pins live. A cold build is minutes (proot's
+        # makefile is quick); a warm one is a download-free UP-TO-DATE.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+
+      - name: Build and verify the :linux native module
+        # Same product assertion as :freerdp above, plus the property the
+        # userspace's exec model depends on: libproot.so and
+        # libproot-loader.so must be static executables. A dynamic proot
+        # would resolve its interpreter outside nativeLibraryDir and die at
+        # exec time - a failure packaging cannot see. make, readelf and awk
+        # (proot's makefile uses them) are preinstalled on the runner image.
+        run: |
+          set -euo pipefail
+          ./gradlew --stacktrace :linux:assembleDebug
+          declare -A ELF_SIGNATURE=(
+            [arm64-v8a]='ARM aarch64'
+            [armeabi-v7a]='ARM, EABI5'
+            [x86_64]='x86-64'
+          )
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            for LIB in libproot libproot-loader liblinuxpty; do
+              SO="linux/build/native/jniLibs/${ABI}/${LIB}.so"
+              test -f "${SO}" || { echo "missing ${SO}"; exit 1; }
+            done
+            file "linux/build/native/jniLibs/${ABI}/libproot.so" \
+              | grep -F "${ELF_SIGNATURE[${ABI}]}"
+            file "linux/build/native/jniLibs/${ABI}/libproot.so" \
+              | grep -F 'statically linked'
+            file "linux/build/native/jniLibs/${ABI}/libproot-loader.so" \
+              | grep -F 'statically linked'
+            file "linux/build/native/jniLibs/${ABI}/liblinuxpty.so" \
+              | grep -F "${ELF_SIGNATURE[${ABI}]}"
+            echo "verified ${ABI}: ${ELF_SIGNATURE[${ABI}]}"
+          done
+
   lint:
     name: Lint (release variant)
     needs: native
@@ -216,6 +261,17 @@ jobs:
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        # Same contract as the FreeRDP restore above: needs:native guarantees
+        # the native job's post-step save of this exact key is visible here,
+        # so :linux's preBuild-wired fetch and build tasks find their declared
+        # outputs and go UP-TO-DATE. Restored, never written, and no
+        # restore-keys for the same reason the FreeRDP cache has none.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
@@ -293,6 +349,17 @@ jobs:
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        # Same contract as the FreeRDP restore above: needs:native guarantees
+        # the native job's post-step save of this exact key is visible here,
+        # so :linux's preBuild-wired fetch and build tasks find their declared
+        # outputs and go UP-TO-DATE. Restored, never written, and no
+        # restore-keys for the same reason the FreeRDP cache has none.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
@@ -416,6 +483,17 @@ jobs:
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        # Same contract as the FreeRDP restore above: needs:native guarantees
+        # the native job's post-step save of this exact key is visible here,
+        # so :linux's preBuild-wired fetch and build tasks find their declared
+        # outputs and go UP-TO-DATE. Restored, never written, and no
+        # restore-keys for the same reason the FreeRDP cache has none.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
