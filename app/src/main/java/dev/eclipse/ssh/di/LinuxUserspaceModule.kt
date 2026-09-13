@@ -62,10 +62,15 @@ object LinuxUserspaceModule {
     fun provideLinuxUserspaceGraph(@ApplicationContext context: Context): LinuxUserspaceGraph? {
         val distro = LinuxDistroCatalog.forDevice(Build.SUPPORTED_ABIS.toList()) ?: return null
 
+        // A context with no native library directory (Robolectric, or an install whose native
+        // code was never extracted) has nowhere the pinned proot could be execve'd from, which
+        // is the same story as an unmapped ABI: this device cannot run a userspace.
+        val nativeLibraryDir = context.applicationInfo.nativeLibraryDir ?: return null
+
         val rootDir = File(context.filesDir, "linux")
         val runtime = ProotRuntime(
             rootDir = rootDir,
-            nativeLibraryDir = context.applicationInfo.nativeLibraryDir,
+            nativeLibraryDir = nativeLibraryDir,
             spawner = LinuxPtySpawner,
         )
         val installer = RootfsInstaller(rootDir, distro)
