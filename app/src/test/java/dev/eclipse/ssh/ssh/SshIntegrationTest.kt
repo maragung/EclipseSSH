@@ -39,6 +39,7 @@ import org.apache.sshd.common.file.virtualfs.VirtualFileSystemFactory
 import org.apache.sshd.common.kex.BuiltinDHFactories
 import org.apache.sshd.common.mac.BuiltinMacs
 import org.apache.sshd.common.session.ConnectionService
+import org.apache.sshd.common.session.helpers.AbstractConnectionService
 import org.apache.sshd.common.signature.BuiltinSignatures
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
@@ -870,7 +871,11 @@ class SshIntegrationTest {
             val session = trustedConnect(manager, hostProfile(), PASSWORD)
             store.install(sessionKey = "it-archive-host", session = session, hostId = "it-archive-host")
             fun openChannelCount(): Int =
-                session.getService(ConnectionService::class.java).channels.size
+                // getChannels() lives on AbstractConnectionService, not on the ConnectionService
+                // interface; the concrete service behind a client session is always the
+                // implementation (ClientConnectionService), so the cast cannot fail here.
+                (session.getService(ConnectionService::class.java) as AbstractConnectionService)
+                    .channels.size
             val baseline = openChannelCount()
 
             repeat(3) {
