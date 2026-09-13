@@ -101,7 +101,7 @@ class UbuntuDistributionManager(
         val apt = runSessionCommand("apt-get check", APT_TIMEOUT_MS)
         val account = whoami?.outputText()?.trim()
         return HealthReport(
-            shellWorks = shell?.exitCode == 0 && shell.outputText().contains(PROBE_MARKER),
+            shellWorks = shell != null && shell.exitCode == 0 && shell.outputText().contains(PROBE_MARKER),
             account = account,
             accountCorrect = account == ACCOUNT_NAME,
             networkUp = network?.exitCode == 0,
