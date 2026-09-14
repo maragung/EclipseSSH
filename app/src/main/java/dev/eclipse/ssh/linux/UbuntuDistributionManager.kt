@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.URI
 import java.net.URL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -29,20 +30,32 @@ import kotlinx.coroutines.withContext
  * @param runtime the proot context this manager runs its commands through
  * @param appUid the app's Android uid, registered as the `ubuntu` account
  * @param appGid the app's Android gid for the account's primary group
- * @param dnsServers resolvers written into the rootfs's `/etc/resolv.conf`; injectable so the
- *   wiring layer can derive them from the device's live network instead of the defaults
+ * @param dnsServers supplies the resolvers written into the rootfs's `/etc/resolv.conf`. A
+ *   function, resolved when the file is written, because the graph is built once while the
+ *   device's network keeps changing — a captured list would freeze the rootfs to whatever
+ *   network it was built on, and Repair could then never fix a DNS breakage
  * @param mirrorListUrl the always-current mirror feed used when the primary archive fails;
- *   injectable so tests point it at something that refuses instantly instead of touching the
- *   network
+ *   injectable so tests point it at something that refuses instantly — or a `file:` URL —
+ *   instead of touching the network
+ * @param networkOnline consulted before the network-heavy phases; returning false fails the
+ *   step as a typed [UserspaceFailure.Offline] instead of letting every rung fail for a reason
+ *   that is not any mirror's
+ * @param aptUpdateAttemptTimeoutMs one rung's whole budget; injectable so a test can time a
+ *   rung out without waiting ten real minutes
  */
 class UbuntuDistributionManager(
     private val distro: LinuxDistro,
     private val runtime: ProotRuntime,
     private val appUid: Int,
     private val appGid: Int,
-    private val dnsServers: List<String> = DEFAULT_DNS_SERVERS,
+    private val dnsServers: () -> List<String> = { DEFAULT_DNS_SERVERS },
     private val mirrorListUrl: String = DEFAULT_MIRROR_LIST_URL,
+    private val networkOnline: () -> Boolean = { true },
+    private val aptUpdateAttemptTimeoutMs: Long = APT_UPDATE_ATTEMPT_TIMEOUT_MS,
 ) {
+    /** Structured trace of everything this manager does; the export path is wired in a later pass. */
+    val diagnostics = UserspaceDiagnostics()
+
     private val rootfs: File get() = runtime.rootfsDir
 
     /**
@@ -50,6 +63,21 @@ class UbuntuDistributionManager(
      * Cached rather than re-fetched because Repair re-runs the same ladder over the same network.
      */
     private var fetchedMirrors: List<String>? = null
+
+    /**
+     * The resolvers [configureDns] actually wrote — what a DNS failure must name, and what the
+     * taxonomy classifier receives. Kept even though the file could be read back, because the
+     * written list is the filtered one and the file is the truth of the past.
+     */
+    private var writtenDnsServers: List<String> = emptyList()
+
+    /**
+     * How the mirror feed answered, once [aptUpdate] has needed it; null until then. Carried
+     * separately from [fetchedMirrors] because "the feed was unreachable" and "the feed named no
+     * usable mirror" are different facts, and the ladder's failure message must be able to say
+     * which one it was.
+     */
+    private var mirrorFeedStatus: String? = null
 
     /**
      * The setup pipeline, in order. Each step either completes or throws — there is no partial
@@ -72,18 +100,33 @@ class UbuntuDistributionManager(
         onProgress: (String) -> Unit = {},
     ): SetupReport {
         val warnings = mutableListOf<String>()
+        requireOnline("starting setup")
         onStep(SetupStep.REGISTER_USER)
         registerUbuntuUser()
         onStep(SetupStep.PREPARE_WORKSPACE)
         prepareWorkspace()
         onStep(SetupStep.CONFIGURE_DNS)
         configureDns()
+        // Still inside the DNS step's label: resolution is verified from inside proot before a
+        // single package byte is fetched, so a dead resolver is named as DNS — not discovered by
+        // exhausting the whole mirror ladder ten minutes later.
+        verifyResolution()
         onStep(SetupStep.CONFIGURE_APT)
         configureAptSources()
         onStep(SetupStep.UPDATE_PACKAGES)
+        // The first proot execution used to be the apt rung itself, which is how a broken runtime
+        // read as "every mirror is down". The smoke command answers before any archive is asked
+        // anything, and its verdict is a [UserspaceFailure.ProotLaunchFailed].
+        verifyRuntime()
+        // The dpkg repair prologue: an interrupted earlier install leaves dpkg half-configured,
+        // and apt refuses to proceed until `dpkg --configure -a` has run — the one state Repair
+        // is routed to, so Repair itself must be able to clear it (tolerated here: the ladder is
+        // the real verdict, this pass only clears what it can).
+        repairPackageState(warnings, onProgress)
+        requireOnline("updating package lists")
         aptUpdate(onProgress)
         onStep(SetupStep.INSTALL_BASE_PACKAGES)
-        installBasePackages(onProgress)
+        installBasePackages(onProgress, warnings)
         configureSudo(warnings)
         onStep(SetupStep.INSTALL_NODEJS)
         installNodeJs(warnings, onProgress)
@@ -167,24 +210,92 @@ class UbuntuDistributionManager(
     }
 
     private fun configureDns() {
+        val servers = filterDnsServers(dnsServers())
+        writtenDnsServers = servers
         val resolv = File(rootfs, "etc/resolv.conf")
         // Ubuntu Base ships this as a symlink into /run/systemd/resolve, which does not exist
         // under proot; replace it with a real file or every name lookup fails.
         resolv.delete()
         resolv.writeText(
             buildString {
-                dnsServers.forEach { append("nameserver $it\n") }
+                servers.forEach { append("nameserver $it\n") }
                 append("options timeout:2 attempts:3\n")
             },
+        )
+        diagnostics.record(
+            UserspaceDiagnosticCategory.DNS,
+            "resolv.conf written",
+            detail = servers.joinToString(" "),
         )
     }
 
     /**
-     * Writes the primary archive into sources.list. The first `apt-get update` rung runs against
-     * exactly this file; [aptUpdate] rewrites it only when a rung further down the ladder wins.
+     * Proves resolution works from inside proot before anything network-heavy runs: `getent`
+     * against the archive host the ladder's first rung will ask for. A failure here is a typed
+     * [UserspaceFailure.DnsUnresolved] naming the resolvers that were written — not a mirror
+     * verdict ten minutes later.
+     *
+     * Launcher-aware: if proot itself cannot run, `getent` never executed and the exit code is
+     * the launcher's — that is a [UserspaceFailure.ProotLaunchFailed], not a DNS fact.
+     */
+    private suspend fun verifyResolution() {
+        val startedAt = System.currentTimeMillis()
+        val result = runRootCommand("getent hosts $networkHost", RESOLUTION_TIMEOUT_MS)
+        val failure = UserspaceFailure.fromAptRun(
+            networkHost,
+            result?.exitCode,
+            result?.outputText() ?: "",
+            dnsServers = writtenDnsServers,
+        )
+        if (failure is UserspaceFailure.ProotLaunchFailed) throw failure
+        if (result == null || result.exitCode != 0) {
+            throw UserspaceFailure.DnsUnresolved(
+                servers = writtenDnsServers,
+                detail = if (result == null) {
+                    "the check did not answer within ${RESOLUTION_TIMEOUT_MS / 1000} seconds"
+                } else {
+                    result.outputText().take(500).ifBlank { "getent hosts $networkHost failed without a word" }
+                },
+            )
+        }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.DNS,
+            "resolution verified",
+            detail = networkHost,
+            exitCode = 0,
+            durationMs = System.currentTimeMillis() - startedAt,
+        )
+    }
+
+    /**
+     * Writes the primary archive into sources.list, and retires every apt source the rootfs
+     * shipped that the app did not write. Ubuntu Base's newer releases carry a deb822
+     * `ubuntu.sources` pointed at the primary archive: left alone, every rung would fetch the
+     * failing primary alongside the mirror under test and the ladder could never succeed. The
+     * app's own NodeSource entry is ours, not a shipped one — a repair must not retire it.
      */
     private fun configureAptSources() {
+        disableShippedAptLists()
         writeSourcesList(primaryArchiveUrl(distro))
+    }
+
+    private fun disableShippedAptLists() {
+        val dir = File(rootfs, "etc/apt/sources.list.d")
+        val shipped = dir.listFiles() ?: return
+        for (file in shipped) {
+            val name = file.name
+            val ours = name == NODESOURCE_LIST_FILE
+            val aptList = name.endsWith(".list") || name.endsWith(".sources")
+            if (!ours && aptList && !name.endsWith(".disabled")) {
+                if (file.renameTo(File(dir, "$name.disabled"))) {
+                    diagnostics.record(
+                        UserspaceDiagnosticCategory.APT,
+                        "shipped source disabled",
+                        detail = name,
+                    )
+                }
+            }
+        }
     }
 
     /**
@@ -196,12 +307,27 @@ class UbuntuDistributionManager(
      * Repair — and every later `apt-get install` — reuses the mirror that actually worked on this
      * device, on this network.
      *
-     * A rung that fails or times out is a fact about the network, not about the install; only
-     * every rung failing ends the step, and then the error names every archive tried and the tail
-     * of the last attempt, because "could not update" alone would hide which mirror said why.
+     * Every rung runs *scoped* — `Dir::Etc::sourcelist` pinned to the sources.list it just wrote,
+     * `sourceparts` pointed at /dev/null — so a rung's verdict is a fact about the archive under
+     * test, not about whatever else the rootfs's `sources.list.d` carries. The winner is then
+     * confirmed by one unscoped update, which picks up the other lists too (a NodeSource entry,
+     * on a repair).
+     *
+     * Three verdicts are not any mirror's, and the ladder treats them accordingly: a rung that
+     * dies with the launcher's exit code (126/127/128+n) or with proot's own error text aborts
+     * the whole step as a [UserspaceFailure.ProotLaunchFailed] — descending would only burn every
+     * remaining rung against a broken runtime; a timed-out rung is recorded and the ladder moves
+     * on; and when every rung has failed, the failure is classified from the evidence and thrown
+     * typed, the last-known-good mirror is restored into sources.list first (an exhausted ladder
+     * must not leave the last failed mirror as the rootfs's standing configuration), and the
+     * message names every archive tried, what the mirror feed said, and the tail of the last
+     * attempt.
      */
     private suspend fun aptUpdate(onProgress: (String) -> Unit) {
         val failures = mutableListOf<String>()
+        // (baseUri, exitCode, output) per failed rung — the evidence the exhaustion classifier
+        // walks, in ladder order.
+        val evidence = mutableListOf<Triple<String, Int?, String>>()
         var lastTail = ""
         // The ladder starts with the two primary rungs alone; the fallback rungs join only once
         // both have failed, at the bottom of the loop.
@@ -210,15 +336,80 @@ class UbuntuDistributionManager(
         while (rungs.isNotEmpty()) {
             val attempt = rungs.removeFirst()
             writeSourcesList(attempt.baseUri)
-            val result = runRootCommand(aptUpdateCommand(attempt), APT_UPDATE_ATTEMPT_TIMEOUT_MS, lineTracker(onProgress))
-            if (result != null && result.exitCode == 0) return
+            val startedAt = System.currentTimeMillis()
+            val result = runRootCommand(aptUpdateCommand(attempt), aptUpdateAttemptTimeoutMs, lineTracker(onProgress))
+            val durationMs = System.currentTimeMillis() - startedAt
+            if (result != null && result.exitCode == 0) {
+                recordLastGoodMirror(attempt.baseUri)
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "rung won",
+                    detail = attempt.baseUri,
+                    exitCode = 0,
+                    durationMs = durationMs,
+                )
+                // The scoped rung only refreshed the archive under test; one unscoped update
+                // confirms the whole sources tree. Best-effort: the lists the install needs are
+                // already on disk, and a third-party entry failing here must not undo a won rung.
+                val unscoped = runRootCommand(
+                    aptUpdateCommand(attempt, scoped = false),
+                    aptUpdateAttemptTimeoutMs,
+                    lineTracker(onProgress),
+                )
+                if (unscoped == null || unscoped.exitCode != 0) {
+                    diagnostics.record(
+                        UserspaceDiagnosticCategory.APT,
+                        "unscoped confirmation failed",
+                        detail = "after ${attempt.baseUri}",
+                        exitCode = unscoped?.exitCode,
+                    )
+                }
+                return
+            }
+            val output = result?.outputText() ?: ""
             failures +=
                 if (result == null) {
-                    "${attempt.baseUri}: timed out after ${APT_UPDATE_ATTEMPT_TIMEOUT_MS / 60000} minutes"
+                    "${attempt.baseUri}: timed out after ${aptUpdateAttemptTimeoutMs / 60000} minutes"
                 } else {
                     "${attempt.baseUri}: exit ${result.exitCode}"
                 }
-            lastTail = result?.outputText()?.take(2000) ?: lastTail
+            // A null result carries no signature at all, so it can never be mistaken for the
+            // launcher's — the timeout is recorded, and the ladder moves on to the next rung.
+            evidence += Triple(attempt.baseUri, result?.exitCode, output.take(2000))
+            lastTail = output.take(2000).ifBlank { lastTail }
+            if (result == null) {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "rung timed out",
+                    detail = attempt.baseUri,
+                    durationMs = durationMs,
+                )
+            } else {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "rung failed",
+                    detail = "${attempt.baseUri}" +
+                        (output.lineSequence().map { it.trim() }.firstOrNull { it.startsWith("Err:") || it.startsWith("E:") }
+                            ?.let { " $it" } ?: ""),
+                    exitCode = result.exitCode,
+                    durationMs = durationMs,
+                )
+            }
+            UserspaceFailure.fromAptRun(attempt.baseUri, result?.exitCode, output, dnsServers = writtenDnsServers)
+                ?.let { classified ->
+                    if (classified is UserspaceFailure.ProotLaunchFailed) {
+                        // The launcher's exit codes and proot's own error text are facts about
+                        // the runtime, not about this or any mirror: descend no further.
+                        diagnostics.record(
+                            UserspaceDiagnosticCategory.PROOT,
+                            "ladder aborted",
+                            detail = "rung ${attempt.baseUri}",
+                            exitCode = result?.exitCode,
+                        )
+                        restoreLastGoodMirror()
+                        throw classified
+                    }
+                }
             if (rungs.isEmpty() && !extendedWithFallbacks) {
                 // Both primary rungs are gone: only now is the live mirror list worth a fetch —
                 // a happy-path install must not pay for the fallbacks it never needs. The fetch
@@ -230,9 +421,106 @@ class UbuntuDistributionManager(
                 rungs += fallbackCandidates(distro, fetched)
             }
         }
-        throw IOException(
-            "Updating package lists failed on every archive tried: ${failures.joinToString("; ")}" +
-                (lastTail.takeIf { it.isNotBlank() }?.let { " - last output: $it" } ?: ""),
+        restoreLastGoodMirror()
+        val feedNote = mirrorFeedStatus?.let { " (mirror feed: $it)" } ?: ""
+        val summary =
+            "every archive tried: ${failures.joinToString("; ")}$feedNote" +
+                (lastTail.takeIf { it.isNotBlank() }?.let { " - last output: $it" } ?: "")
+        // First rung whose evidence the taxonomy recognizes decides the type; the summary rides
+        // along as the detail so no rung stops being named.
+        throw evidence.firstNotNullOfOrNull { (uri, exitCode, output) ->
+            UserspaceFailure.fromAptRun(uri, exitCode, output, dnsServers = writtenDnsServers, detail = summary)
+        } ?: IOException(
+            "Updating package lists failed on every archive tried: $summary",
+        )
+    }
+
+    /**
+     * `dpkg --configure -a` plus an `apt-get -f install`, run before the ladder: the one pass
+     * that can clear a half-configured dpkg state. Tolerated — its failure is captured and
+     * reported as a warning, because the ladder below is the step's real verdict and a fresh
+     * rootfs has nothing to configure anyway.
+     */
+    private suspend fun repairPackageState(warnings: MutableList<String>, onProgress: (String) -> Unit) {
+        val startedAt = System.currentTimeMillis()
+        val result = runRootCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        val ok = result != null && result.exitCode == 0
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            "dpkg repair pass",
+            exitCode = result?.exitCode,
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = if (ok) null else result?.outputText()?.take(200),
+        )
+        if (!ok) {
+            warnings +=
+                "the dpkg repair pass did not fully succeed" +
+                    (result?.outputText()?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                        ?.let { ": $it" } ?: ": the pass did not answer in time")
+        }
+    }
+
+    /**
+     * The runtime smoke step: `echo <marker>` under the same argv every scripted command uses.
+     * The whole point is that this is the first proot execution in the pipeline — before it, the
+     * ladder's apt rung was, and a runtime that could not launch at all reported itself as an
+     * all-mirrors-failed apt error. Non-zero, silent, or over-budget: a typed
+     * [UserspaceFailure.ProotLaunchFailed] that names the runtime, not any mirror.
+     */
+    private suspend fun verifyRuntime() {
+        val startedAt = System.currentTimeMillis()
+        val result = runRootCommand("echo $RUNTIME_SMOKE_MARKER", RUNTIME_SMOKE_TIMEOUT_MS)
+        val ok = result != null && result.exitCode == 0 && result.outputText().contains(RUNTIME_SMOKE_MARKER)
+        diagnostics.record(
+            UserspaceDiagnosticCategory.PROOT,
+            "smoke",
+            exitCode = result?.exitCode,
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = if (ok) null else "echo marker not answered",
+        )
+        if (!ok) {
+            throw UserspaceFailure.ProotLaunchFailed(
+                exitCode = result?.exitCode ?: -1,
+                tail = result?.outputText()?.take(2000) ?: "",
+                detail = if (result == null) {
+                    "the smoke command did not answer within ${RUNTIME_SMOKE_TIMEOUT_MS / 1000} seconds"
+                } else {
+                    null
+                },
+            )
+        }
+    }
+
+    /** The offline gate for the network-heavy phases: one check, one typed verdict. */
+    private fun requireOnline(phase: String) {
+        if (!networkOnline()) {
+            diagnostics.record(UserspaceDiagnosticCategory.APT, "offline gate", detail = phase)
+            throw UserspaceFailure.Offline(detail = "checked before $phase")
+        }
+    }
+
+    /**
+     * Persists the winning mirror base to this manager's own sidecar — not the userspace state
+     * file, whose lifecycle is the manager-above's — so a later exhausted ladder has something
+     * known-good to restore.
+     */
+    private fun recordLastGoodMirror(baseUri: String) {
+        runCatching { File(runtime.rootDir, LAST_GOOD_MIRROR_FILE).writeText(baseUri) }
+            .onFailure {
+                diagnostics.record(UserspaceDiagnosticCategory.APT, "last-good-mirror write failed", detail = it.message)
+            }
+    }
+
+    /** Restores the last-known-good mirror — or the primary, when none has ever won — into sources.list. */
+    private fun restoreLastGoodMirror() {
+        val lastGood = runCatching { File(runtime.rootDir, LAST_GOOD_MIRROR_FILE).takeIf { it.isFile }?.readText()?.trim() }
+            .getOrNull()
+        val base = lastGood?.takeIf { it.isNotBlank() } ?: primaryArchiveUrl(distro)
+        writeSourcesList(base)
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            "restored mirror",
+            detail = base + (if (lastGood == null) " (primary; no last-known-good recorded)" else ""),
         )
     }
 
@@ -241,15 +529,50 @@ class UbuntuDistributionManager(
      * years behind (jammy ships 12.x, end-of-life since 2022), and the spec's toolchain — `pnpm`,
      * the OpenCode CLI — needs a modern runtime, so [installNodeJs] installs a current one from
      * the pinned NodeSource repository instead.
+     *
+     * Not all-or-nothing: the whole list is asked for first; a failure retries once with
+     * `--fix-missing` (a partially-populated cache from an interrupted earlier run is exactly
+     * what it exists for); a second failure falls back to installing the list package by
+     * package, so one unavailable package becomes a warning, not a failed install. Only every
+     * single package failing ends the step — that is a broken apt, not a missing one.
      */
-    private suspend fun installBasePackages(onProgress: (String) -> Unit) {
-        requireRoot(
-            "Installing base packages",
-            "apt-get install -y --no-install-recommends ${BASE_PACKAGES.joinToString(" ")}",
-            INSTALL_TIMEOUT_MS,
-            onOutput = lineTracker(onProgress),
-        )
+    private suspend fun installBasePackages(onProgress: (String) -> Unit, warnings: MutableList<String>) {
+        requireOnline("installing the base packages")
+        val command = basePackagesCommand()
+        val first = runRootCommand(command, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        if (first != null && first.exitCode == 0) return
+        val retry = runRootCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        if (retry != null && retry.exitCode == 0) {
+            warnings += "base packages needed a --fix-missing retry to install"
+            return
+        }
+        var installed = 0
+        for (pkg in BASE_PACKAGES) {
+            val result = runRootCommand("apt-get install -y --no-install-recommends $pkg", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+            if (result != null && result.exitCode == 0) {
+                installed++
+            } else {
+                warnings +=
+                    "package '$pkg' was not installed" +
+                        (result?.outputText()?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                            ?.let { ": $it" } ?: ": the install did not answer in time")
+            }
+        }
+        if (installed == 0) {
+            throw UserspaceFailure.fromCommandOutput(
+                "Installing base packages",
+                first?.exitCode ?: retry?.exitCode,
+                first?.outputText() ?: retry?.outputText() ?: "",
+                dnsServers = writtenDnsServers,
+            ) ?: IOException(
+                "Installing base packages failed (exit ${first?.exitCode ?: retry?.exitCode}): " +
+                    (first?.outputText() ?: retry?.outputText() ?: "").take(2000),
+            )
+        }
     }
+
+    private fun basePackagesCommand(): String =
+        "apt-get install -y --no-install-recommends ${BASE_PACKAGES.joinToString(" ")}"
 
     /**
      * Gives `ubuntu` passwordless sudo. Every file in the rootfs is already owned by the app uid,
@@ -331,17 +654,37 @@ class UbuntuDistributionManager(
     // ------------------------------------------------------------------ command helpers
 
     /**
-     * The environment for scripted root commands: the runtime's clean base plus the one knob apt
-     * tooling needs to never stop and ask a question no pty user is there to answer.
+     * The environment for scripted root commands: the runtime's clean base plus the knobs apt
+     * tooling needs to never stop and ask a question no pty user is there to answer, and two
+     * deliberate adjustments of its own —
+     *
+     *  - `PATH` gains `$HOME/.local/bin` (first, where a login shell would put it), because
+     *    `pip install --user` and friends land there and nothing found them;
+     *  - `LC_ALL=C` pins apt's message text to English, which the failure classifier's regexes
+     *    read. A locale-dependent "E:" line would classify as nothing; this pin makes the text a
+     *    contract.
      */
-    private fun rootEnv(): List<String> = runtime.baseEnv() + "DEBIAN_FRONTEND=noninteractive"
+    private fun rootEnv(): List<String> =
+        runtime.baseEnv()
+            .map { entry ->
+                if (entry.startsWith("PATH=")) {
+                    "PATH=$HOME_DIR/.local/bin:${entry.removePrefix("PATH=")}"
+                } else {
+                    entry
+                }
+            } + listOf("LC_ALL=C", "DEBIAN_FRONTEND=noninteractive")
 
     private suspend fun runRootCommand(
         command: String,
         timeoutMs: Long,
         onOutput: ((ByteArray) -> Unit)? = null,
-    ): ProotCommandResult? =
+    ): ProotCommandResult? = try {
         runtime.runCommand(runtime.commandArgv(command, asRoot = true), env = rootEnv(), timeoutMs = timeoutMs, onOutput = onOutput)
+    } catch (e: IOException) {
+        // Cross-fork contract: the runtime layer refuses to spawn with its own worded message
+        // ("runtime storage not ready: …"); the taxonomy maps it so the user reads one verdict.
+        throw UserspaceFailure.fromMessage(e.message ?: "", e) ?: e
+    }
 
     /**
      * Runs a command through the *session* argv — no fake root — because [healthProbe] must prove
@@ -349,22 +692,6 @@ class UbuntuDistributionManager(
      */
     private suspend fun runSessionCommand(command: String, timeoutMs: Long): ProotCommandResult? =
         runtime.runCommand(runtime.sessionArgv(command), env = runtime.baseEnv(), timeoutMs = timeoutMs)
-
-    private suspend fun requireRoot(
-        step: String,
-        command: String,
-        timeoutMs: Long,
-        onOutput: ((ByteArray) -> Unit)? = null,
-    ): ProotCommandResult {
-        val result = runRootCommand(command, timeoutMs, onOutput)
-            ?: throw IOException("$step timed out after ${timeoutMs / 60000} minutes")
-        if (result.exitCode != 0) {
-            // The tail, not the whole log: apt failures name the failing step near the end, and a
-            // full npm transcript would bury it.
-            throw IOException("$step failed (exit ${result.exitCode}): ${result.outputText().take(2000)}")
-        }
-        return result
-    }
 
     /**
      * Wraps [ProotRuntime.runCommand]'s chunk callback into "the newest line of output", which is
@@ -386,27 +713,49 @@ class UbuntuDistributionManager(
 
     /**
      * The always-current official mirror feed, fetched once [aptUpdate] has exhausted the primary
-     * archive. Plain HTTP on purpose: the guest apt has no CA store until `ca-certificates` installs
-     * from the base packages this very update unlocks, and plain-HTTP mirrors are still
-     * integrity-safe because apt verifies the GPG-signed Release files end to end.
+     * archive, over HTTPS: this fetch runs on the Android side, through the platform's own trust
+     * store, so the "guest apt has no CA store" argument for plain-HTTP mirrors does not apply to
+     * it — and since targetSdk 28 the platform denies cleartext by default, which silently turned
+     * the old http feed into a dead rung. A `file:` URL is served from disk, so tests inject a
+     * feed without touching the network.
      *
-     * Any failure reads as an empty list — the built-in fallbacks still run, so the feed is never
-     * a new single point of failure.
+     * Any failure reads as an empty list with a recorded outcome — the built-in fallbacks still
+     * run, so the feed is never a new single point of failure, and the exhaustion message can say
+     * whether the feed was unreachable or simply named nothing usable.
      */
     private suspend fun fetchMirrorList(): List<String> = withContext(Dispatchers.IO) {
-        val body = runCatching {
-            val connection = URL(mirrorListUrl).openConnection() as HttpURLConnection
-            connection.connectTimeout = MIRROR_FETCH_TIMEOUT_MS
-            connection.readTimeout = MIRROR_FETCH_TIMEOUT_MS
-            try {
-                val code = connection.responseCode
-                if (code !in 200..299) return@runCatching ""
-                connection.inputStream.bufferedReader().use { it.readText() }
-            } finally {
-                connection.disconnect()
-            }
-        }.getOrDefault("")
-        parseMirrorList(body, primaryArchiveUrl(distro))
+        val outcome = runCatching { fetchFeedBody() }
+        val body = outcome.getOrNull()
+        val mirrors = body?.let { parseMirrorList(it, primaryArchiveUrl(distro)) } ?: emptyList()
+        mirrorFeedStatus = when {
+            outcome.isFailure ->
+                "unreachable" + outcome.exceptionOrNull()
+                    ?.let { " (${(it.message ?: it.javaClass.simpleName).take(100)})" }
+            mirrors.isEmpty() -> "fetched, but it named no usable mirror"
+            else -> "ok, ${mirrors.size} mirrors"
+        }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            "mirror feed",
+            detail = "$mirrorListUrl -> $mirrorFeedStatus",
+        )
+        mirrors
+    }
+
+    private fun fetchFeedBody(): String {
+        if (mirrorListUrl.startsWith("file:")) {
+            return File(URI(mirrorListUrl).path).readText()
+        }
+        val connection = URL(mirrorListUrl).openConnection() as HttpURLConnection
+        connection.connectTimeout = MIRROR_FETCH_TIMEOUT_MS
+        connection.readTimeout = MIRROR_FETCH_TIMEOUT_MS
+        return try {
+            val code = connection.responseCode
+            check(code in 200..299) { "HTTP $code" }
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
     }
 
     private val networkHost: String
@@ -427,8 +776,11 @@ class UbuntuDistributionManager(
         /**
          * Ubuntu's official mirror list, generated fresh per request and sorted for the asking
          * IP's region. This — not a hardcoded list — is what keeps the fallback mirrors current.
+         * HTTPS because the fetch runs on the Android side through the platform trust store; the
+         * guest apt's lack of a CA store constrains the *entries* (see [parseMirrorList]), not
+         * the feed.
          */
-        const val DEFAULT_MIRROR_LIST_URL = "http://mirrors.ubuntu.com/mirrors.txt"
+        const val DEFAULT_MIRROR_LIST_URL = "https://mirrors.ubuntu.com/mirrors.txt"
 
         /**
          * The apt-delivered toolchain: editors and file tools, certificates, git, Python, sudo and
@@ -461,6 +813,9 @@ class UbuntuDistributionManager(
         private const val NODESOURCE_KEY_URL =
             "https://deb.nodesource.com/gpgkey/nodesource.gpg.key"
 
+        /** The file [installNodeJs] writes — ours, never to be retired by [disableShippedAptLists]. */
+        private const val NODESOURCE_LIST_FILE = "nodesource.list"
+
         /** One pinned major Node series; a bump is a deliberate change, not drift. */
         private const val NODESOURCE_REPO = "https://deb.nodesource.com/node_24.x"
 
@@ -483,9 +838,24 @@ class UbuntuDistributionManager(
 
         private const val PROBE_MARKER = "eclipse-probe-ok"
 
+        /** What the runtime smoke step echoes back; anything else — or nothing — is a launch failure. */
+        private const val RUNTIME_SMOKE_MARKER = "eclipse-runtime-ok"
+
+        /** The dpkg repair prologue, verbatim: configure half-installed packages, then fix broken deps. */
+        private const val DPKG_REPAIR_COMMAND = "dpkg --configure -a && apt-get -y -f install"
+
+        /** This manager's own sidecar for the last mirror that won a rung. */
+        private const val LAST_GOOD_MIRROR_FILE = "last-good-mirror"
+
         private const val PROBE_TIMEOUT_MS = 2 * 60_000L
         private const val NETWORK_TIMEOUT_MS = 60_000L
         private const val APT_TIMEOUT_MS = 5 * 60_000L
+
+        /** The in-proot resolution check: short, because a wedged resolver is a wedged resolver. */
+        private const val RESOLUTION_TIMEOUT_MS = 15_000L
+
+        /** The runtime smoke command must answer quickly or the runtime is not answering at all. */
+        private const val RUNTIME_SMOKE_TIMEOUT_MS = 15_000L
 
         /**
          * One apt-update rung. Shorter than the step used to wait on a single archive, because a
@@ -577,32 +947,75 @@ private const val FETCHED_MIRROR_RUNGS = 3
  * Parses the official mirror feed's body into ladder candidates. Pure on purpose — the rules are
  * decision logic and get tested like the ladder itself.
  *
- * The rules: one URL per line; plain `http://` only (the guest apt has no CA store until
- * `ca-certificates` installs from the base packages this update unlocks, while a plain-HTTP mirror
- * is still integrity-safe because apt verifies the GPG-signed Release files); trailing slashes
- * trimmed so `http://x/ubuntu/` and `http://x/ubuntu` dedupe; the primary archive dropped (it has
- * already failed twice by the time this list is consulted); and only the first
- * [FETCHED_MIRROR_RUNGS] kept, in the feed's order — the feed is geo-sorted for the asking IP, so
- * the first entries are the nearest ones.
+ * The rules: one URL per line matching [MIRROR_ENTRY] exactly — plain `http://` with a bare
+ * registered hostname, an optional port, and a path over the path-safe characters, nothing else.
+ * The guest apt has no CA store until `ca-certificates` installs from the base packages this
+ * update unlocks (so `https` entries stay out), and a hostile feed must not smuggle suite or
+ * component fields, a `#` fragment, userinfo or anything else past `trim()` and into a generated
+ * `deb` line. Trailing slashes are trimmed so `http://x/ubuntu/` and `http://x/ubuntu` dedupe;
+ * the primary archive is dropped (it has already failed twice by the time this list is
+ * consulted); and only the first [FETCHED_MIRROR_RUNGS] are kept, in the feed's order — the feed
+ * is geo-sorted for the asking IP, so the first entries are the nearest ones.
  */
 internal fun parseMirrorList(body: String, primaryArchiveUrl: String): List<String> =
     body.lineSequence()
         .map { it.trim().trimEnd('/') }
-        .filter { it.startsWith("http://") }
+        .filter { MIRROR_ENTRY.matches(it) }
         .distinct()
         .filter { it != primaryArchiveUrl }
         .take(FETCHED_MIRROR_RUNGS)
         .toList()
 
+/** The exact shape a feed entry may take: http, bare host, optional port, tame path — nothing else. */
+private val MIRROR_ENTRY = Regex("""http://[A-Za-z0-9.-]+(:\d+)?(/[A-Za-z0-9._~/-]*)?""")
+
+/**
+ * Filters the platform's resolver list down to what `/etc/resolv.conf` can honestly carry. Pure
+ * on purpose — the rules are decision logic and get tested like the ladder.
+ *
+ * The rules: parseable literals only (a scope-suffixed link-local like `fe80::1%wlan0` is
+ * unparseable by glibc's `res_init` and would sit as a dead nameserver eating the lookup
+ * budget); IPv4 before IPv6 (a rung can force IPv4, and a v6-only list then resolves nothing);
+ * at most [MAX_DNS_SERVERS] entries kept, minus one slot reserved for a public fallback
+ * resolver appended last — so a degenerate platform list degrades to slow instead of failing,
+ * and never silently exceeds the three nameservers glibc reads.
+ */
+internal fun filterDnsServers(candidates: List<String>): List<String> {
+    val ipv4 = candidates.filter { isIpv4Literal(it) }.distinct()
+    val ipv6 = candidates.filter { isIpv6Literal(it) }.distinct()
+    val platform = (ipv4 + ipv6).take(MAX_DNS_SERVERS - 1)
+    val fallback = UbuntuDistributionManager.DEFAULT_DNS_SERVERS.firstOrNull { it !in platform } ?: return platform
+    return platform + fallback
+}
+
+/** glibc reads at most three nameservers; a fourth would be silently dropped, not queued. */
+private const val MAX_DNS_SERVERS = 3
+
+/** A dotted quad with each octet in range — `res_init` parses exactly this and nothing more. */
+private fun isIpv4Literal(candidate: String): Boolean {
+    if (!candidate.matches(Regex("""\d{1,3}(\.\d{1,3}){3}"""))) return false
+    return candidate.split('.').all { it.toInt() in 0..255 }
+}
+
+/** An IPv6 literal: hex and colons (IPv4-mapped tail allowed), at least two colons, no scope suffix. */
+private fun isIpv6Literal(candidate: String): Boolean =
+    candidate.count { it == ':' } >= 2 &&
+        candidate.matches(Regex("""[0-9A-Fa-f:]{2,}(\.\d{1,3}){0,2}"""))
+
 /**
  * The apt-get command for one rung of the ladder: three attempts per archive, no translation
  * indexes (a phone install never reads them and they are half the download), and a connect
  * timeout short enough that a black-holed address fails over instead of eating the rung's whole
- * budget. Rung two adds `-o Acquire::ForceIPv4=true` — see [AptUpdateAttempt]. Pure so the test
- * can assert the exact command the pty receives.
+ * budget. Rung two adds `-o Acquire::ForceIPv4=true` — see [AptUpdateAttempt]. Scoped by
+ * default: the rung's verdict must be a fact about the archive under test, not about whatever
+ * else the rootfs's `sources.list.d` carries. Pure so the test can assert the exact command the
+ * pty receives.
  */
-internal fun aptUpdateCommand(attempt: AptUpdateAttempt): String = buildString {
+internal fun aptUpdateCommand(attempt: AptUpdateAttempt, scoped: Boolean = true): String = buildString {
     append("apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none -o Acquire::http::Timeout=30")
+    if (scoped) {
+        append(" -o Dir::Etc::sourcelist=/etc/apt/sources.list -o Dir::Etc::sourceparts=/dev/null")
+    }
     if (attempt.forceIpv4) append(" -o Acquire::ForceIPv4=true")
 }
 
