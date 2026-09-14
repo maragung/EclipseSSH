@@ -976,15 +976,24 @@ private val MIRROR_ENTRY = Regex("""http://[A-Za-z0-9.-]+(:\d+)?(/[A-Za-z0-9._~/
  * The rules: parseable literals only (a scope-suffixed link-local like `fe80::1%wlan0` is
  * unparseable by glibc's `res_init` and would sit as a dead nameserver eating the lookup
  * budget); IPv4 before IPv6 (a rung can force IPv4, and a v6-only list then resolves nothing);
- * at most [MAX_DNS_SERVERS] entries kept, minus one slot reserved for a public fallback
- * resolver appended last — so a degenerate platform list degrades to slow instead of failing,
+ * at most [MAX_DNS_SERVERS] entries kept, with one slot reserved for a public fallback
+ * resolver appended last — unless the platform list already carries a public resolver, in which
+ * case no slot is reserved — so a degenerate platform list degrades to slow instead of failing,
  * and never silently exceeds the three nameservers glibc reads.
  */
 internal fun filterDnsServers(candidates: List<String>): List<String> {
     val ipv4 = candidates.filter { isIpv4Literal(it) }.distinct()
     val ipv6 = candidates.filter { isIpv6Literal(it) }.distinct()
-    val platform = (ipv4 + ipv6).take(MAX_DNS_SERVERS - 1)
-    val fallback = UbuntuDistributionManager.DEFAULT_DNS_SERVERS.firstOrNull { it !in platform } ?: return platform
+    val all = ipv4 + ipv6
+    // The reserved fallback slot exists to guarantee a public resolver; when the platform list
+    // already carries one, the reservation is redundant — a third platform server (the LAN
+    // resolver the device actually uses) serves the user better than a second public one.
+    val fallbacks = UbuntuDistributionManager.DEFAULT_DNS_SERVERS
+    if (fallbacks.any { it in all }) {
+        return all.take(MAX_DNS_SERVERS)
+    }
+    val platform = all.take(MAX_DNS_SERVERS - 1)
+    val fallback = fallbacks.firstOrNull { it !in platform } ?: return platform
     return platform + fallback
 }
 

@@ -4,6 +4,8 @@ import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 
@@ -710,10 +712,19 @@ class UbuntuDistributionManagerTest {
         }
     }
 
-    /** A pty whose read parks once, bounded, then ends the stream: wedged, but never forever. */
+    /**
+     * A pty whose read parks once, bounded, then ends the stream: wedged, but never forever.
+     *
+     * The park honors the PtyProcess contract the runtime's cancellation relies on — close() is
+     * the one thing that can wake a blocked read — so when the rung's timeout closes the process,
+     * the read returns instead of parking out its full budget. A close that left the read parked
+     * would model a kernel bug, not a wedged apt-get.
+     */
     private class WedgedPtyProcess : PtyProcess {
+        private val wake = CountDownLatch(1)
+
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-            Thread.sleep(WEDGE_PARK_MS)
+            wake.await(WEDGE_PARK_MS, TimeUnit.MILLISECONDS)
             return -1
         }
 
@@ -723,7 +734,7 @@ class UbuntuDistributionManagerTest {
 
         override fun awaitExit(): Int = 1
 
-        override fun close() = Unit
+        override fun close() = wake.countDown()
     }
 
     private fun distro(arch: String, release: String = "jammy") =

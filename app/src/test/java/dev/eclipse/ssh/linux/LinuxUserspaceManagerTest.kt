@@ -355,10 +355,19 @@ internal class ScriptedPtySpawner : PtySpawner {
     /** Every spawn's full argv and environment — the exec-model invariant's evidence. */
     val spawns = mutableListOf<SpawnRecord>()
 
-    /** How to answer a command: exit code to output. Replace per test to break things. */
+    /**
+     * How to answer a command: exit code to output. Replace per test to break things.
+     *
+     * The default answers every marker the real pipeline asks: the distribution manager's runtime
+     * smoke (`echo eclipse-runtime-ok`, the first proot execution in setup) and the health probe
+     * (`whoami`, `echo eclipse-probe-ok`). A harness that never overrides respond therefore gets
+     * a userspace that installs and probes clean — the shape every end-to-end test here wants.
+     */
     var respond: (String) -> Pair<Int, String> = { command ->
         if (command == "whoami") {
             0 to "ubuntu\n"
+        } else if (command == "echo eclipse-runtime-ok") {
+            0 to "eclipse-runtime-ok\n"
         } else if (command.startsWith("echo eclipse-probe-ok")) {
             0 to "eclipse-probe-ok\n"
         } else {

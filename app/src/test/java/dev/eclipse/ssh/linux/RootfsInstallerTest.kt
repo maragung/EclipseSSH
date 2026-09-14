@@ -279,11 +279,13 @@ class RootfsInstallerTest {
         // The fixture gzips 3 MB of zeros down to almost nothing; a pin claiming half that
         // compressed size passes the content-length band (exactly at its 2x boundary) while the
         // extraction budget - 10x the pin - lands far below what actually unpacks. That is the
-        // gzip-bomb shape: small download, huge tree.
+        // gzip-bomb shape: small download, huge tree. The pin is the ceiling of half: an odd
+        // fixture length would otherwise floor a byte under the boundary and the download band,
+        // not the extraction budget, would refuse the tarball first.
         val distro = TestTarballs.fixtureDistro(
             "https://fixtures.invalid/rootfs.tar.gz",
             TestTarballs.sha256(fixture),
-            rootfsSizeBytes = fixture.length() / 2,
+            rootfsSizeBytes = (fixture.length() + 1) / 2,
         )
         val installer = installInto(root, fixture, distro = distro)
 
