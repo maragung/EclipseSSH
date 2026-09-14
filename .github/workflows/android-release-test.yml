@@ -1,0 +1,477 @@
+# Release APK validation pipeline: the APK that ships is the APK that is
+# tested. Not the debug build, not a Gradle-installed artifact - the actual
+# release asset (per-ABI, release-key signed, R8-minified) is downloaded from
+# the GitHub release, verified, installed on a hosted emulator, and the full
+# instrumented suite runs against it via `am instrument`, with the test APK
+# rebuilt at the same tag and signature-gated against the app.
+#
+# Stages: checkout -> JDK/SDK -> build the release androidTest APK -> obtain
+# the release APK (asset download, or assembleRelease for pre-release
+# validation on a branch) -> verify package/version/ABI/signature -> boot the
+# emulator -> install the release APK -> smoke launch -> run the suite ->
+# scan logcat for crashes/ANRs the suite cannot see -> collect diagnostics ->
+# generate the report -> gate the release (a failure pulls the release back
+# to draft and files an issue) -> optionally run the autonomous repair loop.
+#
+# Why am instrument instead of connectedReleaseAndroidTest: Gradle's connected
+# task installs ITS OWN freshly-built app APK, which would silently test the
+# wrong artifact. Installing the release asset first and running only the
+# test APK guarantees the app under test is the distribution artifact.
+name: Android release test
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to validate (default: latest release)'
+        required: false
+        default: ''
+      api_levels:
+        description: 'Comma-separated emulator API levels (matrix)'
+        required: false
+        default: '35,30'
+      apk_source:
+        description: 'release = download the published asset; build = assembleRelease from this ref (pre-release validation)'
+        required: false
+        default: 'release'
+      run_repair:
+        description: 'Let the autonomous repair job run when ANTHROPIC_AUTH_TOKEN is configured'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Emulator slots are scarce repo-wide; queue rather than cancel, so a
+  # cancelled run never reads as a failed validation.
+  group: android-release-test-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: 'android-37.0'
+  TARGET_SDK: 'android-35'
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
+
+jobs:
+  resolve:
+    name: Resolve the target
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      apk_source: ${{ steps.meta.outputs.apk_source }}
+      api_levels: ${{ steps.meta.outputs.api_levels }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve tag, source and matrix
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            SOURCE="release"
+          else
+            SOURCE="${{ inputs.apk_source }}"
+            TAG="${{ inputs.tag }}"
+            if [ -z "$TAG" ] && [ "$SOURCE" = "release" ]; then
+              TAG="$(gh release view --json tagName --jq .tagName)"
+            fi
+          fi
+          if [ "$SOURCE" = "release" ]; then
+            test -n "$TAG" || { echo "no release tag to validate"; exit 1; }
+          fi
+          # The matrix comes in as "35,30" and leaves as a JSON array.
+          LEVELS="${{ inputs.api_levels }}"
+          [ -n "$LEVELS" ] || LEVELS='35,30'
+          API_LEVELS="$(printf '%s' "$LEVELS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "api_levels=$API_LEVELS" >> "$GITHUB_OUTPUT"
+          echo "validating tag=$TAG source=$SOURCE levels=$API_LEVELS"
+
+  test:
+    name: Release APK on API ${{ matrix.api_level }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        api_level: ${{ fromJson(needs.resolve.outputs.api_levels) }}
+    env:
+      SYSTEM_IMAGE: 'system-images;android-${{ matrix.api_level }};default;x86_64'
+      TAG: ${{ needs.resolve.outputs.tag }}
+      APK_SOURCE: ${{ needs.resolve.outputs.apk_source }}
+      APP_PACKAGE: dev.eclipse.ssh
+      TEST_PACKAGE: dev.eclipse.ssh.test
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the tested code
+        # Release mode: the tag the asset was built from, so the rebuilt test
+        # APK matches the app byte-for-byte in version and resources. Build
+        # mode: the ref the workflow was dispatched on.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.APK_SOURCE == 'release' && env.TAG || github.ref }}
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            emulator
+            ${{ env.SYSTEM_IMAGE }}
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Restore release signing material
+        # The androidTest APK must carry the SAME signature as the released
+        # app or Android refuses the instrumentation pair - so the release
+        # key is needed here even though this job never publishes anything.
+        id: signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PROPERTIES" ]; then
+            mkdir -p keystore
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > keystore/eclipse-release.jks
+            printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > keystore.properties
+            chmod 600 keystore/eclipse-release.jks keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets: the test APK and a build-mode APK would be debug-signed and cannot pair with a release-signed app." >&2
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the release androidTest APK (and app APK in build mode)
+        run: |
+          set -euo pipefail
+          if [ "$APK_SOURCE" = "build" ]; then
+            ./gradlew :app:assembleRelease :app:assembleReleaseAndroidTest
+          else
+            ./gradlew :app:assembleReleaseAndroidTest
+          fi
+          TEST_APK="$(find app/build/outputs/apk/androidTest/release -name '*.apk' | head -1)"
+          test -n "$TEST_APK" || { echo "no androidTest APK produced"; exit 1; }
+          echo "TEST_APK=$TEST_APK" >> "$GITHUB_ENV"
+
+      - name: Obtain the APK under test
+        id: apk
+        run: |
+          set -euo pipefail
+          mkdir -p apk-under-test out
+          if [ "$APK_SOURCE" = "release" ]; then
+            # Per-ABI splits are the distribution artifacts; x86_64 is what
+            # the emulator runs, with the universal build as the fallback.
+            gh release download "$TAG" --dir apk-under-test \
+              --pattern 'app-x86_64-release.apk' --pattern 'app-universal-release.apk' || true
+            APK="$(ls apk-under-test/app-x86_64-release.apk 2>/dev/null || ls apk-under-test/*.apk | head -1)"
+          else
+            APK="$(find app/build/outputs/apk/release -name '*x86_64*.apk' | head -1)"
+            [ -n "$APK" ] || APK="$(find app/build/outputs/apk/release -name '*universal*.apk' | head -1)"
+            [ -n "$APK" ] || APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
+          fi
+          test -n "$APK" || { echo "no release APK found to test"; exit 1; }
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          echo "APK under test: $APK ($(stat -c%s "$APK") bytes)"
+
+      - name: Verify the release APK
+        # Package, version against the checked-out source, ABI, debug flag,
+        # v2+v3 signature - before anything is installed.
+        run: |
+          set -euo pipefail
+          EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
+          EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
+          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
+
+      - name: Enable KVM device permissions
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          for _ in $(seq 1 10); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
+          if [ ! -w /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          test -w /dev/kvm || { echo "/dev/kvm is not openable"; exit 1; }
+
+      - name: Create and boot the headless AVD
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+            --force --name ci-release-test \
+            --package "$SYSTEM_IMAGE" \
+            --device pixel_6
+          if ! "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx ci-release-test; then
+            echo "avdmanager reported success but the emulator cannot see ci-release-test"
+            exit 1
+          fi
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci-release-test \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
+          if ! timeout 120 "$ADB" wait-for-device; then
+            echo "adb never saw the emulator"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+          BOOT=""
+          for _ in $(seq 1 90); do
+            if ! pgrep -f "emulator.*ci-release-test" >/dev/null; then
+              echo "the emulator process died during boot"
+              tail -200 /tmp/emulator.log
+              exit 1
+            fi
+            BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          if [ "$BOOT" != "1" ]; then
+            echo "emulator did not finish booting"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+
+      - name: Install the release APK and smoke-launch it
+        # The one moment this pipeline exists for: the distribution artifact
+        # itself lands on a device. Install failure, startup crash or a
+        # launch that never reports ok all fail here.
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" install -r "$APK"
+          "$ADB" logcat -c
+          LAUNCH="$("$ADB" shell am start -W -n "$APP_PACKAGE/.MainActivity")"
+          echo "$LAUNCH"
+          grep -q "Status: ok" <<<"$LAUNCH" || { echo "the release APK did not launch cleanly"; exit 1; }
+          # The first frame is composed before the screenshot, so the shot is
+          # evidence of the first-run screen, not of a blank window.
+          sleep 5
+          "$ADB" exec-out screencap -p > out/first-launch.png
+          "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS
+
+      - name: Signature-gate the test APK against the app
+        # Android requires the instrumentation pair to share a signer. A
+        # mismatch means the androidTest APK was not signed with the release
+        # key - a pipeline configuration failure worth its own message, not
+        # an app bug to auto-fix.
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
+          APP_CERT="$("$APKSIGNER" verify --print-certs "$APK" | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)"
+          TEST_CERT="$("$APKSIGNER" verify --print-certs "$TEST_APK" | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)"
+          echo "app  cert: $APP_CERT"
+          echo "test cert: $TEST_CERT"
+          [ -n "$APP_CERT" ] && [ "$APP_CERT" = "$TEST_CERT" ] || {
+            echo "the androidTest APK's signature does not match the release APK's -"
+            echo "assembleReleaseAndroidTest must be signed with the release key for am instrument to accept the pair."
+            exit 1
+          }
+
+      - name: Install the test APK and run the full suite
+        # continue-on-error so a failing suite still produces the crash scan,
+        # the diagnostics and the report - evidence first, verdict second.
+        id: suite
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" install -r "$TEST_APK"
+          # timeout(1) is the hang detector: a wedged suite or a frozen UI
+          # fails in 50 minutes instead of eating the job timeout silently.
+          timeout 50m "$ADB" shell am instrument -w \
+            "$TEST_PACKAGE/androidx.test.runner.AndroidJUnitRunner" 2>&1 | tee out/test-stdout.txt
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Scan the device log for crashes and ANRs
+        # Independent of the suite verdict: a passing suite with a crashed
+        # background service is still a failed release.
+        id: crashscan
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" logcat -d -v time > out/logcat-full.txt
+          bash testing/scan-crashes.sh out/logcat-full.txt "$APP_PACKAGE" out/crash-report.json
+
+      - name: Collect diagnostics
+        if: always()
+        run: bash testing/collect-diagnostics.sh out "$APP_PACKAGE" post-suite
+
+      - name: Generate the report
+        if: always()
+        run: |
+          set -euo pipefail
+          SUITE_OK="${{ steps.suite.outcome == 'success' && 'yes' || 'no' }}"
+          CRASH_OK="${{ steps.crashscan.outcome == 'success' && 'yes' || 'no' }}"
+          if [ "$SUITE_OK" = "yes" ] && [ "$CRASH_OK" = "yes" ]; then PASSED=yes; else PASSED=no; fi
+          if [ ! -f out/test-stdout.txt ]; then echo "(the suite never produced output)" > out/test-stdout.txt; fi
+          python3 testing/generate-report.py out "$TAG" "${{ matrix.api_level }}" \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" \
+            out/test-stdout.txt out/release-validation.json \
+            out/crash-report.json "$PASSED"
+          echo "PASSED=$PASSED" >> "$GITHUB_ENV"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-test-api${{ matrix.api_level }}
+          path: out
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Verdict
+        if: always()
+        run: test "$PASSED" = "yes"
+
+      - name: Shred signing material
+        if: always()
+        run: |
+          rm -f keystore.properties
+          rm -rf keystore
+
+  gate:
+    name: Release gate
+    needs: [resolve, test]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Download every matrix report
+        uses: actions/download-artifact@fa0a86b8c8b4b906e4694c3bcc39a2f0b7a8bfa6 # v6.0.0
+        with:
+          pattern: release-test-api*
+          path: reports
+
+      - name: Gate the release and file the failure
+        run: |
+          set -euo pipefail
+          VERDICTS="$(find reports -name release-test-report.md -exec grep -m1 -A0 '^**\(PASS\|FAIL\)**$' {} \; || true)"
+          FAILED_LEGS="$(find reports -name release-test-report.md -exec grep -l '^\*\*FAIL\*\*$' {} \; | wc -l)"
+          if [ "$FAILED_LEGS" -eq 0 ]; then
+            echo "all matrix legs passed"
+            if [ "${{ github.event_name }}" = "release" ]; then
+              gh release comment "$TAG" --body "Validated by the release-test pipeline (android-release-test.yml): the published APK installed, launched, and passed the full instrumented suite with no crash or ANR signatures. Report: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            fi
+            exit 0
+          fi
+          {
+            echo "## Release test failure: $TAG"
+            echo
+            echo "The published release APK failed validation on $FAILED_LEGS emulator leg(s). Per the release gate, the release has been pulled back to draft until the failures are fixed and the pipeline is green."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            for f in $(find reports -name release-test-report.md | sort); do
+              echo "### $f"
+              echo
+              cat "$f"
+              echo
+            done
+            for f in $(find reports -name failure-report.json | sort); do
+              echo "### $f"
+              echo '```json'
+              cat "$f"
+              echo '```'
+            done
+          } > failure-body.md
+          if [ "${{ github.event_name }}" = "release" ]; then
+            gh release edit "$TAG" --draft --latest=false || true
+          fi
+          gh issue create \
+            --title "Release test failure: $TAG" \
+            --body-file failure-body.md \
+            --label release-test-failure || true
+          exit 1
+
+  auto-fix:
+    name: Autonomous repair
+    needs: [resolve, gate]
+    if: failure() && inputs.run_repair != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    steps:
+      - name: Check out the tested code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.apk_source == 'release' && needs.resolve.outputs.tag || github.ref }}
+
+      - name: Download the failure report
+        uses: actions/download-artifact@fa0a86b8c8b4b906e4694c3bcc39a2f0b7a8bfa6 # v6.0.0
+        with:
+          pattern: release-test-api*
+          path: run-artifacts
+
+      - name: Run the repair loop
+        # Does nothing without ANTHROPIC_AUTH_TOKEN (exit 78): the issue
+        # above already carries the full report, and repair falls back to
+        # the maintainer's session. Never a silent skip.
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          MAX_REPAIR_ATTEMPTS: ${{ vars.MAX_REPAIR_ATTEMPTS || '5' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          REPORT="$(find run-artifacts -name failure-report.json | head -1)"
+          test -n "$REPORT" || { echo "no failure report artifact"; exit 1; }
+          BASE_REF="${{ needs.resolve.outputs.apk_source == 'release' && needs.resolve.outputs.tag || github.ref_name }}"
+          bash testing/auto-fix.sh "$REPORT" "$BASE_REF" run-artifacts
