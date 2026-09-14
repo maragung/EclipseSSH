@@ -311,6 +311,10 @@ class LinuxUserspaceManager(
             // proot's temp dir holds its glue symlinks; NOFOLLOW so the sweep cannot chase one out.
             deleteTreeNoFollow(runtime.tmpDir)
             stateFile().delete()
+            // The distribution's mirror memo lives beside the rootfs, not inside it, so it
+            // survives deleteRootfs — but it describes an install that no longer exists, and a
+            // leftover here is why a "removed entirely" root still shows bytes in use.
+            distribution.clearLastGoodMirror()
             // Belt under the not-while-Installing check: a lock left by any path is gone with
             // everything else, so the next install starts from a clean slate.
             storage.releaseInstallLock()

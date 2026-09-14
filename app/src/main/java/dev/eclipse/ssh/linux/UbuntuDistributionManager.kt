@@ -511,6 +511,19 @@ class UbuntuDistributionManager(
             }
     }
 
+    /**
+     * Clears the last-good-mirror sidecar. The uninstall path calls this: the memo describes an
+     * install that no longer exists, and leaving it under the userspace root would make "removed
+     * entirely" a lie a storage-usage read can see. A deleted memo is not a loss — the next
+     * install's ladder re-probes and records a fresh winner.
+     */
+    fun clearLastGoodMirror() {
+        runCatching { File(runtime.rootDir, LAST_GOOD_MIRROR_FILE).delete() }
+            .onFailure {
+                diagnostics.record(UserspaceDiagnosticCategory.APT, "last-good-mirror delete failed", detail = it.message)
+            }
+    }
+
     /** Restores the last-known-good mirror — or the primary, when none has ever won — into sources.list. */
     private fun restoreLastGoodMirror() {
         val lastGood = runCatching { File(runtime.rootDir, LAST_GOOD_MIRROR_FILE).takeIf { it.isFile }?.readText()?.trim() }
