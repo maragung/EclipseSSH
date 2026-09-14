@@ -30,6 +30,14 @@ data class LinuxDistro(
     val rootfsTarballUrl: String,
     /** SHA256 of the tarball; a mismatch aborts the install. */
     val rootfsSha256: String,
+    /**
+     * The pinned tarball's approximate size in bytes, for the storage gates: the free-space
+     * check before the download and the sanity check against what the server reports. It is an
+     * estimate by design — the SHA is the integrity pin — so every check using it allows for
+     * the estimate being wrong in either direction. 0 (the default for hand-built test distros)
+     * means "unknown", and the gates skip rather than guess.
+     */
+    val rootfsSizeBytes: Long = 0L,
 )
 
 /**
@@ -58,6 +66,8 @@ object LinuxDistroCatalog {
         val release: String,
         /** The point release this build was verified against; a bump must re-verify the SHA256s. */
         val pointRelease: String,
+        /** The tarball's approximate size, shared by the per-arch entries; see [LinuxDistro.rootfsSizeBytes]. */
+        val tarballSizeBytes: Long,
         val sha256ByArch: Map<String, String>,
     )
 
@@ -76,6 +86,7 @@ object LinuxDistroCatalog {
         listOf(
             ReleaseSeries(
                 id = "ubuntu-26.04",
+                tarballSizeBytes = 34_000_000L,
                 displayName = "Ubuntu 26.04 LTS",
                 release = "resolute",
                 pointRelease = "26.04.1",
@@ -88,6 +99,7 @@ object LinuxDistroCatalog {
             ),
             ReleaseSeries(
                 id = "ubuntu-24.04",
+                tarballSizeBytes = 31_000_000L,
                 displayName = "Ubuntu 24.04 LTS",
                 release = "noble",
                 pointRelease = "24.04.5",
@@ -100,6 +112,7 @@ object LinuxDistroCatalog {
             ),
             ReleaseSeries(
                 id = "ubuntu-22.04",
+                tarballSizeBytes = 30_000_000L,
                 displayName = "Ubuntu 22.04 LTS",
                 release = "jammy",
                 pointRelease = "22.04.5",
@@ -112,6 +125,7 @@ object LinuxDistroCatalog {
             ),
             ReleaseSeries(
                 id = "ubuntu-20.04",
+                tarballSizeBytes = 29_000_000L,
                 displayName = "Ubuntu 20.04 LTS",
                 release = "focal",
                 pointRelease = "20.04.5",
@@ -137,6 +151,7 @@ object LinuxDistroCatalog {
                         "$CDIMAGE_RELEASES_URL/${s.id.removePrefix("ubuntu-")}/release/" +
                             "ubuntu-base-${s.pointRelease}-base-$arch.tar.gz",
                     rootfsSha256 = s.sha256ByArch.getValue(arch),
+                    rootfsSizeBytes = s.tarballSizeBytes,
                 )
             }
         }

@@ -2,7 +2,9 @@ package dev.eclipse.ssh.linux
 
 import dev.eclipse.ssh.ssh.TerminalChannel
 import java.io.File
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -46,14 +48,18 @@ data class ProotCommandResult(
  * @param rootDir the userspace root (`filesDir/linux`): rootfs, tmp, state and workspace live under it
  * @param nativeLibraryDir the APK's extracted native library directory
  * @param spawner the fork seam — [LinuxPtySpawner] in production, a fake in tests
+ * @param storage the one owner of every userspace path; defaults to one for this root, but the
+ *   graph passes its shared instance so runtime and installer can never disagree about where the
+ *   rootfs lives
  */
 class ProotRuntime(
     val rootDir: File,
     private val nativeLibraryDir: String,
     private val spawner: PtySpawner,
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
 ) {
-    val rootfsDir: File get() = File(rootDir, "rootfs")
-    val tmpDir: File get() = File(rootDir, "tmp")
+    val rootfsDir: File get() = storage.rootfsDir
+    val tmpDir: File get() = storage.tmpDir
 
     /** The proot binary, as the first argv element. */
     private val prootBinary: String get() = File(nativeLibraryDir, "libproot.so").path
@@ -131,11 +137,18 @@ class ProotRuntime(
      * shell is the `ubuntu` account) and the environment of [baseEnv], on a pty of [rows] x
      * [columns].
      *
+     * Storage is verified first: `PROOT_TMP_DIR` names [RuntimeStorageManager.tmpDir], and proot
+     * that cannot write there dies with "can't create temporary directory: Permission denied" —
+     * the historical failure this check exists to make impossible. An environment variable is not
+     * a directory.
+     *
      * The caller owns the returned [PtyProcess] — in production it goes straight into
      * [LocalTerminalChannel], which takes sole ownership of the fd pair.
      */
-    fun spawnSession(rows: Int, columns: Int): PtyProcess =
-        spawner.spawn(sessionArgv(), baseEnv(), spawnCwd.absolutePath, rows, columns)
+    fun spawnSession(rows: Int, columns: Int): PtyProcess {
+        storage.requireReady()
+        return spawner.spawn(sessionArgv(), baseEnv(), spawnCwd.absolutePath, rows, columns)
+    }
 
     /**
      * Runs one proot command to completion and captures what it printed.
@@ -145,6 +158,14 @@ class ProotRuntime(
      * path is [LocalTerminalChannel]'s. The pty exists even for scripted commands because the
      * rootfs's tooling assumes a terminal is present, and proot is only ever started through one.
      *
+     * The read runs as a child job and the timeout waits on it with `await()` — a coroutine parked
+     * in the pty's blocking JNI read has no suspension point, so a timeout wrapped around the read
+     * loop itself could never fire (the historical shape of this method: a wedged `apt-get update`
+     * hung the whole install, pty slot and all). `await()` *is* cancellable, so the timeout fires
+     * on schedule; what the timeout then does is [PtyProcess.close] — the master-side hangup wakes
+     * the blocked read and SIGHUPs the child — which is why the close lives on the timeout path
+     * and in the catch, not only in a finally the timeout could not reach.
+     *
      * [onOutput], when given, sees each chunk as it arrives instead of only at the end. It exists
      * for the minutes-long setup commands: an `apt-get update` whose output nobody sees until it
      * finishes is indistinguishable from a wedged one on the install screen. Called on
@@ -152,7 +173,8 @@ class ProotRuntime(
      * return, nothing more.
      *
      * @param timeoutMs the whole command — output, exit, everything — must finish within this
-     * @return the exit code and output, or null when the command did not finish in time
+     * @return the exit code and output, or null when the command did not finish in time (the
+     *   child has been SIGHUPed by then, not leaked)
      */
     suspend fun runCommand(
         argv: List<String>,
@@ -160,37 +182,65 @@ class ProotRuntime(
         timeoutMs: Long = DEFAULT_COMMAND_TIMEOUT_MS,
         onOutput: ((ByteArray) -> Unit)? = null,
     ): ProotCommandResult? = withContext(Dispatchers.IO) {
+        storage.requireReady()
         val process = spawner.spawn(argv, env, spawnCwd.absolutePath, rows = 24, columns = 80)
+        liveScripted += process
         try {
-            withTimeoutOrNull(timeoutMs) {
-                val collected = mutableListOf<ByteArray>()
-                val chunk = ByteArray(READ_CHUNK)
-                while (true) {
-                    val read = process.read(chunk, 0, chunk.size)
-                    if (read < 0) break
-                    if (read > 0) {
-                        val part = chunk.copyOf(read)
-                        onOutput?.invoke(part)
-                        collected += part
-                    }
-                }
+            val reader = async { readToCompletion(process, onOutput) }
+            val output = withTimeoutOrNull(timeoutMs) { reader.await() }
+            if (output == null) {
+                // Timed out: the reader is still parked in a blocking read no cancellation can
+                // reach. Closing the pty is what unblocks it (master hangup) and SIGHUPs the
+                // child. The reader's read then errors — the expected face of a torn-down pty,
+                // which readToCompletion treats as end-of-stream.
+                runCatching { process.close() }
+                runCatching { reader.await() }
+                null
+            } else {
                 // After end-of-stream the child has exited; the reap is quick and race-free by
                 // design (see linuxpty.c: awaitExit waits on a child that has already terminated).
-                // ByteArray has no flatten(): the sizes are summed first so the single copy is
-                // exact, not a grow-as-you-go buffer.
-                val total = collected.sumOf { it.size }
-                val output = ByteArray(total)
-                var offset = 0
-                for (part in collected) {
-                    part.copyInto(output, offset)
-                    offset += part.size
-                }
                 ProotCommandResult(process.awaitExit(), output)
             }
         } catch (t: Throwable) {
+            // Cancellation and reader failure both land here: either way the child is SIGHUPed
+            // rather than left holding a pty slot.
             runCatching { process.close() }
             throw t
+        } finally {
+            liveScripted -= process
         }
+    }
+
+    /**
+     * Reads one child's output to end-of-stream and returns it as one buffer. A read that throws
+     * ends the stream instead of the command: after a timeout-driven close(), the error IS the
+     * end of the stream.
+     */
+    private fun readToCompletion(
+        process: PtyProcess,
+        onOutput: ((ByteArray) -> Unit)?,
+    ): ByteArray {
+        val collected = mutableListOf<ByteArray>()
+        val chunk = ByteArray(READ_CHUNK)
+        while (true) {
+            val read = runCatching { process.read(chunk, 0, chunk.size) }.getOrDefault(-1)
+            if (read < 0) break
+            if (read > 0) {
+                val part = chunk.copyOf(read)
+                onOutput?.invoke(part)
+                collected += part
+            }
+        }
+        // ByteArray has no flatten(): the sizes are summed first so the single copy is
+        // exact, not a grow-as-you-go buffer.
+        val total = collected.sumOf { it.size }
+        val output = ByteArray(total)
+        var offset = 0
+        for (part in collected) {
+            part.copyInto(output, offset)
+            offset += part.size
+        }
+        return output
     }
 
     companion object {
@@ -198,5 +248,24 @@ class ProotRuntime(
         const val DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000L
 
         private const val READ_CHUNK = 4096
+    }
+
+    // ------------------------------------------------------------------ scripted-process registry
+
+    /** The in-flight runCommand children. */
+    private val liveScripted = CopyOnWriteArrayList<PtyProcess>()
+
+    /** Whether any scripted command is still in flight — consulted before reclaiming storage. */
+    fun hasLiveScriptedProcesses(): Boolean = liveScripted.isNotEmpty()
+
+    /**
+     * SIGHUPs every in-flight scripted command. Each close is best-effort: a child that is
+     * already gone is not an error. The interactive sessions are deliberately untouched — closing
+     * the user's terminals is the process manager's call, not the runtime's.
+     */
+    fun killScriptedProcesses() {
+        for (process in liveScripted) {
+            runCatching { process.close() }
+        }
     }
 }
