@@ -379,6 +379,13 @@ jobs:
           timeout 50m "$ADB" shell am instrument -w \
             "$TEST_PACKAGE/androidx.test.runner.AndroidJUnitRunner" 2>&1 | tee out/test-stdout.txt
           test "${PIPESTATUS[0]}" -eq 0
+          # am instrument -w exits 0 even when the run reports JUnit
+          # failures (run 34839975508: exit 0 with "There were 23
+          # failures" - the whole suite errored and the leg still went
+          # green). The JUnit text summary is the real verdict: "OK (N
+          # tests...)" prints only when every test passed, so a suite that
+          # fails or never runs any test cannot slip through.
+          grep -Eq '^OK \([0-9]+ test' out/test-stdout.txt
 
       - name: Scan the device log for crashes and ANRs
         # Independent of the suite verdict: a passing suite with a crashed

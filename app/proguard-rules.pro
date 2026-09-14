@@ -71,6 +71,37 @@
 # that decides whether to narrow this to the facade classes.
 -keep class kotlin.** { *; }
 
+# Run 34839975508 got past both keeps above and revealed the shape of the
+# whole problem: every EXTERNAL dependency the androidTest code links
+# against counts as "provided by the base APK" for the test APK's R8 pass
+# (so it is not packaged there), while the app's own R8 pass strips or
+# renames it - the class then exists in neither APK under its original name.
+# App-module classes are exempt from this: they ship inside the test APK,
+# which is why SecureVaultInstrumentedTest was the only class whose tests
+# actually passed. The missing set is therefore the library namespaces the
+# androidTest sources and the Compose test rules reference by name:
+#
+#   kotlinx.coroutines.JobKt / DelayWithTimeoutDiagnostics - all 23 test
+#     errors of run 34839975508 (IdlingResourceRegistry init, and class
+#     loading through ScanningTestLoader)
+#   androidx.compose.ui/runtime - the semantics tree the Compose test rules
+#     walk (probe of the shipped v1.1.17 APK: Modifier, ComposeNode,
+#     SemanticsNode, AbstractComposeView, CompositionLocal, Snapshot - all
+#     renamed)
+#   androidx.room and androidx.lifecycle - direct imports of the androidTest
+#     sources (Room, Migration, Lifecycle - all renamed in v1.1.17)
+#   androidx.activity plus its ComponentActivity superclass chain:
+#     androidx.core, androidx.savedstate (createAndroidComposeRule's bound;
+#     both ComponentActivity classes, SavedStateRegistry, LifecycleOwner,
+#     ViewModel probed renamed in v1.1.17)
+-keep class kotlinx.coroutines.** { *; }
+-keep class androidx.compose.** { *; }
+-keep class androidx.room.** { *; }
+-keep class androidx.activity.** { *; }
+-keep class androidx.core.** { *; }
+-keep class androidx.lifecycle.** { *; }
+-keep class androidx.savedstate.** { *; }
+
 # Truth's error-prone annotations reference the javac model API, which Android
 # does not ship; compile-time-only references, never evaluated on a device.
 # Belt under test-proguard-rules.pro in case an androidTest R8 pass consumes
