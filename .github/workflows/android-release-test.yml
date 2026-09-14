@@ -216,9 +216,12 @@ jobs:
           # file and its DSL reference; guarded so a tag that already carries
           # them is untouched.
           if ! grep -q 'testProguardFiles' app/build.gradle.kts; then
-            cat > app/test-proguard-rules.pro <<'RULES'
--dontwarn javax.lang.model.**
-RULES
+            # printf, not a heredoc: the heredoc body would have to sit at
+            # column 0 to close its delimiter, which walks the body out of
+            # this run block's YAML literal scalar and makes the whole
+            # workflow file unparseable (GitHub then registers it triggerless
+            # and every dispatch 422s).
+            printf '%s\n' '-dontwarn javax.lang.model.**' > app/test-proguard-rules.pro
             sed -i '0,/isMinifyEnabled = true/s//isMinifyEnabled = true\n            testProguardFiles("test-proguard-rules.pro")/' app/build.gradle.kts
           fi
           grep -q 'dontwarn javax.lang.model' app/proguard-rules.pro || \
