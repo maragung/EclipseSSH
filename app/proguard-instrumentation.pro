@@ -215,7 +215,7 @@
 -keep class kotlinx.coroutines.YieldContext$Key { *; }
 -keep class kotlinx.coroutines.YieldKt { *; }
 
-# The one app class the androidTest pair reaches into: UbuntuE2eVerificationTest
+# The app classes the androidTest pair reaches into: UbuntuE2eVerificationTest
 # reads graph.runtime / graph.manager, getters nothing in the app calls (the
 # app reads the fields directly), so R8 stripped them while the class itself
 # survived renamed - NoSuchMethodError, not NoClassDefFoundError (android-ubuntu-e2e
@@ -223,7 +223,17 @@
 # or getManager() on the obfuscated LinuxUserspaceGraph). The test APK is
 # compiled against the R8 mapping, so the renamed return types in the kept
 # descriptors line up on both sides.
+#
+# E2E run 34869834710 peeled the next layer: with the graph's getters kept,
+# the suite's own calls into the objects they return started resolving and
+# failing. sessionArgv() is a trivial ProotRuntime facade (it only forwards
+# to commandArgv) that R8 inlined at every app call site and then removed -
+# 9 failures - and LinuxUserspaceManager's state getter and refreshHealth()
+# suspend are members only the suite calls - 2 failures. Whole-class keeps,
+# same reasoning as the graph keep above.
 -keep class dev.eclipse.ssh.di.LinuxUserspaceGraph { *; }
+-keep class dev.eclipse.ssh.linux.ProotRuntime { *; }
+-keep class dev.eclipse.ssh.linux.LinuxUserspaceManager { *; }
 
 # ---------------------------------------------------------------------------
 # Stage 2: androidx.compose, narrowed from the whole-namespace keep in

@@ -253,6 +253,22 @@ class E2eDriver:
             time.sleep(1.2)
         return self.visible("Ubuntu on this device", "Linux userspace")
 
+    def scroll_to_install_button(self, max_swipes=6):
+        """The section's action row sits below the NotInstalled row, and since the
+        version chooser that row also carries a dropdown - so on a fresh install
+        the section is taller than one screen and the Install button lands below
+        the fold. scroll_to_linux_section stops at the section title, and a
+        uiautomator dump only contains on-screen nodes, so tapping without this
+        walk fails with 'the Install button was not found' (E2E run 34869834710).
+        The section is followed only by About, whose rows never say Install, so
+        the first visible Install belongs to the action row."""
+        for _ in range(max_swipes):
+            if self.find(self.dump(), BUTTON_INSTALL):
+                return True
+            self.adb.swipe(540, 1400, 540, 500, 400)
+            time.sleep(1.2)
+        return self.visible(BUTTON_INSTALL)
+
     def start_install_via_ui(self):
         """Settings -> Linux userspace -> Install -> the confirmation dialog's
         Install. Returns once the Installing state is on screen."""
@@ -261,8 +277,10 @@ class E2eDriver:
             raise RuntimeError("the Linux userspace settings section was never visible")
         if not self.find(self.dump(), LABEL_INSTALL_ROW, LABEL_NEEDS_REPAIR, LABEL_INSTALLED):
             raise RuntimeError("no Ubuntu row to install from - unexpected section state")
-        if not self.tap_last(self.dump(), BUTTON_INSTALL):
+        if not self.scroll_to_install_button():
             raise RuntimeError("the Install button was not found")
+        if not self.tap_last(self.dump(), BUTTON_INSTALL):
+            raise RuntimeError("the Install row's Install button could not be tapped")
         time.sleep(1.5)
         # The confirmation dialog. Its Install button is the trailing match - the
         # row's button is still in the hierarchy behind the dialog.
