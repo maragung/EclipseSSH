@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import android.os.StatFs
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 
 /**
  * One owner for every path the Linux userspace keeps on disk, plus the storage-level invariants
@@ -17,10 +18,10 @@ import java.io.IOException
  * variable is not a directory. Every path now comes from here, so the directory and the variable
  * that names it can never drift apart again.
  *
- * Deliberately plain Kotlin — `java.io` and nothing else — so the JVM tests construct it against
- * a temp directory. The one Android dependency, [StatFs], sits behind an injectable probe, and
- * under `returnDefaultValues` unit tests it reports 0, which every caller treats as "unknown",
- * not as "full".
+ * Deliberately plain Kotlin — `java.io`, plus `java.nio.file.Files` where a create must explain
+ * itself (see [ensureDirectory]) — so the JVM tests construct it against a temp directory. The one
+ * Android dependency, [StatFs], sits behind an injectable probe, and under `returnDefaultValues`
+ * unit tests it reports 0, which every caller treats as "unknown", not as "full".
  *
  * @param rootDir the userspace root (`filesDir/linux`); everything below lives under it
  */
@@ -32,6 +33,11 @@ class RuntimeStorageManager(
     private val pidProvider: () -> Int = { android.os.Process.myPid() },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    /** How many times [ensureDirectory] tries before reporting; see its doc for why it retries. */
+    private companion object {
+        const val CREATE_ATTEMPTS = 3
+        const val CREATE_RETRY_DELAY_MS = 250L
+    }
     /** The completed, in-place rootfs. */
     val rootfsDir: File get() = File(rootDir, "rootfs")
 
@@ -71,8 +77,7 @@ class RuntimeStorageManager(
      */
     fun ensureReady(): Result<Unit> = runCatching {
         for (dir in listOf(rootDir, tmpDir, downloadsDir)) {
-            if (!dir.exists() && !dir.mkdirs()) throw IOException("cannot create $dir")
-            if (!dir.isDirectory) throw IOException("$dir is not a directory")
+            ensureDirectory(dir)
         }
         val probe = File(tmpDir, ".probe-${System.nanoTime()}")
         try {
@@ -81,6 +86,48 @@ class RuntimeStorageManager(
         } finally {
             probe.delete()
         }
+    }
+
+    /**
+     * Creates one runtime directory, or proves it already is one.
+     *
+     * A plain `mkdirs()` reports failure as a bare `false`, and every distinct cause collapses into
+     * the same message: a dangling symlink parked at the path (mkdir answers EEXIST, `exists()`
+     * answers false), a transient filesystem error, or a directory another thread created between
+     * the `exists()` check and the `mkdir()`. The first E2E install died exactly here with no way
+     * to tell those apart — `cannot create …/tmp` and nothing else — so this method does three
+     * things a boolean cannot:
+     *
+     *  1. [Files.createDirectories] instead of `mkdirs()`: it throws with the underlying errno as
+     *     the message, and treats a directory that appeared concurrently as success, so the benign
+     *     race stops being a failure at all.
+     *  2. A short retry, because the failure window it guards sits mid-install on CI emulators,
+     *     where a one-off I/O error should not burn a 15-minute run.
+     *  3. A failure message that dumps the observable state of the path — exists, is a directory,
+     *     is a symlink, parent writable, free bytes, and the last errno — so the next artifact
+     *     names the real cause instead of another dead end.
+     */
+    private fun ensureDirectory(dir: File) {
+        if (dir.isDirectory) return
+        var lastFailure: IOException? = null
+        for (attempt in 1..CREATE_ATTEMPTS) {
+            try {
+                Files.createDirectories(dir.toPath())
+                if (dir.isDirectory) return
+                throw IOException("$dir is not a directory")
+            } catch (failure: IOException) {
+                lastFailure = failure
+            }
+            if (attempt < CREATE_ATTEMPTS) Thread.sleep(CREATE_RETRY_DELAY_MS * attempt)
+        }
+        val path = dir.toPath()
+        throw IOException(
+            "cannot create $dir (exists=${dir.exists()} isDirectory=${dir.isDirectory} " +
+                "symlink=${runCatching { Files.isSymbolicLink(path) }.getOrDefault(false)} " +
+                "parentWritable=${dir.parentFile?.canWrite() == true} freeBytes=${freeBytes()}; " +
+                "last reason: ${lastFailure?.message})",
+            lastFailure,
+        )
     }
 
     /**
