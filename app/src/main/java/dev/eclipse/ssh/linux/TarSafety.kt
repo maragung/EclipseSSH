@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import java.io.File
 import java.io.IOException
 import java.io.PushbackInputStream
+import java.nio.file.FileVisitOption
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -116,7 +117,12 @@ internal fun deleteTreeNoFollow(root: File): Boolean {
             FileVisitResult.CONTINUE
     }
     return runCatching {
-        Files.walkFileTree(path, setOf(LinkOption.NOFOLLOW_LINKS), Int.MAX_VALUE, visitor)
+        // walkFileTree never follows symlinks unless FileVisitOption.FOLLOW_LINKS is passed,
+        // so an empty options set IS the no-follow walk: the second parameter is visit
+        // options, not [LinkOption]s, and passing NOFOLLOW_LINKS there does not even compile.
+        // Link targeting stays the visitor's concern: it deletes entries as files, so a
+        // link's target is never touched and no traversal crosses one.
+        Files.walkFileTree(path, emptySet<FileVisitOption>(), Int.MAX_VALUE, visitor)
         true
     }.getOrDefault(false)
 }
