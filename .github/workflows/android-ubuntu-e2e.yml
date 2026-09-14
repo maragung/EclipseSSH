@@ -383,6 +383,11 @@ jobs:
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
+      # gh resolves the repository from a local git checkout, which this job
+      # does not have (it only reads downloaded artifacts); without GH_REPO it
+      # dies with "failed to run git: not a git repository" and the || true on
+      # issue creation swallows it, so no failure issue would ever be filed.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Download every matrix report
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
