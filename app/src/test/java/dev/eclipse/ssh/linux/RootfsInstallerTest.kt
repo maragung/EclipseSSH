@@ -130,7 +130,7 @@ class RootfsInstallerTest {
         assertThat(downloads).isEqualTo(1)
         assertThat(installer.isExtracted()).isFalse()
         // The partial .part file is cleaned up, not left to be mistaken for a resume point.
-        assertThat(root.resolve("rootfs-arm64.tar.gz.part").exists()).isFalse()
+        assertThat(root.resolve("downloads/rootfs-arm64.tar.gz.part").exists()).isFalse()
     }
 
     @Test

@@ -23,9 +23,10 @@ import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
  */
 class LinuxWorkspaceManager(
     private val runtime: ProotRuntime,
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(runtime.rootDir),
 ) {
     /** The workspace, as an outer (Android) path. */
-    val workspaceDir: File get() = File(runtime.rootfsDir, "home/ubuntu/workspace")
+    val workspaceDir: File get() = File(storage.rootfsDir, "home/ubuntu/workspace")
 
     fun exists(): Boolean = workspaceDir.isDirectory
 

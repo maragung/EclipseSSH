@@ -46,14 +46,18 @@ data class ProotCommandResult(
  * @param rootDir the userspace root (`filesDir/linux`): rootfs, tmp, state and workspace live under it
  * @param nativeLibraryDir the APK's extracted native library directory
  * @param spawner the fork seam — [LinuxPtySpawner] in production, a fake in tests
+ * @param storage the one owner of every userspace path; defaults to one for this root, but the
+ *   graph passes its shared instance so runtime and installer can never disagree about where the
+ *   rootfs lives
  */
 class ProotRuntime(
     val rootDir: File,
     private val nativeLibraryDir: String,
     private val spawner: PtySpawner,
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
 ) {
-    val rootfsDir: File get() = File(rootDir, "rootfs")
-    val tmpDir: File get() = File(rootDir, "tmp")
+    val rootfsDir: File get() = storage.rootfsDir
+    val tmpDir: File get() = storage.tmpDir
 
     /** The proot binary, as the first argv element. */
     private val prootBinary: String get() = File(nativeLibraryDir, "libproot.so").path

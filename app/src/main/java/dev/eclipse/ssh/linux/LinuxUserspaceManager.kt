@@ -32,7 +32,8 @@ import kotlinx.coroutines.sync.withLock
  *
  * @param rootDir the userspace root (`filesDir/linux`)
  * @param distro the pinned distribution this manager installs and runs
- * @param backupFile where the keep-workspace uninstall parks its snapshot; deliberately outside
+ * @param backupFile where the keep-workspace uninstall parks its snapshot, when a caller (a test)
+ *   needs its own; by default the storage manager's path, which sits deliberately outside
  *   [rootDir] so an uninstall (which deletes the root) cannot destroy the thing it was keeping
  */
 class LinuxUserspaceManager(
@@ -43,10 +44,17 @@ class LinuxUserspaceManager(
     private val distribution: UbuntuDistributionManager,
     private val processes: LinuxProcessManager,
     private val workspace: LinuxWorkspaceManager,
-    private val backupFile: File = File(rootDir.parentFile, "linux-workspace-backup.tar.gz"),
+    backupFile: File? = null,
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val transition = Mutex()
+
+    /**
+     * The effective backup location: the storage manager's single definition, overridable for
+     * tests that isolate each harness's backup from its neighbours in a shared temp directory.
+     */
+    private val backupFile: File = backupFile ?: storage.workspaceBackupFile
 
     private val _state = MutableStateFlow<LinuxUserspaceState>(initialState())
     val state: StateFlow<LinuxUserspaceState> = _state
@@ -277,7 +285,7 @@ class LinuxUserspaceManager(
             LinuxUserspaceState.NotInstalled
         }
 
-    private fun stateFile(): File = File(rootDir, "state.properties")
+    private fun stateFile(): File = storage.stateFile
 
     /**
      * The constructor's state: persisted facts checked against the filesystem, so a crash, a

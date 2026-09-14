@@ -35,15 +35,16 @@ class RootfsInstaller(
     private val rootDir: File,
     private val distro: LinuxDistro,
     private val downloader: HttpDownloader = UrlConnectionDownloader(),
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
 ) {
     /** Where the tarball is downloaded to before verification. */
-    val tarballFile: File get() = File(rootDir, "rootfs-${distro.ubuntuArch}.tar.gz")
+    val tarballFile: File get() = File(storage.downloadsDir, "rootfs-${distro.ubuntuArch}.tar.gz")
 
     /** Where the rootfs is unpacked before being moved into place. */
-    private val stagingDir: File get() = File(rootDir, "rootfs.staging")
+    private val stagingDir: File get() = storage.stagingDir
 
     /** The completed, in-place rootfs. */
-    val rootfsDir: File get() = File(rootDir, "rootfs")
+    val rootfsDir: File get() = storage.rootfsDir
 
     /**
      * Progress through the install, for the UI's install screen. Byte-precise for the download
@@ -86,7 +87,9 @@ class RootfsInstaller(
      * @throws IOException on any network, verification or extraction failure
      */
     suspend fun install(onProgress: (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
-        rootDir.mkdirs()
+        // Storage first: the download lands under downloads/ and the probe inside ensureReady()
+        // fails here — with a name — rather than as a mid-download EACCES.
+        storage.requireReady()
         download(onProgress)
         onProgress(Progress.Verifying)
         verify()
@@ -96,6 +99,7 @@ class RootfsInstaller(
     }
 
     private suspend fun download(onProgress: (Progress) -> Unit) {
+        migrateLegacyTarball()
         if (tarballFile.isFile && verifyFileSha256(tarballFile, distro.rootfsSha256)) {
             // A previously verified tarball is reused, not re-downloaded: an interrupted install
             // resumes rather than starting its 30 MB download again.
@@ -104,7 +108,7 @@ class RootfsInstaller(
         // Captured so the downloader's non-suspending chunk callback can still honour
         // cancellation — a cancelled install must stop mid-download, not after 30 MB more.
         val job = coroutineContext[Job]
-        val temp = File(rootDir, tarballFile.name + ".part")
+        val temp = File(storage.downloadsDir, tarballFile.name + ".part")
         try {
             downloader.download(
                 distro.rootfsTarballUrl,
@@ -121,6 +125,25 @@ class RootfsInstaller(
             }
         } finally {
             temp.delete()
+        }
+    }
+
+    /**
+     * Tarballs used to be downloaded straight into the userspace root, before the downloads
+     * directory existed. A verified leftover moves over (the retry resumes instead of
+     * re-downloading); anything else is swept — it is garbage pinning the space the next attempt
+     * needs.
+     */
+    private fun migrateLegacyTarball() {
+        val legacy = File(storage.rootDir, tarballFile.name)
+        if (!legacy.isFile) return
+        if (verifyFileSha256(legacy, distro.rootfsSha256)) {
+            if (!legacy.renameTo(tarballFile)) {
+                legacy.copyTo(tarballFile, overwrite = true)
+                legacy.delete()
+            }
+        } else {
+            legacy.delete()
         }
     }
 
