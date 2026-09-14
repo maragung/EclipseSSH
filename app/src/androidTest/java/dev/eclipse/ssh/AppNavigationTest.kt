@@ -179,15 +179,27 @@ class AppNavigationTest {
         // Addressed by the setting it belongs to rather than by its current value, which the previous
         // run of this test on this device is allowed to have changed.
         val trigger = { compose.onNode(hasContentDescription("Terminal theme,", substring = true)) }
+
+        // An option in the open menu. While the menu is up, the trigger still shows the selected
+        // option's name, so when that is the option being addressed a plain text match finds both
+        // ("Dark" found twice: trigger value and menu item). The trigger is the node that also
+        // announces "Terminal theme, ..."; a menu item never does, so that is the difference.
+        // Negation is the SemanticsMatcher member operator `not`, invoked with `!` — there is no
+        // top-level `not` function to import in androidx.compose.ui.test.
+        fun option(label: String) = compose.onNode(
+            hasText(label) and hasClickAction() and
+                !hasContentDescription("Terminal theme,", substring = true),
+        )
+
         trigger().performClick()
         compose.waitForIdle()
 
         // The options a compact picker has to be able to offer without breaking the row.
-        compose.onNodeWithText("Dark").assertIsDisplayed()
-        compose.onNodeWithText("Light").assertIsDisplayed()
-        compose.onNodeWithText("Amber").assertIsDisplayed()
+        option("Dark").assertIsDisplayed()
+        option("Light").assertIsDisplayed()
+        option("Amber").assertIsDisplayed()
 
-        compose.onNodeWithText("Amber").performClick()
+        option("Amber").performClick()
         compose.waitForIdle()
         compose.onNodeWithContentDescription("Terminal theme, Amber").assertExists()
 
@@ -199,7 +211,7 @@ class AppNavigationTest {
         compose.onNodeWithContentDescription("Terminal theme, Amber").assertExists()
 
         trigger().performClick()
-        compose.onNodeWithText("Dark").performClick()
+        option("Dark").performClick()
         compose.waitForIdle()
         compose.onNodeWithContentDescription("Terminal theme, Dark").assertExists()
     }

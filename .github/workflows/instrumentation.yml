@@ -1,19 +1,14 @@
 # Instrumentation tests (connectedAndroidTest). Separated from ci.yml
-# because it requires a runner with a working Android emulator or a
-# real device attached.
+# because an emulator boot plus the full instrumented suite is a much
+# longer pipeline than the rest of CI, and deserves its own timeout and
+# its own concurrency group.
 #
-# The brief calls for "Android instrumentation tests on every
-# push/PR", and the README's "compile of the instrumentation sources"
-# wording is the placeholder behaviour that ships until a real runner
-# is available. This workflow is the second half of that promise.
-#
-# Configure the runner in Settings -> Environments -> instrumentation
-# (self-hosted runner with the label `android-emulator`) and on
-# `github.repository` -> Settings -> Actions -> Runners. The
-# `runs-on: [self-hosted, android-emulator]` selector is the way to
-# point at a specific runner pool. If no runner is available, the
-# workflow is silently skipped, which is the right behaviour for a
-# brief that does not have a real-device budget.
+# The brief calls for "Android instrumentation tests on every push/PR".
+# This used to wait for a self-hosted `android-emulator` runner that was
+# never provisioned, so every run sat queued forever and had to be
+# cancelled. GitHub's Linux runners expose /dev/kvm, which is all the
+# emulator needs: the workflow now boots its own headless AVD on the
+# hosted pool and the suite actually runs.
 name: Instrumentation
 
 on:
@@ -42,16 +37,12 @@ env:
   # need the NDK toolchain and a CMake the SDK manager does not carry.
   FREERDP_NDK_VERSION: '29.0.13113456'
   FREERDP_CMAKE_VERSION: '4.1.2'
+  SYSTEM_IMAGE: 'system-images;android-35;default;x86_64'
 
 jobs:
   instrumentation:
     name: connectedAndroidTest
-    # `runs-on: [self-hosted, android-emulator]` is the documented
-    # pattern: the runner label is provisioned by the operator and
-    # the job only runs where the label is present. On a public
-    # runner this job is silently absent, which is the intended
-    # fallback.
-    runs-on: [self-hosted, android-emulator]
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
@@ -71,6 +62,8 @@ jobs:
           cmdline-tools-version: '11479570'
           packages: >-
             platform-tools
+            emulator
+            ${{ env.SYSTEM_IMAGE }}
             platforms;${{ env.COMPILE_SDK }}
             build-tools;${{ env.BUILD_TOOLS }}
             ndk;${{ env.FREERDP_NDK_VERSION }}
@@ -122,12 +115,161 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Enable KVM device permissions
+        # The runner image ships /dev/kvm, but the runner user needs a udev
+        # rule to open it. Without this the emulator falls back to software
+        # emulation, which does not boot API 35 inside any sane timeout.
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          # `udevadm trigger` returns before the udev worker has applied the
+          # new mode - the first hosted run passed this check by timing luck
+          # and the second lost the same race 28ms later. Poll for the node
+          # to settle, and chmod directly if it never does; the rule matters
+          # for persistence across reboots, which a CI runner never does.
+          for _ in $(seq 1 10); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
+          if [ ! -w /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          test -w /dev/kvm || {
+            echo "/dev/kvm is still not openable - this runner cannot run the emulator"
+            ls -l /dev/kvm || true
+            id
+            exit 1
+          }
+
+      - name: Create and boot the headless AVD
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          # avdmanager and the emulator each resolve their own AVD directory
+          # when this is unset (the emulator searches $ANDROID_AVD_HOME,
+          # $ANDROID_SDK_HOME/avd and $HOME/.android/avd, while cmdline-tools'
+          # avdmanager is free to pick differently), and a create that lands
+          # where the emulator never looks is an instant "Unknown AVD name"
+          # death - the startup failure the first hosted run wedged on. Pin
+          # both ends to one directory.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+            --force --name ci-instrumented \
+            --package "$SYSTEM_IMAGE" \
+            --device pixel_6
+          # Assert the create landed where the emulator will look, with the
+          # directory listing as the diagnosis if it did not.
+          if ! "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx ci-instrumented; then
+            echo "avdmanager reported success but the emulator cannot see ci-instrumented"
+            ls -la "$ANDROID_AVD_HOME" || true
+            exit 1
+          fi
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci-instrumented \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
+          # Bounded: an emulator that died at startup leaves adb with no device
+          # to wait for, and an unbounded `wait-for-device` then hangs until the
+          # job timeout instead of failing fast. That exact hang wedged the
+          # concurrency group for over an hour on the first hosted run.
+          if ! timeout 120 "$ADB" wait-for-device; then
+            echo "adb never saw the emulator - it likely died at startup"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+          # adb sees the emulator long before the guest OS is up;
+          # sys.boot_completed is the flag the platform itself sets when
+          # the boot intent fires.
+          BOOT=""
+          for _ in $(seq 1 60); do
+            # A boot poll that outlives the emulator process is polling a
+            # corpse; fail the moment the emulator is gone rather than
+            # burning the remaining polls.
+            if ! pgrep -f "emulator.*ci-instrumented" >/dev/null; then
+              echo "the emulator process died during boot"
+              tail -200 /tmp/emulator.log
+              exit 1
+            fi
+            BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          if [ "$BOOT" != "1" ]; then
+            echo "emulator did not finish booting"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+
+      - name: Pre-grant the notification permission
+        # MainActivity asks for POST_NOTIFICATIONS the first time it composes
+        # (a runtime permission from API 33, and targetSdk 35). On a fresh AVD
+        # nothing has been granted, so every test launch raised the system
+        # permission dialog on top of the activity under test ~300ms after it
+        # resumed - the activity paused before its first frame completed, and
+        # that single dialog is what the first hosted run's 17 UI failures all
+        # trace back to (15x "No compose hierarchies found in the app" from
+        # queries against an interrupted composition, and the
+        # "Activity never becomes requested state RESUMED" timeouts). The
+        # non-UI suites passed because they never launch the activity.
+        # Installing the app here and granting once puts every test in the
+        # state a real device reaches after the user accepts the prompt; the
+        # reinstall connectedDebugAndroidTest performs afterwards keeps the
+        # grant (only a full uninstall would drop it).
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          ./gradlew :app:installDebug
+          "$ADB" shell pm grant dev.eclipse.ssh.debug android.permission.POST_NOTIFICATIONS
+
       - name: Run connectedAndroidTest
-        # Emulator must be running and visible to adb. The default
-        # behaviour is to pick a single device; if a Farm or
-        # DeviceFarmer pool is in use, override with
-        # `-Pandroid.injected.testDevice=<serial>`.
-        run: ./gradlew --stacktrace connectedDebugAndroidTest
+        # The emulator booted above is the only device adb can see, so the
+        # default single-device selection is correct. The suite reports into
+        # the standard connected-test directories uploaded below.
+        # logcat is cleared right before the suite: Gradle's connected-test
+        # output does not include the device log, and without a fresh buffer
+        # the only evidence for a device-side crash is buried in minutes of
+        # boot noise. "No compose hierarchies found in the app" failures
+        # need the AndroidRuntime lines this captures to diagnose at all.
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" logcat -c
+          ./gradlew --stacktrace connectedDebugAndroidTest
+
+      - name: Capture the device log
+        # Dumped on any outcome: a suite that fails leaves the crash here, and
+        # a suite that passes costs one artifact upload of a mostly-empty log.
+        if: always()
+        run: |
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          if "$ADB" get-state >/dev/null 2>&1; then
+            "$ADB" logcat -d > /tmp/logcat.txt
+          else
+            echo "device is gone - nothing to dump" > /tmp/logcat.txt
+          fi
+
+      - name: Upload the device log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logcat
+          path: /tmp/logcat.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload the emulator log
+        # The device-side evidence for a failed suite is usually in here:
+        # a crash in setup, an ANR, or the guest rebooting mid-run.
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: emulator-log
+          path: /tmp/emulator.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload instrumentation reports
         if: always()

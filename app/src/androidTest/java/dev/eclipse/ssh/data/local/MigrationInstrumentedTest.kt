@@ -84,10 +84,16 @@ class MigrationInstrumentedTest {
     @Test
     fun aDatabaseFromANewerBuildIsResetRatherThanRefused() = runTest {
         // The production fallback is now downgrade-only (see AppModule.provideDatabase). On real SQLite
-        // as on the JVM, a file left by a build one version ahead - user_version 17 here - has no path
-        // back, so it is destructively recreated at the current version rather than refused. A missing
-        // *upgrade* migration is left to throw, which is the loud half the unit suite pins.
-        seedVersion2(userVersion = 17)
+        // as on the JVM, a downgrade - a file left by a build one version ahead, e.g. after a Play
+        // Store rollback - has no migration path back and never can, so refusing to open it would be
+        // a crash loop with no way out from inside the app. Resetting is the recoverable direction.
+        // user_version 19 is that newer build; the row shape beneath it is irrelevant, because a
+        // destructive downgrade drops every table first. One *ahead* of this build's own 18, not
+        // equal to or behind it: a file at 17 would take the 17_18 upgrade against a v2 table shape
+        // and die in schema validation (exactly what the first hosted run of this test caught -
+        // the seed said 17 from when 16 was current and nobody noticed, because this suite had
+        // never executed anywhere).
+        seedVersion2(userVersion = 19)
 
         val db = openLikeProduction()
 
