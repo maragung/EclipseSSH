@@ -5,7 +5,6 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
-import androidx.compose.ui.test.not
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -185,9 +184,11 @@ class AppNavigationTest {
         // option's name, so when that is the option being addressed a plain text match finds both
         // ("Dark" found twice: trigger value and menu item). The trigger is the node that also
         // announces "Terminal theme, ..."; a menu item never does, so that is the difference.
+        // Negation is the SemanticsMatcher member operator `not`, invoked with `!` — there is no
+        // top-level `not` function to import in androidx.compose.ui.test.
         fun option(label: String) = compose.onNode(
             hasText(label) and hasClickAction() and
-                not(hasContentDescription("Terminal theme,", substring = true)),
+                !hasContentDescription("Terminal theme,", substring = true),
         )
 
         trigger().performClick()
