@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.background.LinuxUserspaceService
 import dev.eclipse.ssh.di.LinuxUserspaceGraph
+import dev.eclipse.ssh.di.LinuxUserspaceGraphProvider
 import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxProcessManager
 import dev.eclipse.ssh.linux.LinuxUserspaceManager
@@ -85,6 +86,17 @@ class LinuxUserspaceControllerTest {
 
         private fun newHarness(): Harness =
             Harness(TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)))
+
+        /**
+         * The controller under a hand-built graph. The provider's real build needs
+         * `nativeLibraryDir`, which Robolectric does not provide (it can only produce null), so
+         * the graph under test is injected through the provider's test seam — the same seam exists
+         * precisely because this suite builds its graph around the scripted proot instead.
+         */
+        private fun newController(graph: LinuxUserspaceGraph?): LinuxUserspaceController {
+            val provider = LinuxUserspaceGraphProvider(appContext).apply { setGraphForTest(graph) }
+            return LinuxUserspaceController(appContext, provider)
+        }
     }
 
     /**
@@ -104,7 +116,7 @@ class LinuxUserspaceControllerTest {
 
     @Test
     fun `an unsupported device reports itself with no state to render`() = runTest {
-        val controller = LinuxUserspaceController(appContext, graph = null)
+        val controller = newController(null)
 
         val ui = controller.uiState.value
         assertThat(ui.supported).isFalse()
@@ -124,7 +136,7 @@ class LinuxUserspaceControllerTest {
     fun `install surfaces in the UI state and refreshes the storage numbers`() = runTest {
         mainOnTheTestScheduler()
         val harness = newHarness()
-        val controller = LinuxUserspaceController(appContext, harness.graph)
+        val controller = newController(harness.graph)
 
         controller.install()
         // Wait for the settled state *and* the storage numbers that follow it: the state turns
@@ -150,7 +162,7 @@ class LinuxUserspaceControllerTest {
     fun `an impossible action becomes an error sentence, not a crash`() = runTest {
         mainOnTheTestScheduler()
         val harness = newHarness()
-        val controller = LinuxUserspaceController(appContext, harness.graph)
+        val controller = newController(harness.graph)
 
         // Start on a not-installed userspace: the manager refuses, the controller relays the
         // refusal as the sentence the settings screen shows under the section.
@@ -174,7 +186,7 @@ class LinuxUserspaceControllerTest {
     fun `a running userspace promotes the foreground hold service, and stopping demotes it`() = runTest {
         mainOnTheTestScheduler()
         val harness = newHarness()
-        val controller = LinuxUserspaceController(appContext, harness.graph)
+        val controller = newController(harness.graph)
         val app = appContext as android.app.Application
         // The binding's first act is a demotion: the collector's initial read of NotInstalled
         // stops a service that was never started. The flush runs the collector's start (it may
@@ -207,7 +219,7 @@ class LinuxUserspaceControllerTest {
     fun `a keep-workspace uninstall parks the backup the next install restores`() = runTest {
         mainOnTheTestScheduler()
         val harness = newHarness()
-        val controller = LinuxUserspaceController(appContext, harness.graph)
+        val controller = newController(harness.graph)
 
         controller.install()
         controller.uiState.first { it.state is LinuxUserspaceState.Stopped && it.storageUsedBytes > 0 }

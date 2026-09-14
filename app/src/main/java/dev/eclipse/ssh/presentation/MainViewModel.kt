@@ -128,6 +128,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
@@ -692,12 +694,22 @@ class MainViewModel @Inject constructor(
      * terminal, so every state that cannot keep that promise hides it — see [LocalLinuxHost].
      */
     val localLinuxCard: StateFlow<HostProfile?> =
-        linuxUserspace.graph?.let { graph ->
-            val profile = LocalLinuxHost.hostProfile(graph.distro)
-            combine(graph.manager.state, graph.manager.lastHealth) { state, health ->
-                if (LocalLinuxHost.shouldShowCard(state, health)) profile else null
-            }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-        } ?: MutableStateFlow(null)
+        // The graph as a flow, not a value: while nothing is installed the settings screen's
+        // version chooser can swap the graph, and a card flow built around the process-start
+        // graph would keep reading a NotInstalled that is no longer anyone's truth. flatMapLatest
+        // re-derives the card from whichever graph is current — and cancels the previous graph's
+        // collectors, which is harmless here because a swap is only legal while the card is
+        // hidden (NotInstalled is exactly the state shouldShowCard rejects).
+        linuxUserspace.graphFlow.flatMapLatest { graph ->
+            if (graph == null) {
+                flowOf(null)
+            } else {
+                val profile = LocalLinuxHost.hostProfile(graph.distro)
+                combine(graph.manager.state, graph.manager.lastHealth) { state, health ->
+                    if (LocalLinuxHost.shouldShowCard(state, health)) profile else null
+                }
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     init {
         viewModelScope.launch {
