@@ -66,6 +66,12 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            // ProGuard rule files included only in the test APK: its R8 pass
+            // (minifyReleaseAndroidTestWithR8, live once testBuildType is
+            // "release") does not read the proguardFiles above, and dies on
+            // Truth's compile-time-only javax.lang.model references without
+            // the dontwarn this file carries.
+            testProguardFiles("test-proguard-rules.pro")
             val releaseSigning = signingConfigs.getByName("release")
             signingConfig = if (releaseSigning.storeFile != null) {
                 releaseSigning
