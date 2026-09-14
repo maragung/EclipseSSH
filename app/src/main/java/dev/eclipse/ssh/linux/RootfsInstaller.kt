@@ -88,14 +88,40 @@ class RootfsInstaller(
      */
     suspend fun install(onProgress: (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
         // Storage first: the download lands under downloads/ and the probe inside ensureReady()
-        // fails here — with a name — rather than as a mid-download EACCES.
+        // fails here — with a name — rather than as a mid-download EACCES. The sweep then clears
+        // fragments a crashed attempt left pinning the space this one needs.
         storage.requireReady()
+        storage.sweepOrphanPartFiles()
+        checkFreeSpace()
         download(onProgress)
         onProgress(Progress.Verifying)
         verify()
         extract(onProgress)
         moveIntoPlace()
         rootfsDir
+    }
+
+    /**
+     * Refuses to start a download the disk cannot hold. The budget is deliberately coarse — the
+     * tarball, several multiples of it unpacked (the extracted rootfs plus apt's working space),
+     * and a headroom for everything else the app stores — because the alternative failure is
+     * discovering ENOSPC half way through a 30 MB download on a metered connection.
+     *
+     * A free-space answer of 0 means "unknown" (the JVM's unmocked StatFs, or a probe failure),
+     * never "full", so it never blocks an install.
+     */
+    private fun checkFreeSpace() {
+        val free = storage.freeBytes()
+        if (free <= 0L) return
+        val needed = distro.rootfsSizeBytes * NEEDED_TARBALL_MULTIPLE + FREE_SPACE_HEADROOM_BYTES
+        if (free < needed) {
+            // The prefix is a contract: the error taxonomy reads "Ubuntu needs" as DiskFull.
+            throw IOException(
+                "Ubuntu needs about ${needed / MIB} MB of free storage to install " +
+                    "(the download plus the unpacked system), but only about ${free / MIB} MB is free. " +
+                    "Free up storage and try again.",
+            )
+        }
     }
 
     private suspend fun download(onProgress: (Progress) -> Unit) {
@@ -109,16 +135,42 @@ class RootfsInstaller(
         // cancellation — a cancelled install must stop mid-download, not after 30 MB more.
         val job = coroutineContext[Job]
         val temp = File(storage.downloadsDir, tarballFile.name + ".part")
+        var receivedFinal = 0L
+        var reportedTotal = 0L
         try {
             downloader.download(
                 distro.rootfsTarballUrl,
                 temp,
                 onChunk = { received, total ->
                     job?.ensureActive()
+                    receivedFinal = received
+                    if (total > 0) reportedTotal = total
+                    // The server's content length versus the pin: wildly off in either direction
+                    // means the URL is no longer serving the file this build was verified against
+                    // (an error page with a 200, a redirect to something else) — fail now, not
+                    // after 30 MB of the wrong bytes.
+                    if (total > 0 && distro.rootfsSizeBytes > 0) {
+                        val expected = distro.rootfsSizeBytes
+                        if (total > expected * 2 || total < expected / 2) {
+                            throw IOException(
+                                "the rootfs download is $total bytes, but the pinned ${distro.displayName} " +
+                                    "tarball is about $expected bytes - the URL is serving something else",
+                            )
+                        }
+                    }
                     onProgress(Progress.Downloading(received, total))
                 },
             )
-            verifyFileSha256(temp, distro.rootfsSha256)
+            if (reportedTotal > 0 && receivedFinal != reportedTotal) {
+                throw IOException(
+                    "the rootfs download was truncated: $receivedFinal of $reportedTotal bytes arrived",
+                )
+            }
+            // Fail closed: an unverifiable temp file is deleted by the finally below, never
+            // renamed into place as if it were the pinned tarball.
+            if (!verifyFileSha256(temp, distro.rootfsSha256)) {
+                throw IOException("Rootfs checksum mismatch for ${distro.displayName}")
+            }
             if (!temp.renameTo(tarballFile)) {
                 temp.copyTo(tarballFile, overwrite = true)
                 temp.delete()
@@ -209,12 +261,29 @@ class RootfsInstaller(
     }
 
     private fun moveIntoPlace() {
-        rootfsDir.deleteRecursively()
+        // The previous rootfs is parked beside the new one rather than deleted first: the old
+        // delete-then-rename ordering had a window where a crash left *neither* root, and the
+        // parked copy is also the rollback if the swap itself fails.
+        val parked = File(storage.rootDir, "rootfs.old")
+        parked.deleteRecursively()
+        var parkedPrevious = false
+        if (rootfsDir.exists()) {
+            parkedPrevious = rootfsDir.renameTo(parked)
+            if (!parkedPrevious) {
+                // Renaming the old root away failed for reasons we cannot fix here; deleting it
+                // reopens the no-root window but keeps the install able to proceed.
+                rootfsDir.deleteRecursively()
+            }
+        }
         if (!stagingDir.renameTo(rootfsDir)) {
+            if (parkedPrevious) {
+                parked.renameTo(rootfsDir)
+            }
             // Same-filesystem rename only fails for reasons we cannot fix here; report rather than
             // half-move.
             throw IOException("Could not move the extracted rootfs into place at $rootfsDir")
         }
+        parked.deleteRecursively()
         // The tarball has served its purpose; keeping it would pin 30 MB for nothing.
         tarballFile.delete()
     }
@@ -256,6 +325,14 @@ class RootfsInstaller(
     companion object {
         private const val DOWNLOAD_BUFFER = 64 * 1024
         private const val PROGRESS_EVERY_ENTRIES = 200
+
+        /** The tarball plus this many multiples of it: the extracted rootfs and apt's working space. */
+        private const val NEEDED_TARBALL_MULTIPLE = 5L
+
+        /** Room for everything else the app stores, on top of the userspace's own needs. */
+        private const val FREE_SPACE_HEADROOM_BYTES = 600L * 1024 * 1024
+
+        private const val MIB = 1024L * 1024
     }
 }
 

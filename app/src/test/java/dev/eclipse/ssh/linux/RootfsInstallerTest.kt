@@ -164,6 +164,85 @@ class RootfsInstallerTest {
     }
 
     @Test
+    fun `low free space refuses before the download starts`() = runBlocking {
+        val root = newRoot()
+        var downloads = 0
+        val installer = RootfsInstaller(
+            root,
+            TestTarballs.fixtureDistro(
+                "https://fixtures.invalid/rootfs.tar.gz",
+                "00".repeat(32),
+                rootfsSizeBytes = 30L * 1024 * 1024,
+            ),
+            HttpDownloader { _, _, _ -> downloads++ },
+            storage = RuntimeStorageManager(root, freeBytesProbe = { 100L * 1024 * 1024 }),
+        )
+
+        var thrown: IOException? = null
+        try {
+            installer.install { }
+        } catch (e: IOException) {
+            thrown = e
+        }
+        // The prefix is the taxonomy's DiskFull marker — a phone out of space must be told that,
+        // not handed a download that dies of ENOSPC half way through.
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).startsWith("Ubuntu needs")
+        assertThat(downloads).isEqualTo(0)
+    }
+
+    @Test
+    fun `a server reporting a size the pin does not recognize is refused`() = runBlocking {
+        val root = newRoot()
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        // The pin claims a tarball four times the size of what is served — the shape of a URL
+        // that stopped serving the file it was pinned to.
+        val distro = TestTarballs.fixtureDistro(
+            "https://fixtures.invalid/rootfs.tar.gz",
+            TestTarballs.sha256(fixture),
+            rootfsSizeBytes = fixture.length() * 4,
+        )
+        val installer = installInto(root, fixture, distro = distro)
+
+        var thrown: IOException? = null
+        try {
+            installer.install { }
+        } catch (e: IOException) {
+            thrown = e
+        }
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).contains("serving something else")
+        assertThat(installer.isExtracted()).isFalse()
+    }
+
+    @Test
+    fun `a truncated download is refused before it can look verified`() = runBlocking {
+        val root = newRoot()
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        val truncated = HttpDownloader { _, target, onChunk ->
+            val all = fixture.readBytes()
+            val delivered = all.size / 2
+            target.outputStream().use { output -> output.write(all, 0, delivered) }
+            onChunk(delivered.toLong(), all.size.toLong())
+        }
+        val installer = installInto(root, fixture, downloader = truncated)
+
+        var thrown: IOException? = null
+        try {
+            installer.install { }
+        } catch (e: IOException) {
+            thrown = e
+        }
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).contains("truncated")
+        assertThat(installer.isExtracted()).isFalse()
+    }
+
+    @Test
     fun `a verified tarball left by a failed install is not downloaded again`() = runBlocking {
         val root = newRoot()
         val escapeParent = Files.createTempDirectory("linux-escape").toFile()

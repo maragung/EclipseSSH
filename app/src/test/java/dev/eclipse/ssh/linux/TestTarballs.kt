@@ -67,8 +67,12 @@ internal object TestTarballs {
             digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
         }
 
-    /** A distro pointing at the fixture: the URL never resolves, the downloader is faked. */
-    fun fixtureDistro(url: String, sha256: String): LinuxDistro =
+    /**
+     * A distro pointing at the fixture: the URL never resolves, the downloader is faked. The size
+     * defaults to 0 — "unknown", which skips the size gates — because most tests only care about
+     * the extraction; the gate tests pass a real number.
+     */
+    fun fixtureDistro(url: String, sha256: String, rootfsSizeBytes: Long = 0L): LinuxDistro =
         LinuxDistro(
             id = "ubuntu-22.04",
             displayName = "Ubuntu 22.04 LTS",
@@ -76,6 +80,7 @@ internal object TestTarballs {
             ubuntuArch = "arm64",
             rootfsTarballUrl = url,
             rootfsSha256 = sha256,
+            rootfsSizeBytes = rootfsSizeBytes,
         )
 
     /** A downloader that serves [source] regardless of the URL asked for. */
