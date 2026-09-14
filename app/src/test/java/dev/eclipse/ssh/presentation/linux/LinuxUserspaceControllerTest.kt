@@ -7,6 +7,7 @@ import dev.eclipse.ssh.background.LinuxUserspaceService
 import dev.eclipse.ssh.di.LinuxUserspaceGraph
 import dev.eclipse.ssh.di.LinuxUserspaceGraphProvider
 import dev.eclipse.ssh.linux.LinuxDistro
+import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxProcessManager
 import dev.eclipse.ssh.linux.LinuxUserspaceManager
 import dev.eclipse.ssh.linux.LinuxUserspaceState
@@ -213,6 +214,77 @@ class LinuxUserspaceControllerTest {
         controller.uiState.first { it.state is LinuxUserspaceState.Stopped }
         testScheduler.advanceUntilIdle()
         assertThat(shadowOf(app).nextStoppedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+    }
+
+    @Test
+    fun `the holding predicate covers every state that runs proot children`() {
+        // The truth table the binding rule and the service's self-stop rule share. The left
+        // column is every state the machine has: the four that fork or hold proot children hold
+        // the process, and the two settled ones do not.
+        assertThat(LinuxUserspaceState.Running(sinceMs = 0).holdsProcess()).isTrue()
+        assertThat(LinuxUserspaceState.Installing(LinuxInstallStep.Verifying).holdsProcess()).isTrue()
+        assertThat(LinuxUserspaceState.Starting.holdsProcess()).isTrue()
+        assertThat(LinuxUserspaceState.Stopping.holdsProcess()).isTrue()
+        assertThat(LinuxUserspaceState.NotInstalled.holdsProcess()).isFalse()
+        assertThat(LinuxUserspaceState.NeedsRepair("broken").holdsProcess()).isFalse()
+    }
+
+    @Test
+    fun `an install promotes the foreground hold while it runs`() = runTest {
+        mainOnTheTestScheduler()
+        val harness = newHarness()
+        val controller = newController(harness.graph)
+        val app = appContext as android.app.Application
+
+        // Consume the binding's first act — the demotion of the initial NotInstalled state — so
+        // the starts below are only the ones this test means.
+        testScheduler.advanceUntilIdle()
+        assertThat(shadowOf(app).nextStoppedService).isNotNull()
+
+        controller.install()
+        controller.uiState.first { it.state is LinuxUserspaceState.Stopped && it.storageUsedBytes > 0 }
+        testScheduler.advanceUntilIdle()
+
+        // An install ends at Stopped and never enters Running, so the only service start this
+        // whole sequence can have produced is Installing's own promotion — the coverage that
+        // makes a screen-off during the minutes-long apt phase unable to kill the process.
+        assertThat(shadowOf(app).nextStartedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+        // And the settled install demotes it again.
+        assertThat(shadowOf(app).nextStoppedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+    }
+
+    @Test
+    fun `a lost foreground hold is asked for again`() = runTest {
+        mainOnTheTestScheduler()
+        val harness = newHarness()
+        val controller = newController(harness.graph)
+        val app = appContext as android.app.Application
+
+        controller.install()
+        controller.uiState.first { it.state is LinuxUserspaceState.Stopped && it.storageUsedBytes > 0 }
+        controller.start()
+        controller.uiState.first { it.state is LinuxUserspaceState.Running }
+        testScheduler.advanceUntilIdle()
+
+        // Drain the two promotions the sequence above produced — the install's and Running's —
+        // so what follows can only be the binding asking again.
+        assertThat(shadowOf(app).nextStartedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+        assertThat(shadowOf(app).nextStartedService?.component?.className)
+            .isEqualTo(LinuxUserspaceService::class.java.name)
+        // The hold stands: nothing re-asks while it does.
+        assertThat(shadowOf(app).peekNextStartedService()).isNull()
+
+        // The six-hour dataSync cap took the hold away while the userspace stays Running —
+        // without the lost signal, the edge-triggered rule would never promote again and the
+        // user would be degraded until the next Stop/Start.
+        controller.onForegroundHoldLost()
+        testScheduler.advanceUntilIdle()
+
+        assertThat(shadowOf(app).nextStartedService?.component?.className)
             .isEqualTo(LinuxUserspaceService::class.java.name)
     }
 

@@ -2,18 +2,30 @@ package dev.eclipse.ssh.linux
 
 import dev.eclipse.ssh.ssh.TerminalChannel
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 
 /**
  * The table of live local userspace sessions — which open terminal channels belong to the Linux
  * userspace, so "Stop Ubuntu" can close exactly those and nothing else.
  *
  * The channels themselves live in the session store alongside SSH channels (that is the point of
- * the [TerminalChannel] seam); this manager holds only the *local* registry. Closing every local
+ * the [TerminalChannel] seam); this registry holds only the *local* sessions. Closing every local
  * session is a different act from closing an SSH connection — there is no transport to tear down,
  * just processes to SIGHUP — and it must not touch a terminal talking to a server in another
  * country, which is why the store alone cannot do it.
+ *
+ * Self-unregistering: a shell that ends on its own (the user types `exit`) reports its ending to
+ * the collector, and no app close path runs for it — so a registry that only forgot sessions on
+ * the tab's close would keep counting corpses, and the settings screen and the FGS notification
+ * would say "3 terminals held open" about sessions that exited an hour ago. On [register] this
+ * registry launches a supervisor that awaits the channel's ending and then forgets it, keyed on
+ * *identity*: a reconnect's replacement registered under the same session key is never evicted by
+ * the old channel's exit.
  *
  * The count is a [StateFlow], not a getter, because the settings screen and the host card both
  * display it and should not poll: every register/unregister publishes, and Compose collects.
@@ -21,7 +33,14 @@ import kotlinx.coroutines.flow.StateFlow
  * All methods are safe from any thread; register/unregister happen on the ViewModel's session
  * open/close paths, closeAll on Stop.
  */
-class LinuxProcessManager {
+class LinuxSessionRegistry(
+    /**
+     * Where the per-session supervisors run. Injectable so tests can drive them deterministically;
+     * production uses its own supervisor scope, because this registry lives as long as the process
+     * and its supervisors only ever await a channel's ending.
+     */
+    private val supervision: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+) {
 
     private val sessions = ConcurrentHashMap<String, TerminalChannel>()
 
@@ -32,6 +51,13 @@ class LinuxProcessManager {
     fun register(sessionKey: String, channel: TerminalChannel) {
         sessions[sessionKey] = channel
         recount()
+        supervision.launch {
+            channel.awaitClosed()
+            // Identity, not the key: only this registration goes. The remove is conditional, so a
+            // replacement registered under the same key survives the old channel's ending, and an
+            // unregister that already ran is simply a no-op when the ending arrives late.
+            if (sessions.remove(sessionKey, channel)) recount()
+        }
     }
 
     /** Forgets a session without closing it — the close path calls this after the channel ended. */
@@ -61,3 +87,11 @@ class LinuxProcessManager {
         _sessionCount.value = sessions.size
     }
 }
+
+/**
+ * The registry's earlier name, kept so code written against it — the graph provider that
+ * constructs it, the manager that closes it on Stop — keeps compiling while callers migrate to
+ * the name that says what it is.
+ */
+@Deprecated("Renamed to LinuxSessionRegistry: it is a registry of terminal sessions, not a process manager")
+typealias LinuxProcessManager = LinuxSessionRegistry

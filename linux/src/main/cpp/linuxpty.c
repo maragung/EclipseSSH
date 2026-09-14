@@ -227,12 +227,22 @@ out:
  * end-of-stream: when the child side exits, reads fail with EIO (Linux pty
  * semantics), which is the signal the JVM read loop treats as EOF. EINTR is
  * retried internally.
+ *
+ * A pty whose slot is already freed was closed or reaped by another thread;
+ * it reports end-of-stream rather than reading through a descriptor number
+ * the process may have handed to something else. The liveness check shares
+ * the table lock with close/awaitExit; the read itself runs without it,
+ * because it blocks.
  */
 JNIEXPORT jint JNICALL
 Java_dev_eclipse_ssh_linux_LinuxPty_read(
         JNIEnv *env, jclass clazz, jint fd,
         jbyteArray buffer, jint offset, jint length) {
     (void) clazz;
+    pthread_mutex_lock(&ptys_lock);
+    int live = slot_for_master(fd) != NULL;
+    pthread_mutex_unlock(&ptys_lock);
+    if (!live) return -1;
     jbyte buf[4096];
     jint chunk = length < (jint) sizeof(buf) ? length : (jint) sizeof(buf);
     ssize_t n;
@@ -249,13 +259,19 @@ Java_dev_eclipse_ssh_linux_LinuxPty_read(
  * Method:    write
  *
  * Full write (loops over partial writes). Returns the byte count written or
- * -1 on a dead pty (EIO/EPIPE: the child is gone).
+ * -1 on a dead pty (EIO/EPIPE: the child is gone) - including a pty whose
+ * slot was already freed, which refuses rather than writing through a
+ * possibly reused descriptor.
  */
 JNIEXPORT jint JNICALL
 Java_dev_eclipse_ssh_linux_LinuxPty_write(
         JNIEnv *env, jclass clazz, jint fd,
         jbyteArray buffer, jint offset, jint length) {
     (void) clazz;
+    pthread_mutex_lock(&ptys_lock);
+    int live = slot_for_master(fd) != NULL;
+    pthread_mutex_unlock(&ptys_lock);
+    if (!live) return -1;
     jbyte buf[4096];
     jint written = 0;
     while (written < length) {
@@ -277,13 +293,21 @@ Java_dev_eclipse_ssh_linux_LinuxPty_write(
  * Method:    resize
  *
  * Updates the pty window size and delivers SIGWINCH to the child's
- * foreground process group, exactly like resizing a terminal window.
+ * foreground process group, exactly like resizing a terminal window. A pty
+ * whose slot is already freed is a no-op: the ioctl would land on whatever
+ * the process has since reused the descriptor number for. The lookup runs
+ * under the table lock like close/awaitExit's, so a resize racing a close
+ * either sees the live slot or does nothing - never a half-torn-down one.
  */
 JNIEXPORT void JNICALL
 Java_dev_eclipse_ssh_linux_LinuxPty_resize(
         JNIEnv *env, jclass clazz, jint fd, jint rows, jint cols) {
     (void) env;
     (void) clazz;
+    pthread_mutex_lock(&ptys_lock);
+    struct pty_slot *slot = slot_for_master(fd);
+    pthread_mutex_unlock(&ptys_lock);
+    if (slot == NULL) return;
     struct winsize ws = { (unsigned short) rows, (unsigned short) cols, 0, 0 };
     ioctl(fd, TIOCSWINSZ, &ws);
 }
@@ -296,6 +320,11 @@ Java_dev_eclipse_ssh_linux_LinuxPty_resize(
  * returns the wait status: the exit code (0-255), or 128+signal. Call after
  * the read loop saw end-of-stream - the kernel hands the child's exit to
  * the first waitpid, so there is no race between EOF and the reap.
+ *
+ * An fd with no live slot has already been closed (or is being closed by
+ * another thread): it returns -1 without touching the descriptor, because
+ * a close here would land on whatever the process has since reused the
+ * number for.
  */
 JNIEXPORT jint JNICALL
 Java_dev_eclipse_ssh_linux_LinuxPty_awaitExit(
@@ -307,6 +336,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_awaitExit(
     pid_t pid = slot != NULL ? slot->pid : -1;
     if (slot != NULL) slot->in_use = 0;
     pthread_mutex_unlock(&ptys_lock);
+    if (slot == NULL) return -1;
 
     int status = 0;
     if (pid > 0) {
@@ -327,6 +357,9 @@ Java_dev_eclipse_ssh_linux_LinuxPty_awaitExit(
  * is already gone, and frees the slot. Callers that want the exit status
  * must use awaitExit; after close the pid is deliberately reaped here so a
  * dropped terminal cannot leak a zombie.
+ *
+ * Idempotent: an fd with no live slot was already closed or reaped, and
+ * closing it again would hit a descriptor the process may have reused.
  */
 JNIEXPORT void JNICALL
 Java_dev_eclipse_ssh_linux_LinuxPty_close(
@@ -338,6 +371,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_close(
     pid_t pid = slot != NULL ? slot->pid : -1;
     if (slot != NULL) slot->in_use = 0;
     pthread_mutex_unlock(&ptys_lock);
+    if (slot == NULL) return;
 
     close(fd);
     if (pid > 0) {
