@@ -73,6 +73,21 @@ class LinuxUserspaceGraph(
 class LinuxUserspaceGraphProvider @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
+    /**
+     * Where the user's version choice lives. Deliberately outside the userspace root: the root is
+     * what an uninstall deletes, and the choice is a preference about the *next* install, not a
+     * fact about the current one.
+     */
+    private val selectionFile: File = File(context.filesDir, "linux-distro-selection.properties")
+
+    /** Every LTS this device can run, newest first — the install screen's version list. */
+    val versions: List<LinuxDistro> = LinuxDistroCatalog.versionsFor(Build.SUPPORTED_ABIS.toList())
+
+    // Both of the declarations above have to precede this one. Property initializers run in
+    // declaration order, and buildGraph() reads selectionFile and versions; declared below it,
+    // each is still the JVM default — null — while the graph builds, and process start died with
+    // an NPE inside readDistroId before a frame could be drawn. The crash is device-identical;
+    // Robolectric is merely what saw it first, because it builds the real Hilt graph.
     private val _graph = MutableStateFlow(buildGraph())
 
     /** The graph to act on right now; null on a device that cannot run a userspace. */
@@ -80,9 +95,6 @@ class LinuxUserspaceGraphProvider @Inject constructor(
 
     /** The graph as a flow, for subscribers that must re-derive when a version choice swaps it. */
     val graphFlow: StateFlow<LinuxUserspaceGraph?> = _graph
-
-    /** Every LTS this device can run, newest first — the install screen's version list. */
-    val versions: List<LinuxDistro> = LinuxDistroCatalog.versionsFor(Build.SUPPORTED_ABIS.toList())
 
     /**
      * Chooses the version the Install button downloads. Refused (false) on an unsupported device,
@@ -189,13 +201,6 @@ class LinuxUserspaceGraphProvider @Inject constructor(
                 ?: versions.firstOrNull { it.id == LinuxDistroCatalog.DEFAULT_DISTRO_ID }
                 ?: versions.firstOrNull()
     }
-
-    /**
-     * Where the user's version choice lives. Deliberately outside the userspace root: the root is
-     * what an uninstall deletes, and the choice is a preference about the *next* install, not a
-     * fact about the current one.
-     */
-    private val selectionFile: File = File(context.filesDir, "linux-distro-selection.properties")
 
     private fun readDistroId(file: File): String? {
         if (!file.isFile) return null

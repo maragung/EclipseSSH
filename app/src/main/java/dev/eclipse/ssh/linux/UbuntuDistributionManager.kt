@@ -542,15 +542,20 @@ internal fun builtinMirrorUrls(distro: LinuxDistro): List<String> =
  * the primary again with IPv4 forced, then the fetched mirrors, then the built-ins. Pure on
  * purpose — the retry policy is decision logic, and decision logic gets tested like everything
  * else.
+ *
+ * Rungs are deduplicated and compared to the primary after trimming trailing slashes, so a mirror
+ * that differs from an earlier rung only by its slash is one rung, not two. [parseMirrorList]
+ * already trims what it parses; this is the second line of defence for the mirrors that reach it
+ * any other way.
  */
 internal fun aptUpdateCandidates(distro: LinuxDistro, fetchedMirrors: List<String>): List<AptUpdateAttempt> {
-    val primary = primaryArchiveUrl(distro)
+    val primary = primaryArchiveUrl(distro).trimEnd('/')
     val fallbacks = (fetchedMirrors + builtinMirrorUrls(distro))
-        .distinct()
-        .filter { it != primary }
+        .distinctBy { it.trimEnd('/') }
+        .filter { it.trimEnd('/') != primary }
     return listOf(
-        AptUpdateAttempt(primary, forceIpv4 = false),
-        AptUpdateAttempt(primary, forceIpv4 = true),
+        AptUpdateAttempt(primaryArchiveUrl(distro), forceIpv4 = false),
+        AptUpdateAttempt(primaryArchiveUrl(distro), forceIpv4 = true),
     ) + fallbacks.map { AptUpdateAttempt(it, forceIpv4 = false) }
 }
 
