@@ -64,4 +64,61 @@ class LinuxDistroCatalogTest {
         // device unsupported, silently.
         assertThat(LinuxDistroCatalog.all.map { it.id }).contains(LinuxDistroCatalog.DEFAULT_DISTRO_ID)
     }
+
+    @Test
+    fun `every entry is a unique id-arch pair`() {
+        // Two entries answering to the same id and architecture would make byId's "the" entry a
+        // silent first-match, and an installed-state distroId ambiguous.
+        val pairs = LinuxDistroCatalog.all.map { it.id to it.ubuntuArch }
+        assertThat(pairs.distinct()).isEqualTo(pairs)
+        assertThat(LinuxDistroCatalog.all).hasSize(12)
+    }
+
+    @Test
+    fun `versionsFor offers every LTS newest first`() {
+        // The chooser's contract: the list is the installable versions for THIS device's arch,
+        // newest LTS first, so "the latest" is always element zero and nothing has to sort.
+        val versions = LinuxDistroCatalog.versionsFor(listOf("arm64-v8a", "armeabi-v7a"))
+        assertThat(versions.map { it.id }).containsExactly(
+            "ubuntu-26.04",
+            "ubuntu-24.04",
+            "ubuntu-22.04",
+            "ubuntu-20.04",
+        ).inOrder()
+        assertThat(versions.all { it.ubuntuArch == "arm64" }).isTrue()
+    }
+
+    @Test
+    fun `versionsFor is empty where the device maps to no arch`() {
+        assertThat(LinuxDistroCatalog.versionsFor(listOf("x86"))).isEmpty()
+        assertThat(LinuxDistroCatalog.versionsFor(emptyList())).isEmpty()
+    }
+
+    @Test
+    fun `byId finds the exact entry and nothing vague`() {
+        val distro = LinuxDistroCatalog.byId("ubuntu-24.04", "armhf")
+        assertThat(distro).isNotNull()
+        assertThat(distro!!.release).isEqualTo("noble")
+        assertThat(distro.rootfsTarballUrl).contains("24.04.5")
+        // A different arch under the same id is a different entry, not the same one again.
+        assertThat(LinuxDistroCatalog.byId("ubuntu-24.04", "amd64")!!.rootfsSha256)
+            .isNotEqualTo(distro.rootfsSha256)
+        assertThat(LinuxDistroCatalog.byId("ubuntu-25.10", "arm64")).isNull()
+    }
+
+    @Test
+    fun `each series carries the codename its apt suites are named after`() {
+        // The distribution manager derives every apt suite from `release`; a typo here would make
+        // the archive 404 on the first apt update of a fresh install.
+        val codenames =
+            mapOf(
+                "ubuntu-26.04" to "resolute",
+                "ubuntu-24.04" to "noble",
+                "ubuntu-22.04" to "jammy",
+                "ubuntu-20.04" to "focal",
+            )
+        LinuxDistroCatalog.all.forEach { distro ->
+            assertThat(distro.release).isEqualTo(codenames.getValue(distro.id))
+        }
+    }
 }

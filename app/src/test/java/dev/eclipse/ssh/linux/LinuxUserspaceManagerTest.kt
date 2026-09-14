@@ -102,9 +102,13 @@ class LinuxUserspaceManagerTest {
 
         // The setup pipeline really ran through the scripted proot: package lists updated, the
         // toolchain installed, and both ran with fake root (the "-0" proot sessions need for dpkg).
+        // The happy path never leaves the ladder's first rung - the primary archive succeeds and no
+        // mirror is fetched - which is what pins the flags every rung carries.
         val rootCommands = harness.spawner.commandsWith.filter { it.first }
         assertThat(rootCommands).isNotEmpty()
-        assertThat(rootCommands.map { it.second }).contains("apt-get update -o Acquire::Retries=3")
+        assertThat(rootCommands.map { it.second }).contains(
+            "apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none -o Acquire::http::Timeout=30",
+        )
         assertThat(
             rootCommands.map { it.second }.any { it.startsWith("apt-get install -y --no-install-recommends") },
         ).isTrue()
