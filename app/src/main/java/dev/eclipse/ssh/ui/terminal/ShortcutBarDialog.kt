@@ -2,6 +2,7 @@ package dev.eclipse.ssh.ui.terminal
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,6 +24,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -184,15 +187,35 @@ private fun LayoutSection(prefs: KeyBarPrefs, onChange: (KeyBarPrefs) -> Unit) {
                 ) { Icon(Icons.Default.KeyboardArrowUp, contentDescription = null) }
             }
         }
+        // A dropdown, not three chips: the dialog's column is narrow, and three
+        // side-by-side chips squeezed this label until it wrapped into a stacked mess and
+        // pushed the row wider than the layout chips above it. One control, every size,
+        // one tap.
+        var sizeMenuOpen by remember { mutableStateOf(false) }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Cap size", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                KeyBarSize.entries.forEach { size ->
-                    FilterChip(
-                        selected = prefs.size == size,
-                        onClick = { onChange(prefs.copy(size = size)) },
-                        label = { Text(size.name.lowercase().replaceFirstChar(Char::uppercase)) },
-                    )
+            Text(
+                "Cap size",
+                Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium,
+                // One line, always - a label stacking under width pressure is exactly the
+                // layout bug this dropdown replaces.
+                maxLines = 1,
+            )
+            Box {
+                TextButton(
+                    onClick = { sizeMenuOpen = true },
+                    modifier = Modifier.semantics { contentDescription = "Cap size" },
+                ) {
+                    Text(prefs.size.name.lowercase().replaceFirstChar(Char::uppercase))
+                    Icon(Icons.Default.KeyboardArrowDown, contentDescription = null)
+                }
+                DropdownMenu(expanded = sizeMenuOpen, onDismissRequest = { sizeMenuOpen = false }) {
+                    KeyBarSize.entries.forEach { size ->
+                        DropdownMenuItem(
+                            text = { Text(size.name.lowercase().replaceFirstChar(Char::uppercase)) },
+                            onClick = { onChange(prefs.copy(size = size)); sizeMenuOpen = false },
+                        )
+                    }
                 }
             }
         }
