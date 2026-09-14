@@ -79,14 +79,16 @@
 # (androidx.collection.mutableIntObjectMapOf, whose class survived renamed
 # while the trivial facade method was inlined away everywhere in the app).
 # The keeps below therefore cover every namespace the androidTest sources
-# and the Compose test rules touch: compose ui/runtime (the semantics tree
-# the rules walk), room and lifecycle (direct test imports), activity plus
-# its ComponentActivity superclass chain (core, savedstate -
-# createAndroidComposeRule's bound), and collection. HostProfile and the
-# transfer DAO are covered by the data rule above; kotlin and
-# kotlinx.coroutines moved to proguard-instrumentation.pro above. The next
-# build's APK size report decides whether any of this gets narrowed.
--keep class androidx.compose.** { *; }
+# and the Compose test rules touch: room and lifecycle (direct test
+# imports), activity plus its ComponentActivity superclass chain (core,
+# savedstate - createAndroidComposeRule's bound), and collection.
+# HostProfile and the transfer DAO are covered by the data rule above;
+# kotlin, kotlinx.coroutines and androidx.compose moved to
+# proguard-instrumentation.pro as exact per-class lists (stage 1 validated
+# by release-test run 34863389211, both legs green, the x86_64 APK down
+# 1.38 MB to 41,868,849 bytes; compose is stage 2, validated by the run
+# after it). The next build's APK size report decides whether any of this
+# gets narrowed.
 -keep class androidx.room.** { *; }
 -keep class androidx.activity.** { *; }
 -keep class androidx.core.** { *; }
