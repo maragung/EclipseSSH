@@ -40,7 +40,9 @@ class LinuxWorkspaceManager(
 
     /** Empties the workspace but keeps the directory itself, so the mounted home never loses it. */
     fun clear() {
-        workspaceDir.listFiles()?.forEach { it.deleteRecursively() }
+        // NOFOLLOW deletion: workspace content can contain symlinks (a project's node_modules
+        // always does), and a follow-the-link delete would chase them out of the workspace.
+        workspaceDir.listFiles()?.forEach { deleteTreeNoFollow(it) }
         workspaceDir.mkdirs()
     }
 
@@ -94,7 +96,11 @@ class LinuxWorkspaceManager(
                     TarArchiveEntry.LF_DIR -> target.mkdirs()
                     TarArchiveEntry.LF_SYMLINK -> {
                         target.parentFile?.mkdirs()
+                        // The snapshot is written by this app, but a moved or edited backup file
+                        // must not become an escape hatch: same link-target rule as the rootfs.
+                        resolveLinkInsideRoot(workspaceDir, entry.name, entry.linkName)
                         target.delete()
+                        deleteTreeNoFollow(target)
                         java.nio.file.Files.createSymbolicLink(
                             target.toPath(),
                             java.nio.file.Path.of(entry.linkName),

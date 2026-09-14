@@ -77,8 +77,8 @@ class RootfsInstaller(
      */
     fun deleteRootfs() {
         tarballFile.delete()
-        rootfsDir.deleteRecursively()
-        stagingDir.deleteRecursively()
+        deleteTreeNoFollow(rootfsDir)
+        deleteTreeNoFollow(stagingDir)
     }
 
     /**
@@ -113,7 +113,7 @@ class RootfsInstaller(
     private fun validateStaging() {
         val findings = validator.validate(stagingDir)
         if (findings.isEmpty()) return
-        stagingDir.deleteRecursively()
+        deleteTreeNoFollow(stagingDir)
         throw IOException(
             "the extracted rootfs failed validation: " +
                 findings.joinToString("; ") { "${it.path} ${it.problem}" },
@@ -230,9 +230,11 @@ class RootfsInstaller(
      */
     private suspend fun extract(onProgress: (Progress) -> Unit) {
         onProgress(Progress.Extracting(0))
-        stagingDir.deleteRecursively()
+        deleteTreeNoFollow(stagingDir)
         stagingDir.mkdirs()
         var entries = 0
+        var written = 0L
+        val budget = extractionBudgetBytes()
         openTarStream(tarballFile, DOWNLOAD_BUFFER).use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
@@ -245,10 +247,14 @@ class RootfsInstaller(
                     }
                     TarArchiveEntry.LF_SYMLINK -> {
                         target.parentFile?.mkdirs()
+                        // Where the link points must resolve inside the staging root too: a
+                        // symlink pointing out is an escape hatch none of the entry-name checks
+                        // would catch, because nothing is written through it here.
+                        resolveLinkInsideRoot(stagingDir, entry.name, entry.linkName)
                         // Created and deleted: if a previous extraction (or the rootfs itself)
                         // already put something there, the symlink must replace it.
                         target.delete()
-                        kotlin.runCatching { target.deleteRecursively() }
+                        deleteTreeNoFollow(target)
                         java.nio.file.Files.createSymbolicLink(target.toPath(), java.nio.file.Path.of(entry.linkName))
                     }
                     TarArchiveEntry.LF_LINK -> {
@@ -256,18 +262,31 @@ class RootfsInstaller(
                         val source = resolveInside(stagingDir, entry.linkName)
                         // Hardlinks inside one tarball are duplicates of an earlier entry; copying
                         // is the portable equivalent and costs one file.
-                        if (source.isFile) source.copyTo(target, overwrite = true)
+                        if (source.isFile) {
+                            source.copyTo(target, overwrite = true)
+                            written += target.length()
+                        }
                     }
                     TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
                         target.parentFile?.mkdirs()
                         target.outputStream().use { output -> tar.copyTo(output) }
                         applyMode(target, entry.mode)
+                        written += target.length()
                     }
                     else -> {
                         // Device nodes, fifos and the like: the rootfs does not need them — proot
                         // binds the host's /dev — and creating them would require privileges the
                         // app does not have anyway.
                     }
+                }
+                // The decompression-bomb budget: the pin says what the tarball weighs, so the
+                // tree it unpacks to is bounded at a multiple of that. A gzip bomb that would
+                // fill the disk is refused mid-extraction, with the staging tree reclaimable.
+                if (written > budget) {
+                    throw IOException(
+                        "the rootfs archive expands beyond the expected size " +
+                            "(${written / (1024 * 1024)} MB unpacked from a ${tarballFile.length() / (1024 * 1024)} MB tarball) - refusing to continue",
+                    )
                 }
                 entries++
                 if (entries % PROGRESS_EVERY_ENTRIES == 0) {
@@ -279,19 +298,31 @@ class RootfsInstaller(
         onProgress(Progress.Extracting(entries))
     }
 
+    /**
+     * What the tarball is allowed to unpack to: ~10x the pinned compressed size, which a real
+     * Ubuntu Base image (66 MB from a 28 MB tarball) fits with room to spare and a gzip bomb does
+     * not. Without a pin (a hand-built test distro), a fixed ceiling stands in.
+     */
+    private fun extractionBudgetBytes(): Long =
+        if (distro.rootfsSizeBytes > 0) {
+            distro.rootfsSizeBytes * 10
+        } else {
+            DEFAULT_EXTRACTION_BUDGET_BYTES
+        }
+
     private fun moveIntoPlace() {
         // The previous rootfs is parked beside the new one rather than deleted first: the old
         // delete-then-rename ordering had a window where a crash left *neither* root, and the
         // parked copy is also the rollback if the swap itself fails.
         val parked = File(storage.rootDir, "rootfs.old")
-        parked.deleteRecursively()
+        deleteTreeNoFollow(parked)
         var parkedPrevious = false
         if (rootfsDir.exists()) {
             parkedPrevious = rootfsDir.renameTo(parked)
             if (!parkedPrevious) {
                 // Renaming the old root away failed for reasons we cannot fix here; deleting it
                 // reopens the no-root window but keeps the install able to proceed.
-                rootfsDir.deleteRecursively()
+                deleteTreeNoFollow(rootfsDir)
             }
         }
         if (!stagingDir.renameTo(rootfsDir)) {
@@ -302,7 +333,7 @@ class RootfsInstaller(
             // half-move.
             throw IOException("Could not move the extracted rootfs into place at $rootfsDir")
         }
-        parked.deleteRecursively()
+        deleteTreeNoFollow(parked)
         // The tarball has served its purpose; keeping it would pin 30 MB for nothing.
         tarballFile.delete()
     }
@@ -350,6 +381,12 @@ class RootfsInstaller(
 
         /** Room for everything else the app stores, on top of the userspace's own needs. */
         private const val FREE_SPACE_HEADROOM_BYTES = 600L * 1024 * 1024
+
+        /**
+         * The extraction ceiling when the pin carries no size (a hand-built distro): enough for a
+         * real rootfs, small enough that a gzip bomb dies long before the disk does.
+         */
+        private const val DEFAULT_EXTRACTION_BUDGET_BYTES = 500L * 1024 * 1024
 
         private const val MIB = 1024L * 1024
     }

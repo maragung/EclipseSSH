@@ -250,7 +250,8 @@ class LinuxUserspaceManager(
             backupFile.delete()
         }
         installer.deleteRootfs()
-        runtime.tmpDir.deleteRecursively()
+        // proot's temp dir holds its glue symlinks; NOFOLLOW so the sweep cannot chase one out.
+        deleteTreeNoFollow(runtime.tmpDir)
         stateFile().delete()
         _lastHealth.value = null
         _state.value = LinuxUserspaceState.NotInstalled

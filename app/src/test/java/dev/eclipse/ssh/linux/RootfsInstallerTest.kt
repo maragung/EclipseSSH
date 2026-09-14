@@ -270,6 +270,37 @@ class RootfsInstallerTest {
     }
 
     @Test
+    fun `a tarball that expands far beyond its pin is refused mid-extraction`() = runBlocking {
+        val root = newRoot()
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        // The fixture gzips 3 MB of zeros down to almost nothing; a pin claiming half that
+        // compressed size passes the content-length band (exactly at its 2x boundary) while the
+        // extraction budget - 10x the pin - lands far below what actually unpacks. That is the
+        // gzip-bomb shape: small download, huge tree.
+        val distro = TestTarballs.fixtureDistro(
+            "https://fixtures.invalid/rootfs.tar.gz",
+            TestTarballs.sha256(fixture),
+            rootfsSizeBytes = fixture.length() / 2,
+        )
+        val installer = installInto(root, fixture, distro = distro)
+
+        var thrown: IOException? = null
+        try {
+            installer.install { }
+        } catch (e: IOException) {
+            thrown = e
+        }
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).contains("expands beyond the expected size")
+        // Nothing moved into place; the half-extracted staging tree stays for the retry to
+        // reclaim, but the disk is not filled to the end of the bomb.
+        assertThat(installer.rootfsDir.exists()).isFalse()
+        assertThat(installer.isExtracted()).isFalse()
+    }
+
+    @Test
     fun `a verified tarball left by a failed install is not downloaded again`() = runBlocking {
         val root = newRoot()
         val escapeParent = Files.createTempDirectory("linux-escape").toFile()
