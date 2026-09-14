@@ -94,8 +94,9 @@ class LinuxUserspaceControllerTest {
          * precisely because this suite builds its graph around the scripted proot instead.
          */
         private fun newController(graph: LinuxUserspaceGraph?): LinuxUserspaceController {
-            val provider = LinuxUserspaceGraphProvider(appContext).apply { setGraphForTest(graph) }
-            return LinuxUserspaceController(appContext, provider)
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val provider = LinuxUserspaceGraphProvider(context).apply { setGraphForTest(graph) }
+            return LinuxUserspaceController(context, provider)
         }
     }
 

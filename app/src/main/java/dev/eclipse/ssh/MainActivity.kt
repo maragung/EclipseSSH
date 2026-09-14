@@ -5946,7 +5946,20 @@ private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
                 } else {
                     "Not installed · real bash, apt, Node.js and Python, on the device"
                 },
-            ) { }
+            ) {
+                // The version chooser lives here and only here: once anything is on disk the
+                // installed version is the only relevant one (Repair and Start operate on it), so
+                // the dropdown disappears with the Not Installed state that gave it a choice to
+                // make. Selecting swaps the graph, and the Install dialog below names whatever
+                // the dropdown left selected.
+                SettingDropdown(
+                    label = "Ubuntu version",
+                    options = ui.availableVersions,
+                    selected = distro,
+                    optionLabel = { it.displayName },
+                    onSelect = { linuxUserspace.selectDistro(it.id) },
+                )
+            }
             is LinuxUserspaceState.Stopped -> SettingRow(
                 Icons.Default.Terminal,
                 "Ubuntu on this device",
@@ -6138,20 +6151,26 @@ private fun describeInstallStep(step: LinuxInstallStep): Pair<String, Float?> = 
     }
     LinuxInstallStep.Verifying -> "Verifying the download" to null
     is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files" to null
-    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step) to null
+    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail) to null
     LinuxInstallStep.VerifyingHealth -> "Running the health check" to null
 }
 
-private fun describeSetupStep(step: SetupStep): String = when (step) {
-    SetupStep.REGISTER_USER -> "Creating the ubuntu account"
-    SetupStep.PREPARE_WORKSPACE -> "Preparing the workspace"
-    SetupStep.CONFIGURE_DNS -> "Configuring DNS"
-    SetupStep.CONFIGURE_APT -> "Configuring package sources"
-    SetupStep.UPDATE_PACKAGES -> "Updating package lists"
-    SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
-    SetupStep.INSTALL_NODEJS -> "Installing Node.js"
-    SetupStep.INSTALL_GLOBAL_TOOLS -> "Installing pnpm and the OpenCode CLI"
-    SetupStep.VERIFY -> "Verifying"
+private fun describeSetupStep(step: SetupStep, detail: String?): String {
+    val label = when (step) {
+        SetupStep.REGISTER_USER -> "Creating the ubuntu account"
+        SetupStep.PREPARE_WORKSPACE -> "Preparing the workspace"
+        SetupStep.CONFIGURE_DNS -> "Configuring DNS"
+        SetupStep.CONFIGURE_APT -> "Configuring package sources"
+        SetupStep.UPDATE_PACKAGES -> "Updating package lists"
+        SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
+        SetupStep.INSTALL_NODEJS -> "Installing Node.js"
+        SetupStep.INSTALL_GLOBAL_TOOLS -> "Installing pnpm and the OpenCode CLI"
+        SetupStep.VERIFY -> "Verifying"
+    }
+    // The newest command output beside the step's label: a slow-but-alive `apt-get update` shows
+    // "Get: 47 …" crawling instead of a label that could be wedged for all the user can tell.
+    // Capped because an apt line is unbounded prose, and this sits in a settings row's subtitle.
+    return if (detail.isNullOrBlank()) label else "$label · ${detail.trim().take(80)}"
 }
 
 @Composable
