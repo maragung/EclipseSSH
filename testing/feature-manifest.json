@@ -1,0 +1,64 @@
+{
+  "comment": "Machine-readable inventory of user-facing features. Each entry names the screen it lives on, its priority for the release gate (critical = the release must not ship if its journey fails), and the suite that exercises it today. Update this file whenever a destination, dialog, or background flow is added or renamed - the release-test report lists these ids, so a stale manifest is a lie in the report.",
+  "app": {
+    "applicationId": "dev.eclipse.ssh",
+    "debugApplicationId": "dev.eclipse.ssh.debug",
+    "minSdk": 28,
+    "targetSdk": 35,
+    "activities": [
+      "dev.eclipse.ssh.MainActivity (launcher, deep links ssh:// and eclipse://)",
+      "dev.eclipse.ssh.ui.editor.TextEditorActivity",
+      "dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity"
+    ],
+    "services": [
+      "dev.eclipse.ssh.background.EclipseSessionService (dataSync FGS: SSH shells, SFTP, port forwards)",
+      "dev.eclipse.ssh.background.LinuxUserspaceService (FGS for the proot/Ubuntu userspace)",
+      "dev.eclipse.ssh.feature.qstile.QuickConnectTileService"
+    ],
+    "receivers": [
+      "dev.eclipse.ssh.background.BootRestoreReceiver",
+      "dev.eclipse.ssh.widget.QuickConnectWidget"
+    ],
+    "providers": ["androidx.core.content.FileProvider"],
+    "permissions": [
+      "INTERNET", "ACCESS_NETWORK_STATE", "FOREGROUND_SERVICE",
+      "FOREGROUND_SERVICE_DATA_SYNC", "POST_NOTIFICATIONS", "WAKE_LOCK",
+      "RECEIVE_BOOT_COMPLETED", "USE_BIOMETRIC"
+    ]
+  },
+  "features": [
+    { "id": "app.first-launch", "screen": "Hosts", "priority": "critical", "testedBy": "AppNavigationTest.everyDestinationIsReachableAndRendersItsFirstRunContent" },
+    { "id": "navigation.all-destinations", "screen": "All", "priority": "critical", "testedBy": "AppNavigationTest.everyDestinationIsReachableAndRendersItsFirstRunContent" },
+    { "id": "navigation.state-persistence", "screen": "All", "priority": "critical", "testedBy": "AppNavigationTest.theSelectedDestinationSurvivesActivityRecreation, ReleaseChaosJourneyTest" },
+    { "id": "hosts.list-and-search", "screen": "Hosts", "priority": "critical", "testedBy": "AppNavigationTest (search field renders, seeded rows)" },
+    { "id": "hosts.add-dialog", "screen": "Hosts", "priority": "critical", "testedBy": "AppNavigationTest.theAddHostDialogOpensAndCancelsWithoutSavingAnything, ReleaseChaosJourneyTest.theAddHostDialogSurvivesARotation" },
+    { "id": "hosts.paste-password", "screen": "Hosts (Add host)", "priority": "high", "testedBy": "AppNavigationTest.theAddHostDialogsPasswordFieldOffersAPasteButton" },
+    { "id": "hosts.overflow-actions", "screen": "Hosts", "priority": "high", "testedBy": "AppNavigationTest.aHostCardOffersItsActionsBehindTheOverflowMenuOnly, AppNavigationTest.removingAHostAsksBeforeItDeletesAnything" },
+    { "id": "hosts.remove-confirmation", "screen": "Hosts", "priority": "high", "testedBy": "AppNavigationTest.removingAHostAsksBeforeItDeletesAnything" },
+    { "id": "terminal.empty-state", "screen": "Terminal", "priority": "critical", "testedBy": "AppNavigationTest.everyDestinationIsReachableAndRendersItsFirstRunContent" },
+    { "id": "transfers.queue", "screen": "Transfers", "priority": "critical", "testedBy": "AppNavigationTest (seeded rows render)" },
+    { "id": "files.explorer-first-run", "screen": "Files", "priority": "critical", "testedBy": "AppNavigationTest.everyDestinationIsReachableAndRendersItsFirstRunContent" },
+    { "id": "files.saf-folder-picker", "screen": "Files", "priority": "high", "testedBy": "AppNavigationTest (Pick folder affordance)" },
+    { "id": "settings.sections", "screen": "Settings", "priority": "critical", "testedBy": "AppNavigationTest (Security/Workspace/Port forwarding/Backup & restore/Background processing)" },
+    { "id": "settings.terminal-theme", "screen": "Settings", "priority": "medium", "testedBy": "AppNavigationTest.theTerminalThemeDropdownSelectsAThemeAndKeepsIt" },
+    { "id": "settings.autologin-sftp-switch", "screen": "Hosts (Add host)", "priority": "medium", "testedBy": "AppNavigationTest.theAddHostFormCarriesTheAutoLoginSftpSwitch" },
+    { "id": "a11y.content-descriptions", "screen": "All", "priority": "high", "testedBy": "AppNavigationTest.theHostsScreenActionsAreLabelledForScreenReaders" },
+    { "id": "lifecycle.activity-recreation", "screen": "All", "priority": "critical", "testedBy": "MainActivityLifecycleTest, ReleaseChaosJourneyTest.rotatingThroughEveryDestinationKeepsTheScreenUsable" },
+    { "id": "lifecycle.rapid-navigation", "screen": "All", "priority": "high", "testedBy": "ReleaseChaosJourneyTest.rapidTapsOnTheNavigationBarsNeverCrashOrLoseTheScreen" },
+    { "id": "data.migration-from-v2", "screen": "All", "priority": "critical", "testedBy": "MigrationInstrumentedTest (Room schema migrations)" },
+    { "id": "security.keychain", "screen": "Settings", "priority": "critical", "testedBy": "androidTest security/ suite" },
+    { "id": "ssh.connect-and-shell", "screen": "Terminal", "priority": "critical", "testedBy": "JVM suite (embedded MINA server: TerminalSessionLifecycle, ConnectionMatrix); on-device requires a reachable SSH server, covered by the session-driven loop" },
+    { "id": "sftp.file-operations", "screen": "Files", "priority": "high", "testedBy": "JVM suite (embedded MINA SFTP)" },
+    { "id": "linux.userspace-install", "screen": "Settings > Workspace", "priority": "critical", "testedBy": "JVM suite (RootfsInstaller, UbuntuDistributionManager, LinuxUserspaceManager); the on-device install needs ~600 MB and network, exercised by the session-driven loop" },
+    { "id": "editor.open-and-edit", "screen": "TextEditorActivity", "priority": "medium", "testedBy": "JVM suite (TextEditorActivityRobolectricTest)" },
+    { "id": "rdp.connect", "screen": "RemoteDesktopActivity", "priority": "medium", "testedBy": "JVM suite (FreeRDP native build verification); a live RDP server is not in CI" },
+    { "id": "widget.quick-connect", "screen": "Launcher", "priority": "low", "testedBy": "not automated - manifest presence and boot receiver verified by build + lint" },
+    { "id": "notifications.permission-and-foreground", "screen": "System", "priority": "high", "testedBy": "release-test workflow pre-grants POST_NOTIFICATIONS; FGS notification asserted by lifecycle suites" }
+  ],
+  "matrix": {
+    "apiLevels": ["35", "30"],
+    "device": "pixel_6",
+    "abi": "x86_64",
+    "comment": "API 35 is the current target; API 30 is one step above minSdk 28 and covers the older-platform path (legacy packaging, desugaring, notification permission differences). Extend via the workflow_dispatch api_levels input."
+  }
+}
