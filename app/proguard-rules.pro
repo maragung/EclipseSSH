@@ -53,6 +53,24 @@
 # NoClassDefFoundError: androidx.tracing.Trace (release-test run 34832807524).
 -keep class androidx.tracing.** { *; }
 
+# The same mechanism takes the Kotlin stdlib facade classes. Run 34837380295
+# got past androidx.tracing (the runner advanced from onCreate line 26 to line
+# 45) and then died on the next class of the same kind:
+#
+#   NoClassDefFoundError: Failed resolution of: Lkotlin/LazyKt;
+#     at androidx.test.platform.io.TestDirCalculator.<init>
+#     at androidx.test.runner.AndroidJUnitRunner.registerTestStorage
+#
+# LazyKt holds top-level functions; once the optimizer inlines their call
+# sites the facade class is unreferenced here, R8 removes it, the test APK
+# never had a copy (it treats this app's classpath as provided), and
+# androidx.test cannot resolve it through the shared instrumentation
+# classloader. Keeping the stdlib beats chasing facades one crash at a time.
+# The cost is real - the stdlib is no longer shrunk or obfuscated in the
+# release APK - so the APK size the release build reports is the measurement
+# that decides whether to narrow this to the facade classes.
+-keep class kotlin.** { *; }
+
 # Truth's error-prone annotations reference the javac model API, which Android
 # does not ship; compile-time-only references, never evaluated on a device.
 # Belt under test-proguard-rules.pro in case an androidTest R8 pass consumes
