@@ -214,3 +214,13 @@
 -keep class kotlinx.coroutines.YieldContext { *; }
 -keep class kotlinx.coroutines.YieldContext$Key { *; }
 -keep class kotlinx.coroutines.YieldKt { *; }
+
+# The one app class the androidTest pair reaches into: UbuntuE2eVerificationTest
+# reads graph.runtime / graph.manager, getters nothing in the app calls (the
+# app reads the fields directly), so R8 stripped them while the class itself
+# survived renamed - NoSuchMethodError, not NoClassDefFoundError (android-ubuntu-e2e
+# run 34854865510: 11 failures, all getRuntime()Ldev/eclipse/ssh/linux/ProotRuntime;
+# or getManager() on the obfuscated LinuxUserspaceGraph). The test APK is
+# compiled against the R8 mapping, so the renamed return types in the kept
+# descriptors line up on both sides.
+-keep class dev.eclipse.ssh.di.LinuxUserspaceGraph { *; }
