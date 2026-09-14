@@ -497,7 +497,9 @@ class UbuntuDistributionManager(
         private const val GLOBAL_TOOL_TIMEOUT_MS = 15 * 60_000L
 
         /** The mirror feed must answer quickly or not participate at all. */
-        private const val MIRROR_FETCH_TIMEOUT_MS = 10_000L
+        // HttpURLConnection's timeouts are Int milliseconds, so the constant stays Int even though
+        // every other timeout in this class is a Long.
+        private const val MIRROR_FETCH_TIMEOUT_MS = 10_000
     }
 }
 
