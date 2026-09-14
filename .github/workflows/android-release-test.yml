@@ -208,6 +208,21 @@ jobs:
           # release-signed app under test.
           grep -q 'testBuildType' app/build.gradle.kts || \
             sed -i '0,/^android {/s//android {\n    testBuildType = "release"/' app/build.gradle.kts
+          # The androidTest APK's own R8 pass (minifyReleaseAndroidTestWithR8,
+          # live once testBuildType is release) does not read the app's
+          # proguardFiles - it needs testProguardFiles, and dies on Truth's
+          # compile-time-only javax.lang.model references without them. Tags
+          # cut before this pipeline existed have neither, so inject the rules
+          # file and its DSL reference; guarded so a tag that already carries
+          # them is untouched.
+          if ! grep -q 'testProguardFiles' app/build.gradle.kts; then
+            cat > app/test-proguard-rules.pro <<'RULES'
+-dontwarn javax.lang.model.**
+RULES
+            sed -i '0,/isMinifyEnabled = true/s//isMinifyEnabled = true\n            testProguardFiles("test-proguard-rules.pro")/' app/build.gradle.kts
+          fi
+          grep -q 'dontwarn javax.lang.model' app/proguard-rules.pro || \
+            printf '\n# Truth compile-time-only annotations reference the javac model API.\n-dontwarn javax.lang.model.**\n' >> app/proguard-rules.pro
           if [ "$APK_SOURCE" = "build" ]; then
             ./gradlew :app:assembleRelease :app:assembleReleaseAndroidTest
           else

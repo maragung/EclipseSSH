@@ -41,3 +41,9 @@
 
 # Kotlin coroutines internals used via reflection by the debug agent.
 -dontwarn kotlinx.coroutines.**
+
+# Truth's error-prone annotations reference the javac model API, which Android
+# does not ship; compile-time-only references, never evaluated on a device.
+# Belt under test-proguard-rules.pro in case an androidTest R8 pass consumes
+# this file instead.
+-dontwarn javax.lang.model.**
