@@ -433,6 +433,11 @@ jobs:
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
+      # gh resolves the repository from a local git checkout, which this job
+      # deliberately does not have (it only reads downloaded artifacts) - run
+      # 34832807524 left "failed to run git: not a git repository" and the
+      # || true on issue creation swallowed it, so no failure issue was filed.
+      GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - name: Download every matrix report
