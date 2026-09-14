@@ -730,3 +730,95 @@
 -keep class androidx.compose.ui.util.MathHelpersKt { *; }
 -keep class androidx.compose.ui.viewinterop.AndroidView_androidKt { *; }
 -keep class androidx.compose.ui.window.DialogWindowProvider { *; }
+
+# ---------------------------------------------------------------------------
+# Stage 3: the remaining androidx namespaces (room, activity, core,
+# lifecycle, savedstate, collection), narrowed from the whole-namespace
+# keeps in proguard-rules.pro. Same derivation as stages 1 and 2 (see the
+# header). Notably the extraction found ZERO savedstate references: the
+# old broad keep covered the ComponentActivity superclass chain that
+# loading transitively needs, but the pair only breaks where the TEST
+# references a class R8 removed - and no test code or test library
+# references a savedstate class. androidx.room.Room is the one hand
+# addition: the test sources import it directly (Room.databaseBuilder),
+# and no scanned library constant pool mentions it.
+#
+# Stage 2 (compose) was validated by release-test run 34868038866, both
+# legs green, the x86_64 APK down 20.7 MB to 21,162,616 bytes - the
+# whole-namespace compose keep had been freezing the entire Compose
+# stack unshrunk.
+# ---------------------------------------------------------------------------
+-keep class androidx.activity.ComponentActivity { *; }
+-keep class androidx.activity.compose.ComponentActivityKt { *; }
+-keep class androidx.collection.IntObjectMapKt { *; }
+-keep class androidx.collection.MutableIntObjectMap { *; }
+-keep class androidx.core.os.ConfigurationCompat { *; }
+-keep class androidx.core.os.LocaleListCompat { *; }
+-keep class androidx.core.view.ViewConfigurationCompat { *; }
+-keep class androidx.core.view.ViewGroupKt { *; }
+-keep class androidx.core.view.WindowInsetsCompat { *; }
+-keep class androidx.lifecycle.Lifecycle { *; }
+-keep class androidx.lifecycle.Lifecycle$Event { *; }
+-keep class androidx.lifecycle.Lifecycle$State { *; }
+-keep class androidx.lifecycle.LifecycleEventObserver { *; }
+-keep class androidx.lifecycle.LifecycleObserver { *; }
+-keep class androidx.lifecycle.LifecycleOwner { *; }
+-keep class androidx.lifecycle.ViewTreeLifecycleOwner { *; }
+-keep class androidx.room.BaseRoomConnectionManager { *; }
+-keep class androidx.room.BaseRoomConnectionManager$DriverWrapper { *; }
+-keep class androidx.room.DatabaseConfiguration { *; }
+-keep class androidx.room.InvalidationTracker { *; }
+-keep class androidx.room.Room { *; }
+-keep class androidx.room.RoomDatabase { *; }
+-keep class androidx.room.RoomDatabase$Callback { *; }
+-keep class androidx.room.RoomDatabase$JournalMode { *; }
+-keep class androidx.room.RoomDatabase$MigrationContainer { *; }
+-keep class androidx.room.RoomDatabase$PrepackagedDatabaseCallback { *; }
+-keep class androidx.room.RoomOpenDelegate { *; }
+-keep class androidx.room.RoomOpenDelegate$ValidationResult { *; }
+-keep class androidx.room.Transactor { *; }
+-keep class androidx.room.driver.SupportSQLiteConnection { *; }
+-keep class androidx.room.driver.SupportSQLiteDriver { *; }
+-keep class androidx.room.migration.AutoMigrationSpec { *; }
+-keep class androidx.room.migration.Migration { *; }
+-keep class androidx.room.migration.bundle.BaseEntityBundle { *; }
+-keep class androidx.room.migration.bundle.DatabaseBundle { *; }
+-keep class androidx.room.migration.bundle.DatabaseViewBundle { *; }
+-keep class androidx.room.migration.bundle.EntityBundle { *; }
+-keep class androidx.room.migration.bundle.FieldBundle { *; }
+-keep class androidx.room.migration.bundle.ForeignKeyBundle { *; }
+-keep class androidx.room.migration.bundle.FtsEntityBundle { *; }
+-keep class androidx.room.migration.bundle.IndexBundle { *; }
+-keep class androidx.room.migration.bundle.PrimaryKeyBundle { *; }
+-keep class androidx.room.migration.bundle.SchemaBundle { *; }
+-keep class androidx.room.migration.bundle.SchemaBundle$Companion { *; }
+-keep class androidx.room.testing.AndroidMigrationTestHelper { *; }
+-keep class androidx.room.testing.BundleUtil { *; }
+-keep class androidx.room.testing.ConfigurationFactory { *; }
+-keep class androidx.room.testing.ConnectionManagerFactory { *; }
+-keep class androidx.room.testing.CreateOpenDelegate { *; }
+-keep class androidx.room.testing.DefaultTestConnectionManager { *; }
+-keep class androidx.room.testing.MigrateOpenDelegate { *; }
+-keep class androidx.room.testing.MigrationTestHelper { *; }
+-keep class androidx.room.testing.MigrationTestHelperKt { *; }
+-keep class androidx.room.testing.SQLiteDriverMigrationTestHelper { *; }
+-keep class androidx.room.testing.SQLiteDriverMigrationTestHelper$createDatabase$connection$1 { *; }
+-keep class androidx.room.testing.SQLiteDriverMigrationTestHelper$runMigrationsAndValidate$connection$1 { *; }
+-keep class androidx.room.testing.SupportSQLiteMigrationTestHelper { *; }
+-keep class androidx.room.testing.SupportSQLiteMigrationTestHelper$SupportTestConnectionManager { *; }
+-keep class androidx.room.testing.SupportSQLiteMigrationTestHelper$SupportTestConnectionManager$SupportOpenHelperCallback { *; }
+-keep class androidx.room.testing.SupportSQLiteMigrationTestHelper$createDatabase$connection$1 { *; }
+-keep class androidx.room.testing.SupportSQLiteMigrationTestHelper$databaseInstance$1 { *; }
+-keep class androidx.room.testing.SupportSQLiteMigrationTestHelper$runMigrationsAndValidate$connection$1 { *; }
+-keep class androidx.room.testing.TestConnectionManager { *; }
+-keep class androidx.room.testing.TestOpenDelegate { *; }
+-keep class androidx.room.util.FtsTableInfo { *; }
+-keep class androidx.room.util.FtsTableInfo$Companion { *; }
+-keep class androidx.room.util.KClassUtil { *; }
+-keep class androidx.room.util.TableInfo { *; }
+-keep class androidx.room.util.TableInfo$Column { *; }
+-keep class androidx.room.util.TableInfo$Companion { *; }
+-keep class androidx.room.util.TableInfo$ForeignKey { *; }
+-keep class androidx.room.util.TableInfo$Index { *; }
+-keep class androidx.room.util.ViewInfo { *; }
+-keep class androidx.room.util.ViewInfo$Companion { *; }

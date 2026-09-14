@@ -78,23 +78,20 @@
 # becomes NoSuchMethodError inside a mapped class
 # (androidx.collection.mutableIntObjectMapOf, whose class survived renamed
 # while the trivial facade method was inlined away everywhere in the app).
-# The keeps below therefore cover every namespace the androidTest sources
-# and the Compose test rules touch: room and lifecycle (direct test
-# imports), activity plus its ComponentActivity superclass chain (core,
-# savedstate - createAndroidComposeRule's bound), and collection.
+# The whole-namespace keeps that used to sit here covered every namespace
+# the androidTest sources and the Compose test rules touch: room and
+# lifecycle (direct test imports), activity plus its ComponentActivity
+# superclass chain (core, savedstate - createAndroidComposeRule's bound),
+# and collection.
 # HostProfile and the transfer DAO are covered by the data rule above;
 # kotlin, kotlinx.coroutines and androidx.compose moved to
 # proguard-instrumentation.pro as exact per-class lists (stage 1 validated
 # by release-test run 34863389211, both legs green, the x86_64 APK down
-# 1.38 MB to 41,868,849 bytes; compose is stage 2, validated by the run
-# after it). The next build's APK size report decides whether any of this
-# gets narrowed.
--keep class androidx.room.** { *; }
--keep class androidx.activity.** { *; }
--keep class androidx.core.** { *; }
--keep class androidx.lifecycle.** { *; }
--keep class androidx.savedstate.** { *; }
--keep class androidx.collection.** { *; }
+# 1.38 MB to 41,868,849 bytes; stage 2 compose validated by run
+# 34868038866, both legs green, down another 20.7 MB to 21,162,616
+# bytes). room, activity, core, lifecycle, savedstate and collection
+# followed in stage 3 - the whole-namespace keeps below are gone, also
+# narrowed into proguard-instrumentation.pro.
 # Run 34847297300: javax.inject sits on the app classpath via Hilt, so
 # androidx.test (whose runner and Espresso reference javax.inject.Provider)
 # treats it as provided and does not package it - while this APK's own pass
