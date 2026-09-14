@@ -18,6 +18,7 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.io.Closeable
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.security.KeyPair
 import java.security.MessageDigest
 import java.security.PublicKey
@@ -34,12 +35,10 @@ import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import org.apache.sshd.agent.SshAgent
 import org.apache.sshd.agent.SshAgentFactory
 import org.apache.sshd.agent.SshAgentServer
@@ -622,12 +621,21 @@ class SshConnectionManager @Inject constructor(
      * parks the stat producer forever otherwise. The bound returns the producer to the UI as
      * "Unavailable" instead.
      *
-     * The timeout is translated out of [TimeoutCancellationException] before it leaves: that
-     * class *is* a [CancellationException], and the callers' cancellation branches rethrow those
-     * on sight - a timeout would have silenced the producer instead of reporting, exactly the
-     * bug the caller's own catch exists to avoid. [IOException] keeps it on the ordinary failure
-     * path. The underlying channel stays wedged until its transport notices; the wait is what is
-     * bounded here, not the remote command.
+     * The bound is MINA's own, not a coroutine timeout around a blocking call. `withTimeout`
+     * cannot deliver its cancellation into a thread blocked in a socket read: since kotlinx.coroutines
+     * 1.4, `withContext` waits for its block to finish even when the caller is cancelled, so a
+     * `withTimeout { withContext(Dispatchers.IO) { ... } }` spelling of this leaves the IO thread
+     * reading from the wedged transport for as long as the transport cares to stay silent - days,
+     * in the field, and a leaked thread per stat query. `executeRemoteCommand(command, Duration)`
+     * instead bounds both the channel open and the wait for the command's result inside MINA, and
+     * returns - or throws - within the budget on any server, however wedged. What stays true of
+     * the old spelling: a caller cancelled mid-wait does not return early; it returns when the
+     * bounded call does, which is at most `timeoutMs` later.
+     *
+     * The timeout is translated out of [SocketTimeoutException] before it leaves, because the
+     * message contract - "did not answer" - is what the failure copy and the tests speak, and
+     * because MINA's own message names the mechanics rather than the symptom. [IOException] keeps
+     * it on the ordinary failure path, out of the callers' cancellation branches.
      *
      * @param timeoutMs the budget; overridable so a test can make it seconds rather than the
      *   production default.
@@ -637,12 +645,12 @@ class SshConnectionManager @Inject constructor(
         command: String,
         timeoutMs: Long = REMOTE_COMMAND_TIMEOUT_MS,
     ): String =
-        try {
-            withTimeout(timeoutMs) {
-                withContext(Dispatchers.IO) { session.executeRemoteCommand(command).trim() }
+        withContext(Dispatchers.IO) {
+            try {
+                session.executeRemoteCommand(command, Duration.ofMillis(timeoutMs)).trim()
+            } catch (timedOut: SocketTimeoutException) {
+                throw IOException("The server did not answer '$command' within ${timeoutMs / 1000}s", timedOut)
             }
-        } catch (timedOut: TimeoutCancellationException) {
-            throw IOException("The server did not answer '$command' within ${timeoutMs / 1000}s", timedOut)
         }
 
     /** Trusts this fingerprint for the profile's host. False when it could not be persisted. */

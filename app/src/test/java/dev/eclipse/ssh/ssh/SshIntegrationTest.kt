@@ -810,11 +810,15 @@ class SshIntegrationTest {
      * the process lived. The bound is what [SshConnectionManager.REMOTE_COMMAND_TIMEOUT_MS] ships
      * with; the override exists so this test can make it one second instead of thirty.
      *
-     * The failure must also arrive as an [IOException], not as the [kotlinx.coroutines.TimeoutCancellationException]
-     * it starts as: that class is a [kotlinx.coroutines.CancellationException], and the producer's
-     * cancellation branch rethrows those on sight - a timeout surfacing as cancellation would
-     * have silenced the stat card instead of marking it "Unavailable", which is the exact bug the
-     * caller's own catch exists to avoid.
+     * The failure must also arrive as an [IOException] carrying the "did not answer" sentence,
+     * not as the raw [java.net.SocketTimeoutException] MINA raises when its bound fires: the
+     * message is what the stat producer shows and what a log grep finds. The reason it has to be
+     * an ordinary exception and never a cancellation is unchanged from the first draft of this
+     * bound - a [kotlinx.coroutines.TimeoutCancellationException] is a
+     * [kotlinx.coroutines.CancellationException], and the producer's cancellation branch
+     * rethrows those on sight, so a timeout surfacing as cancellation would have silenced the
+     * stat card instead of marking it "Unavailable", which is the exact bug the caller's own
+     * catch exists to avoid.
      */
     @Test(timeout = 120_000)
     fun `a command that never answers fails the caller instead of hanging it`() {
