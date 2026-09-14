@@ -5,6 +5,7 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.junit4.waitUntil
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -83,6 +84,9 @@ class AppNavigationTest {
         // The header renders unconditionally; the queue itself is not empty on a clean install,
         // so assert the seeded rows arrived from Room rather than the "No transfers" branch.
         compose.onNodeWithText("Transfer queue").assertIsDisplayed()
+        // The rows come from Room, whose first emission lands on a dispatch Compose's idle
+        // detection cannot observe — wait for it rather than racing it (see awaitSeededRow).
+        awaitSeededRow("release-bundle.tar.gz")
         compose.onNodeWithText("release-bundle.tar.gz").assertIsDisplayed()
         compose.onNodeWithText("deploy.sh").assertExists()
 
@@ -226,11 +230,16 @@ class AppNavigationTest {
     @Test
     fun aHostCardOffersItsActionsBehindTheOverflowMenuOnly() {
         compose.waitForIdle()
+        awaitSeededRow(SEEDED_HOST)
 
         assertWithMessage("a Connect button is back on the host cards")
             .that(compose.onAllNodesWithText("Connect").fetchSemanticsNodes()).isEmpty()
 
-        compose.onNodeWithContentDescription("More actions for $SEEDED_HOST").performScrollTo().performClick()
+        // The kebab is addressed in the unmerged tree: its description lives on the Icon
+        // inside the button, and a hosted device has once composed the card without
+        // exposing the button in the merged tree — the unmerged tree always has it.
+        compose.onNodeWithContentDescription("More actions for $SEEDED_HOST", useUnmergedTree = true)
+            .performScrollTo().performClick()
         compose.waitForIdle()
 
         compose.onNodeWithText("Connect").assertIsDisplayed()
@@ -249,8 +258,10 @@ class AppNavigationTest {
     @Test
     fun removingAHostAsksBeforeItDeletesAnything() {
         compose.waitForIdle()
+        awaitSeededRow(SEEDED_HOST)
 
-        compose.onNodeWithContentDescription("More actions for $SEEDED_HOST").performScrollTo().performClick()
+        compose.onNodeWithContentDescription("More actions for $SEEDED_HOST", useUnmergedTree = true)
+            .performScrollTo().performClick()
         compose.onNodeWithText("Remove").performClick()
         compose.waitForIdle()
 
@@ -264,7 +275,7 @@ class AppNavigationTest {
         compose.waitForIdle()
 
         // Nothing was deleted: the card is still there, with its menu still on it.
-        compose.onNodeWithContentDescription("More actions for $SEEDED_HOST").assertExists()
+        compose.onNodeWithContentDescription("More actions for $SEEDED_HOST", useUnmergedTree = true).assertExists()
     }
 
     /** The per-host SFTP switch is on the form, labelled, and says what each position does. */
@@ -285,6 +296,19 @@ class AppNavigationTest {
         assertWithMessage("the switch has no explanation under it").that(explained).isEqualTo(1)
 
         compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
+    }
+
+    /**
+     * Seeded content arrives from Room over a background dispatch that Compose's idle
+     * detection cannot observe, so a test that addresses a seeded row right after
+     * [waitForIdle] races the first emission — on a loaded device the assertion can run
+     * before the row composes. Waiting is the honest contract: this suite assumes a clean
+     * install, so the seeds are a fact; only their arrival is async.
+     */
+    private fun awaitSeededRow(text: String) {
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+        }
     }
 
     private companion object {
