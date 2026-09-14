@@ -13,8 +13,11 @@ import androidx.lifecycle.LifecycleService
 import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.MainActivity
 import dev.eclipse.ssh.R
+import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
+import dev.eclipse.ssh.presentation.linux.holdsProcess
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -25,7 +28,9 @@ import kotlinx.coroutines.launch
 
 /**
  * Holds the app process — and with it every forked proot shell — at foreground importance while
- * the local Ubuntu userspace is [LinuxUserspaceState.Running].
+ * the local Ubuntu userspace is in a state that runs proot children: Running (the open
+ * terminals), and Installing, Starting or Stopping (the lifecycle operations' own proot runs —
+ * an install is the longest of them, and screen-off during it must not kill the process).
  *
  * The userspace has no daemon to keep alive (proot is a fresh fork per shell; see
  * `ProotRuntime`), so what backgrounding actually risks is the *process*: Android reclaims a
@@ -34,11 +39,13 @@ import kotlinx.coroutines.launch
  * it is kept.
  *
  * Existence is derived, never requested: [LinuxUserspaceController] owns the binding — it starts
- * this service when the state machine enters Running and stops it when the machine leaves — and
- * this service *also* watches the state itself and stops itself if it is ever alive while the
- * userspace is not Running. The second rule is the belt to the first's braces: it makes the
- * service self-healing against any future path into the state machine the controller's binding
- * does not know about, and it is the same "derived, never registered" posture as the host card.
+ * this service when the state machine enters a holding state and stops it when the machine
+ * leaves — and this service *also* watches the state itself, under the same
+ * [dev.eclipse.ssh.presentation.linux.holdsProcess] predicate, and stops itself if it is ever
+ * alive while the userspace is in no state that needs holding. The second rule is the belt to
+ * the first's braces: it makes the service self-healing against any future path into the state
+ * machine the controller's binding does not know about, and it is the same "derived, never
+ * registered" posture as the host card.
  *
  * Started with [ACTION_STOP] only from the notification's Stop action; that is the one-stop
  * gesture the notification exists to offer, and it goes through the manager (the same code path
@@ -67,7 +74,10 @@ class LinuxUserspaceService : LifecycleService() {
             ServiceCompat.startForeground(
                 this,
                 NotificationChannels.ID_LINUX,
-                buildNotification(sessionCount = graph.processes.sessionCount.value),
+                buildNotification(
+                    state = graph.manager.state.value,
+                    sessionCount = graph.processes.sessionCount.value,
+                ),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                 } else {
@@ -86,11 +96,13 @@ class LinuxUserspaceService : LifecycleService() {
             combine(graph.manager.state, graph.processes.sessionCount) { state, count ->
                 state to count
             }.collect { (state, count) ->
-                if (state !is LinuxUserspaceState.Running) {
+                // The same predicate the controller's binding rule uses — a Running-only rule here
+                // would undemote an install the binding now deliberately promotes.
+                if (!state.holdsProcess()) {
                     stopSelf()
                     return@collect
                 }
-                updateNotification(count)
+                updateNotification(state, count)
             }
         }
     }
@@ -155,7 +167,7 @@ class LinuxUserspaceService : LifecycleService() {
         super.onDestroy()
     }
 
-    private fun buildNotification(sessionCount: Int): Notification {
+    private fun buildNotification(state: LinuxUserspaceState, sessionCount: Int): Notification {
         val openIntent = PendingIntent.getActivity(
             this,
             0,
@@ -168,22 +180,73 @@ class LinuxUserspaceService : LifecycleService() {
             Intent(this, LinuxUserspaceService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        return NotificationCompat.Builder(this, NotificationChannels.LINUX)
+        val builder = NotificationCompat.Builder(this, NotificationChannels.LINUX)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(getString(R.string.notif_linux_title))
-            .setContentText(getString(R.string.notif_linux_body, sessionCount))
+            .setContentText(notificationBody(state, sessionCount))
             .setContentIntent(openIntent)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(0, getString(R.string.notif_linux_action_open), openIntent)
-            .addAction(0, getString(R.string.notif_linux_action_stop), stopIntent)
+        if (state !is LinuxUserspaceState.Installing) {
+            // Stop is a lifecycle verb the manager refuses mid-install, so during Installing the
+            // action would be a button that does nothing; it returns once the install settles.
+            builder.addAction(0, getString(R.string.notif_linux_action_stop), stopIntent)
+        }
+        return builder
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
-    private fun updateNotification(sessionCount: Int) {
+    /**
+     * What the notification says about the userspace right now. Installing gets the install's own
+     * phase — the same live evidence the settings screen's progress line shows — because a
+     * backgrounded install is exactly when the user needs to see that it is alive and moving.
+     */
+    private fun notificationBody(state: LinuxUserspaceState, sessionCount: Int): String =
+        when (state) {
+            is LinuxUserspaceState.Installing -> "Installing Ubuntu · ${describeInstallStep(state.step)}"
+            LinuxUserspaceState.Starting -> "Starting Ubuntu"
+            LinuxUserspaceState.Stopping -> "Stopping Ubuntu"
+            // Running, and — for the moment between a state change and this service's own
+            // stop — the settled states, where the session count is the line the user reads.
+            else -> getString(R.string.notif_linux_body, sessionCount)
+        }
+
+    /**
+     * One install phase as the notification body renders it. Plain literals, matching the settings
+     * screen's own install-progress vocabulary (describeInstallStep in MainActivity), which is
+     * also literal: the labels ship beside apt's own English output either way.
+     */
+    private fun describeInstallStep(step: LinuxInstallStep): String = when (step) {
+        is LinuxInstallStep.Downloading -> "downloading"
+        LinuxInstallStep.Verifying -> "verifying the download"
+        is LinuxInstallStep.Extracting -> "extracting · ${step.entries} files"
+        is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail)
+        LinuxInstallStep.VerifyingHealth -> "running the health check"
+    }
+
+    private fun describeSetupStep(step: SetupStep, detail: String?): String {
+        val label = when (step) {
+            SetupStep.REGISTER_USER -> "creating the ubuntu account"
+            SetupStep.PREPARE_WORKSPACE -> "preparing the workspace"
+            SetupStep.CONFIGURE_DNS -> "configuring DNS"
+            SetupStep.CONFIGURE_APT -> "configuring package sources"
+            SetupStep.UPDATE_PACKAGES -> "updating package lists"
+            SetupStep.INSTALL_BASE_PACKAGES -> "installing the base packages"
+            SetupStep.INSTALL_NODEJS -> "installing Node.js"
+            SetupStep.INSTALL_GLOBAL_TOOLS -> "installing pnpm and the OpenCode CLI"
+            SetupStep.VERIFY -> "verifying"
+        }
+        // The newest command output beside the label — the notification's one line of proof that
+        // a slow-but-alive apt is moving. Capped, because an apt line is unbounded prose and the
+        // notification body is one line.
+        return if (detail.isNullOrBlank()) label else "$label · ${detail.trim().take(80)}"
+    }
+
+    private fun updateNotification(state: LinuxUserspaceState, sessionCount: Int) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        runCatching { manager.notify(NotificationChannels.ID_LINUX, buildNotification(sessionCount)) }
+        runCatching { manager.notify(NotificationChannels.ID_LINUX, buildNotification(state, sessionCount)) }
     }
 
     companion object {

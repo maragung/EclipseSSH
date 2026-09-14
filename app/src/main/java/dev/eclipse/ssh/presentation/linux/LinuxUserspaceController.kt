@@ -71,6 +71,22 @@ data class LinuxUserspaceUiState(
 )
 
 /**
+ * The states during which the app process — and with it every forked proot child, scripted or
+ * interactive — needs holding at foreground importance: [LinuxUserspaceState.Running] holds open
+ * terminals, and Installing, Starting and Stopping run proot children of their own (an install is
+ * the longest phase the userspace ever has, and screen-off during it used to kill every child
+ * mid-apt).
+ *
+ * One predicate, shared by the controller's binding rule and the service's self-stop rule, so the
+ * two sides of the binding can never disagree about what it covers.
+ */
+fun LinuxUserspaceState.holdsProcess(): Boolean =
+    this is LinuxUserspaceState.Running ||
+        this is LinuxUserspaceState.Installing ||
+        this is LinuxUserspaceState.Starting ||
+        this is LinuxUserspaceState.Stopping
+
+/**
  * The Linux userspace's UI surface: one state object for the settings screen, one action per
  * lifecycle verb, and nothing else. The managers underneath ([LinuxUserspaceManager] and its
  * graph) are deliberately not exposed — the UI acts through named actions so every transition
@@ -313,29 +329,32 @@ class LinuxUserspaceController @Inject constructor(
     }
 
     /**
-     * Keeps [LinuxUserspaceService] alive exactly while the state machine is Running.
+     * Keeps [LinuxUserspaceService] alive exactly while the state machine is in a state that runs
+     * proot children — see [LinuxUserspaceState.holdsProcess].
      *
      * Every Ubuntu terminal is a child of this process, so the spec's "backgrounding the app does
      * not stop Ubuntu" is a process-liveness promise, and the foreground service is how it is
-     * kept. This is the one owner of the binding — every path into Running (Settings' Start, a
-     * terminal opening a stopped userspace, a future Repair that ends running) promotes the
-     * process, and every path out (Stop, an uninstall) demotes it — while the service itself
-     * watches the same state and stops itself if it is ever alive without a Running userspace, so
-     * neither side trusts the other.
+     * kept. Installing is covered for the same reason: an install runs apt and Node setup inside
+     * proot for the longest phase the userspace ever has, and without the hold a screen-off during
+     * it would kill every child mid-install. This is the one owner of the binding — every entry
+     * into a holding state (Settings' Install and Start, a terminal opening a stopped userspace)
+     * promotes the process, and every path out (Stop, an uninstall, a failed install) demotes it —
+     * while the service itself watches the same states and stops itself if it is ever alive
+     * without a userspace that needs holding, so neither side trusts the other.
      *
      * The promotion can be refused on API 31+ when the app is not visible, which today cannot
-     * happen (every entry into Running is a user action), so the refusal branch is defensive: the
-     * userspace keeps running and the alert is the honest "Ubuntu is now only as durable as the
-     * app being open" instead of a silent loss of background protection.
+     * happen (every entry into a holding state is a user action), so the refusal branch is
+     * defensive: the userspace keeps running and the alert is the honest "Ubuntu is now only as
+     * durable as the app being open" instead of a silent loss of background protection.
      */
     private fun holdProcessWhileRunning(manager: LinuxUserspaceManager) {
         scope.launch {
             manager.state
-                .map { it is LinuxUserspaceState.Running }
+                .map { it.holdsProcess() }
                 .distinctUntilChanged()
-                .collect { running ->
+                .collect { hold ->
                     val intent = Intent(appContext, LinuxUserspaceService::class.java)
-                    if (running) {
+                    if (hold) {
                         val promoted = runCatching {
                             ContextCompat.startForegroundService(appContext, intent)
                         }.isSuccess
