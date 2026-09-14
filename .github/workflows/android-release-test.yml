@@ -120,6 +120,17 @@ jobs:
         with:
           ref: ${{ env.APK_SOURCE == 'release' && env.TAG || github.ref }}
 
+      - name: Check out the pipeline harness
+        # The tested checkout above is the release tag, which predates the
+        # testing/ scripts this workflow drives - those live on the ref the
+        # workflow itself runs from: the default branch for release events,
+        # the dispatched ref for manual runs. Two checkouts, two roles: the
+        # tag is the code under test, this one is the harness.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'release' && 'main' || github.ref }}
+          path: pipeline
+
       - name: Set up JDK 17.0.13
         uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
         with:
@@ -188,6 +199,15 @@ jobs:
       - name: Build the release androidTest APK (and app APK in build mode)
         run: |
           set -euo pipefail
+          # testBuildType has no gradle.properties spelling - it exists only in
+          # the DSL - and tags cut before this pipeline existed do not set it.
+          # Without it AGP creates androidTest tasks for the debug build type
+          # only, so :app:assembleReleaseAndroidTest does not exist. Setting it
+          # makes the androidTest APK carry the release applicationId and the
+          # release signature restored above, so it pairs with the
+          # release-signed app under test.
+          grep -q 'testBuildType' app/build.gradle.kts || \
+            sed -i '0,/^android {/s//android {\n    testBuildType = "release"/' app/build.gradle.kts
           if [ "$APK_SOURCE" = "build" ]; then
             ./gradlew :app:assembleRelease :app:assembleReleaseAndroidTest
           else
@@ -224,7 +244,7 @@ jobs:
           set -euo pipefail
           EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
           EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
-          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
+          bash pipeline/testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
 
       - name: Enable KVM device permissions
         run: |
@@ -341,11 +361,11 @@ jobs:
           set -euo pipefail
           ADB="$ANDROID_HOME/platform-tools/adb"
           "$ADB" logcat -d -v time > out/logcat-full.txt
-          bash testing/scan-crashes.sh out/logcat-full.txt "$APP_PACKAGE" out/crash-report.json
+          bash pipeline/testing/scan-crashes.sh out/logcat-full.txt "$APP_PACKAGE" out/crash-report.json
 
       - name: Collect diagnostics
         if: always()
-        run: bash testing/collect-diagnostics.sh out "$APP_PACKAGE" post-suite
+        run: bash pipeline/testing/collect-diagnostics.sh out "$APP_PACKAGE" post-suite
 
       - name: Generate the report
         if: always()
@@ -355,7 +375,7 @@ jobs:
           CRASH_OK="${{ steps.crashscan.outcome == 'success' && 'yes' || 'no' }}"
           if [ "$SUITE_OK" = "yes" ] && [ "$CRASH_OK" = "yes" ]; then PASSED=yes; else PASSED=no; fi
           if [ ! -f out/test-stdout.txt ]; then echo "(the suite never produced output)" > out/test-stdout.txt; fi
-          python3 testing/generate-report.py out "$TAG" "${{ matrix.api_level }}" \
+          python3 pipeline/testing/generate-report.py out "$TAG" "${{ matrix.api_level }}" \
             "$GITHUB_SHA" "$GITHUB_REPOSITORY" \
             out/test-stdout.txt out/release-validation.json \
             out/crash-report.json "$PASSED"
@@ -393,7 +413,7 @@ jobs:
       TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - name: Download every matrix report
-        uses: actions/download-artifact@fa0a86b8c8b4b906e4694c3bcc39a2f0b7a8bfa6 # v6.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
         with:
           pattern: release-test-api*
           path: reports
@@ -455,8 +475,16 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.apk_source == 'release' && needs.resolve.outputs.tag || github.ref }}
 
+      - name: Check out the pipeline harness
+        # The tested checkout is the release tag, which predates testing/;
+        # auto-fix.sh lives on the ref the workflow runs from.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'release' && 'main' || github.ref }}
+          path: pipeline
+
       - name: Download the failure report
-        uses: actions/download-artifact@fa0a86b8c8b4b906e4694c3bcc39a2f0b7a8bfa6 # v6.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
         with:
           pattern: release-test-api*
           path: run-artifacts
@@ -474,4 +502,4 @@ jobs:
           REPORT="$(find run-artifacts -name failure-report.json | head -1)"
           test -n "$REPORT" || { echo "no failure report artifact"; exit 1; }
           BASE_REF="${{ needs.resolve.outputs.apk_source == 'release' && needs.resolve.outputs.tag || github.ref_name }}"
-          bash testing/auto-fix.sh "$REPORT" "$BASE_REF" run-artifacts
+          bash pipeline/testing/auto-fix.sh "$REPORT" "$BASE_REF" run-artifacts
