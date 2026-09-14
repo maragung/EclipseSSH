@@ -18,7 +18,12 @@ internal object TestTarballs {
      * Writes a minimal Ubuntu-Base-shaped tar.gz: `bin/`, `etc/{passwd,group,shadow}`,
      * `etc/apt/` (a directory Ubuntu Base ships and setup writes `sources.list` into), a
      * `/bin/bash` with the executable bit, and a symlink — everything the installer's entry-type
-     * handling and the distribution manager's setup rewrites touch.
+     * handling, the rootfs validator's manifest and the distribution manager's setup rewrites
+     * touch.
+     *
+     * The trailing pad of zeros exists solely to carry the fixture past [RootfsValidator]'s
+     * extracted-size floor: it gzip-compresses to almost nothing on disk but unpacks to more
+     * bytes than a real rootfs would ever be mistaken for.
      */
     fun writeRootfsFixture(target: File): File {
         target.parentFile?.mkdirs()
@@ -27,13 +32,35 @@ internal object TestTarballs {
                 putDirectory(tar, "bin")
                 putDirectory(tar, "etc")
                 putDirectory(tar, "etc/apt")
+                putDirectory(tar, "lib")
                 putDirectory(tar, "usr")
                 putDirectory(tar, "usr/bin")
+                putDirectory(tar, "var/lib")
                 putFile(tar, "bin/bash", "fake shell\n".toByteArray(), mode = 0b111_101_101)
+                putSymlink(tar, "bin/sh", "bash")
+                putSymlink(tar, "usr/bin/env", "../../bin/bash")
+                putFile(tar, "usr/bin/apt-get", "fake apt\n".toByteArray(), mode = 0b111_101_101)
+                putFile(tar, "lib/ld-linux-aarch64.so.1", "fake linker\n".toByteArray(), mode = 0b111_101_101)
                 putFile(tar, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n".toByteArray())
                 putFile(tar, "etc/group", "root:x:0:\ndaemon:x:1:\n".toByteArray())
                 putFile(tar, "etc/shadow", "root:*:19850:0:99999:7:::\ndaemon:*:19850:0:99999:7:::\n".toByteArray())
-                putSymlink(tar, "usr/bin/env", "../../bin/bash")
+                putFile(tar, "etc/apt/sources.list", "deb https://fixtures.invalid/ubuntu jammy main\n".toByteArray())
+                putFile(tar, "var/lib/rootfs-fixture.pad", ByteArray(3 * 1024 * 1024))
+            }
+        }
+        return target
+    }
+
+    /**
+     * A tarball that downloads, verifies and extracts cleanly — and is still not a rootfs: it has
+     * no shell, no linker, no apt. What [RootfsValidator] exists to catch, in one fixture.
+     */
+    fun writeSparseFixture(target: File): File {
+        target.parentFile?.mkdirs()
+        GZIPOutputStream(target.outputStream().buffered()).use { gzip ->
+            TarArchiveOutputStream(gzip).use { tar ->
+                putDirectory(tar, "etc")
+                putFile(tar, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\n".toByteArray())
             }
         }
         return target

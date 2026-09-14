@@ -243,6 +243,33 @@ class RootfsInstallerTest {
     }
 
     @Test
+    fun `a tarball that extracts to an incomplete tree is refused before it is moved into place`() = runBlocking {
+        val root = newRoot()
+        // Downloads, verifies and extracts cleanly - and is still not a rootfs (no shell, no
+        // linker, no apt). Only the validator can tell, and this is where its verdict lands.
+        val sparse = TestTarballs.writeSparseFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("sparse.tar.gz"),
+        )
+        val installer = installInto(root, sparse)
+
+        var thrown: IOException? = null
+        try {
+            installer.install { }
+        } catch (e: IOException) {
+            thrown = e
+        }
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).contains("failed validation")
+        // The findings are named, so the failure is readable rather than mysterious.
+        assertThat(thrown!!.message).contains("/bin/bash")
+        // Nothing was moved into place, and the rejected staging tree is reclaimed rather than
+        // left pinning the space the retry needs.
+        assertThat(root.resolve("rootfs").exists()).isFalse()
+        assertThat(root.resolve("rootfs.staging").exists()).isFalse()
+        assertThat(installer.isExtracted()).isFalse()
+    }
+
+    @Test
     fun `a verified tarball left by a failed install is not downloaded again`() = runBlocking {
         val root = newRoot()
         val escapeParent = Files.createTempDirectory("linux-escape").toFile()

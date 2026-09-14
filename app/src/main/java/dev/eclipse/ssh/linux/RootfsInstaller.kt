@@ -36,6 +36,7 @@ class RootfsInstaller(
     private val distro: LinuxDistro,
     private val downloader: HttpDownloader = UrlConnectionDownloader(),
     private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
+    private val validator: RootfsValidator = RootfsValidator(),
 ) {
     /** Where the tarball is downloaded to before verification. */
     val tarballFile: File get() = File(storage.downloadsDir, "rootfs-${distro.ubuntuArch}.tar.gz")
@@ -97,8 +98,26 @@ class RootfsInstaller(
         onProgress(Progress.Verifying)
         verify()
         extract(onProgress)
+        validateStaging()
         moveIntoPlace()
         rootfsDir
+    }
+
+    /**
+     * The staging tree's examination before it is allowed to become the rootfs: the manifest and
+     * the size floor from [RootfsValidator]. A tree that fails is deleted here — it is
+     * regenerable from the (verified, kept) tarball — and the install fails naming what was
+     * wrong, instead of moving a broken rootfs into place and letting the first shell be the
+     * thing that discovers it.
+     */
+    private fun validateStaging() {
+        val findings = validator.validate(stagingDir)
+        if (findings.isEmpty()) return
+        stagingDir.deleteRecursively()
+        throw IOException(
+            "the extracted rootfs failed validation: " +
+                findings.joinToString("; ") { "${it.path} ${it.problem}" },
+        )
     }
 
     /**
