@@ -237,6 +237,39 @@ class LinuxUserspaceManagerTest {
     }
 
     @Test
+    fun `an interrupted install comes back as NeedsRepair and the retry reclaims its staging`() = runTest {
+        // The crash shape: the installing marker was written, then the process died
+        // mid-extraction - a junk staging tree, no rootfs. Construction classifies it as
+        // repairable (never as a healthy install), and the install that follows reclaims the
+        // staging tree and completes.
+        val interruptedRoot =
+            Files.createTempDirectory("linux-userspace-interrupted").toFile().apply { deleteOnExit() }
+        interruptedRoot.resolve("state.properties")
+            .writeText("installing=true\ndistroId=ubuntu-22.04\nphase=download\nstartedAtMs=1\n")
+        interruptedRoot.resolve("rootfs.staging/etc").mkdirs()
+        interruptedRoot.resolve("rootfs.staging/etc/half-written.conf").writeText("truncated by the crash\n")
+        val harness = Harness(
+            TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)),
+            interruptedRoot,
+        )
+
+        val state = harness.manager.state.value
+        assertThat(state).isInstanceOf(LinuxUserspaceState.NeedsRepair::class.java)
+        assertThat((state as LinuxUserspaceState.NeedsRepair).detail).contains("interrupted")
+
+        harness.manager.install()
+
+        assertThat(harness.manager.state.value).isEqualTo(LinuxUserspaceState.Stopped)
+        assertThat(harness.installer.rootfsDir.resolve("bin/bash").isFile).isTrue()
+        // The junk tree is gone - reclaimed by the real extraction - and the run's bookkeeping
+        // cleaned itself up: no in-flight marker left for the next construction to misread, no
+        // lock left to refuse the next install.
+        assertThat(interruptedRoot.resolve("rootfs.staging").exists()).isFalse()
+        assertThat(interruptedRoot.resolve("state.properties").readText()).doesNotContain("installing=true")
+        assertThat(interruptedRoot.resolve("install.lock").exists()).isFalse()
+    }
+
+    @Test
     fun `every proot spawn carries the loader, the tmp dir and the binds`() = runTest {
         val harness = newHarness()
         harness.manager.install()

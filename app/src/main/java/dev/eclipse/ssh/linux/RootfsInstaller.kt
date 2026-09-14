@@ -70,14 +70,21 @@ class RootfsInstaller(
     fun isExtracted(): Boolean = !stagingDir.exists() && File(rootfsDir, "bin").isDirectory
 
     /**
-     * Deletes the rootfs and every installer artifact (tarball, staging).
-     *
-     * Does not touch the workspace: workspace survival across uninstall is the manager's decision
-     * to make, and this class has no opinion about it.
+     * Deletes the download and every extracted tree — the uninstall path, which owns the "none of
+     * it is kept" decision.
      */
     fun deleteRootfs() {
         tarballFile.delete()
         deleteTreeNoFollow(rootfsDir)
+        deleteTreeNoFollow(stagingDir)
+    }
+
+    /**
+     * Reclaims a staging tree a failed install left behind, keeping the verified tarball so the
+     * retry resumes from it instead of re-downloading. The manager's failure path calls this; it
+     * never touches a rootfs that made it into place.
+     */
+    fun reclaimFailedExtraction() {
         deleteTreeNoFollow(stagingDir)
     }
 
