@@ -403,10 +403,12 @@ class Adb:
             ["logcat", "-d", "-v", "brief", "-t", str(lines)], timeout=30)
         return out if rc == 0 else ""
 
-    def new_crash_lines(self, package):
+    def new_crash_lines(self):
         """Scan the tail of logcat for crash/ANR signatures not yet reported.
         Deduplication is by full line so a scan after every action does not
-        re-report the same stack on each step."""
+        re-report the same stack on each step. Note the scan is not filtered
+        by package: a crash is attributed by the caller's context, and a
+        system_server fatal that takes the app down is still a finding."""
         fresh = []
         for line in self.logcat().splitlines():
             for label, pattern in CRASH_PATTERNS:
