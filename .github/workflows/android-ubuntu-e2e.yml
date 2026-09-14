@@ -1,0 +1,469 @@
+# Ubuntu-installation E2E: the in-app Linux userspace, installed for real on a
+# hosted emulator and proven usable - not by the UI saying so, but by commands
+# actually answering inside the installed environment.
+#
+# What "for real" means here, end to end:
+#   - the release x86_64 APK (R8-minified, release-signed) is installed, not a
+#     debug build - the proot/native path must survive minification;
+#   - the driver drives the UI a user would drive: Settings -> Linux userspace
+#     -> Install -> confirm, then watches the real download (pinned Ubuntu
+#     Base rootfs over the network), SHA-256 verification, extraction, apt
+#     setup and the toolchain install inside proot;
+#   - only THEN does the arg-gated UbuntuE2eVerificationTest execute commands
+#     in the installed environment (shell, os-release, account, DNS, apt,
+#     HTTP, persistence markers) through the app's own session argv;
+#   - mode STANDARD additionally exercises the install mid-flight (background,
+#     rotation, screen off) and persistence across an app force-stop; mode
+#     FULL adds real failure injections (full disk, process kill mid-download,
+#     airplane mode mid-download) and proves honest failure + retry.
+#
+# Why x86_64 only: the emulator runs x86_64, the catalog maps x86_64 to the
+# amd64 rootfs, and the linux module packages an x86_64 proot - the only leg
+# where every layer is arch-matched the way it is on a real device.
+#
+# Dispatch-only (like the universal pipeline): a run costs a real install
+# cycle, so it runs when asked, not on every push.
+name: Ubuntu E2E test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'SMOKE | STANDARD | FULL (FULL adds failure injections and needs adb root)'
+        required: false
+        default: 'STANDARD'
+      api_levels:
+        description: 'Comma-separated emulator API levels (matrix)'
+        required: false
+        default: '35'
+      install_timeout:
+        description: 'Minutes to wait for one install cycle'
+        required: false
+        default: '30'
+      run_repair:
+        description: 'Let the autonomous repair job run when ANTHROPIC_AUTH_TOKEN is configured'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Emulator slots are scarce repo-wide; queue rather than cancel, so a
+  # cancelled run never reads as a failed validation.
+  group: ubuntu-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: 'android-37.0'
+  TARGET_SDK: 'android-35'
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
+
+jobs:
+  resolve:
+    name: Resolve the matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ steps.meta.outputs.mode }}
+      api_levels: ${{ steps.meta.outputs.api_levels }}
+      install_timeout: ${{ steps.meta.outputs.install_timeout }}
+    steps:
+      - name: Resolve mode, matrix and timeout
+        id: meta
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}"
+          case "$MODE" in SMOKE|STANDARD|FULL) ;; *) MODE=STANDARD ;; esac
+          LEVELS="${{ inputs.api_levels }}"
+          [ -n "$LEVELS" ] || LEVELS='35'
+          API_LEVELS="$(printf '%s' "$LEVELS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)"
+          TIMEOUT="${{ inputs.install_timeout }}"
+          case "$TIMEOUT" in ''|*[!0-9]*) TIMEOUT=30 ;; esac
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "api_levels=$API_LEVELS" >> "$GITHUB_OUTPUT"
+          echo "install_timeout=$TIMEOUT" >> "$GITHUB_OUTPUT"
+          echo "running mode=$MODE levels=$API_LEVELS install_timeout=$TIMEOUT"
+
+  test:
+    name: Ubuntu E2E on API ${{ matrix.api_level }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        api_level: ${{ fromJson(needs.resolve.outputs.api_levels) }}
+    env:
+      SYSTEM_IMAGE: 'system-images;android-${{ matrix.api_level }};default;x86_64'
+      MODE: ${{ needs.resolve.outputs.mode }}
+      INSTALL_TIMEOUT: ${{ needs.resolve.outputs.install_timeout }}
+      APP_PACKAGE: dev.eclipse.ssh
+      TEST_PACKAGE: dev.eclipse.ssh.test
+    steps:
+      - name: Check out the code and the harness
+        # Dispatch-only: the ref this workflow runs from is both the code under
+        # test and the home of the testing/ scripts - one checkout, two roles.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17.0.13
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            emulator
+            ${{ env.SYSTEM_IMAGE }}
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Restore release signing material
+        # The androidTest APK must carry the SAME signature as the app or
+        # Android refuses the instrumentation pair - so the release key is
+        # needed here even though this job never publishes anything.
+        id: signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PROPERTIES" ]; then
+            mkdir -p keystore
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > keystore/eclipse-release.jks
+            printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > keystore.properties
+            chmod 600 keystore/eclipse-release.jks keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets: the release pair cannot be built." >&2
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the release APK and its androidTest APK
+        run: |
+          set -euo pipefail
+          # This workflow postdates the DSL lines the release-test pipeline had
+          # to inject into old tags, so they are asserted rather than injected:
+          # a missing testBuildType or testProguardFiles on a ref that carries
+          # this file is a regression in the build script, not something to
+          # paper over at build time.
+          grep -q 'testBuildType' app/build.gradle.kts || {
+            echo "app/build.gradle.kts lost testBuildType - the androidTest APK would not pair with the release build"; exit 1; }
+          grep -q 'testProguardFiles' app/build.gradle.kts || {
+            echo "app/build.gradle.kts lost testProguardFiles - the androidTest R8 pass would fail on Truth's annotations"; exit 1; }
+          ./gradlew :app:assembleRelease :app:assembleReleaseAndroidTest
+          APK="$(find app/build/outputs/apk/release -name '*x86_64*.apk' | head -1)"
+          [ -n "$APK" ] || APK="$(find app/build/outputs/apk/release -name '*universal*.apk' | head -1)"
+          [ -n "$APK" ] || APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
+          test -n "$APK" || { echo "no release APK produced"; exit 1; }
+          TEST_APK="$(find app/build/outputs/apk/androidTest/release -name '*.apk' | head -1)"
+          test -n "$TEST_APK" || { echo "no androidTest APK produced"; exit 1; }
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          echo "TEST_APK=$TEST_APK" >> "$GITHUB_ENV"
+          echo "APK under test: $APK ($(stat -c%s "$APK") bytes)"
+
+      - name: Verify the release APK
+        run: |
+          set -euo pipefail
+          EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
+          EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
+          mkdir -p out
+          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
+
+      - name: Enable KVM device permissions
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          for _ in $(seq 1 10); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
+          if [ ! -w /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          test -w /dev/kvm || { echo "/dev/kvm is not openable"; exit 1; }
+
+      - name: Create and boot the headless AVD
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+            --force --name ci-ubuntu-e2e \
+            --package "$SYSTEM_IMAGE" \
+            --device pixel_6
+          if ! "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx ci-ubuntu-e2e; then
+            echo "avdmanager reported success but the emulator cannot see ci-ubuntu-e2e"
+            exit 1
+          fi
+          # FULL mode's storage-failure phase fills /data and reads it back as
+          # root; the default (AOSP) system image allows adb root, and a refusal
+          # here is exactly the misconfiguration that phase would trip over
+          # later - fail it now, with a name.
+          if [ "$MODE" = "FULL" ]; then
+            "$ADB" root || { echo "FULL mode needs adb root on the emulator image"; exit 1; }
+          fi
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci-ubuntu-e2e \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
+          if ! timeout 120 "$ADB" wait-for-device; then
+            echo "adb never saw the emulator"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+          BOOT=""
+          for _ in $(seq 1 90); do
+            if ! pgrep -f "emulator.*ci-ubuntu-e2e" >/dev/null; then
+              echo "the emulator process died during boot"
+              tail -200 /tmp/emulator.log
+              exit 1
+            fi
+            BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          if [ "$BOOT" != "1" ]; then
+            echo "emulator did not finish booting"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+
+      - name: Install the app and test APKs
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          "$ADB" install -r "$APK"
+          "$ADB" install -r "$TEST_APK"
+          "$ADB" logcat -c
+          "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS || true
+          LAUNCH="$("$ADB" shell am start -W -n "$APP_PACKAGE/.MainActivity")"
+          echo "$LAUNCH"
+          grep -q "Status: ok" <<<"$LAUNCH" || { echo "the release APK did not launch cleanly"; exit 1; }
+          "$ADB" shell am force-stop "$APP_PACKAGE"
+
+      - name: Signature-gate the test APK against the app
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner"
+          APP_CERT="$("$APKSIGNER" verify --print-certs "$APK" | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)"
+          TEST_CERT="$("$APKSIGNER" verify --print-certs "$TEST_APK" | sed -n "s/^Signer #1 certificate SHA-256 digest: //p" | head -1)"
+          echo "app  cert: $APP_CERT"
+          echo "test cert: $TEST_CERT"
+          [ -n "$APP_CERT" ] && [ "$APP_CERT" = "$TEST_CERT" ] || {
+            echo "the androidTest APK's signature does not match the release APK's -"
+            echo "assembleReleaseAndroidTest must be signed with the release key for am instrument to accept the pair."
+            exit 1
+          }
+
+      - name: Run the E2E driver
+        # continue-on-error so a failing run still produces the crash scan, the
+        # diagnostics and the report - evidence first, verdict second.
+        id: driver
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          timeout 165m python3 testing/ubuntu-e2e/driver.py \
+            --package "$APP_PACKAGE" --test-package "$TEST_PACKAGE" \
+            --out out --mode "$MODE" --install-timeout "$INSTALL_TIMEOUT"
+
+      - name: Scan the device log for crashes and ANRs
+        id: crashscan
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          # The driver's own logcat capture may be missing if it died early.
+          if [ ! -f out/logcat-full.txt ]; then
+            "$ADB" logcat -d -v time > out/logcat-full.txt
+          fi
+          bash testing/scan-crashes.sh out/logcat-full.txt "$APP_PACKAGE" out/crash-report.json
+
+      - name: Collect diagnostics
+        if: always()
+        run: bash testing/collect-diagnostics.sh out "$APP_PACKAGE" post-e2e
+
+      - name: Generate the report
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f out/phase-results.json ]; then
+            echo '{"mode":"'"$MODE"'","phases":[{"phase":"driver","status":"fail","stage":"DRIVER","detail":"the driver produced no results (crashed or timed out)","durationSeconds":0,"evidence":[]}]}' > out/phase-results.json
+          fi
+          python3 testing/ubuntu-e2e/summary.py out "$MODE" "${{ matrix.api_level }}" \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY"
+          if [ -f out/ubuntu-e2e-report.md ]; then
+            cat out/ubuntu-e2e-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          PASSED=no
+          if ! grep -q 'FINAL RESULT: FAIL' out/ubuntu-e2e-report.md 2>/dev/null; then PASSED=yes; fi
+          # A crash signature anywhere fails the run even with a green table:
+          # the point of the scan is what the happy path misses.
+          if [ -f out/crash-report.json ] && grep -q '"signatureMatches": [1-9]' out/crash-report.json; then
+            PASSED=no
+          fi
+          echo "PASSED=$PASSED" >> "$GITHUB_ENV"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ubuntu-e2e-api${{ matrix.api_level }}
+          path: out
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the failure report for the repair loop
+        # A dedicated, stable-name artifact: auto-fix.sh re-downloads exactly
+        # this name after its retest run to compare failure counts. Not gated
+        # on failure() - the driver step is continue-on-error, so its failure
+        # does not trip that condition; the PASSED env flag is the real verdict.
+        if: always() && env.PASSED != 'yes'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failure-report
+          path: out/failure-report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Verdict
+        if: always()
+        run: test "$PASSED" = "yes"
+
+      - name: Shred signing material
+        if: always()
+        run: |
+          rm -f keystore.properties
+          rm -rf keystore
+
+  gate:
+    name: E2E gate
+    needs: [resolve, test]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download every matrix report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
+        with:
+          pattern: ubuntu-e2e-api*
+          path: reports
+
+      - name: File the failure
+        run: |
+          set -euo pipefail
+          FAILED_LEGS="$(find reports -name ubuntu-e2e-report.md -exec grep -l 'FINAL RESULT: FAIL' {} \; | wc -l)"
+          if [ "$FAILED_LEGS" -eq 0 ]; then
+            echo "all matrix legs passed"
+            exit 0
+          fi
+          {
+            echo "## Ubuntu E2E failure"
+            echo
+            echo "The Ubuntu installation E2E failed on $FAILED_LEGS emulator leg(s)."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            for f in $(find reports -name ubuntu-e2e-report.md | sort); do
+              echo "### $f"
+              echo
+              cat "$f"
+              echo
+            done
+            for f in $(find reports -name failure-report.json | sort); do
+              echo "### $f"
+              echo '```json'
+              cat "$f"
+              echo '```'
+            done
+          } > failure-body.md
+          gh issue create \
+            --title "Ubuntu E2E failure: $GITHUB_SHA" \
+            --body-file failure-body.md \
+            --label ubuntu-e2e-failure || true
+          exit 1
+
+  auto-fix:
+    name: Autonomous repair
+    needs: [resolve, gate]
+    if: failure() && inputs.run_repair != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    steps:
+      - name: Check out the code and the harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the failure report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
+        with:
+          pattern: failure-report
+          path: run-artifacts
+
+      - name: Download the run evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
+        with:
+          pattern: ubuntu-e2e-api*
+          path: run-artifacts
+
+      - name: Run the repair loop
+        # Does nothing without ANTHROPIC_AUTH_TOKEN (exit 78): the issue above
+        # already carries the full report, and repair falls back to the
+        # maintainer's session. Never a silent skip.
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          MAX_REPAIR_ATTEMPTS: ${{ vars.MAX_REPAIR_ATTEMPTS || '3' }}
+          GH_TOKEN: ${{ github.token }}
+          # Retest against THIS pipeline: a fix for a userspace failure must be
+          # proven by the same install-and-use E2E, not by the release suite.
+          RETEST_WORKFLOW: android-ubuntu-e2e.yml
+          RETEST_ARGS: -f mode=STANDARD -f api_levels=35 -f run_repair=false
+        run: |
+          set -euo pipefail
+          REPORT="$(find run-artifacts -name failure-report.json | head -1)"
+          test -n "$REPORT" || { echo "no failure report artifact"; exit 1; }
+          bash testing/auto-fix.sh "$REPORT" "${{ github.ref_name }}" run-artifacts

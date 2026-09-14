@@ -77,12 +77,16 @@ PROMPT
 
   # Rebuild and retest the FIXED code: the workflow builds its own release
   # APK from this branch (apk_source=build), installs it on the emulator and
-  # runs the same suite.
-  RUN_URL="$(gh workflow run android-release-test.yml \
+  # runs the same suite. RETEST_WORKFLOW/RETEST_ARGS let another pipeline
+  # (the Ubuntu E2E) reuse this loop against its own workflow; the defaults
+  # are the release-test pipeline this script was born in.
+  RETEST_WORKFLOW="${RETEST_WORKFLOW:-android-release-test.yml}"
+  RETEST_ARGS="${RETEST_ARGS:--f apk_source=build -f api_levels=35 -f run_repair=false}"
+  RUN_URL="$(gh workflow run "$RETEST_WORKFLOW" \
     --ref "$BRANCH" \
-    -f apk_source=build -f api_levels=35 -f run_repair=false \
+    $RETEST_ARGS \
     && sleep 10 \
-    && gh run list --workflow=android-release-test.yml --branch "$BRANCH" --limit 1 --json url --jq '.[0].url')"
+    && gh run list --workflow="$RETEST_WORKFLOW" --branch "$BRANCH" --limit 1 --json url --jq '.[0].url')"
   echo "retest: $RUN_URL"
   if gh run watch "$(basename "$RUN_URL")" --exit-status; then
     echo "the fix passed the full pipeline - opening a PR for review"
