@@ -236,6 +236,20 @@ android {
                 listOf("BC", "EdDSA").forEach { provider ->
                     test.systemProperty("org.apache.sshd.security.provider.$provider.useNamed", "false")
                 }
+                // Robolectric runs the app as debuggable, so EclipseApp's own logging rule leaves
+                // sshd's slf4j-simple output at DEBUG: a packet-level commentary of every embedded
+                // server and client the suite starts. Gradle turns each line into a test-output
+                // event — worker-to-build-process IPC plus an entry in the binary results — and a
+                // full suite produces megabytes of it, thousands of events a minute, all of it
+                // routine. The cost is not the disk: a run that wedges with this firehose on stops
+                // mid-write in both report files and reports nothing at all, where the same run at
+                // WARN leaves readable results up to the wedge. Every sshd failure path logs at
+                // WARN or ERROR, so a failing suite stays diagnosable — the DEBUG detail belongs
+                // to a local run, where `-Dorg.slf4j.simpleLogger.defaultLogLevel=debug` puts it
+                // back. Set here rather than by EclipseApp because the property has to exist
+                // before the first logger is created, and EclipseApp yields to a property the
+                // host already set.
+                test.systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn")
                 // The default condensed format prints only the exception class and one frame —
                 // `IllegalStateException at SomeTest.kt:289` — which names the wait that timed out
                 // but not what it was waiting *for*: the describe() strings and assertion diffs
