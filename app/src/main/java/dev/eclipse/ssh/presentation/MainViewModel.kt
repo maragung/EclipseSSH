@@ -2311,8 +2311,11 @@ class MainViewModel @Inject constructor(
             )
             return
         }
-        val attempt = (reconnectAttempts[sessionKey] ?: 0) + 1
-        reconnectAttempts[sessionKey] = attempt
+        // Spent atomically: the read-then-write pair could resurrect a count that a stable-session
+        // reset had just wiped - the collector that resets runs on another coroutine - handing a
+        // dropped session more attempts than its policy allows. `merge` computes against the value
+        // as it is at this instant, so a reset that lands first starts the new ladder from one.
+        val attempt = reconnectAttempts.merge(sessionKey, 1, Int::plus) ?: 1
         val job = viewModelScope.launch {
             val globalSeconds = runCatching { settingsRepository.settings.first().reconnectBaseSeconds }
                 .getOrDefault(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
@@ -2346,7 +2349,10 @@ class MainViewModel @Inject constructor(
             // handed back before parking — otherwise a long outage would arrive with an exhausted
             // ladder the moment it ended.
             if (!networkMonitor.online.value) {
-                reconnectAttempts[sessionKey] = attempt - 1
+                // Handed back atomically, and only if the entry still exists: `computeIfPresent`
+                // cannot mint a -1 for a key a stable-session reset or a closed tab already
+                // removed, where a plain write of `attempt - 1` would have.
+                reconnectAttempts.computeIfPresent(sessionKey) { _, spent -> spent - 1 }
                 updateTab(sessionKey) {
                     it?.copy(state = SessionConnectionState.RECONNECTING, lastError = "Waiting for a network…")
                 }

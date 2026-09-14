@@ -16,7 +16,9 @@ import dev.eclipse.ssh.data.model.TERMINAL_ROWS_RANGE
 import dev.eclipse.ssh.data.model.isForcedTerminalSize
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import java.io.Closeable
+import java.io.IOException
 import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.security.KeyPair
 import java.security.MessageDigest
 import java.security.PublicKey
@@ -32,6 +34,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.first
@@ -367,6 +370,11 @@ class SshConnectionManager @Inject constructor(
                 else -> client.connect(profile.username, profile.host, profile.port, context, null)
             }.verify(timeout, TimeUnit.SECONDS)
                 .session
+            // No manual cancel on a failed verify, and this is deliberate: since sshd 2.13 a
+            // `verify` with no CancelOption behaves as if CANCEL_ON_TIMEOUT and
+            // CANCEL_ON_INTERRUPT were passed - on expiry it cancels the future itself, and the
+            // client's connect listeners close the session and the socket under it. A cancel
+            // added here would be cancelling a future the library has already cancelled.
         } finally {
             // The underlying client owns the socket; this is the only thing this frame owns.
             tunnelled?.let(tunnelledTargets::remove)
@@ -580,13 +588,70 @@ class SshConnectionManager @Inject constructor(
      *
      * Anything with a bounded scope wants [withSftp] instead.
      */
-    suspend fun openSftp(session: ClientSession): SftpClient = withContext(Dispatchers.IO) {
-        SftpClientFactory.instance().createSftpClient(session)
+    suspend fun openSftp(session: ClientSession): SftpClient {
+        // A channel that finished opening is never dropped. `createSftpClient` performs blocking
+        // I/O *and* starts the channel, and a caller cancelled while it runs gets its
+        // CancellationException from `withContext` with the result discarded on the way - a live
+        // SFTP channel left attached to the session, holding an open handle and a server-side
+        // channel slot until the whole session ends, one per cancelled transfer, until the server
+        // starts refusing channels altogether. Same shape as [PortForwardingManager.bindOnIo]:
+        // the var is written inside the block, before cancellation can land on the result, so the
+        // catch closes what was claimed. The close runs on IO under NonCancellable - this catch
+        // is already on the cancelled path, and an SFTP close writes to the socket, which the
+        // main thread must not do (see [withSftp] for what that costs).
+        var opened: SftpClient? = null
+        try {
+            return withContext(Dispatchers.IO) {
+                SftpClientFactory.instance().createSftpClient(session).also { opened = it }
+            }
+        } catch (cancelled: CancellationException) {
+            opened?.let {
+                withContext(NonCancellable + Dispatchers.IO) { runCatching(it::close) }
+            }
+            throw cancelled
+        }
     }
 
-    suspend fun runCommand(session: ClientSession, command: String): String = withContext(Dispatchers.IO) {
-        session.executeRemoteCommand(command).trim()
-    }
+    /**
+     * Runs one command and answers its trimmed output.
+     *
+     * Bounded, because the callers are status queries (`hostname`, `uptime`, `free`, `df`) whose
+     * answers are worth exactly one screen refresh: a server that accepts the channel and never
+     * replies - wedged under load, or a transport that died without an error reaching this side -
+     * parks the stat producer forever otherwise. The bound returns the producer to the UI as
+     * "Unavailable" instead.
+     *
+     * The bound is MINA's own, not a coroutine timeout around a blocking call. `withTimeout`
+     * cannot deliver its cancellation into a thread blocked in a socket read: since kotlinx.coroutines
+     * 1.4, `withContext` waits for its block to finish even when the caller is cancelled, so a
+     * `withTimeout { withContext(Dispatchers.IO) { ... } }` spelling of this leaves the IO thread
+     * reading from the wedged transport for as long as the transport cares to stay silent - days,
+     * in the field, and a leaked thread per stat query. `executeRemoteCommand(command, Duration)`
+     * instead bounds both the channel open and the wait for the command's result inside MINA, and
+     * returns - or throws - within the budget on any server, however wedged. What stays true of
+     * the old spelling: a caller cancelled mid-wait does not return early; it returns when the
+     * bounded call does, which is at most `timeoutMs` later.
+     *
+     * The timeout is translated out of [SocketTimeoutException] before it leaves, because the
+     * message contract - "did not answer" - is what the failure copy and the tests speak, and
+     * because MINA's own message names the mechanics rather than the symptom. [IOException] keeps
+     * it on the ordinary failure path, out of the callers' cancellation branches.
+     *
+     * @param timeoutMs the budget; overridable so a test can make it seconds rather than the
+     *   production default.
+     */
+    suspend fun runCommand(
+        session: ClientSession,
+        command: String,
+        timeoutMs: Long = REMOTE_COMMAND_TIMEOUT_MS,
+    ): String =
+        withContext(Dispatchers.IO) {
+            try {
+                session.executeRemoteCommand(command, Duration.ofMillis(timeoutMs)).trim()
+            } catch (timedOut: SocketTimeoutException) {
+                throw IOException("The server did not answer '$command' within ${timeoutMs / 1000}s", timedOut)
+            }
+        }
 
     /** Trusts this fingerprint for the profile's host. False when it could not be persisted. */
     fun trustHost(profile: HostProfile, fingerprint: String): Boolean =
@@ -789,6 +854,14 @@ class SshConnectionManager @Inject constructor(
 
         /** Keep-alive interval used when neither the host nor the settings have an opinion. */
         const val DEFAULT_KEEP_ALIVE_SECONDS = 30
+
+        /**
+         * The budget for one [runCommand] status query. Generous rather than tight — these run
+         * against the host's own binaries, and a box slow enough to miss it is reporting
+         * "Unavailable" for a refresh the user asked for, not losing anything - while an unbounded
+         * wait would hold the producer forever on a server that never answers at all.
+         */
+        const val REMOTE_COMMAND_TIMEOUT_MS = 30_000L
     }
 }
 
