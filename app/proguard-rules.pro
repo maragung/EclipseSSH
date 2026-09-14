@@ -30,9 +30,14 @@
 # ---------------------------------------------------------------------------
 # Room / Hilt / WorkManager
 # ---------------------------------------------------------------------------
-# Room entities and DAOs live in dev.eclipse.ssh.data.local (the previous rule
-# pointed at a ".db" sub-package that does not exist and matched nothing).
--keep class dev.eclipse.ssh.data.local.** { *; }
+# Room entities and DAOs live in dev.eclipse.ssh.data.local, TransferDao and
+# TransferEntity directly under dev.eclipse.ssh.data, and HostProfile (whose
+# properties the instrumentation suite asserts) in dev.eclipse.ssh.data.model.
+# The androidTest APK compiles against this build's R8 mapping: a member only
+# the suite calls (TransferDao.count, HostProfile.getTags) is unreferenced by
+# app code, so without this keep R8 strips it and the suite dies with
+# NoSuchMethodError (release-test run 34843780520, both legs).
+-keep class dev.eclipse.ssh.data.** { *; }
 # Room.databaseBuilder resolves the generated "<Database>_Impl" class by name.
 -keep class * extends androidx.room.RoomDatabase { <init>(); }
 -keep class * extends androidx.work.ListenableWorker {
@@ -71,29 +76,25 @@
 # that decides whether to narrow this to the facade classes.
 -keep class kotlin.** { *; }
 
-# Run 34839975508 got past both keeps above and revealed the shape of the
-# whole problem: every EXTERNAL dependency the androidTest code links
-# against counts as "provided by the base APK" for the test APK's R8 pass
-# (so it is not packaged there), while the app's own R8 pass strips or
-# renames it - the class then exists in neither APK under its original name.
-# App-module classes are exempt from this: they ship inside the test APK,
-# which is why SecureVaultInstrumentedTest was the only class whose tests
-# actually passed. The missing set is therefore the library namespaces the
-# androidTest sources and the Compose test rules reference by name:
-#
-#   kotlinx.coroutines.JobKt / DelayWithTimeoutDiagnostics - all 23 test
-#     errors of run 34839975508 (IdlingResourceRegistry init, and class
-#     loading through ScanningTestLoader)
-#   androidx.compose.ui/runtime - the semantics tree the Compose test rules
-#     walk (probe of the shipped v1.1.17 APK: Modifier, ComposeNode,
-#     SemanticsNode, AbstractComposeView, CompositionLocal, Snapshot - all
-#     renamed)
-#   androidx.room and androidx.lifecycle - direct imports of the androidTest
-#     sources (Room, Migration, Lifecycle - all renamed in v1.1.17)
-#   androidx.activity plus its ComponentActivity superclass chain:
-#     androidx.core, androidx.savedstate (createAndroidComposeRule's bound;
-#     both ComponentActivity classes, SavedStateRegistry, LifecycleOwner,
-#     ViewModel probed renamed in v1.1.17)
+# Run 34839975508 got past both keeps above and run 34843780520 got past
+# this block's earlier form, which together pinned down the real mechanism
+# (the "provided by the base APK" framing above is close but incomplete):
+# the androidTest APK is compiled against this build's R8 mapping, so every
+# reference the test code makes to a surviving class is rewritten to its
+# obfuscated name and resolves fine. The suite only dies where R8 REMOVED
+# something outright - a class nobody references becomes
+# NoClassDefFoundError under its original name (androidx.tracing.Trace,
+# kotlin.LazyKt, kotlinx.coroutines.JobKt), a member only the suite calls
+# becomes NoSuchMethodError inside a mapped class
+# (androidx.collection.mutableIntObjectMapOf, whose class survived renamed
+# while the trivial facade method was inlined away everywhere in the app).
+# The keeps below therefore cover every namespace the androidTest sources
+# and the Compose test rules touch: compose ui/runtime (the semantics tree
+# the rules walk), room and lifecycle (direct test imports), activity plus
+# its ComponentActivity superclass chain (core, savedstate -
+# createAndroidComposeRule's bound), and collection. HostProfile and the
+# transfer DAO are covered by the data rule above. The next build's APK
+# size report decides whether any of this gets narrowed.
 -keep class kotlinx.coroutines.** { *; }
 -keep class androidx.compose.** { *; }
 -keep class androidx.room.** { *; }
@@ -101,6 +102,7 @@
 -keep class androidx.core.** { *; }
 -keep class androidx.lifecycle.** { *; }
 -keep class androidx.savedstate.** { *; }
+-keep class androidx.collection.** { *; }
 
 # Truth's error-prone annotations reference the javac model API, which Android
 # does not ship; compile-time-only references, never evaluated on a device.
