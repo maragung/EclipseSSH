@@ -135,11 +135,18 @@ class ProotRuntime(
      * shell is the `ubuntu` account) and the environment of [baseEnv], on a pty of [rows] x
      * [columns].
      *
+     * Storage is verified first: `PROOT_TMP_DIR` names [RuntimeStorageManager.tmpDir], and proot
+     * that cannot write there dies with "can't create temporary directory: Permission denied" —
+     * the historical failure this check exists to make impossible. An environment variable is not
+     * a directory.
+     *
      * The caller owns the returned [PtyProcess] — in production it goes straight into
      * [LocalTerminalChannel], which takes sole ownership of the fd pair.
      */
-    fun spawnSession(rows: Int, columns: Int): PtyProcess =
-        spawner.spawn(sessionArgv(), baseEnv(), spawnCwd.absolutePath, rows, columns)
+    fun spawnSession(rows: Int, columns: Int): PtyProcess {
+        storage.requireReady()
+        return spawner.spawn(sessionArgv(), baseEnv(), spawnCwd.absolutePath, rows, columns)
+    }
 
     /**
      * Runs one proot command to completion and captures what it printed.

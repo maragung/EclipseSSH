@@ -89,6 +89,10 @@ class LinuxUserspaceManager(
      * @throws IOException on any download, verification, extraction or health-check failure
      */
     suspend fun install(): SetupReport = transition.withLock {
+        // Storage before anything: every proot spawn this install leads to needs PROOT_TMP_DIR to
+        // exist and be writable, and failing that here — by name — beats failing it five minutes
+        // in as proot's "Permission denied".
+        storage.requireReady()
         requireIdleForInstall()
         try {
             installer.install { progress ->
@@ -142,6 +146,9 @@ class LinuxUserspaceManager(
      * corrupted", and Running is the state the foreground service is held in.
      */
     suspend fun start() = transition.withLock {
+        // Same storage-before-proot rule as install(): the health probe spawns proot, and a tmp
+        // directory that cannot be written to is the failure this names early.
+        storage.requireReady()
         val current = _state.value
         check(current is LinuxUserspaceState.Stopped || current is LinuxUserspaceState.NeedsRepair) {
             "Start is only possible from Stopped or Needs Repair, not $current"
@@ -187,6 +194,7 @@ class LinuxUserspaceManager(
      * pipeline runs again over whatever is there, and the health check has the final word.
      */
     suspend fun repair(): SetupReport = transition.withLock {
+        storage.requireReady()
         val current = _state.value
         check(current is LinuxUserspaceState.NeedsRepair || current is LinuxUserspaceState.Stopped) {
             "Repair is only possible from Stopped or Needs Repair, not $current"

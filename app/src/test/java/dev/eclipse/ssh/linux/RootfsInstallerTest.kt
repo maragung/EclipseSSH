@@ -134,6 +134,36 @@ class RootfsInstallerTest {
     }
 
     @Test
+    fun `an unwritable root fails before any download starts`() = runBlocking {
+        val root = newRoot()
+        root.mkdirs()
+        root.setWritable(false)
+        try {
+            var downloads = 0
+            val installer = RootfsInstaller(
+                root,
+                TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", "00".repeat(32)),
+            ) { _, _, _ -> downloads++ }
+
+            var thrown: IOException? = null
+            try {
+                installer.install { }
+            } catch (e: IOException) {
+                thrown = e
+            }
+            // The message prefix is a contract: the error taxonomy reads "runtime storage not
+            // ready" as the storage failure, distinct from anything proot itself would report.
+            assertThat(thrown).isNotNull()
+            assertThat(thrown!!.message).startsWith("runtime storage not ready")
+            // Nothing was fetched — the failure is named before the first byte, not after 30 MB.
+            assertThat(downloads).isEqualTo(0)
+        } finally {
+            // The temp root's deleteOnExit cleanup needs the writability back.
+            root.setWritable(true)
+        }
+    }
+
+    @Test
     fun `a verified tarball left by a failed install is not downloaded again`() = runBlocking {
         val root = newRoot()
         val escapeParent = Files.createTempDirectory("linux-escape").toFile()
