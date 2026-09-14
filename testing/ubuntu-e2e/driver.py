@@ -442,6 +442,21 @@ class E2eDriver:
         rc, out = self.adb.shell("pm clear %s" % self.package, timeout=60)
         if rc != 0:
             raise RuntimeError("pm clear failed: %s" % out[:200])
+        # pm clear also revokes runtime permissions, so the app's first-launch
+        # POST_NOTIFICATIONS prompt (MainActivity asks once, API 33+) would put
+        # the system permission dialog in front of the UI this driver then
+        # dumps - uiautomator captures the foreground window, which is the
+        # GrantPermissionsActivity, and the very first open_settings failed on
+        # exactly that (run 34854865510: "the Settings tab was not found on
+        # screen"). Pre-grant instead, the way android-release-test.yml does.
+        # On API < 33 the permission does not exist and pm grant would fail an
+        # otherwise-passing leg (release-test run 34832807524, API 30), so the
+        # grant is guarded on the device's own SDK level.
+        rc, out = self.adb.shell("getprop ro.build.version.sdk", timeout=30)
+        if rc == 0 and out.strip().isdigit() and int(out.strip()) >= 33:
+            self.adb.shell(
+                "pm grant %s android.permission.POST_NOTIFICATIONS" % self.package,
+                timeout=30)
 
     def storage_gate(self):
         """The insufficient-storage failure mode, played for real: fill /data to
