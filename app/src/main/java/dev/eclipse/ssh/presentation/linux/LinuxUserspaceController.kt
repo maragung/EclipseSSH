@@ -4,6 +4,9 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.eclipse.ssh.MainActivity
 import dev.eclipse.ssh.R
@@ -126,6 +129,21 @@ class LinuxUserspaceController @Inject constructor(
     private val _installWarnings = MutableStateFlow<List<String>>(emptyList())
 
     /**
+     * Whether the app is on screen, from the process-wide lifecycle. The binding's re-promotion
+     * rule is foreground-gated (see [holdProcessWhileRunning]), because Android 15 only allows a
+     * dataSync promotion while the app is visible — after the six-hour cap takes one away, the
+     * next return to the screen is the first legal moment to ask for it back.
+     */
+    private val appInForeground = MutableStateFlow(true)
+
+    /**
+     * Set when the service's own onTimeout took the foreground hold away (the Android 15 six-hour
+     * dataSync cap): the userspace keeps running unprotected, and the binding should re-promote on
+     * the next foreground transition rather than trust its last promotion forever.
+     */
+    private val foregroundHoldLost = MutableStateFlow(false)
+
+    /**
      * The three storage facts as one value, not three flows. A recompute used to write bytes, file
      * count and the pending-backup claim as three separate StateFlow writes, and a subscriber
      * could observe the combination in between — most misleadingly a freshly restored workspace
@@ -191,6 +209,24 @@ class LinuxUserspaceController @Inject constructor(
                 probeInstalledUserspace(manager)
                 holdProcessWhileRunning(manager)
             }
+        }
+
+        // The foreground signal the binding's re-promotion rule is gated on. runCatching because
+        // the initializer that wires ProcessLifecycleOwner can be absent in stripped test
+        // environments; there the signal stays true and the binding behaves exactly as it did
+        // before the rule existed.
+        runCatching {
+            ProcessLifecycleOwner.get().lifecycle.addObserver(
+                object : DefaultLifecycleObserver {
+                    override fun onStart(owner: LifecycleOwner) {
+                        appInForeground.value = true
+                    }
+
+                    override fun onStop(owner: LifecycleOwner) {
+                        appInForeground.value = false
+                    }
+                },
+            )
         }
     }
 
@@ -329,6 +365,17 @@ class LinuxUserspaceController @Inject constructor(
     }
 
     /**
+     * Called by [LinuxUserspaceService] when the foreground hold it was holding is gone — the
+     * Android 15 six-hour dataSync timeout, or a promotion the system refused. The userspace
+     * itself keeps running, unprotected; the binding re-promotes on the next foreground
+     * transition — the first moment Android will hear the request again — instead of trusting its
+     * last promotion forever.
+     */
+    internal fun onForegroundHoldLost() {
+        foregroundHoldLost.value = true
+    }
+
+    /**
      * Keeps [LinuxUserspaceService] alive exactly while the state machine is in a state that runs
      * proot children — see [LinuxUserspaceState.holdsProcess].
      *
@@ -342,23 +389,47 @@ class LinuxUserspaceController @Inject constructor(
      * while the service itself watches the same states and stops itself if it is ever alive
      * without a userspace that needs holding, so neither side trusts the other.
      *
-     * The promotion can be refused on API 31+ when the app is not visible, which today cannot
-     * happen (every entry into a holding state is a user action), so the refusal branch is
-     * defensive: the userspace keeps running and the alert is the honest "Ubuntu is now only as
-     * durable as the app being open" instead of a silent loss of background protection.
+     * Promotion is also re-attempted, not remembered. The Android 15 dataSync cap stops the
+     * service after six hours while the userspace stays Running, and a binding that edge-triggered
+     * on the state machine alone would never promote it again — the user would be degraded to
+     * "Ubuntu survives only while the app is open" until the next Stop/Start, silently. So the
+     * rule combines three signals — the state, whether the app is on screen (Android only grants
+     * the promotion while visible), and whether the hold was taken away by a timeout — and asks
+     * again on every foreground transition while a hold is owed. A refused ask posts the honest
+     * "Ubuntu is now only as durable as the app being open" alert, and the next transition asks
+     * again; the 24-hour window that took the hold away is also the only thing that rolls it
+     * back, and a backgrounded app cannot be the one to notice.
      */
     private fun holdProcessWhileRunning(manager: LinuxUserspaceManager) {
         scope.launch {
-            manager.state
-                .map { it.holdsProcess() }
-                .distinctUntilChanged()
-                .collect { hold ->
-                    val intent = Intent(appContext, LinuxUserspaceService::class.java)
-                    if (hold) {
+            var held = false
+            // Distinct per signal, then distinct as a triple: an install's progress churns
+            // Installing emissions that all mean the same thing to this rule.
+            combine(
+                manager.state.map { it.holdsProcess() }.distinctUntilChanged(),
+                appInForeground,
+                foregroundHoldLost,
+            ) { holds, foreground, lost ->
+                HoldSignal(holds, foreground, lost)
+            }.distinctUntilChanged().collect { signal ->
+                val intent = Intent(appContext, LinuxUserspaceService::class.java)
+                when {
+                    !signal.holds -> {
+                        appContext.stopService(intent)
+                        held = false
+                        foregroundHoldLost.value = false
+                    }
+                    // Foreground-gated: a promotion asked for while invisible is refused on
+                    // API 31+, so the rule waits for the screen. While invisible with the hold
+                    // still ours, nothing changes — the service, or its absence, stays as it is.
+                    signal.foreground && (!held || signal.lost) -> {
                         val promoted = runCatching {
                             ContextCompat.startForegroundService(appContext, intent)
                         }.isSuccess
-                        if (!promoted) {
+                        if (promoted) {
+                            held = true
+                            foregroundHoldLost.value = false
+                        } else {
                             postAlert(
                                 appContext,
                                 NotificationChannels.ID_LINUX_PROMOTION,
@@ -372,12 +443,18 @@ class LinuxUserspaceController @Inject constructor(
                                 ),
                             )
                         }
-                    } else {
-                        appContext.stopService(intent)
                     }
                 }
+            }
         }
     }
+
+    /** The binding rule's inputs as one value: what the state owes, and what may be asked. */
+    private data class HoldSignal(
+        val holds: Boolean,
+        val foreground: Boolean,
+        val lost: Boolean,
+    )
 
     private suspend fun refreshStorageNumbers() {
         val graph = graphProvider.graph ?: return

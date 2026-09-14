@@ -13,6 +13,7 @@ import androidx.lifecycle.LifecycleService
 import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.MainActivity
 import dev.eclipse.ssh.R
+import dev.eclipse.ssh.di.LinuxUserspaceGraph
 import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.SetupStep
@@ -68,24 +69,7 @@ class LinuxUserspaceService : LifecycleService() {
             return
         }
         NotificationChannels.ensureCreated(this)
-        // API 31+ rejects background foreground-service starts and API 34+ requires the declared
-        // type; either failure must not take the process down (EclipseSessionService's posture).
-        val promoted = runCatching {
-            ServiceCompat.startForeground(
-                this,
-                NotificationChannels.ID_LINUX,
-                buildNotification(
-                    state = graph.manager.state.value,
-                    sessionCount = graph.processes.sessionCount.value,
-                ),
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                } else {
-                    0
-                },
-            )
-        }.isSuccess
-        if (!promoted) {
+        if (!promote(graph)) {
             stopSelf()
             return
         }
@@ -118,6 +102,15 @@ class LinuxUserspaceService : LifecycleService() {
             serviceScope.launch {
                 runCatching { graph.manager.stop() }
             }
+        } else if (graph != null) {
+            // A plain re-start of an already-promoted service. Every startForegroundService call
+            // re-arms the "must call startForeground" deadline — even for a service already in
+            // the foreground — so the promotion is repeated, not assumed from onCreate. The
+            // controller's re-promotion rule (after the dataSync timeout) depends on this
+            // answering its re-starts correctly.
+            if (!promote(graph)) {
+                stopSelf(startId)
+            }
         }
         // Not sticky: if the process was killed, every proot child died with it and the fresh
         // process's state machine is not Running, so a restarted service would observe that and
@@ -126,18 +119,53 @@ class LinuxUserspaceService : LifecycleService() {
     }
 
     /**
+     * Promotes this service to the foreground with the notification the current state earns.
+     *
+     * API 31+ rejects background foreground-service starts and API 34+ requires the declared
+     * type; either failure must not take the process down (EclipseSessionService's posture). A
+     * failure also tells the controller the hold is gone, so its binding rule asks again on the
+     * next foreground transition instead of remembering a promotion that died here.
+     */
+    private fun promote(graph: LinuxUserspaceGraph): Boolean =
+        runCatching {
+            ServiceCompat.startForeground(
+                this,
+                NotificationChannels.ID_LINUX,
+                buildNotification(
+                    state = graph.manager.state.value,
+                    sessionCount = graph.processes.sessionCount.value,
+                ),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                } else {
+                    0
+                },
+            )
+        }.isSuccess.also { promoted ->
+            if (!promoted) {
+                linuxUserspace.onForegroundHoldLost()
+            }
+        }
+
+    /**
      * Android 15 caps dataSync foreground services at six hours per 24-hour window and then calls
      * this; a service that does not stop itself within seconds is killed with a fatal
      * `RemoteServiceException`. Stopping is safe by design: the userspace's Running state and its
      * shells are left exactly as they are — an activity on screen holds the process at foreground
      * importance on its own — and the state machine stays Running, so Settings and the host card
      * keep telling the truth. What is lost is only the *background* protection, and the alert
-     * says so rather than letting the shells die silently later.
+     * says so rather than letting the shells die silently later. The controller is told as well,
+     * so its binding rule asks for the hold back on the next foreground transition once the
+     * 24-hour window rolls, instead of the degradation lasting until the next Stop/Start.
      *
      * Deliberately does not call `super`: the base method exists only from API 35, and its
      * implementation there is a no-op anyway.
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
+        // Tell the binding rule first, before anything else can go wrong in the teardown: after
+        // this service dies nothing else knows the hold is gone, and the rule must ask again on
+        // the next foreground transition rather than trust its last promotion forever.
+        linuxUserspace.onForegroundHoldLost()
         // Stopping is the deadline's only deliverable, so it happens before the alert - the
         // alert is three binder calls (permission check, PendingIntent build, notify) that the
         // "few seconds" of grace should not be spent on. The posting still runs: destruction is
