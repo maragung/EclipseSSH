@@ -5,6 +5,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -32,7 +33,13 @@ class ReleaseChaosJourneyTest {
 
     private fun tab(label: String) = compose.onNode(hasText(label) and hasClickAction())
 
-    /** A seeded row's first emission is async (see [AppNavigationTest.awaitSeededRow]). */
+    /**
+     * A seeded row's first emission is async (see [AppNavigationTest.awaitSeededRow]).
+     *
+     * `onAllNodesWithText` is an extension on SemanticsNodeInteractionsProvider, so the
+     * receiver form needs its androidx.compose.ui.test import — the call compiles only
+     * once that import is present, as this file's first CI run demonstrated.
+     */
     private fun awaitSeededRow(text: String) {
         compose.waitUntil(timeoutMillis = 10_000) {
             compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
