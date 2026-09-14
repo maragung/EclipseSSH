@@ -42,6 +42,17 @@
 # Kotlin coroutines internals used via reflection by the debug agent.
 -dontwarn kotlinx.coroutines.**
 
+# AndroidJUnitRunner (and Espresso underneath it) resolves androidx.tracing
+# through the shared instrumentation classloader: the androidTest APK's own R8
+# pass sees the class on the app's classpath (it arrives transitively via Room)
+# and treats it as "provided by the base APK", so it is not packaged into the
+# test APK either. That makes this APK the only place it can exist - and the
+# optimize file's -assumenosideeffects on android.os.Trace empties every
+# app-side call site, so without this keep R8 strips the class as dead code and
+# every instrumented run dies in AndroidJUnitRunner.onCreate with
+# NoClassDefFoundError: androidx.tracing.Trace (release-test run 34832807524).
+-keep class androidx.tracing.** { *; }
+
 # Truth's error-prone annotations reference the javac model API, which Android
 # does not ship; compile-time-only references, never evaluated on a device.
 # Belt under test-proguard-rules.pro in case an androidTest R8 pass consumes

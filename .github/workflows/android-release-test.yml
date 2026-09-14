@@ -335,7 +335,12 @@ jobs:
           # evidence of the first-run screen, not of a blank window.
           sleep 5
           "$ADB" exec-out screencap -p > out/first-launch.png
-          "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS
+          # POST_NOTIFICATIONS exists from API 33; on older images pm grant
+          # throws IllegalArgumentException: Unknown permission and would fail
+          # a leg that had otherwise passed (release-test run 34832807524, API 30).
+          if [ "${{ matrix.api_level }}" -ge 33 ]; then
+            "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS
+          fi
 
       - name: Signature-gate the test APK against the app
         # Android requires the instrumentation pair to share a signer. A
