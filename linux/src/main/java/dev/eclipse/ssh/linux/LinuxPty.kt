@@ -52,7 +52,9 @@ public object LinuxPty {
      * Blocking read from the pty master into [buffer] at [offset], at most
      * [length] bytes (short reads are normal stream behavior). Returns the
      * byte count, or -1 on end-of-stream - on a pty that means the child
-     * side is gone (EIO), which is the exit signal for the reader loop.
+     * side is gone (EIO), which is the exit signal for the reader loop. A
+     * pty that was already closed or reaped also reports -1, never reading
+     * through a descriptor number the process may have reused.
      */
     public external fun read(
         fd: Int,
@@ -64,7 +66,8 @@ public object LinuxPty {
     /**
      * Writes [length] bytes of [buffer] at [offset] to the pty master,
      * looping over partial writes. Returns the count written, or -1 when the
-     * child is gone.
+     * child is gone - or the pty was already closed or reaped, in which case
+     * the write is refused rather than landing on a reused descriptor.
      */
     public external fun write(
         fd: Int,
@@ -75,7 +78,8 @@ public object LinuxPty {
 
     /**
      * Resizes the pty and delivers SIGWINCH to the child's foreground
-     * process group, like resizing a terminal window.
+     * process group, like resizing a terminal window. A no-op on a pty that
+     * was already closed or reaped.
      */
     public external fun resize(fd: Int, rows: Int, cols: Int)
 
@@ -83,15 +87,17 @@ public object LinuxPty {
      * Blocks until the child exits, closes the master fd and returns the
      * wait status: the exit code (0-255) or 128+signal. Call once, after
      * [read] reported end-of-stream. Returns -1 if the child could not be
-     * reaped.
+     * reaped, or the pty was already closed or reaped by another thread.
      */
     public external fun awaitExit(fd: Int): Int
 
     /**
      * Tears the pty down without waiting: closes the master (which delivers
      * SIGHUP to the child session), reaps the child non-blockingly and
-     * leaves no zombie behind. Terminals dropped without a clean exit go
-     * through here; terminals that ended on their own go through
+     * leaves no zombie behind. Idempotent - a pty that was already closed or
+     * reaped is left untouched, so however many ending paths race, the
+     * descriptor is closed exactly once. Terminals dropped without a clean
+     * exit go through here; terminals that ended on their own go through
      * [awaitExit].
      */
     public external fun close(fd: Int)
