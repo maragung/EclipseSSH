@@ -879,11 +879,19 @@ class Engine:
             if status == "fail":
                 self.any_failure = True
             # A hard budget violation ends the run with what it has; the
-            # remaining journeys are recorded as skipped-by-budget.
+            # remaining journeys are recorded as skipped so the report's
+            # tally can never read "fewer journeys ran" as "more passed".
             if time.monotonic() > self.deadline:
                 print("time budget exhausted after journey %s" % name,
                       file=sys.stderr)
                 break
+        ran = {j["journey"] for j in self.journeys}
+        for name, min_rank, _fn in journeys:
+            if name not in ran and min_rank <= self.rank:
+                self.journeys.append({
+                    "journey": name, "status": "skipped",
+                    "detail": "budget exhausted before this journey ran",
+                })
         self.write_outputs()
 
     def write_outputs(self):
