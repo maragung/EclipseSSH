@@ -58,23 +58,13 @@
 # NoClassDefFoundError: androidx.tracing.Trace (release-test run 34832807524).
 -keep class androidx.tracing.** { *; }
 
-# The same mechanism takes the Kotlin stdlib facade classes. Run 34837380295
-# got past androidx.tracing (the runner advanced from onCreate line 26 to line
-# 45) and then died on the next class of the same kind:
-#
-#   NoClassDefFoundError: Failed resolution of: Lkotlin/LazyKt;
-#     at androidx.test.platform.io.TestDirCalculator.<init>
-#     at androidx.test.runner.AndroidJUnitRunner.registerTestStorage
-#
-# LazyKt holds top-level functions; once the optimizer inlines their call
-# sites the facade class is unreferenced here, R8 removes it, the test APK
-# never had a copy (it treats this app's classpath as provided), and
-# androidx.test cannot resolve it through the shared instrumentation
-# classloader. Keeping the stdlib beats chasing facades one crash at a time.
-# The cost is real - the stdlib is no longer shrunk or obfuscated in the
-# release APK - so the APK size the release build reports is the measurement
-# that decides whether to narrow this to the facade classes.
--keep class kotlin.** { *; }
+# The same mechanism takes the Kotlin stdlib and coroutines facade classes
+# (run 34837380295: NoClassDefFoundError: kotlin.LazyKt in the runner). They
+# are now kept as an exact per-class list in proguard-instrumentation.pro -
+# derived from what the androidTest APK actually references - instead of the
+# whole-namespace keep this used to be, which froze the entire stdlib and
+# coroutines unshrunk and cost ~26 MB on the x86_64 APK. The remaining
+# namespaces below are still broad pending the same narrowing.
 
 # Run 34839975508 got past both keeps above and run 34843780520 got past
 # this block's earlier form, which together pinned down the real mechanism
@@ -88,21 +78,20 @@
 # becomes NoSuchMethodError inside a mapped class
 # (androidx.collection.mutableIntObjectMapOf, whose class survived renamed
 # while the trivial facade method was inlined away everywhere in the app).
-# The keeps below therefore cover every namespace the androidTest sources
-# and the Compose test rules touch: compose ui/runtime (the semantics tree
-# the rules walk), room and lifecycle (direct test imports), activity plus
-# its ComponentActivity superclass chain (core, savedstate -
-# createAndroidComposeRule's bound), and collection. HostProfile and the
-# transfer DAO are covered by the data rule above. The next build's APK
-# size report decides whether any of this gets narrowed.
--keep class kotlinx.coroutines.** { *; }
--keep class androidx.compose.** { *; }
--keep class androidx.room.** { *; }
--keep class androidx.activity.** { *; }
--keep class androidx.core.** { *; }
--keep class androidx.lifecycle.** { *; }
--keep class androidx.savedstate.** { *; }
--keep class androidx.collection.** { *; }
+# The whole-namespace keeps that used to sit here covered every namespace
+# the androidTest sources and the Compose test rules touch: room and
+# lifecycle (direct test imports), activity plus its ComponentActivity
+# superclass chain (core, savedstate - createAndroidComposeRule's bound),
+# and collection.
+# HostProfile and the transfer DAO are covered by the data rule above;
+# kotlin, kotlinx.coroutines and androidx.compose moved to
+# proguard-instrumentation.pro as exact per-class lists (stage 1 validated
+# by release-test run 34863389211, both legs green, the x86_64 APK down
+# 1.38 MB to 41,868,849 bytes; stage 2 compose validated by run
+# 34868038866, both legs green, down another 20.7 MB to 21,162,616
+# bytes). room, activity, core, lifecycle, savedstate and collection
+# followed in stage 3 - the whole-namespace keeps below are gone, also
+# narrowed into proguard-instrumentation.pro.
 # Run 34847297300: javax.inject sits on the app classpath via Hilt, so
 # androidx.test (whose runner and Espresso reference javax.inject.Provider)
 # treats it as provided and does not package it - while this APK's own pass
