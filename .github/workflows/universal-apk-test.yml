@@ -1,0 +1,613 @@
+# Universal Android APK test pipeline: any APK, with or without source.
+#
+# The engine under testing/universal/ is black-box and adb-driven - no
+# instrumentation, no Compose rules, no app-specific knowledge. It discovers
+# what the app is from the APK (aapt2) and what it does from a live emulator
+# (uiautomator dumps), then drives journeys (launch, navigation, dialogs,
+# safe input fuzzing, lifecycle chaos, permissions, network, persistence,
+# seeded random exploration) and fails on crashes, ANRs, blank screens and
+# broken flows. An autonomous repair loop can follow when source is
+# available and configured.
+#
+# Stages: resolve (source + matrix) -> test (per API level: obtain APK ->
+# verify -> boot emulator -> install -> launch via the discovered launchable
+# activity -> discover -> explore -> scan logcat -> collect diagnostics ->
+# report -> verdict) -> gate (aggregate legs, issue/comment) -> auto-fix
+# (claude CLI loop, only for build-from-source runs with the token).
+#
+# Section 30 rule: url and artifact-from-release runs test the APK itself
+# and still produce every report section; source-level auto-fix is skipped
+# and stated as skipped, never pretended.
+name: Universal APK test
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_source:
+        description: 'artifact-from-release | url | build-from-source'
+        required: false
+        default: 'build-from-source'
+      apk_url:
+        description: 'Direct APK URL (required when apk_source=url)'
+        required: false
+        default: ''
+      tag:
+        description: 'Release tag (apk_source=artifact-from-release; default: latest release)'
+        required: false
+        default: ''
+      mode:
+        description: 'SMOKE | STANDARD | DEEP | RELEASE (RELEASE needs both matrix levels)'
+        required: false
+        default: 'STANDARD'
+      api_levels:
+        description: 'Comma-separated emulator API levels (matrix)'
+        required: false
+        default: '35,30'
+      seed:
+        description: 'Deterministic exploration seed (recorded in the trace)'
+        required: false
+        default: '20260914'
+      max_actions:
+        description: 'Override the mode action budget (empty = mode default)'
+        required: false
+        default: ''
+      max_test_minutes:
+        description: 'Override the mode time budget in minutes (empty = mode default)'
+        required: false
+        default: ''
+      max_repair_attempts:
+        description: 'Cap for the autonomous repair loop'
+        required: false
+        default: '5'
+      run_repair:
+        description: 'Let the autonomous repair job run when ANTHROPIC_AUTH_TOKEN is configured'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Emulator slots are scarce repo-wide; queue rather than cancel, so a
+  # cancelled run never reads as a failed validation.
+  group: universal-apk-test-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dfile.encoding=UTF-8
+  BUILD_TOOLS: '36.0.0'
+  COMPILE_SDK: 'android-37.0'
+  TARGET_SDK: 'android-35'
+  FREERDP_NDK_VERSION: '29.0.13113456'
+  FREERDP_CMAKE_VERSION: '4.1.2'
+
+jobs:
+  resolve:
+    name: Resolve the target
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      apk_source: ${{ steps.meta.outputs.apk_source }}
+      apk_url: ${{ steps.meta.outputs.apk_url }}
+      api_levels: ${{ steps.meta.outputs.api_levels }}
+      mode: ${{ steps.meta.outputs.mode }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve source, matrix and mode
+        id: meta
+        run: |
+          set -euo pipefail
+          SOURCE="${{ inputs.apk_source }}"
+          TAG="${{ inputs.tag }}"
+          APK_URL="${{ inputs.apk_url }}"
+          MODE="${{ inputs.mode }}"
+          [ -n "$SOURCE" ] || SOURCE=build-from-source
+          [ -n "$MODE" ] || MODE=STANDARD
+          case "$SOURCE" in
+            artifact-from-release)
+              # Same default as the release pipeline: no tag means the
+              # latest published release.
+              if [ -z "$TAG" ]; then
+                TAG="$(gh release view --json tagName --jq .tagName)"
+              fi
+              test -n "$TAG" || { echo "no release tag to download from"; exit 1; }
+              ;;
+            url)
+              test -n "$APK_URL" || { echo "apk_source=url needs apk_url"; exit 1; }
+              ;;
+            build-from-source)
+              # The dispatch ref is both the source under test and the ref
+              # that carries this workflow file.
+              ;;
+            *)
+              echo "unknown apk_source '$SOURCE' (artifact-from-release | url | build-from-source)"
+              exit 1
+              ;;
+          esac
+          # The matrix comes in as "35,30" and leaves as a JSON array.
+          LEVELS="${{ inputs.api_levels }}"
+          [ -n "$LEVELS" ] || LEVELS='35,30'
+          API_LEVELS="$(printf '%s' "$LEVELS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)"
+          # RELEASE is the strict gate: both matrix levels are mandatory,
+          # because the recommendation must not rest on one image.
+          if [ "$MODE" = "RELEASE" ] && [ "$(printf '%s' "$API_LEVELS" | jq length)" -lt 2 ]; then
+            echo "RELEASE mode needs at least two api_levels (default 35,30)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "apk_source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
+          echo "api_levels=$API_LEVELS" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "testing source=$SOURCE tag=$TAG mode=$MODE levels=$API_LEVELS"
+
+  test:
+    name: Universal test on API ${{ matrix.api_level }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        api_level: ${{ fromJson(needs.resolve.outputs.api_levels) }}
+    env:
+      SYSTEM_IMAGE: 'system-images;android-${{ matrix.api_level }};default;x86_64'
+      APK_SOURCE: ${{ needs.resolve.outputs.apk_source }}
+      APK_URL: ${{ needs.resolve.outputs.apk_url }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      MODE: ${{ needs.resolve.outputs.mode }}
+      SEED: ${{ inputs.seed }}
+      MAX_ACTIONS_IN: ${{ inputs.max_actions }}
+      MAX_MINUTES_IN: ${{ inputs.max_test_minutes }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the pipeline ref
+        # The dispatch ref carries testing/universal (the engine must always
+        # be the dispatched version, even in apk-only runs) and, in
+        # build-from-source mode, is the code under test. artifact/url runs
+        # deliberately do NOT check out the app source (Section 30): the
+        # report states that source-level repair was not attempted.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17.0.13
+        if: env.APK_SOURCE == 'build-from-source'
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Set up Android SDK
+        # Always: aapt2 (verification + discovery) and adb/emulator come
+        # from this SDK regardless of how the APK was obtained. The NDK and
+        # platforms are needed only by the build, but keeping one package
+        # list mirrors the release pipeline exactly - one recipe, not two.
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: '11479570'
+          packages: >-
+            platform-tools
+            emulator
+            ${{ env.SYSTEM_IMAGE }}
+            platforms;${{ env.COMPILE_SDK }}
+            build-tools;${{ env.BUILD_TOOLS }}
+            ndk;${{ env.FREERDP_NDK_VERSION }}
+          cache-packages: true
+
+      - name: Install pinned CMake and Ninja
+        if: env.APK_SOURCE == 'build-from-source'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            "cmake==${FREERDP_CMAKE_VERSION}" ninja
+          cmake --version | grep -F "cmake version ${FREERDP_CMAKE_VERSION}"
+          ninja --version
+
+      - name: Cache the FreeRDP native build tree
+        if: env.APK_SOURCE == 'build-from-source'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: freerdp/build
+          key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
+
+      - name: Cache the Linux userspace native build tree
+        if: env.APK_SOURCE == 'build-from-source'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        with:
+          path: linux/build
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+
+      - name: Set up Gradle
+        if: env.APK_SOURCE == 'build-from-source'
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Restore release signing material
+        # Only the build needs the key: the artifact the workflow publishes
+        # for itself must be signed the way a distribution artifact is.
+        if: env.APK_SOURCE == 'build-from-source'
+        id: signing
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$RELEASE_KEYSTORE_PROPERTIES" ]; then
+            mkdir -p keystore
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > keystore/eclipse-release.jks
+            printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > keystore.properties
+            chmod 600 keystore/eclipse-release.jks keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets: the built APK is debug-signed. The verifier records it; the strict RELEASE gate fails it." >&2
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the release APK
+        if: env.APK_SOURCE == 'build-from-source'
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleRelease
+
+      - name: Obtain the APK under test
+        id: apk
+        run: |
+          set -euo pipefail
+          mkdir -p apk-under-test
+          case "$APK_SOURCE" in
+            build-from-source)
+              # Per-ABI splits are the distribution artifacts; x86_64 is
+              # what the emulator runs, universal/any as the fallback.
+              APK="$(find app/build/outputs/apk/release -name '*x86_64*.apk' | head -1)"
+              [ -n "$APK" ] || APK="$(find app/build/outputs/apk/release -name '*universal*.apk' | head -1)"
+              [ -n "$APK" ] || APK="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
+              ;;
+            artifact-from-release)
+              gh release download "$TAG" --dir apk-under-test --pattern '*.apk'
+              APK="$(ls apk-under-test/*x86_64*.apk 2>/dev/null | head -1)"
+              [ -n "$APK" ] || APK="$(ls apk-under-test/*.apk | head -1)"
+              ;;
+            url)
+              curl -fL --retry 3 --connect-timeout 30 -o apk-under-test/app.apk "$APK_URL"
+              APK="apk-under-test/app.apk"
+              ;;
+          esac
+          test -n "$APK" || { echo "no APK found to test"; exit 1; }
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          echo "APK under test: $APK ($(stat -c%s "$APK") bytes)"
+
+      - name: Verify the APK
+        # Universal check: installable and testable on this emulator
+        # (readable package, launchable activity, valid signature, x86_64
+        # or no native code). Nothing app-specific; strict only in RELEASE.
+        run: |
+          set -euo pipefail
+          STRICT=""
+          [ "$MODE" = "RELEASE" ] && STRICT="strict"
+          mkdir -p artifacts/reports
+          bash testing/universal/verify-apk.sh "$APK" \
+            artifacts/reports/apk-validation.json $STRICT
+
+      - name: Enable KVM device permissions
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          for _ in $(seq 1 10); do
+            [ -w /dev/kvm ] && break
+            sleep 0.5
+          done
+          if [ ! -w /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          test -w /dev/kvm || { echo "/dev/kvm is not openable"; exit 1; }
+
+      - name: Create and boot the headless AVD
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd \
+            --force --name ci-universal-test \
+            --package "$SYSTEM_IMAGE" \
+            --device pixel_6
+          if ! "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fx ci-universal-test; then
+            echo "avdmanager reported success but the emulator cannot see ci-universal-test"
+            exit 1
+          fi
+          nohup "$ANDROID_HOME/emulator/emulator" -avd ci-universal-test \
+            -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
+            -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
+          if ! timeout 120 "$ADB" wait-for-device; then
+            echo "adb never saw the emulator"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+          BOOT=""
+          for _ in $(seq 1 90); do
+            if ! pgrep -f "emulator.*ci-universal-test" >/dev/null; then
+              echo "the emulator process died during boot"
+              tail -200 /tmp/emulator.log
+              exit 1
+            fi
+            BOOT="$("$ADB" shell getprop sys.boot_completed | tr -d '\r')"
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          if [ "$BOOT" != "1" ]; then
+            echo "emulator did not finish booting"
+            tail -200 /tmp/emulator.log
+            exit 1
+          fi
+
+      - name: Install the APK and launch via the discovered activity
+        # The one app-specific fact the pipeline needs - package and
+        # launchable activity - comes from the APK itself (aapt2), never
+        # from a hardcoded constant.
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
+          mkdir -p artifacts/screenshots
+          "$ADB" install -r "$APK"
+          BADGING="$("$AAPT2" dump badging "$APK")"
+          APP_PACKAGE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*$/\1/p" | head -1)"
+          LAUNCHABLE="$(printf '%s\n' "$BADGING" | sed -n "s/^launchable-activity: name='\([^']*\)'.*$/\1/p" | head -1)"
+          test -n "$APP_PACKAGE" || { echo "no package in the APK badging"; exit 1; }
+          test -n "$LAUNCHABLE" || { echo "no launchable activity in the APK badging"; exit 1; }
+          "$ADB" logcat -c
+          LAUNCH="$("$ADB" shell am start -W -n "$APP_PACKAGE/$LAUNCHABLE")"
+          echo "$LAUNCH"
+          grep -q "Status: ok" <<<"$LAUNCH" || { echo "the APK did not launch cleanly"; exit 1; }
+          # The first frame is composed before the screenshot, so the shot
+          # is evidence of the first-run screen, not of a blank window.
+          sleep 5
+          "$ADB" exec-out screencap -p > artifacts/screenshots/00-first-launch.png
+          # Pre-grant notifications like a user who accepted at first run;
+          # guarded because apps that do not declare it must not fail here.
+          "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+          echo "APP_PACKAGE=$APP_PACKAGE" >> "$GITHUB_ENV"
+          echo "LAUNCHABLE=$LAUNCHABLE" >> "$GITHUB_ENV"
+          echo "launched $APP_PACKAGE/$LAUNCHABLE"
+
+      - name: Build the application model
+        # Static pass from the APK plus the observed first screen; the
+        # explorer reads no other configuration.
+        run: |
+          set -euo pipefail
+          AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
+          python3 testing/universal/discover-app.py \
+            --apk "$APK" \
+            --aapt2 "$AAPT2" \
+            --out artifacts/reports/application-model.json \
+            --merge-runtime --package "$APP_PACKAGE"
+
+      - name: Run the exploration engine
+        # continue-on-error: a failed run must still produce the crash
+        # scan, the diagnostics and the report - evidence first, verdict
+        # second. timeout(1) is the hang detector around the engine.
+        id: explore
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            SMOKE) DEFAULT_MINUTES=5 ;;
+            STANDARD) DEFAULT_MINUTES=15 ;;
+            DEEP) DEFAULT_MINUTES=30 ;;
+            RELEASE) DEFAULT_MINUTES=45 ;;
+          esac
+          MINUTES="$MAX_MINUTES_IN"
+          [ -n "$MINUTES" ] || MINUTES="$DEFAULT_MINUTES"
+          ARGS=(--model artifacts/reports/application-model.json
+                --out artifacts --mode "$MODE" --seed "$SEED"
+                --max-minutes "$MINUTES")
+          if [ -n "$MAX_ACTIONS_IN" ]; then
+            ARGS+=(--max-actions "$MAX_ACTIONS_IN")
+          fi
+          # Minutes + 15 of grace: the engine bounds itself, the outer
+          # timeout only catches a wedged adb or a runaway device.
+          timeout "$((MINUTES + 15))m" python3 testing/universal/explore.py "${ARGS[@]}"
+
+      - name: Scan the device log for crashes and ANRs
+        # Independent of the explorer's verdict: journeys can pass while a
+        # background service crashes, and that still fails the gate.
+        id: crashscan
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          mkdir -p artifacts/logs artifacts/crashes
+          "$ADB" logcat -d -v time > artifacts/logs/logcat-full.txt
+          python3 testing/universal/scan-issues.py \
+            artifacts/logs/logcat-full.txt "$APP_PACKAGE" \
+            artifacts/crashes/universal-crash-report.json \
+            artifacts/crashes/crash-events.json \
+            artifacts/traces/action-trace.json
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          bash testing/collect-diagnostics.sh artifacts "$APP_PACKAGE" post-exploration
+          # ANR traces in their own folder per the artifact layout; a
+          # permission denial is recorded, not fatal (guarded like the
+          # collector itself).
+          mkdir -p artifacts/anr
+          "$ANDROID_HOME/platform-tools/adb" shell "cat /data/anr/* 2>/dev/null" \
+            > artifacts/anr/anr-traces.txt 2>&1 || true
+
+      - name: File the APK into the artifact layout
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/apk
+          cp "$APK" artifacts/apk/under-test.apk
+
+      - name: Generate the report
+        if: always()
+        run: |
+          set -euo pipefail
+          # Section 30: only build-from-source has source checked out;
+          # the report states auto-fix as skipped for apk-only runs.
+          SOURCE_AVAILABLE=no
+          [ "$APK_SOURCE" = "build-from-source" ] && SOURCE_AVAILABLE=yes
+          if [ ! -f artifacts/crashes/universal-crash-report.json ]; then
+            echo '{"status":"unknown","classes":{},"totalFindings":0}' \
+              > artifacts/crashes/universal-crash-report.json
+          fi
+          python3 testing/universal/generate-report.py \
+            artifacts/reports \
+            artifacts/reports/application-model.json \
+            artifacts/traces/journeys.json \
+            artifacts/traces/action-trace.json \
+            artifacts/crashes/universal-crash-report.json \
+            artifacts/reports/apk-validation.json \
+            "$MODE" "${{ matrix.api_level }}" \
+            "$GITHUB_SHA" "$GITHUB_REPOSITORY" \
+            "$SOURCE_AVAILABLE" artifacts/environment.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: universal-test-api${{ matrix.api_level }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Verdict
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f artifacts/reports/universal-test-result.json ]; then
+            echo "no universal-test-result.json - the run died before reporting"
+            exit 1
+          fi
+          STATUS="$(python3 -c "import json;print(json.load(open('artifacts/reports/universal-test-result.json'))['status'])")"
+          echo "verdict: $STATUS"
+          test "$STATUS" = "PASS"
+
+      - name: Shred signing material
+        if: always()
+        run: |
+          rm -f keystore.properties
+          rm -rf keystore
+
+  gate:
+    name: Universal gate
+    needs: [resolve, test]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download every matrix report
+        uses: actions/download-artifact@fa0a86b8c8b4b906e4694c3bcc39a2f0b7a8bfa6 # v6.0.0
+        with:
+          pattern: universal-test-api*
+          path: reports
+
+      - name: Gate the run and file the failure
+        run: |
+          set -euo pipefail
+          # Per-leg verdicts come from universal-test-result.json; a leg
+          # that died before reporting (boot failure, install failure,
+          # invalid signing) produced no result file, and needs.test.result
+          # is the truth the per-leg verdict step already computed.
+          FAILED_LEGS=0
+          TOTAL_LEGS=0
+          for f in $(find reports -name universal-test-result.json | sort); do
+            STATUS="$(python3 -c "import json;print(json.load(open('$f'))['status'])")"
+            echo "$f: $STATUS"
+            TOTAL_LEGS=$((TOTAL_LEGS + 1))
+            if [ "$STATUS" != "PASS" ]; then
+              FAILED_LEGS=$((FAILED_LEGS + 1))
+            fi
+          done
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            # Any leg that never reached its verdict counts as failed.
+            FAILED_LEGS=$((FAILED_LEGS + 1))
+          fi
+          if [ "$FAILED_LEGS" -eq 0 ] && [ "$TOTAL_LEGS" -gt 0 ]; then
+            echo "all $TOTAL_LEGS matrix leg(s) passed"
+            gh api --method POST \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/comments" \
+              -f body="Universal APK test (${{ needs.resolve.outputs.mode }}) passed on all $TOTAL_LEGS leg(s). Reports: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              || echo "(run commenting unavailable - continuing; the run itself is the record)"
+            exit 0
+          fi
+          {
+            echo "## Universal APK test failure (${{ needs.resolve.outputs.mode }})"
+            echo
+            echo "The universal APK test failed on $FAILED_LEGS leg(s). Per the gate: startup crash, critical crash, ANR, install failure, invalid signing or a failed journey all block the recommendation."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            for f in $(find reports -name release-test-report.md | sort); do
+              echo "### $f"
+              echo
+              cat "$f"
+              echo
+            done
+            for f in $(find reports -name universal-test-result.json | sort); do
+              echo "### $f"
+              echo '```json'
+              cat "$f"
+              echo '```'
+            done
+          } > failure-body.md
+          gh issue create \
+            --title "Universal APK test failure (${{ needs.resolve.outputs.mode }}, run $GITHUB_RUN_ID)" \
+            --body-file failure-body.md \
+            --label universal-test-failure || true
+          exit 1
+
+  auto-fix:
+    name: Autonomous repair
+    needs: [resolve, gate]
+    if: failure() && inputs.run_repair == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the ref under test
+        # The dispatch ref: in build-from-source mode it is the code that
+        # was tested AND the ref that carries this workflow file, which the
+        # retest dispatch needs. artifact/url runs have no such ref and the
+        # repair script exits 78 with that reason - never a silent skip.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the run evidence
+        uses: actions/download-artifact@fa0a86b8c8b4b906e4694c3bcc39a2f0b7a8bfa6 # v6.0.0
+        with:
+          pattern: universal-test-api*
+          path: run-artifacts
+
+      - name: Run the repair loop
+        env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          MAX_REPAIR_ATTEMPTS: ${{ inputs.max_repair_attempts || '5' }}
+        run: |
+          set -euo pipefail
+          RESULT="$(find run-artifacts -name universal-test-result.json | sort | head -1)"
+          test -n "$RESULT" || { echo "no universal-test-result.json artifact"; exit 1; }
+          API_LEVEL="$(python3 -c "import json;print(json.load(open('$RESULT'))['apiLevel'])")"
+          bash testing/universal/auto-fix.sh \
+            "$RESULT" \
+            "${{ github.ref_name }}" \
+            run-artifacts \
+            "${{ needs.resolve.outputs.apk_source }}" \
+            "$API_LEVEL" \
+            "${{ needs.resolve.outputs.mode }}"
