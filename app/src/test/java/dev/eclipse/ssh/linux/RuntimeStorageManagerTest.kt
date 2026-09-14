@@ -4,7 +4,6 @@ import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
-import kotlin.io.path.createSymbolicLink
 import org.junit.Test
 
 /**
@@ -59,7 +58,6 @@ class RuntimeStorageManagerTest {
             tmp.toPath(),
             root.toPath().resolve("tmp-does-not-exist"),
         )
-
         val error = runCatching { RuntimeStorageManager(root).requireReady() }.exceptionOrNull()
 
         assertThat(error).isInstanceOf(IOException::class.java)
