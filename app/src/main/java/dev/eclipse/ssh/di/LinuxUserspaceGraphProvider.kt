@@ -162,7 +162,10 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // syscall wrapper; on Android an app's primary gid is its own uid, which is the
             // value the runCatching fallback would land on anyway.
             appGid = runCatching { android.system.Os.getgid() }.getOrDefault(Process.myUid()),
-            dnsServers = liveDnsServers(context),
+            // A lambda, not a snapshot: the resolvers are read each time setup writes
+            // /etc/resolv.conf, so a network change between install and repair lands in the file
+            // instead of pinning the DNS of the moment the graph was built.
+            dnsServers = { liveDnsServers(context) },
         )
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime, storage)
