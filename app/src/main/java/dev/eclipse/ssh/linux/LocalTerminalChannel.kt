@@ -50,6 +50,14 @@ class LocalTerminalChannel(
 
     private val outputEnded = AtomicBoolean(false)
     private val deliberate = AtomicBoolean(false)
+
+    /**
+     * Guards [release]: both ending paths — [close] and [discard] — funnel into it, and both are
+     * reachable for the same channel (Stop's closeAll, the session store's forget, a replaced
+     * registration). A second teardown would close a master fd the process may have already
+     * handed to something else, so exactly one caller proceeds.
+     */
+    private val released = AtomicBoolean(false)
     private val droppedChunkCount = AtomicLong()
     private val lastActivityAt = AtomicLong(0)
 
@@ -117,6 +125,9 @@ class LocalTerminalChannel(
     }
 
     override fun resize(newColumns: Int, newRows: Int) {
+        // A released channel has no pty to resize: the master fd is closed and possibly reused,
+        // and the native bridge would refuse the ioctl anyway.
+        if (released.get()) return
         // Same clamping discipline as the SSH channel: the display's limits, agreed once, so the
         // pty and the terminal buffer never disagree about which size they hold.
         val safeColumns = newColumns.coerceIn(TERMINAL_COLUMN_RANGE)
@@ -146,11 +157,20 @@ class LocalTerminalChannel(
      * The teardown both ending paths share: stop accepting writes, drain them so a shell reading
      * its last input still gets it, close the pty (SIGHUP to the child's session), then report
      * [SessionEnd.Released] unless the reader already reported the shell's own ending.
+     *
+     * Idempotent by [released]: whichever of close/discard arrives second returns immediately, so
+     * the master fd is closed exactly once however many ending paths race.
      */
     private fun release() {
+        if (!released.compareAndSet(false, true)) return
         writesClosed = true
         // Unblocks the writer if it is parked waiting for something that will never come.
         writes.put(ByteArray(0))
+        // The writer drains whatever the shell has not read yet before the fd goes away. Bounded:
+        // a child that stopped reading its input parks the writer inside process.write forever,
+        // and a close must not be held hostage by it — past the bound the writer's in-flight
+        // write is refused by the native bridge's freed-slot guard instead.
+        writer.join(DRAIN_WAIT_MS)
         process.close()
         // Closing the pty wakes the reader with end-of-stream; let it publish whatever it had
         // already read before the terminator goes in, or the marker lands *ahead* of the shell's
