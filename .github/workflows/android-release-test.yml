@@ -206,7 +206,12 @@ jobs:
           # makes the androidTest APK carry the release applicationId and the
           # release signature restored above, so it pairs with the
           # release-signed app under test.
-          grep -q 'testBuildType' app/build.gradle.kts || \
+          # The guards match CODE, not the word: build.gradle.kts on main
+          # mentions testBuildType in a comment above testProguardFiles, and a
+          # plain grep -q matches that comment, skips the injection, and the
+          # build dies with "task 'assembleReleaseAndroidTest' not found"
+          # (run 34836778347). Anchor each pattern to a DSL-shaped line.
+          grep -Eq '^[[:space:]]*testBuildType[[:space:]]*=' app/build.gradle.kts || \
             sed -i '0,/^android {/s//android {\n    testBuildType = "release"/' app/build.gradle.kts
           # The androidTest APK's own R8 pass (minifyReleaseAndroidTestWithR8,
           # live once testBuildType is release) does not read the app's
@@ -215,7 +220,7 @@ jobs:
           # cut before this pipeline existed have neither, so inject the rules
           # file and its DSL reference; guarded so a tag that already carries
           # them is untouched.
-          if ! grep -q 'testProguardFiles' app/build.gradle.kts; then
+          if ! grep -Eq '^[[:space:]]*testProguardFiles\(' app/build.gradle.kts; then
             # printf, not a heredoc: the heredoc body would have to sit at
             # column 0 to close its delimiter, which walks the body out of
             # this run block's YAML literal scalar and makes the whole
@@ -224,7 +229,7 @@ jobs:
             printf '%s\n' '-dontwarn javax.lang.model.**' > app/test-proguard-rules.pro
             sed -i '0,/isMinifyEnabled = true/s//isMinifyEnabled = true\n            testProguardFiles("test-proguard-rules.pro")/' app/build.gradle.kts
           fi
-          grep -q 'dontwarn javax.lang.model' app/proguard-rules.pro || \
+          grep -Eq '^[[:space:]]*-dontwarn javax[.]lang[.]model' app/proguard-rules.pro || \
             printf '\n# Truth compile-time-only annotations reference the javac model API.\n-dontwarn javax.lang.model.**\n' >> app/proguard-rules.pro
           if [ "$APK_SOURCE" = "build" ]; then
             ./gradlew :app:assembleRelease :app:assembleReleaseAndroidTest
@@ -335,7 +340,12 @@ jobs:
           # evidence of the first-run screen, not of a blank window.
           sleep 5
           "$ADB" exec-out screencap -p > out/first-launch.png
-          "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS
+          # POST_NOTIFICATIONS exists from API 33; on older images pm grant
+          # throws IllegalArgumentException: Unknown permission and would fail
+          # a leg that had otherwise passed (release-test run 34832807524, API 30).
+          if [ "${{ matrix.api_level }}" -ge 33 ]; then
+            "$ADB" shell pm grant "$APP_PACKAGE" android.permission.POST_NOTIFICATIONS
+          fi
 
       - name: Signature-gate the test APK against the app
         # Android requires the instrumentation pair to share a signer. A
@@ -369,6 +379,13 @@ jobs:
           timeout 50m "$ADB" shell am instrument -w \
             "$TEST_PACKAGE/androidx.test.runner.AndroidJUnitRunner" 2>&1 | tee out/test-stdout.txt
           test "${PIPESTATUS[0]}" -eq 0
+          # am instrument -w exits 0 even when the run reports JUnit
+          # failures (run 34839975508: exit 0 with "There were 23
+          # failures" - the whole suite errored and the leg still went
+          # green). The JUnit text summary is the real verdict: "OK (N
+          # tests...)" prints only when every test passed, so a suite that
+          # fails or never runs any test cannot slip through.
+          grep -Eq '^OK \([0-9]+ test' out/test-stdout.txt
 
       - name: Scan the device log for crashes and ANRs
         # Independent of the suite verdict: a passing suite with a crashed
@@ -428,6 +445,11 @@ jobs:
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
+      # gh resolves the repository from a local git checkout, which this job
+      # deliberately does not have (it only reads downloaded artifacts) - run
+      # 34832807524 left "failed to run git: not a git repository" and the
+      # || true on issue creation swallowed it, so no failure issue was filed.
+      GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - name: Download every matrix report
