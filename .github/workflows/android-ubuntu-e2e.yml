@@ -176,14 +176,17 @@ jobs:
       - name: Build the release APK and its androidTest APK
         run: |
           set -euo pipefail
-          # This workflow postdates the DSL lines the release-test pipeline had
-          # to inject into old tags, so they are asserted rather than injected:
-          # a missing testBuildType or testProguardFiles on a ref that carries
-          # this file is a regression in the build script, not something to
-          # paper over at build time.
-          grep -q 'testBuildType' app/build.gradle.kts || {
-            echo "app/build.gradle.kts lost testBuildType - the androidTest APK would not pair with the release build"; exit 1; }
-          grep -q 'testProguardFiles' app/build.gradle.kts || {
+          # Same injection the release-test pipeline performs: main does not
+          # set testBuildType in the DSL (ci.yml still builds
+          # assembleDebugAndroidTest, which testBuildType = "release" would
+          # remove), so the release-flavoured androidTest tasks exist only
+          # after this. The guards match CODE, not the word -
+          # build.gradle.kts mentions testBuildType inside a comment, which a
+          # plain grep satisfies while the DSL never sets it and the build
+          # dies with "task 'assembleReleaseAndroidTest' not found".
+          grep -Eq '^[[:space:]]*testBuildType[[:space:]]*=' app/build.gradle.kts || \
+            sed -i '0,/^android {/s//android {\n    testBuildType = "release"/' app/build.gradle.kts
+          grep -Eq '^[[:space:]]*testProguardFiles\(' app/build.gradle.kts || {
             echo "app/build.gradle.kts lost testProguardFiles - the androidTest R8 pass would fail on Truth's annotations"; exit 1; }
           ./gradlew :app:assembleRelease :app:assembleReleaseAndroidTest
           APK="$(find app/build/outputs/apk/release -name '*x86_64*.apk' | head -1)"
