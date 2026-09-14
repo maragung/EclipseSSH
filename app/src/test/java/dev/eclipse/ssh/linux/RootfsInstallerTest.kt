@@ -143,7 +143,8 @@ class RootfsInstallerTest {
             val installer = RootfsInstaller(
                 root,
                 TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", "00".repeat(32)),
-            ) { _, _, _ -> downloads++ }
+                downloader = { _, _, _ -> downloads++ },
+            )
 
             var thrown: IOException? = null
             try {

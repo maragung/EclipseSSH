@@ -33,10 +33,10 @@ class LinuxUserspaceManagerTest {
         var downloads = 0
         val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
         val installer =
-            RootfsInstaller(rootDir, distro) { _, target, onChunk ->
+            RootfsInstaller(rootDir, distro, downloader = { _, target, onChunk ->
                 downloads++
                 TestTarballs.serving(FIXTURE).download("https://fixtures.invalid/rootfs.tar.gz", target, onChunk)
-            }
+            })
         val distribution = UbuntuDistributionManager(distro, runtime, appUid = 10150, appGid = 10150)
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime)
@@ -304,7 +304,7 @@ class LinuxUserspaceManagerTest {
     fun `a command that never finishes is closed at its timeout, not leaked`() = runBlocking {
         val root = Files.createTempDirectory("proot-timeout").toFile().apply { deleteOnExit() }
         val process = BlockingPtyProcess()
-        val runtime = ProotRuntime(root, "/fake/native/lib") { _, _, _, _, _ -> process }
+        val runtime = ProotRuntime(root, "/fake/native/lib", spawner = { _, _, _, _, _ -> process })
 
         val result = runtime.runCommand(listOf("proot"), timeoutMs = 200)
 
@@ -320,7 +320,7 @@ class LinuxUserspaceManagerTest {
     fun `scripted commands are visible and killable while in flight`() = runBlocking {
         val root = Files.createTempDirectory("proot-kill").toFile().apply { deleteOnExit() }
         val process = BlockingPtyProcess()
-        val runtime = ProotRuntime(root, "/fake/native/lib") { _, _, _, _, _ -> process }
+        val runtime = ProotRuntime(root, "/fake/native/lib", spawner = { _, _, _, _, _ -> process })
 
         val command = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
             runtime.runCommand(listOf("proot"), timeoutMs = 60_000)

@@ -187,7 +187,8 @@ class LocalTerminalChannelTest {
  * Blocking semantics mirror the real bridge: `read` blocks until output or the end of the stream,
  * so the channel's reader thread parks exactly as it would on a real pty.
  */
-internal class FakePtyProcess : PtyProcess {
+// Open because the suite's own fixtures refine it — BlockingWritePtyProcess parks inside write().
+internal open class FakePtyProcess : PtyProcess {
     private val pending = LinkedBlockingQueue<ByteArray>()
     private val exited = CountDownLatch(1)
 
@@ -219,7 +220,7 @@ internal class FakePtyProcess : PtyProcess {
         return n
     }
 
-    override fun write(buffer: ByteArray, offset: Int, length: Int): Int {
+    open override fun write(buffer: ByteArray, offset: Int, length: Int): Int {
         writes.put(buffer.copyOfRange(offset, offset + length))
         return length
     }

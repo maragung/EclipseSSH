@@ -2,6 +2,7 @@ package dev.eclipse.ssh.linux
 
 import com.google.common.truth.Truth.assertThat
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
@@ -623,7 +624,8 @@ class UbuntuDistributionManagerTest {
      * territory. The mirror feed URL points at a localhost port nothing listens on, so the ladder's
      * fetch rung fails instantly instead of touching the network from a unit test.
      */
-    private class Harness(
+    // Inner because its scripted proot's default responses come from the outer class's baseline().
+    private inner class Harness(
         distro: LinuxDistro,
         scripted: ScriptedPtySpawner = ScriptedPtySpawner(),
         wedgeOn: ((String) -> Boolean)? = null,

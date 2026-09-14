@@ -57,9 +57,9 @@ class LinuxUserspaceControllerTest {
         val spawner = ScriptedPtySpawner()
         val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
         val installer =
-            RootfsInstaller(rootDir, distro) { _, target, onChunk ->
+            RootfsInstaller(rootDir, distro, downloader = { _, target, onChunk ->
                 TestTarballs.serving(FIXTURE).download("https://fixtures.invalid/rootfs.tar.gz", target, onChunk)
-            }
+            })
         val distribution = UbuntuDistributionManager(distro, runtime, appUid = 10150, appGid = 10150)
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime)
