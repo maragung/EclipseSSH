@@ -65,6 +65,9 @@ android {
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
+                // The exact per-class keeps the androidTest pair needs (see
+                // the file header for the derivation and regen procedure).
+                "proguard-instrumentation.pro",
             )
             // ProGuard rule files included only in the test APK: its R8 pass
             // (minifyReleaseAndroidTestWithR8, live once testBuildType is
