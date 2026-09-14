@@ -747,10 +747,27 @@
 # legs green, the x86_64 APK down 20.7 MB to 21,162,616 bytes - the
 # whole-namespace compose keep had been freezing the entire Compose
 # stack unshrunk.
+#
+# Follow-up from validation run 34871535994 (both legs, 14 failures,
+# two distinct missing symbols). The extraction had scanned the compose
+# test libraries at the versions the version catalog pins (BOM
+# 2025.04.01 -> ui-test-android 1.8.2), but the resolved graph upgrades
+# compose to 1.11.0, whose AndroidInputDispatcher_androidKt clinit
+# calls androidx.collection.IntSetKt.intSetOf - a reference no scanned
+# constant pool contained, so R8 stripped the method and every
+# performClick()/performTouchInput() test died on it. Rescanning the
+# 1.11.0 AARs against this file also flagged the call's return type,
+# androidx.collection.IntSet. The room miss was different:
+# RoomDatabase$Builder appears as a class constant nowhere (not even in
+# room-testing 2.7.1) - MigrationInstrumentedTest only reaches it as the
+# implicit receiver of Room.databaseBuilder().addMigrations() - so R8
+# renamed the Builder and stripped addMigrations() from it.
 # ---------------------------------------------------------------------------
 -keep class androidx.activity.ComponentActivity { *; }
 -keep class androidx.activity.compose.ComponentActivityKt { *; }
 -keep class androidx.collection.IntObjectMapKt { *; }
+-keep class androidx.collection.IntSet { *; }
+-keep class androidx.collection.IntSetKt { *; }
 -keep class androidx.collection.MutableIntObjectMap { *; }
 -keep class androidx.core.os.ConfigurationCompat { *; }
 -keep class androidx.core.os.LocaleListCompat { *; }
@@ -770,6 +787,7 @@
 -keep class androidx.room.InvalidationTracker { *; }
 -keep class androidx.room.Room { *; }
 -keep class androidx.room.RoomDatabase { *; }
+-keep class androidx.room.RoomDatabase$Builder { *; }
 -keep class androidx.room.RoomDatabase$Callback { *; }
 -keep class androidx.room.RoomDatabase$JournalMode { *; }
 -keep class androidx.room.RoomDatabase$MigrationContainer { *; }
