@@ -89,6 +89,10 @@ class MainActivityLifecycleTest {
             compose.waitForIdle()
             compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
 
+            // The intent the scenario launched the activity with, before the link replaces it.
+            var launchIntent: Intent? = null
+            scenario.onActivity { launchIntent = it.intent }
+
             // singleTask routes an explicit intent for the live instance through onNewIntent
             // rather than creating a second activity.
             context.startActivity(
@@ -99,6 +103,17 @@ class MainActivityLifecycleTest {
 
             compose.onNodeWithText("Authenticate to ci@build.example.com").assertIsDisplayed()
             scenario.onActivity { assertThat(it.isFinishing).isFalse() }
+
+            // MainActivity keeps a delivered link as its intent, and ActivityScenario only accepts
+            // lifecycle callbacks for an activity whose intent still matches the one it launched
+            // with — so from the link's arrival onwards it silently ignored this instance, and
+            // close() waited 45s for a DESTROYED callback it had itself been discarding
+            // ("last lifecycle transition = PAUSED"; on device the activity had long been
+            // destroyed). Putting the launch intent back re-opens the bookkeeping before the
+            // teardown close() performs. The other tests here never deliver a second intent, and
+            // launching with a VIEW intent directly (the no-usable-host cases) tracks that same
+            // intent, so only this test needs the restore.
+            launchIntent?.let { saved -> scenario.onActivity { it.setIntent(saved) } }
         }
     }
 
