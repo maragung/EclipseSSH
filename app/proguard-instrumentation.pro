@@ -39,6 +39,14 @@
 # missed every reference from that library (85 classes). Always scan the
 # -jvm / -android variant of every module, which is where the bytecode
 # actually lives.
+#
+# Run 34860029235 (API 35 leg) then failed its last 3 tests - all
+# MigrationInstrumentedTest, all NoClassDefFoundError:
+# kotlin.coroutines.jvm.internal.Boxing. That class is referenced by the
+# COMPILER OUTPUT of the test sources themselves (the suspend state
+# machine's primitive boxing), not by any library, so the constant-pool
+# extraction could not see it - the compiled test classes do not exist
+# locally. Boxing is added by hand below.
 # ---------------------------------------------------------------------------
 -keep class kotlin.annotation.AnnotationRetention { *; }
 -keep class kotlin.annotation.Retention { *; }
@@ -66,6 +74,7 @@
 -keep class kotlin.coroutines.CoroutineContext$Key { *; }
 -keep class kotlin.coroutines.EmptyCoroutineContext { *; }
 -keep class kotlin.coroutines.intrinsics.IntrinsicsKt { *; }
+-keep class kotlin.coroutines.jvm.internal.Boxing { *; }
 -keep class kotlin.coroutines.jvm.internal.ContinuationImpl { *; }
 -keep class kotlin.coroutines.jvm.internal.DebugMetadata { *; }
 -keep class kotlin.coroutines.jvm.internal.DebugProbesKt { *; }
