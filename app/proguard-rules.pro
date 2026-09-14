@@ -103,6 +103,14 @@
 -keep class androidx.lifecycle.** { *; }
 -keep class androidx.savedstate.** { *; }
 -keep class androidx.collection.** { *; }
+# Run 34847297300: javax.inject sits on the app classpath via Hilt, so
+# androidx.test (whose runner and Espresso reference javax.inject.Provider)
+# treats it as provided and does not package it - while this APK's own pass
+# removes the interface outright (Hilt's generated code references it only in
+# positions R8 can rewrite away). Every remaining test then died either on
+# Provider itself or on androidx.test.espresso.Espresso, whose loading it
+# breaks. MigrationInstrumentedTest passed for the first time in this run.
+-keep class javax.inject.** { *; }
 
 # Truth's error-prone annotations reference the javac model API, which Android
 # does not ship; compile-time-only references, never evaluated on a device.
