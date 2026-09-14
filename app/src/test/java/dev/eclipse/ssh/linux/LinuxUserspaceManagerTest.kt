@@ -3,7 +3,10 @@ package dev.eclipse.ssh.linux
 import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 
@@ -30,10 +33,10 @@ class LinuxUserspaceManagerTest {
         var downloads = 0
         val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
         val installer =
-            RootfsInstaller(rootDir, distro) { _, target, onChunk ->
+            RootfsInstaller(rootDir, distro, downloader = { _, target, onChunk ->
                 downloads++
                 TestTarballs.serving(FIXTURE).download("https://fixtures.invalid/rootfs.tar.gz", target, onChunk)
-            }
+            })
         val distribution = UbuntuDistributionManager(distro, runtime, appUid = 10150, appGid = 10150)
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime)
@@ -232,6 +235,106 @@ class LinuxUserspaceManagerTest {
         )
         assertThat(stale.manager.state.value).isInstanceOf(LinuxUserspaceState.NeedsRepair::class.java)
     }
+
+    @Test
+    fun `an interrupted install comes back as NeedsRepair and the retry reclaims its staging`() = runTest {
+        // The crash shape: the installing marker was written, then the process died
+        // mid-extraction - a junk staging tree, no rootfs. Construction classifies it as
+        // repairable (never as a healthy install), and the install that follows reclaims the
+        // staging tree and completes.
+        val interruptedRoot =
+            Files.createTempDirectory("linux-userspace-interrupted").toFile().apply { deleteOnExit() }
+        interruptedRoot.resolve("state.properties")
+            .writeText("installing=true\ndistroId=ubuntu-22.04\nphase=download\nstartedAtMs=1\n")
+        interruptedRoot.resolve("rootfs.staging/etc").mkdirs()
+        interruptedRoot.resolve("rootfs.staging/etc/half-written.conf").writeText("truncated by the crash\n")
+        val harness = Harness(
+            TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)),
+            interruptedRoot,
+        )
+
+        val state = harness.manager.state.value
+        assertThat(state).isInstanceOf(LinuxUserspaceState.NeedsRepair::class.java)
+        assertThat((state as LinuxUserspaceState.NeedsRepair).detail).contains("interrupted")
+
+        harness.manager.install()
+
+        assertThat(harness.manager.state.value).isEqualTo(LinuxUserspaceState.Stopped)
+        assertThat(harness.installer.rootfsDir.resolve("bin/bash").isFile).isTrue()
+        // The junk tree is gone - reclaimed by the real extraction - and the run's bookkeeping
+        // cleaned itself up: no in-flight marker left for the next construction to misread, no
+        // lock left to refuse the next install.
+        assertThat(interruptedRoot.resolve("rootfs.staging").exists()).isFalse()
+        assertThat(interruptedRoot.resolve("state.properties").readText()).doesNotContain("installing=true")
+        assertThat(interruptedRoot.resolve("install.lock").exists()).isFalse()
+    }
+
+    @Test
+    fun `every proot spawn carries the loader, the tmp dir and the binds`() = runTest {
+        val harness = newHarness()
+        harness.manager.install()
+        harness.runtime.spawnSession(40, 120)
+
+        val spawns = harness.spawner.spawns
+        assertThat(spawns).isNotEmpty()
+        for (spawn in spawns) {
+            // The exec model, pinned per spawn: the binary and loader come from nativeLibraryDir
+            // (the only execve-able directory for this app), the rootfs is the shared path, and
+            // /dev, /proc and /sys are bound because the Ubuntu Base rootfs ships them empty.
+            assertThat(spawn.argv.first()).isEqualTo("/fake/native/lib/libproot.so")
+            assertThat(spawn.argv)
+                .contains("--rootfs=${harness.rootDir.resolve("rootfs").absolutePath}")
+            for (bind in listOf("/dev", "/proc", "/sys")) {
+                val index = spawn.argv.indexOf(bind)
+                assertThat(spawn.argv[index - 1]).isEqualTo("-b")
+            }
+            // PROOT_LOADER must point into nativeLibraryDir, or proot extracts its embedded
+            // loader into PROOT_TMP_DIR - under filesDir, never executable - and dies with EACCES.
+            // PROOT_TMP_DIR names the directory RuntimeStorageManager creates and probes.
+            assertThat(spawn.envp).contains("PROOT_LOADER=/fake/native/lib/libproot-loader.so")
+            assertThat(spawn.envp)
+                .contains("PROOT_TMP_DIR=${harness.rootDir.resolve("tmp").absolutePath}")
+        }
+        // Sessions never run fake root; the setup pipeline's scripted commands do (dpkg's chowns).
+        assertThat(spawns.last().argv.contains("-0")).isFalse()
+        assertThat(spawns.any { it.argv.contains("-0") }).isTrue()
+    }
+
+    @Test
+    fun `a command that never finishes is closed at its timeout, not leaked`() = runBlocking {
+        val root = Files.createTempDirectory("proot-timeout").toFile().apply { deleteOnExit() }
+        val process = BlockingPtyProcess()
+        val runtime = ProotRuntime(root, "/fake/native/lib", spawner = { _, _, _, _, _ -> process })
+
+        val result = runtime.runCommand(listOf("proot"), timeoutMs = 200)
+
+        // The timeout fired, the child was SIGHUPed, and — the part the old blocking read loop
+        // could not do — the blocked read actually ended, so the call returned instead of hanging
+        // the install with the pty slot held.
+        assertThat(result).isNull()
+        assertThat(process.closed).isTrue()
+        assertThat(process.readReturned).isTrue()
+    }
+
+    @Test
+    fun `scripted commands are visible and killable while in flight`() = runBlocking {
+        val root = Files.createTempDirectory("proot-kill").toFile().apply { deleteOnExit() }
+        val process = BlockingPtyProcess()
+        val runtime = ProotRuntime(root, "/fake/native/lib", spawner = { _, _, _, _, _ -> process })
+
+        val command = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+            runtime.runCommand(listOf("proot"), timeoutMs = 60_000)
+        }
+        // Wait until the child is genuinely parked in its read, not just spawned.
+        assertThat(process.readEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue()
+        assertThat(runtime.hasLiveScriptedProcesses()).isTrue()
+
+        runtime.killScriptedProcesses()
+
+        kotlinx.coroutines.withTimeout(5_000) { command.join() }
+        assertThat(process.closed).isTrue()
+        assertThat(runtime.hasLiveScriptedProcesses()).isFalse()
+    }
 }
 
 /**
@@ -246,10 +349,25 @@ internal class ScriptedPtySpawner : PtySpawner {
     /** Every spawn, as (ranWithFakeRoot, command). */
     val commandsWith = mutableListOf<Pair<Boolean, String>>()
 
-    /** How to answer a command: exit code to output. Replace per test to break things. */
+    /** One spawn's full argument vector and environment. */
+    data class SpawnRecord(val argv: List<String>, val envp: List<String>)
+
+    /** Every spawn's full argv and environment — the exec-model invariant's evidence. */
+    val spawns = mutableListOf<SpawnRecord>()
+
+    /**
+     * How to answer a command: exit code to output. Replace per test to break things.
+     *
+     * The default answers every marker the real pipeline asks: the distribution manager's runtime
+     * smoke (`echo eclipse-runtime-ok`, the first proot execution in setup) and the health probe
+     * (`whoami`, `echo eclipse-probe-ok`). A harness that never overrides respond therefore gets
+     * a userspace that installs and probes clean — the shape every end-to-end test here wants.
+     */
     var respond: (String) -> Pair<Int, String> = { command ->
         if (command == "whoami") {
             0 to "ubuntu\n"
+        } else if (command == "echo eclipse-runtime-ok") {
+            0 to "eclipse-runtime-ok\n"
         } else if (command.startsWith("echo eclipse-probe-ok")) {
             0 to "eclipse-probe-ok\n"
         } else {
@@ -264,6 +382,7 @@ internal class ScriptedPtySpawner : PtySpawner {
         rows: Int,
         columns: Int,
     ): PtyProcess {
+        spawns += SpawnRecord(argv, envp)
         val command = argv.lastOrNull() ?: ""
         val asRoot = argv.contains("-0")
         commandsWith += asRoot to command
@@ -295,4 +414,40 @@ private class ScriptedPtyProcess(
     override fun awaitExit(): Int = exitCode
 
     override fun close() = Unit
+}
+
+/**
+ * The wedged-command worst case: a child whose output never arrives, parked in a blocking read
+ * that only a [PtyProcess.close] can wake — which is exactly what [ProotRuntime.runCommand]'s
+ * timeout and [ProotRuntime.killScriptedProcesses] are supposed to do.
+ */
+internal class BlockingPtyProcess : PtyProcess {
+    /** Counted down once read() is genuinely parked, so a test can wait out the spawn race. */
+    val readEntered = CountDownLatch(1)
+    private val wake = CountDownLatch(1)
+
+    var closed = false
+        private set
+
+    /** True once the blocked read actually returned — the proof the timeout was real. */
+    var readReturned = false
+        private set
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        readEntered.countDown()
+        wake.await()
+        readReturned = true
+        return -1
+    }
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int): Int = length
+
+    override fun resize(rows: Int, columns: Int) = Unit
+
+    override fun awaitExit(): Int = 0
+
+    override fun close() {
+        closed = true
+        wake.countDown()
+    }
 }

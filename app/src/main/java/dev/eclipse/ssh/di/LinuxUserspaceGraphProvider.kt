@@ -15,6 +15,7 @@ import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LinuxWorkspaceManager
 import dev.eclipse.ssh.linux.ProotRuntime
 import dev.eclipse.ssh.linux.RootfsInstaller
+import dev.eclipse.ssh.linux.RuntimeStorageManager
 import dev.eclipse.ssh.linux.UbuntuDistributionManager
 import java.io.File
 import java.util.Properties
@@ -135,20 +136,24 @@ class LinuxUserspaceGraphProvider @Inject constructor(
      * from the device's active network when it has any — the fallback is public anycast.
      */
     private fun buildGraph(): LinuxUserspaceGraph? {
-        val distro = resolveDistro() ?: return null
-
         // A context with no native library directory (Robolectric, or an install whose native
         // code was never extracted) has nowhere the pinned proot could be execve'd from, which is
         // the same story as an unmapped ABI: this device cannot run a userspace.
         val nativeLibraryDir = context.applicationInfo.nativeLibraryDir ?: return null
 
         val rootDir = File(context.filesDir, "linux")
+        // One storage manager for the whole graph: every member — runtime, installer, workspace,
+        // manager — derives its paths from the same instance, so no two of them can ever disagree
+        // about where the rootfs, the tmp directory or the state file lives.
+        val storage = RuntimeStorageManager(rootDir)
+        val distro = resolveDistro(storage.stateFile) ?: return null
         val runtime = ProotRuntime(
             rootDir = rootDir,
             nativeLibraryDir = nativeLibraryDir,
             spawner = LinuxPtySpawner,
+            storage = storage,
         )
-        val installer = RootfsInstaller(rootDir, distro)
+        val installer = RootfsInstaller(rootDir, distro, storage = storage)
         val distribution = UbuntuDistributionManager(
             distro = distro,
             runtime = runtime,
@@ -157,10 +162,13 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // syscall wrapper; on Android an app's primary gid is its own uid, which is the
             // value the runCatching fallback would land on anyway.
             appGid = runCatching { android.system.Os.getgid() }.getOrDefault(Process.myUid()),
-            dnsServers = liveDnsServers(context),
+            // A lambda, not a snapshot: the resolvers are read each time setup writes
+            // /etc/resolv.conf, so a network change between install and repair lands in the file
+            // instead of pinning the DNS of the moment the graph was built.
+            dnsServers = { liveDnsServers(context) },
         )
         val processes = LinuxProcessManager()
-        val workspace = LinuxWorkspaceManager(runtime)
+        val workspace = LinuxWorkspaceManager(runtime, storage)
         val manager = LinuxUserspaceManager(
             rootDir = rootDir,
             distro = distro,
@@ -169,16 +177,17 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             distribution = distribution,
             processes = processes,
             workspace = workspace,
+            storage = storage,
         )
         return LinuxUserspaceGraph(distro, runtime, installer, distribution, processes, workspace, manager)
     }
 
     /** Installed distro, else the user's pick, else the default — as the class doc resolves it. */
-    private fun resolveDistro(): LinuxDistro? {
+    private fun resolveDistro(stateFile: File): LinuxDistro? {
         // An id that names no entry this device can run (a catalog change, a moved install) falls
         // through to the next rung rather than failing the whole graph: the manager's own state
         // check is the authority on whether anything is actually installed.
-        val installed = readDistroId(File(context.filesDir, "linux/state.properties"))
+        val installed = readDistroId(stateFile)
         val selected = readDistroId(selectionFile)
         return resolveDistro(versions, installed, selected)
     }

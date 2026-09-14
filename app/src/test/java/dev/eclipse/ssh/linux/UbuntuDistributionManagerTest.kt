@@ -4,6 +4,8 @@ import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.test.runTest
 import org.junit.Test
 
@@ -16,9 +18,16 @@ import org.junit.Test
  * the official live mirror feed, and finally the built-in mirrors — and only fails when every rung
  * has. That policy is decision logic, so it lives in pure functions these tests drive directly,
  * with one scripted-proot test per end-to-end promise: the rung that wins is the sources.list that
- * stays, and exhausting the ladder names every archive tried.
+ * stays, exhausting the ladder names every archive tried, and every rung's verdict is a fact about
+ * its own archive because the command is scoped to the sources.list under test.
  *
- * The NodeSource contract is here too: the suite is `nodistro` and the repo pinned to one major —
+ * The failure taxonomy's end-to-end promises are here too, because they are the manager's to keep:
+ * a rung that dies with the launcher's exit code aborts the ladder as a proot failure instead of
+ * descending, the runtime smoke step answers before any archive is asked anything, a dead resolver
+ * is named as DNS before a single package byte moves, and an offline device never reaches the
+ * ladder at all.
+ *
+ * The NodeSource contract is here as well: the suite is `nodistro` and the repo pinned to one major —
  * the entry this replaced named `jammy` and 404'd on every install — and armhf devices skip the
  * step entirely, because NodeSource publishes no 32-bit ARM packages.
  */
@@ -113,17 +122,22 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
-    fun `the update command pins retries, languages and a connect timeout`() {
+    fun `the update command pins retries, languages, a connect timeout and its own sources`() {
         // The exact strings the pty receives, asserted so a flag nobody can test end to end is at
         // least pinned as written.
-        val plain =
-            aptUpdateCommand(AptUpdateAttempt("http://ports.ubuntu.com/ubuntu-ports", forceIpv4 = false))
-        assertThat(plain).isEqualTo(
+        val attempt = AptUpdateAttempt("http://ports.ubuntu.com/ubuntu-ports", forceIpv4 = false)
+        val scoped = aptUpdateCommand(attempt)
+        assertThat(scoped).isEqualTo(
+            "apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none -o Acquire::http::Timeout=30" +
+                " -o Dir::Etc::sourcelist=/etc/apt/sources.list -o Dir::Etc::sourceparts=/dev/null",
+        )
+        assertThat(aptUpdateCommand(AptUpdateAttempt("http://ports.ubuntu.com/ubuntu-ports", forceIpv4 = true)))
+            .isEqualTo("$scoped -o Acquire::ForceIPv4=true")
+        // The winner's confirmation runs unscoped on purpose: it is there to pick up the lists the
+        // rung was told not to look at.
+        assertThat(aptUpdateCommand(attempt, scoped = false)).isEqualTo(
             "apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none -o Acquire::http::Timeout=30",
         )
-        assertThat(
-            aptUpdateCommand(AptUpdateAttempt("http://ports.ubuntu.com/ubuntu-ports", forceIpv4 = true)),
-        ).isEqualTo("$plain -o Acquire::ForceIPv4=true")
     }
 
     // ------------------------------------------------------------------ the mirror feed
@@ -159,10 +173,57 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a feed entry carrying anything but a bare http url is not a mirror`() {
+        // The feed is network input. Whatever it says must not smuggle suite or component fields,
+        // a fragment, userinfo, a query or an https URL past trim() and into a generated deb line.
+        val primary = "http://ports.ubuntu.com/ubuntu-ports"
+        val body =
+            listOf(
+                "http://evil.example/u jammy main # injected suite fields",
+                "http://user:pass@evil.example/ubuntu-ports",
+                "http://evil.example/ubuntu-ports#fragment",
+                "http://evil.example/ubuntu-ports?suite=jammy",
+                "http://[::1]/ubuntu-ports",
+                "https://secure.example/ubuntu-ports",
+                "http://mirror.ok.example:8080/ubuntu-ports/",
+            ).joinToString("\n")
+
+        val mirrors = parseMirrorList(body, primary)
+
+        assertThat(mirrors).containsExactly("http://mirror.ok.example:8080/ubuntu-ports")
+    }
+
+    @Test
     fun `an empty or unusable feed body yields no mirrors`() {
         val primary = "http://ports.ubuntu.com/ubuntu-ports"
         assertThat(parseMirrorList("", primary)).isEmpty()
         assertThat(parseMirrorList("https://only.example/ubuntu\nnot a url\n", primary)).isEmpty()
+    }
+
+    // ------------------------------------------------------------------ resolver filtering
+
+    @Test
+    fun `resolvers are filtered to literals, ipv4 first, capped at three with a public fallback`() {
+        // A scope-suffixed link-local is unparseable by glibc's res_init: it would sit in
+        // resolv.conf as a dead nameserver eating the lookup budget.
+        assertThat(filterDnsServers(listOf("fe80::1%wlan0", "192.168.1.1", "not-a-server")))
+            .containsExactly("192.168.1.1", "1.1.1.1")
+            .inOrder()
+        // IPv4 before IPv6, duplicates gone, one public fallback appended last.
+        assertThat(filterDnsServers(listOf("2001:db8::1", "10.0.0.1", "10.0.0.1")))
+            .containsExactly("10.0.0.1", "2001:db8::1", "1.1.1.1")
+            .inOrder()
+        // More platform servers than glibc reads: capped at two, so the fallback makes three.
+        assertThat(filterDnsServers(listOf("10.0.0.1", "10.0.0.2", "10.0.0.3")))
+            .containsExactly("10.0.0.1", "10.0.0.2", "1.1.1.1")
+            .inOrder()
+        // Both fallbacks already present: nothing appended, still three at most.
+        assertThat(filterDnsServers(listOf("8.8.8.8", "1.1.1.1", "10.0.0.1")))
+            .containsExactly("8.8.8.8", "1.1.1.1", "10.0.0.1")
+            .inOrder()
+        // A degenerate platform list degrades to the fallbacks alone, never to an empty file.
+        assertThat(filterDnsServers(emptyList())).containsExactly("1.1.1.1").inOrder()
+        assertThat(filterDnsServers(listOf("garbage"))).containsExactly("1.1.1.1").inOrder()
     }
 
     // ------------------------------------------------------------------ end to end, scripted proot
@@ -170,56 +231,362 @@ class UbuntuDistributionManagerTest {
     @Test
     fun `a failing primary archive walks the ladder to a mirror that works and stays`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
-        var plainUpdates = 0
-        harness.spawner.respond = { command ->
+        var scopedUpdates = 0
+        harness.scripted.respond = { command ->
             when {
-                // The NodeSource update is scoped to its own list and not part of the ladder.
-                command.contains("Dir::Etc::sourcelist") -> 0 to ""
-                command.startsWith("apt-get update") -> {
-                    plainUpdates++
+                // A ladder rung: scoped to the sources.list under test. The NodeSource update is
+                // scoped to its own list and never matches this branch.
+                command.startsWith("apt-get update") && isScopedRung(command) -> {
+                    scopedUpdates++
                     // Primary, primary over IPv4, first built-in: all fail. The second built-in
                     // works, and its sources.list is the one that must remain on disk.
-                    if (plainUpdates <= 3) 100 to "Err:1 http://ports.ubuntu.com jammy Release\n" else 0 to ""
+                    if (scopedUpdates <= 3) 100 to "Err:1 http://ports.ubuntu.com jammy Release\n" else 0 to ""
                 }
-                else -> 0 to ""
+                // The winner's unscoped confirmation, and the NodeSource update: neither is a rung.
+                command.startsWith("apt-get update") -> 0 to ""
+                else -> baseline(command)
             }
         }
 
         harness.distribution.setup()
 
-        val updates =
-            harness.spawner.commandsWith
+        // Four rungs ran scoped — the two primaries and the two built-ins — and rung two alone
+        // forced IPv4.
+        val scoped =
+            harness.scripted.commandsWith
                 .map { it.second }
-                .filter { it.startsWith("apt-get update") && !it.contains("Dir::Etc::sourcelist") }
-        assertThat(updates).hasSize(4)
-        assertThat(updates[0]).doesNotContain("ForceIPv4")
-        assertThat(updates[1]).contains("ForceIPv4=true")
+                .filter { it.startsWith("apt-get update") && isScopedRung(it) }
+        assertThat(scoped).hasSize(4)
+        assertThat(scoped[0]).doesNotContain("ForceIPv4")
+        assertThat(scoped[1]).contains("ForceIPv4=true")
+        assertThat(scoped.drop(2).map { it.contains("ForceIPv4") }).containsExactly(false, false).inOrder()
 
-        // The winning rung's base is what Repair and every later install reuse.
+        // Exactly one unscoped update: the confirmation after the win.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .count { it.startsWith("apt-get update") && !it.contains("Dir::Etc::sourcelist") },
+        ).isEqualTo(1)
+
+        // The winning rung's base is what Repair and every later install reuse — on disk and in
+        // the sidecar an exhausted ladder restores from.
         val sources = File(harness.runtime.rootfsDir, "etc/apt/sources.list").readText()
         assertThat(sources).contains("mirror.nju.edu.cn/ubuntu-ports")
         assertThat(sources).doesNotContain("ports.ubuntu.com")
+        assertThat(File(harness.rootDir, "last-good-mirror").readText())
+            .isEqualTo("http://mirror.nju.edu.cn/ubuntu-ports")
+    }
+
+    @Test
+    fun `a feed mirror that works wins the ladder and is recorded as the last known good`() = runTest {
+        // A file: feed, so the test injects the feed's answer without touching the network.
+        val feed =
+            File.createTempFile("mirrors", ".txt").apply {
+                deleteOnExit()
+                writeText(
+                    listOf(
+                        "http://mirror.feed.example/ubuntu-ports/",
+                        "http://mirror.other.example/ubuntu-ports",
+                    ).joinToString("\n"),
+                )
+            }
+        val harness = Harness(distro(arch = "arm64"), mirrorListUrl = "file://${feed.absolutePath}")
+        var scopedUpdates = 0
+        harness.scripted.respond = { command ->
+            when {
+                command.startsWith("apt-get update") && isScopedRung(command) -> {
+                    scopedUpdates++
+                    // Both primary rungs fail; the feed's first mirror wins.
+                    if (scopedUpdates <= 2) 100 to "Err:1 … Could not connect" else 0 to ""
+                }
+                command.startsWith("apt-get update") -> 0 to ""
+                else -> baseline(command)
+            }
+        }
+
+        harness.distribution.setup()
+
+        assertThat(scopedUpdates).isEqualTo(3)
+        val sources = File(harness.runtime.rootfsDir, "etc/apt/sources.list").readText()
+        assertThat(sources).contains("mirror.feed.example/ubuntu-ports")
+        assertThat(File(harness.rootDir, "last-good-mirror").readText())
+            .isEqualTo("http://mirror.feed.example/ubuntu-ports")
     }
 
     @Test
     fun `exhausting the ladder fails the step naming every archive tried`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
-        harness.spawner.respond = { command ->
-            if (command.startsWith("apt-get update") && !command.contains("Dir::Etc::sourcelist")) {
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update")) {
                 100 to "Err:1 … Could not connect"
             } else {
-                0 to ""
+                baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        // The evidence names a timed-out archive, and the type carries it.
+        assertThat(thrown).isInstanceOf(UserspaceFailure.MirrorUnreachable::class.java)
+        assertThat((thrown as UserspaceFailure.MirrorUnreachable).kind)
+            .isEqualTo(UserspaceFailure.Kind.Timeout)
+        // "Could not update" alone would hide which mirror said why; every rung is named.
+        assertThat(thrown.message).contains("ports.ubuntu.com")
+        assertThat(thrown.message).contains("mirrors.ustc.edu.cn")
+        assertThat(thrown.message).contains("mirror.nju.edu.cn")
+        assertThat(thrown.message).contains("Could not connect")
+        // The feed was unreachable (nothing listens on the harness's port), and the message says
+        // so — "unreachable" and "named nothing usable" are different facts.
+        assertThat(thrown.message).contains("mirror feed: unreachable")
+        // No rung won, so the restore is the primary, never the last failed rung.
+        val sources = File(harness.runtime.rootfsDir, "etc/apt/sources.list").readText()
+        assertThat(sources).contains("ports.ubuntu.com/ubuntu-ports")
+    }
+
+    @Test
+    fun `a feed that names no usable mirror is named as such in the exhaustion message`() = runTest {
+        val feed =
+            File.createTempFile("mirrors", ".txt").apply {
+                deleteOnExit()
+                // https-only entries parse to nothing: the feed answered, but unusably.
+                writeText("https://secure.example/ubuntu-ports\n")
+            }
+        val harness = Harness(distro(arch = "arm64"), mirrorListUrl = "file://${feed.absolutePath}")
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update")) {
+                100 to "Err:1 … Could not connect"
+            } else {
+                baseline(command)
             }
         }
 
         val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
 
         assertThat(thrown).isInstanceOf(IOException::class.java)
-        // "Could not update" alone would hide which mirror said why; every rung is named.
-        assertThat(thrown!!.message).contains("ports.ubuntu.com")
-        assertThat(thrown.message).contains("mirrors.ustc.edu.cn")
-        assertThat(thrown.message).contains("mirror.nju.edu.cn")
-        assertThat(thrown.message).contains("Could not connect")
+        assertThat(thrown!!.message).contains("mirror feed: fetched, but it named no usable mirror")
+    }
+
+    @Test
+    fun `a rung dying with the launcher's exit code aborts the ladder as a proot failure`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update") && isScopedRung(command)) {
+                // The historical bug's shape: linuxpty.c _exit(127) on exec failure, no output.
+                127 to ""
+            } else {
+                baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.ProotLaunchFailed::class.java)
+        assertThat((thrown as UserspaceFailure.ProotLaunchFailed).exitCode).isEqualTo(127)
+        // The message names the runtime, never a mirror.
+        assertThat(thrown.message).contains("proot")
+        assertThat(thrown.message).doesNotContain("mirror")
+        // One rung only: descending would burn every remaining rung against a broken runtime —
+        // and the feed would never be fetched either.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .count { it.startsWith("apt-get update") },
+        ).isEqualTo(1)
+        // The aborted rung's mirror is not left as the standing configuration: no rung ever won,
+        // so the restore is the primary.
+        val sources = File(harness.runtime.rootfsDir, "etc/apt/sources.list").readText()
+        assertThat(sources).contains("ports.ubuntu.com/ubuntu-ports")
+    }
+
+    @Test
+    fun `a smoke command that dies silently fails the step before any archive is asked`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command == "echo eclipse-runtime-ok") {
+                // Same shape as the rung killer above: a launcher exit code and not a word.
+                127 to ""
+            } else {
+                baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.ProotLaunchFailed::class.java)
+        assertThat((thrown as UserspaceFailure.ProotLaunchFailed).exitCode).isEqualTo(127)
+        // The old pipeline's first proot execution was the apt rung itself, which is exactly how
+        // a broken runtime read as "every mirror is down". Nothing apt-shaped ran.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it.startsWith("apt-get") || it.startsWith("dpkg") },
+        ).isTrue()
+    }
+
+    @Test
+    fun `a resolver that cannot name the archive host fails as DNS before any package byte`() = runTest {
+        val harness =
+            Harness(
+                distro(arch = "arm64"),
+                // The scope-suffixed link-local is exactly the platform entry the filter exists to
+                // drop; the resolver that survives is the one the failure message must name.
+                dnsServers = { listOf("192.168.1.1", "fe80::1%wlan0") },
+            )
+        harness.scripted.respond = { command ->
+            if (command.startsWith("getent hosts ")) {
+                2 to "" // getent's own "name not found" exit
+            } else {
+                baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.DnsUnresolved::class.java)
+        assertThat((thrown as UserspaceFailure.DnsUnresolved).servers)
+            .containsExactly("192.168.1.1", "1.1.1.1")
+            .inOrder()
+        assertThat(thrown.message).contains("192.168.1.1")
+        // resolv.conf holds the filtered list: the platform resolver plus the public fallback,
+        // and never the unparseable link-local.
+        val resolv = File(harness.runtime.rootfsDir, "etc/resolv.conf").readText()
+        assertThat(resolv).contains("nameserver 192.168.1.1")
+        assertThat(resolv).contains("nameserver 1.1.1.1")
+        assertThat(resolv).doesNotContain("fe80::1")
+        // Discovered here, not ten minutes later by an exhausted ladder: no apt command ran.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it.startsWith("apt-get") },
+        ).isTrue()
+    }
+
+    @Test
+    fun `the resolver list is read when resolv conf is written, not when the manager is built`() = runTest {
+        // The graph is built once; the device's network keeps changing. A captured list would
+        // freeze the rootfs to whatever network it was built on, and Repair could never fix a
+        // DNS breakage by changing networks.
+        var liveServers = listOf("10.0.0.1")
+        val harness = Harness(distro(arch = "arm64"), dnsServers = { liveServers })
+        liveServers = listOf("10.0.0.2")
+
+        harness.distribution.setup()
+
+        val resolv = File(harness.runtime.rootfsDir, "etc/resolv.conf").readText()
+        assertThat(resolv).contains("nameserver 10.0.0.2")
+        assertThat(resolv).doesNotContain("10.0.0.1")
+    }
+
+    @Test
+    fun `an offline device fails before any command runs`() = runTest {
+        val harness = Harness(distro(arch = "arm64"), networkOnline = { false })
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.Offline::class.java)
+        assertThat(harness.scripted.commandsWith).isEmpty()
+    }
+
+    @Test
+    fun `the offline gate re-checks before the network-heavy phases`() = runTest {
+        var online = true
+        val harness = Harness(distro(arch = "arm64"), networkOnline = { online })
+        harness.scripted.respond = { command ->
+            // The network drops while the install is already running: the gate must catch it
+            // before the ladder, not after every rung has failed for no mirror's reason.
+            if (command == "echo eclipse-runtime-ok") online = false
+            baseline(command)
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.Offline::class.java)
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it.startsWith("apt-get update") },
+        ).isTrue()
+    }
+
+    @Test
+    fun `one unavailable base package is a warning, not a failed install`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        var fullListAttempts = 0
+        harness.scripted.respond = { command ->
+            when {
+                // The whole-list command is the only one naming two packages in a row.
+                command.contains("python3-pip sudo") -> {
+                    fullListAttempts++
+                    100 to "E: Unable to locate package some-package"
+                }
+                // One package is simply not available on this mirror: the per-package fallback
+                // turns it into a warning while the other thirteen install.
+                command == "apt-get install -y --no-install-recommends git" ->
+                    100 to "E: Unable to locate package git"
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup()
+
+        // The list ran whole, then once more with --fix-missing, before the per-package fallback.
+        assertThat(fullListAttempts).isEqualTo(2)
+        assertThat(report.warnings.any { it.contains("package 'git' was not installed") }).isTrue()
+    }
+
+    @Test
+    fun `the dpkg repair pass runs before the first archive is asked anything`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+
+        harness.distribution.setup()
+
+        val commands = harness.scripted.commandsWith.map { it.second }
+        val repairIndex = commands.indexOfFirst { it.startsWith("dpkg --configure -a") }
+        val firstUpdateIndex = commands.indexOfFirst { it.startsWith("apt-get update") }
+        assertThat(repairIndex).isAtLeast(0)
+        // An interrupted earlier install leaves dpkg half-configured, and apt refuses to proceed
+        // until the repair pass has run — so the pass must come first, every time.
+        assertThat(repairIndex).isLessThan(firstUpdateIndex)
+    }
+
+    @Test
+    fun `a rung that never answers is timed out and the ladder moves on`() = runTest {
+        var wedgesLeft = 1
+        val harness =
+            Harness(
+                distro(arch = "arm64"),
+                wedgeOn = { command ->
+                    // The first ladder rung wedges: a pty read that produces nothing and ends
+                    // nothing — the shape of an apt-get stuck on a dead network.
+                    if (wedgesLeft > 0 && command.startsWith("apt-get update") && isScopedRung(command)) {
+                        wedgesLeft--
+                        true
+                    } else {
+                        false
+                    }
+                },
+                aptUpdateAttemptTimeoutMs = 250,
+            )
+        val startedAt = System.currentTimeMillis()
+
+        harness.distribution.setup()
+
+        val elapsed = System.currentTimeMillis() - startedAt
+        // The wedged rung did not end the install: the ladder descended to the IPv4 rung and won,
+        // and the timeout is on the record.
+        val scoped =
+            harness.scripted.commandsWith
+                .map { it.second }
+                .filter { it.startsWith("apt-get update") && isScopedRung(it) }
+        assertThat(scoped).hasSize(2)
+        assertThat(harness.distribution.diagnostics.export()).contains("rung timed out")
+        val sources = File(harness.runtime.rootfsDir, "etc/apt/sources.list").readText()
+        assertThat(sources).contains("ports.ubuntu.com/ubuntu-ports")
+        // Until the runtime's read loop becomes cancellable (the storage fork's contract), a
+        // wedged read outlives its own timeout: this branch's rung parks for five real seconds
+        // even though its budget was 250ms. The park is bounded so this test always terminates;
+        // the duration assertion below is the part that turns green once cancellation lands.
+        assertThat(elapsed).isLessThan(WEDGE_PARK_MS - 1_000)
     }
 
     @Test
@@ -228,7 +595,7 @@ class UbuntuDistributionManagerTest {
         harness.distribution.setup()
 
         val entry =
-            harness.spawner.commandsWith
+            harness.scripted.commandsWith
                 .map { it.second }
                 .first { "nodesource" in it }
         // nodistro: NodeSource publishes one suite for every distribution, not one per codename —
@@ -247,7 +614,7 @@ class UbuntuDistributionManagerTest {
 
         // NodeSource publishes amd64 and arm64 only; a 32-bit ARM phone cannot run its packages,
         // so the step must not run at all — and must not fail the install over it.
-        assertThat(harness.spawner.commandsWith.map { it.second }.none { "nodesource" in it }).isTrue()
+        assertThat(harness.scripted.commandsWith.map { it.second }.none { "nodesource" in it }).isTrue()
         assertThat(report.warnings.any { "armhf" in it }).isTrue()
     }
 
@@ -259,17 +626,35 @@ class UbuntuDistributionManagerTest {
      * territory. The mirror feed URL points at a localhost port nothing listens on, so the ladder's
      * fetch rung fails instantly instead of touching the network from a unit test.
      */
-    private class Harness(distro: LinuxDistro) {
-        val spawner = ScriptedPtySpawner()
+    // Inner because its scripted proot's default responses come from the outer class's baseline().
+    private inner class Harness(
+        distro: LinuxDistro,
+        scripted: ScriptedPtySpawner = ScriptedPtySpawner(),
+        wedgeOn: ((String) -> Boolean)? = null,
+        dnsServers: () -> List<String> = { UbuntuDistributionManager.DEFAULT_DNS_SERVERS },
+        networkOnline: () -> Boolean = { true },
+        mirrorListUrl: String = "http://127.0.0.1:1/mirrors.txt",
+        aptUpdateAttemptTimeoutMs: Long = 10 * 60_000L,
+    ) {
+        /** The scripted fake every non-wedged spawn lands in, even when [wedgeOn] wraps it. */
+        val scripted: ScriptedPtySpawner = scripted.apply { respond = { baseline(it) } }
         val rootDir = Files.createTempDirectory("ubuntu-distribution").toFile().apply { deleteOnExit() }
-        val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
+        val runtime =
+            ProotRuntime(
+                rootDir,
+                "/fake/native/lib",
+                if (wedgeOn != null) WedgingPtySpawner(scripted, wedgeOn) else scripted,
+            )
         val distribution =
             UbuntuDistributionManager(
                 distro,
                 runtime,
                 appUid = 10150,
                 appGid = 10150,
-                mirrorListUrl = "http://127.0.0.1:1/mirrors.txt",
+                dnsServers = dnsServers,
+                mirrorListUrl = mirrorListUrl,
+                networkOnline = networkOnline,
+                aptUpdateAttemptTimeoutMs = aptUpdateAttemptTimeoutMs,
             )
 
         init {
@@ -283,6 +668,75 @@ class UbuntuDistributionManagerTest {
         }
     }
 
+    /**
+     * How the scripted proot answers the commands every setup now runs before its apt steps: the
+     * runtime smoke echo must answer its own marker (a silent echo *is* the failure under test
+     * elsewhere), and the in-proot resolution check must name the host it was asked for.
+     */
+    private fun baseline(command: String): Pair<Int, String> = when {
+        command == "echo eclipse-runtime-ok" -> 0 to "eclipse-runtime-ok\n"
+        command.startsWith("getent hosts ") -> 0 to "1.2.3.4 ${command.removePrefix("getent hosts ")}\n"
+        else -> 0 to ""
+    }
+
+    /**
+     * Whether a command is one of the ladder's rungs: scoped to the sources.list under test. The
+     * NodeSource update is scoped to its own list (`sources.list.d/nodesource.list`) and so, by
+     * the space after `sources.list`, never matches.
+     */
+    private fun isScopedRung(command: String): Boolean =
+        command.contains("Dir::Etc::sourcelist=/etc/apt/sources.list ")
+
+    /**
+     * Wraps the scripted spawner with commands that never answer: [wedgeOn] decides per command
+     * whether this spawn's pty read parks instead of producing output — the shape of an apt-get
+     * wedged on a dead network, which the historical bug waited on forever.
+     */
+    private class WedgingPtySpawner(
+        private val delegate: ScriptedPtySpawner,
+        private val wedgeOn: (String) -> Boolean,
+    ) : PtySpawner {
+        override fun spawn(
+            argv: List<String>,
+            envp: List<String>,
+            cwd: String,
+            rows: Int,
+            columns: Int,
+        ): PtyProcess {
+            val command = argv.lastOrNull() ?: ""
+            if (wedgeOn(command)) {
+                delegate.commandsWith += (argv.contains("-0")) to command
+                return WedgedPtyProcess()
+            }
+            return delegate.spawn(argv, envp, cwd, rows, columns)
+        }
+    }
+
+    /**
+     * A pty whose read parks once, bounded, then ends the stream: wedged, but never forever.
+     *
+     * The park honors the PtyProcess contract the runtime's cancellation relies on — close() is
+     * the one thing that can wake a blocked read — so when the rung's timeout closes the process,
+     * the read returns instead of parking out its full budget. A close that left the read parked
+     * would model a kernel bug, not a wedged apt-get.
+     */
+    private class WedgedPtyProcess : PtyProcess {
+        private val wake = CountDownLatch(1)
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            wake.await(WEDGE_PARK_MS, TimeUnit.MILLISECONDS)
+            return -1
+        }
+
+        override fun write(buffer: ByteArray, offset: Int, length: Int): Int = length
+
+        override fun resize(rows: Int, columns: Int) = Unit
+
+        override fun awaitExit(): Int = 1
+
+        override fun close() = wake.countDown()
+    }
+
     private fun distro(arch: String, release: String = "jammy") =
         LinuxDistro(
             id = "ubuntu-22.04",
@@ -292,4 +746,13 @@ class UbuntuDistributionManagerTest {
             rootfsTarballUrl = "https://fixtures.invalid/rootfs.tar.gz",
             rootfsSha256 = "00",
         )
+
+    private companion object {
+        /**
+         * How long a wedged read parks before releasing. Bounded so the test terminates on this
+         * branch, where the runtime's read loop cannot be cancelled; long enough that the rung's
+         * real 250ms budget is what a cancellable loop would enforce.
+         */
+        private const val WEDGE_PARK_MS = 5_000L
+    }
 }

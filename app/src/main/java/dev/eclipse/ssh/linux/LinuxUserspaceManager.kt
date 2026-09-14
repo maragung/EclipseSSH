@@ -2,10 +2,12 @@ package dev.eclipse.ssh.linux
 
 import java.io.File
 import java.util.Properties
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * The userspace's lifecycle: Not Installed → Installing → Stopped ⇄ Starting ⇄ Running →
@@ -32,7 +34,8 @@ import kotlinx.coroutines.sync.withLock
  *
  * @param rootDir the userspace root (`filesDir/linux`)
  * @param distro the pinned distribution this manager installs and runs
- * @param backupFile where the keep-workspace uninstall parks its snapshot; deliberately outside
+ * @param backupFile where the keep-workspace uninstall parks its snapshot, when a caller (a test)
+ *   needs its own; by default the storage manager's path, which sits deliberately outside
  *   [rootDir] so an uninstall (which deletes the root) cannot destroy the thing it was keeping
  */
 class LinuxUserspaceManager(
@@ -43,10 +46,17 @@ class LinuxUserspaceManager(
     private val distribution: UbuntuDistributionManager,
     private val processes: LinuxProcessManager,
     private val workspace: LinuxWorkspaceManager,
-    private val backupFile: File = File(rootDir.parentFile, "linux-workspace-backup.tar.gz"),
+    backupFile: File? = null,
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val transition = Mutex()
+
+    /**
+     * The effective backup location: the storage manager's single definition, overridable for
+     * tests that isolate each harness's backup from its neighbours in a shared temp directory.
+     */
+    private val backupFile: File = backupFile ?: storage.workspaceBackupFile
 
     private val _state = MutableStateFlow<LinuxUserspaceState>(initialState())
     val state: StateFlow<LinuxUserspaceState> = _state
@@ -81,50 +91,77 @@ class LinuxUserspaceManager(
      * @throws IOException on any download, verification, extraction or health-check failure
      */
     suspend fun install(): SetupReport = transition.withLock {
+        // Storage before anything: every proot spawn this install leads to needs PROOT_TMP_DIR to
+        // exist and be writable, and failing that here — by name — beats failing it five minutes
+        // in as proot's "Permission denied".
+        storage.requireReady()
         requireIdleForInstall()
+        // One install at a time, process-wide: the lock is what makes a triple-tapped Install
+        // button or a service-retry racing the UI's retry run exactly one install.
+        storage.acquireInstallLock(distro.id, "install")
         try {
-            installer.install { progress ->
-                _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+            writeInstallingMarker("install")
+            // A repair-shaped install (from NeedsRepair) re-extracts, and re-extraction deletes
+            // the old rootfs — with the workspace inside it. The snapshot parks it where the
+            // restore at the end of this install picks it back up; a snapshot failure aborts,
+            // because proceeding would delete the user's projects with nothing in their place.
+            if (_state.value is LinuxUserspaceState.NeedsRepair && !installer.isExtracted() &&
+                workspace.exists() && workspace.fileCount() > 0
+            ) {
+                workspace.snapshotTo(backupFile)
             }
-            // The belt under the installer's own promise: an extraction that produced nothing
-            // must fail here — an install failure the UI can name — rather than deep inside
-            // setup, where it surfaces as a missing-file error that reads like corruption.
-            check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
-            // The step the progress line belongs to: onStep and onProgress arrive as separate
-            // callbacks, and the emitted state must carry both.
-            var currentSetupStep = SetupStep.REGISTER_USER
-            val report = distribution.setup(
-                onStep = { step ->
-                    currentSetupStep = step
-                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
-                },
-                onProgress = { line ->
-                    // Conflated by the StateFlow: a burst of apt lines collapses to the newest,
-                    // which is exactly the line a watcher wants to see.
-                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
-                },
-            )
-            _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
-            val health = distribution.healthProbe()
-            _lastHealth.value = health
-            check(health.healthy) { "Ubuntu installed but failed its health check: ${health.describe()}" }
-
-            writeInstalledState()
-            val warnings = report.warnings.toMutableList()
-            if (backupFile.isFile) {
-                val restored = runCatching { workspace.restoreFrom(backupFile) }.isSuccess
-                if (restored) {
-                    backupFile.delete()
-                } else {
-                    // Kept, not deleted: the next install (or Repair) tries again.
-                    warnings += "the saved workspace could not be restored; the backup was kept"
+            try {
+                if (!installer.isExtracted()) {
+                    storage.updateInstallLockPhase("download")
+                    installer.install { progress ->
+                        _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+                    }
                 }
+                // The belt under the installer's own promise: an extraction that produced nothing
+                // must fail here — an install failure the UI can name — rather than deep inside
+                // setup, where it surfaces as a missing-file error that reads like corruption.
+                check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
+                // The step the progress line belongs to: onStep and onProgress arrive as separate
+                // callbacks, and the emitted state must carry both.
+                storage.updateInstallLockPhase("setup")
+                var currentSetupStep = SetupStep.REGISTER_USER
+                val report = distribution.setup(
+                    onStep = { step ->
+                        currentSetupStep = step
+                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
+                    },
+                    onProgress = { line ->
+                        // Conflated by the StateFlow: a burst of apt lines collapses to the newest,
+                        // which is exactly the line a watcher wants to see.
+                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
+                    },
+                )
+                storage.updateInstallLockPhase("health")
+                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
+                val health = distribution.healthProbe()
+                _lastHealth.value = health
+                check(health.healthy) { "Ubuntu installed but failed its health check: ${health.describe()}" }
+
+                writeInstalledState()
+                val warnings = report.warnings.toMutableList()
+                if (backupFile.isFile) {
+                    val restored = runCatching { workspace.restoreFrom(backupFile) }.isSuccess
+                    if (restored) {
+                        backupFile.delete()
+                    } else {
+                        // Kept, not deleted: the next install (or Repair) tries again.
+                        warnings += "the saved workspace could not be restored; the backup was kept"
+                    }
+                }
+                _state.value = LinuxUserspaceState.Stopped
+                SetupReport(warnings)
+            } catch (t: Throwable) {
+                onFailedInstallRun()
+                _state.value = failureState(t)
+                throw t
             }
-            _state.value = LinuxUserspaceState.Stopped
-            SetupReport(warnings)
-        } catch (t: Throwable) {
-            _state.value = failureState(t)
-            throw t
+        } finally {
+            storage.releaseInstallLock()
         }
     }
 
@@ -134,12 +171,22 @@ class LinuxUserspaceManager(
      * corrupted", and Running is the state the foreground service is held in.
      */
     suspend fun start() = transition.withLock {
+        // Same storage-before-proot rule as install(): the health probe spawns proot, and a tmp
+        // directory that cannot be written to is the failure this names early.
+        storage.requireReady()
         val current = _state.value
         check(current is LinuxUserspaceState.Stopped || current is LinuxUserspaceState.NeedsRepair) {
             "Start is only possible from Stopped or Needs Repair, not $current"
         }
         _state.value = LinuxUserspaceState.Starting
-        val health = distribution.healthProbe()
+        val health = try {
+            distribution.healthProbe()
+        } catch (t: Throwable) {
+            // A probe that cannot even run — proot failed to spawn — is a repair state, not a
+            // wedged Starting: the settings screen must be able to offer Repair.
+            _state.value = LinuxUserspaceState.NeedsRepair(t.message ?: t.javaClass.simpleName)
+            throw t
+        }
         _lastHealth.value = health
         _state.value =
             if (health.healthy) {
@@ -179,39 +226,65 @@ class LinuxUserspaceManager(
      * pipeline runs again over whatever is there, and the health check has the final word.
      */
     suspend fun repair(): SetupReport = transition.withLock {
+        storage.requireReady()
         val current = _state.value
         check(current is LinuxUserspaceState.NeedsRepair || current is LinuxUserspaceState.Stopped) {
             "Repair is only possible from Stopped or Needs Repair, not $current"
         }
+        storage.acquireInstallLock(distro.id, "repair")
         try {
-            if (!installer.isExtracted()) {
-                installer.install { progress ->
-                    _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
-                }
+            writeInstallingMarker("repair")
+            // Same rule as install(): a re-extraction deletes the old rootfs — and the workspace
+            // inside it — so the workspace is parked where the restore below picks it back up.
+            if (!installer.isExtracted() && workspace.exists() && workspace.fileCount() > 0) {
+                workspace.snapshotTo(backupFile)
             }
-            // Same belt as install(): a repair whose re-extraction still left nothing must fail
-            // as a repair, not as setup's missing-file error.
-            check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
-            var currentSetupStep = SetupStep.REGISTER_USER
-            val report = distribution.setup(
-                onStep = { step ->
-                    currentSetupStep = step
-                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
-                },
-                onProgress = { line ->
-                    _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
-                },
-            )
-            _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
-            val health = distribution.healthProbe()
-            _lastHealth.value = health
-            check(health.healthy) { "Ubuntu was repaired but still fails its health check: ${health.describe()}" }
-            writeInstalledState()
-            _state.value = LinuxUserspaceState.Stopped
-            report
-        } catch (t: Throwable) {
-            _state.value = failureState(t)
-            throw t
+            try {
+                if (!installer.isExtracted()) {
+                    storage.updateInstallLockPhase("download")
+                    installer.install { progress ->
+                        _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+                    }
+                }
+                // Same belt as install(): a repair whose re-extraction still left nothing must fail
+                // as a repair, not as setup's missing-file error.
+                check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
+                storage.updateInstallLockPhase("setup")
+                var currentSetupStep = SetupStep.REGISTER_USER
+                val report = distribution.setup(
+                    onStep = { step ->
+                        currentSetupStep = step
+                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
+                    },
+                    onProgress = { line ->
+                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
+                    },
+                )
+                storage.updateInstallLockPhase("health")
+                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
+                val health = distribution.healthProbe()
+                _lastHealth.value = health
+                check(health.healthy) { "Ubuntu was repaired but still fails its health check: ${health.describe()}" }
+                writeInstalledState()
+                val warnings = report.warnings.toMutableList()
+                if (backupFile.isFile) {
+                    val restored = runCatching { workspace.restoreFrom(backupFile) }.isSuccess
+                    if (restored) {
+                        backupFile.delete()
+                    } else {
+                        // Kept, not deleted: the next install (or Repair) tries again.
+                        warnings += "the saved workspace could not be restored; the backup was kept"
+                    }
+                }
+                _state.value = LinuxUserspaceState.Stopped
+                SetupReport(warnings)
+            } catch (t: Throwable) {
+                onFailedInstallRun()
+                _state.value = failureState(t)
+                throw t
+            }
+        } finally {
+            storage.releaseInstallLock()
         }
     }
 
@@ -226,18 +299,28 @@ class LinuxUserspaceManager(
         check(current !is LinuxUserspaceState.Installing && current !is LinuxUserspaceState.Stopping) {
             "Uninstall is not possible while $current"
         }
-        processes.closeAll()
-        if (keepWorkspace && workspace.exists() && workspace.fileCount() > 0) {
-            workspace.snapshotTo(backupFile)
+        withContext(Dispatchers.IO) {
+            processes.closeAll()
+            if (keepWorkspace && workspace.exists() && workspace.fileCount() > 0) {
+                workspace.snapshotTo(backupFile)
+            }
+            if (!keepWorkspace) {
+                backupFile.delete()
+            }
+            installer.deleteRootfs()
+            // proot's temp dir holds its glue symlinks; NOFOLLOW so the sweep cannot chase one out.
+            deleteTreeNoFollow(runtime.tmpDir)
+            stateFile().delete()
+            // The distribution's mirror memo lives beside the rootfs, not inside it, so it
+            // survives deleteRootfs — but it describes an install that no longer exists, and a
+            // leftover here is why a "removed entirely" root still shows bytes in use.
+            distribution.clearLastGoodMirror()
+            // Belt under the not-while-Installing check: a lock left by any path is gone with
+            // everything else, so the next install starts from a clean slate.
+            storage.releaseInstallLock()
+            _lastHealth.value = null
+            _state.value = LinuxUserspaceState.NotInstalled
         }
-        if (!keepWorkspace) {
-            backupFile.delete()
-        }
-        installer.deleteRootfs()
-        runtime.tmpDir.deleteRecursively()
-        stateFile().delete()
-        _lastHealth.value = null
-        _state.value = LinuxUserspaceState.NotInstalled
     }
 
     /**
@@ -246,13 +329,15 @@ class LinuxUserspaceManager(
      * on a Running one does *not* stop anything, because live sessions may still be fine and Stop
      * is the user's call.
      */
-    suspend fun refreshHealth(): HealthReport {
+    suspend fun refreshHealth(): HealthReport = transition.withLock {
+        // Under the same mutex as every transition: a refresh racing a Start would otherwise
+        // record a verdict about a userspace whose state changed underneath it.
         val health = distribution.healthProbe()
         _lastHealth.value = health
         if (!health.healthy && _state.value is LinuxUserspaceState.Stopped) {
             _state.value = LinuxUserspaceState.NeedsRepair(health.describe())
         }
-        return health
+        health
     }
 
     // ------------------------------------------------------------------ internals
@@ -277,7 +362,7 @@ class LinuxUserspaceManager(
             LinuxUserspaceState.NotInstalled
         }
 
-    private fun stateFile(): File = File(rootDir, "state.properties")
+    private fun stateFile(): File = storage.stateFile
 
     /**
      * The constructor's state: persisted facts checked against the filesystem, so a crash, a
@@ -285,6 +370,12 @@ class LinuxUserspaceManager(
      */
     private fun initialState(): LinuxUserspaceState {
         val props = readStateFile() ?: return LinuxUserspaceState.NotInstalled
+        if (props.getProperty("installing") == "true") {
+            // The last run never reached its finally: whatever is on disk — a half-extracted
+            // staging tree, a rootfs that setup never finished with — is not a system to present
+            // as anything but repairable.
+            return LinuxUserspaceState.NeedsRepair("a previous install was interrupted")
+        }
         if (props.getProperty("installed") != "true" || props.getProperty("distroId") != distro.id) {
             return LinuxUserspaceState.NotInstalled
         }
@@ -312,6 +403,51 @@ class LinuxUserspaceManager(
         props.setProperty("distroId", distro.id)
         props.setProperty("installedAtMs", clock().toString())
         stateFile().outputStream().use { output -> props.store(output, "Eclipse SSH Linux userspace") }
+    }
+
+    /**
+     * Records that an install/repair run is in flight — the fact [initialState] reads back after
+     * a crash to refuse presenting the leftovers as anything but NeedsRepair. Merged into
+     * whatever state is already on disk, so a repair of an installed system does not erase the
+     * installed fact it is trying to restore.
+     */
+    private fun writeInstallingMarker(phase: String) {
+        rootDir.mkdirs()
+        val props = readStateFile() ?: Properties()
+        props.setProperty("installing", "true")
+        props.setProperty("distroId", distro.id)
+        props.setProperty("phase", phase)
+        props.setProperty("startedAtMs", clock().toString())
+        stateFile().outputStream().use { output -> props.store(output, "Eclipse SSH Linux userspace") }
+    }
+
+    /**
+     * What a failed install/repair run leaves behind. A rootfs that extracted stays — the next
+     * attempt's extraction guard resumes from it. A run that produced nothing reclaims its
+     * staging tree while keeping the verified tarball (the retry resumes instead of
+     * re-downloading) and drops the state file. Both clear the installing marker, so the next
+     * construction reads the failure as it was, not as an interruption.
+     */
+    private fun onFailedInstallRun() {
+        if (installer.isExtracted()) {
+            clearInstallingMarker()
+        } else {
+            installer.reclaimFailedExtraction()
+            stateFile().delete()
+        }
+    }
+
+    /** Removes the in-flight marker, preserving any installed fact recorded before the run. */
+    private fun clearInstallingMarker() {
+        val props = readStateFile() ?: return
+        props.remove("installing")
+        props.remove("phase")
+        props.remove("startedAtMs")
+        if (props.getProperty("installed") == "true") {
+            stateFile().outputStream().use { output -> props.store(output, "Eclipse SSH Linux userspace") }
+        } else {
+            stateFile().delete()
+        }
     }
 
     private fun RootfsInstaller.Progress.toInstallStep(): LinuxInstallStep =

@@ -35,15 +35,17 @@ class RootfsInstaller(
     private val rootDir: File,
     private val distro: LinuxDistro,
     private val downloader: HttpDownloader = UrlConnectionDownloader(),
+    private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
+    private val validator: RootfsValidator = RootfsValidator(),
 ) {
     /** Where the tarball is downloaded to before verification. */
-    val tarballFile: File get() = File(rootDir, "rootfs-${distro.ubuntuArch}.tar.gz")
+    val tarballFile: File get() = File(storage.downloadsDir, "rootfs-${distro.ubuntuArch}.tar.gz")
 
     /** Where the rootfs is unpacked before being moved into place. */
-    private val stagingDir: File get() = File(rootDir, "rootfs.staging")
+    private val stagingDir: File get() = storage.stagingDir
 
     /** The completed, in-place rootfs. */
-    val rootfsDir: File get() = File(rootDir, "rootfs")
+    val rootfsDir: File get() = storage.rootfsDir
 
     /**
      * Progress through the install, for the UI's install screen. Byte-precise for the download
@@ -68,15 +70,22 @@ class RootfsInstaller(
     fun isExtracted(): Boolean = !stagingDir.exists() && File(rootfsDir, "bin").isDirectory
 
     /**
-     * Deletes the rootfs and every installer artifact (tarball, staging).
-     *
-     * Does not touch the workspace: workspace survival across uninstall is the manager's decision
-     * to make, and this class has no opinion about it.
+     * Deletes the download and every extracted tree — the uninstall path, which owns the "none of
+     * it is kept" decision.
      */
     fun deleteRootfs() {
         tarballFile.delete()
-        rootfsDir.deleteRecursively()
-        stagingDir.deleteRecursively()
+        deleteTreeNoFollow(rootfsDir)
+        deleteTreeNoFollow(stagingDir)
+    }
+
+    /**
+     * Reclaims a staging tree a failed install left behind, keeping the verified tarball so the
+     * retry resumes from it instead of re-downloading. The manager's failure path calls this; it
+     * never touches a rootfs that made it into place.
+     */
+    fun reclaimFailedExtraction() {
+        deleteTreeNoFollow(stagingDir)
     }
 
     /**
@@ -86,16 +95,63 @@ class RootfsInstaller(
      * @throws IOException on any network, verification or extraction failure
      */
     suspend fun install(onProgress: (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
-        rootDir.mkdirs()
+        // Storage first: the download lands under downloads/ and the probe inside ensureReady()
+        // fails here — with a name — rather than as a mid-download EACCES. The sweep then clears
+        // fragments a crashed attempt left pinning the space this one needs.
+        storage.requireReady()
+        storage.sweepOrphanPartFiles()
+        checkFreeSpace()
         download(onProgress)
         onProgress(Progress.Verifying)
         verify()
         extract(onProgress)
+        validateStaging()
         moveIntoPlace()
         rootfsDir
     }
 
+    /**
+     * The staging tree's examination before it is allowed to become the rootfs: the manifest and
+     * the size floor from [RootfsValidator]. A tree that fails is deleted here — it is
+     * regenerable from the (verified, kept) tarball — and the install fails naming what was
+     * wrong, instead of moving a broken rootfs into place and letting the first shell be the
+     * thing that discovers it.
+     */
+    private fun validateStaging() {
+        val findings = validator.validate(stagingDir)
+        if (findings.isEmpty()) return
+        deleteTreeNoFollow(stagingDir)
+        throw IOException(
+            "the extracted rootfs failed validation: " +
+                findings.joinToString("; ") { "${it.path} ${it.problem}" },
+        )
+    }
+
+    /**
+     * Refuses to start a download the disk cannot hold. The budget is deliberately coarse — the
+     * tarball, several multiples of it unpacked (the extracted rootfs plus apt's working space),
+     * and a headroom for everything else the app stores — because the alternative failure is
+     * discovering ENOSPC half way through a 30 MB download on a metered connection.
+     *
+     * A free-space answer of 0 means "unknown" (the JVM's unmocked StatFs, or a probe failure),
+     * never "full", so it never blocks an install.
+     */
+    private fun checkFreeSpace() {
+        val free = storage.freeBytes()
+        if (free <= 0L) return
+        val needed = distro.rootfsSizeBytes * NEEDED_TARBALL_MULTIPLE + FREE_SPACE_HEADROOM_BYTES
+        if (free < needed) {
+            // The prefix is a contract: the error taxonomy reads "Ubuntu needs" as DiskFull.
+            throw IOException(
+                "Ubuntu needs about ${needed / MIB} MB of free storage to install " +
+                    "(the download plus the unpacked system), but only about ${free / MIB} MB is free. " +
+                    "Free up storage and try again.",
+            )
+        }
+    }
+
     private suspend fun download(onProgress: (Progress) -> Unit) {
+        migrateLegacyTarball()
         if (tarballFile.isFile && verifyFileSha256(tarballFile, distro.rootfsSha256)) {
             // A previously verified tarball is reused, not re-downloaded: an interrupted install
             // resumes rather than starting its 30 MB download again.
@@ -104,23 +160,68 @@ class RootfsInstaller(
         // Captured so the downloader's non-suspending chunk callback can still honour
         // cancellation — a cancelled install must stop mid-download, not after 30 MB more.
         val job = coroutineContext[Job]
-        val temp = File(rootDir, tarballFile.name + ".part")
+        val temp = File(storage.downloadsDir, tarballFile.name + ".part")
+        var receivedFinal = 0L
+        var reportedTotal = 0L
         try {
             downloader.download(
                 distro.rootfsTarballUrl,
                 temp,
                 onChunk = { received, total ->
                     job?.ensureActive()
+                    receivedFinal = received
+                    if (total > 0) reportedTotal = total
+                    // The server's content length versus the pin: wildly off in either direction
+                    // means the URL is no longer serving the file this build was verified against
+                    // (an error page with a 200, a redirect to something else) — fail now, not
+                    // after 30 MB of the wrong bytes.
+                    if (total > 0 && distro.rootfsSizeBytes > 0) {
+                        val expected = distro.rootfsSizeBytes
+                        if (total > expected * 2 || total < expected / 2) {
+                            throw IOException(
+                                "the rootfs download is $total bytes, but the pinned ${distro.displayName} " +
+                                    "tarball is about $expected bytes - the URL is serving something else",
+                            )
+                        }
+                    }
                     onProgress(Progress.Downloading(received, total))
                 },
             )
-            verifyFileSha256(temp, distro.rootfsSha256)
+            if (reportedTotal > 0 && receivedFinal != reportedTotal) {
+                throw IOException(
+                    "the rootfs download was truncated: $receivedFinal of $reportedTotal bytes arrived",
+                )
+            }
+            // Fail closed: an unverifiable temp file is deleted by the finally below, never
+            // renamed into place as if it were the pinned tarball.
+            if (!verifyFileSha256(temp, distro.rootfsSha256)) {
+                throw IOException("Rootfs checksum mismatch for ${distro.displayName}")
+            }
             if (!temp.renameTo(tarballFile)) {
                 temp.copyTo(tarballFile, overwrite = true)
                 temp.delete()
             }
         } finally {
             temp.delete()
+        }
+    }
+
+    /**
+     * Tarballs used to be downloaded straight into the userspace root, before the downloads
+     * directory existed. A verified leftover moves over (the retry resumes instead of
+     * re-downloading); anything else is swept — it is garbage pinning the space the next attempt
+     * needs.
+     */
+    private fun migrateLegacyTarball() {
+        val legacy = File(storage.rootDir, tarballFile.name)
+        if (!legacy.isFile) return
+        if (verifyFileSha256(legacy, distro.rootfsSha256)) {
+            if (!legacy.renameTo(tarballFile)) {
+                legacy.copyTo(tarballFile, overwrite = true)
+                legacy.delete()
+            }
+        } else {
+            legacy.delete()
         }
     }
 
@@ -136,9 +237,11 @@ class RootfsInstaller(
      */
     private suspend fun extract(onProgress: (Progress) -> Unit) {
         onProgress(Progress.Extracting(0))
-        stagingDir.deleteRecursively()
+        deleteTreeNoFollow(stagingDir)
         stagingDir.mkdirs()
         var entries = 0
+        var written = 0L
+        val budget = extractionBudgetBytes()
         openTarStream(tarballFile, DOWNLOAD_BUFFER).use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
@@ -151,10 +254,14 @@ class RootfsInstaller(
                     }
                     TarArchiveEntry.LF_SYMLINK -> {
                         target.parentFile?.mkdirs()
+                        // Where the link points must resolve inside the staging root too: a
+                        // symlink pointing out is an escape hatch none of the entry-name checks
+                        // would catch, because nothing is written through it here.
+                        resolveLinkInsideRoot(stagingDir, entry.name, entry.linkName)
                         // Created and deleted: if a previous extraction (or the rootfs itself)
                         // already put something there, the symlink must replace it.
                         target.delete()
-                        kotlin.runCatching { target.deleteRecursively() }
+                        deleteTreeNoFollow(target)
                         java.nio.file.Files.createSymbolicLink(target.toPath(), java.nio.file.Path.of(entry.linkName))
                     }
                     TarArchiveEntry.LF_LINK -> {
@@ -162,18 +269,31 @@ class RootfsInstaller(
                         val source = resolveInside(stagingDir, entry.linkName)
                         // Hardlinks inside one tarball are duplicates of an earlier entry; copying
                         // is the portable equivalent and costs one file.
-                        if (source.isFile) source.copyTo(target, overwrite = true)
+                        if (source.isFile) {
+                            source.copyTo(target, overwrite = true)
+                            written += target.length()
+                        }
                     }
                     TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
                         target.parentFile?.mkdirs()
                         target.outputStream().use { output -> tar.copyTo(output) }
                         applyMode(target, entry.mode)
+                        written += target.length()
                     }
                     else -> {
                         // Device nodes, fifos and the like: the rootfs does not need them — proot
                         // binds the host's /dev — and creating them would require privileges the
                         // app does not have anyway.
                     }
+                }
+                // The decompression-bomb budget: the pin says what the tarball weighs, so the
+                // tree it unpacks to is bounded at a multiple of that. A gzip bomb that would
+                // fill the disk is refused mid-extraction, with the staging tree reclaimable.
+                if (written > budget) {
+                    throw IOException(
+                        "the rootfs archive expands beyond the expected size " +
+                            "(${written / (1024 * 1024)} MB unpacked from a ${tarballFile.length() / (1024 * 1024)} MB tarball) - refusing to continue",
+                    )
                 }
                 entries++
                 if (entries % PROGRESS_EVERY_ENTRIES == 0) {
@@ -185,13 +305,42 @@ class RootfsInstaller(
         onProgress(Progress.Extracting(entries))
     }
 
+    /**
+     * What the tarball is allowed to unpack to: ~10x the pinned compressed size, which a real
+     * Ubuntu Base image (66 MB from a 28 MB tarball) fits with room to spare and a gzip bomb does
+     * not. Without a pin (a hand-built test distro), a fixed ceiling stands in.
+     */
+    private fun extractionBudgetBytes(): Long =
+        if (distro.rootfsSizeBytes > 0) {
+            distro.rootfsSizeBytes * 10
+        } else {
+            DEFAULT_EXTRACTION_BUDGET_BYTES
+        }
+
     private fun moveIntoPlace() {
-        rootfsDir.deleteRecursively()
+        // The previous rootfs is parked beside the new one rather than deleted first: the old
+        // delete-then-rename ordering had a window where a crash left *neither* root, and the
+        // parked copy is also the rollback if the swap itself fails.
+        val parked = File(storage.rootDir, "rootfs.old")
+        deleteTreeNoFollow(parked)
+        var parkedPrevious = false
+        if (rootfsDir.exists()) {
+            parkedPrevious = rootfsDir.renameTo(parked)
+            if (!parkedPrevious) {
+                // Renaming the old root away failed for reasons we cannot fix here; deleting it
+                // reopens the no-root window but keeps the install able to proceed.
+                deleteTreeNoFollow(rootfsDir)
+            }
+        }
         if (!stagingDir.renameTo(rootfsDir)) {
+            if (parkedPrevious) {
+                parked.renameTo(rootfsDir)
+            }
             // Same-filesystem rename only fails for reasons we cannot fix here; report rather than
             // half-move.
             throw IOException("Could not move the extracted rootfs into place at $rootfsDir")
         }
+        deleteTreeNoFollow(parked)
         // The tarball has served its purpose; keeping it would pin 30 MB for nothing.
         tarballFile.delete()
     }
@@ -233,6 +382,20 @@ class RootfsInstaller(
     companion object {
         private const val DOWNLOAD_BUFFER = 64 * 1024
         private const val PROGRESS_EVERY_ENTRIES = 200
+
+        /** The tarball plus this many multiples of it: the extracted rootfs and apt's working space. */
+        private const val NEEDED_TARBALL_MULTIPLE = 5L
+
+        /** Room for everything else the app stores, on top of the userspace's own needs. */
+        private const val FREE_SPACE_HEADROOM_BYTES = 600L * 1024 * 1024
+
+        /**
+         * The extraction ceiling when the pin carries no size (a hand-built distro): enough for a
+         * real rootfs, small enough that a gzip bomb dies long before the disk does.
+         */
+        private const val DEFAULT_EXTRACTION_BUDGET_BYTES = 500L * 1024 * 1024
+
+        private const val MIB = 1024L * 1024
     }
 }
 

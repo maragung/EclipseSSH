@@ -59,6 +59,17 @@ class LinuxDistroCatalogTest {
     }
 
     @Test
+    fun `every entry carries a plausible tarball size for the storage gates`() {
+        // The size estimate feeds the free-space gate and the content-length sanity check; an
+        // entry with 0 would silently disable both, and a nonsense value would block honest
+        // installs. Ubuntu Base tarballs live in the tens of megabytes.
+        LinuxDistroCatalog.all.forEach { distro ->
+            assertThat(distro.rootfsSizeBytes).isAtLeast(10_000_000L)
+            assertThat(distro.rootfsSizeBytes).isAtMost(100_000_000L)
+        }
+    }
+
+    @Test
     fun `the default distro id exists in the catalogue`() {
         // forDevice filters by DEFAULT_DISTRO_ID; an id nothing answers to would make every
         // device unsupported, silently.

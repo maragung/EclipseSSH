@@ -5,6 +5,7 @@ import dev.eclipse.ssh.ssh.SessionEnd
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
@@ -118,6 +119,65 @@ class LocalTerminalChannelTest {
 
         channel.close()
     }
+
+    @Test
+    fun `a second teardown is a no-op, not a second close of the fd`() {
+        val process = FakePtyProcess()
+        val channel = newChannel(process)
+
+        // Both ending paths are reachable for one channel — Stop's closeAll closes it, the
+        // session store's forget closes it again — and each used to close the master fd, so the
+        // second one landed on whatever the process had since reused the descriptor for.
+        channel.close()
+        channel.discard(null)
+        channel.close()
+
+        val end = runBlocking { channel.awaitClosed() }
+        assertThat(end).isEqualTo(SessionEnd.Released)
+        assertThat(process.closeCount.get()).isEqualTo(1)
+    }
+
+    @Test
+    fun `a resize after release never reaches the pty`() {
+        val process = FakePtyProcess()
+        val channel = newChannel(process)
+
+        channel.close()
+        channel.resize(newColumns = 100, newRows = 30)
+
+        assertThat(process.resizes).isEqualTo(0)
+    }
+
+    @Test
+    fun `a close is not held hostage by a writer parked on a shell that stopped reading`() {
+        val process = BlockingWritePtyProcess()
+        val channel = newChannel(process)
+
+        channel.write("in flight\r")
+        // Park the writer inside process.write; a shell that stopped reading its input does
+        // exactly this, forever.
+        assertThat(process.writeEntered.await(5, TimeUnit.SECONDS)).isTrue()
+
+        val finished = CountDownLatch(1)
+        Thread {
+            channel.close()
+            finished.countDown()
+        }.start()
+
+        // The bounded writer join gives up, the fd is closed and the channel ends — Release()
+        // must return even though the writer never will.
+        assertThat(finished.await(10, TimeUnit.SECONDS)).isTrue()
+        val end = runBlocking { channel.awaitClosed() }
+        assertThat(end).isEqualTo(SessionEnd.Released)
+        assertThat(process.closeCount.get()).isEqualTo(1)
+
+        // And the wedged writer was abandoned, not lost: once the shell (the test) resumes it,
+        // the queued input still lands — ordered after the close, exactly as the queue holds it.
+        process.writeGate.countDown()
+        val written = process.writes.poll(5, TimeUnit.SECONDS)
+        assertThat(written).isNotNull()
+        assertThat(String(written!!)).isEqualTo("in flight\r")
+    }
 }
 
 /**
@@ -127,11 +187,13 @@ class LocalTerminalChannelTest {
  * Blocking semantics mirror the real bridge: `read` blocks until output or the end of the stream,
  * so the channel's reader thread parks exactly as it would on a real pty.
  */
-internal class FakePtyProcess : PtyProcess {
+// Open because the suite's own fixtures refine it — BlockingWritePtyProcess parks inside write().
+internal open class FakePtyProcess : PtyProcess {
     private val pending = LinkedBlockingQueue<ByteArray>()
     private val exited = CountDownLatch(1)
 
     val writes = LinkedBlockingQueue<ByteArray>()
+    val closeCount = AtomicInteger()
     var resizes = 0
         private set
     var lastResize: Pair<Int, Int>? = null
@@ -158,7 +220,7 @@ internal class FakePtyProcess : PtyProcess {
         return n
     }
 
-    override fun write(buffer: ByteArray, offset: Int, length: Int): Int {
+    open override fun write(buffer: ByteArray, offset: Int, length: Int): Int {
         writes.put(buffer.copyOfRange(offset, offset + length))
         return length
     }
@@ -174,9 +236,26 @@ internal class FakePtyProcess : PtyProcess {
     }
 
     override fun close() {
+        closeCount.incrementAndGet()
         // Wake the reader with end-of-stream and unblock awaitExit: this is what SIGHUP-ing the
         // session does on a real pty.
         pending.put(ByteArray(0))
         exited.countDown()
+    }
+}
+
+/**
+ * A [FakePtyProcess] whose [write] parks until the test opens [writeGate] — the shape of a shell
+ * that stopped reading its input, which parks the channel's writer thread inside process.write
+ * forever. [writeEntered] tells the test the writer has actually arrived there.
+ */
+private class BlockingWritePtyProcess : FakePtyProcess() {
+    val writeEntered = CountDownLatch(1)
+    val writeGate = CountDownLatch(1)
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int): Int {
+        writeEntered.countDown()
+        writeGate.await()
+        return super.write(buffer, offset, length)
     }
 }
