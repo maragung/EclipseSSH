@@ -294,6 +294,10 @@ class LinuxUserspaceManagerTest {
             assertThat(spawn.envp).contains("PROOT_LOADER=/fake/native/lib/libproot-loader.so")
             assertThat(spawn.envp)
                 .contains("PROOT_TMP_DIR=${harness.rootDir.resolve("tmp").absolutePath}")
+            // Blocked-syscall diagnostics land in a file this app can write (the fork's default
+            // points at the fork's own app's cache — see linux/proot-patches/0002).
+            assertThat(spawn.envp)
+                .contains("PROOT_SIGSYS_LOG=${harness.rootDir.resolve("sigsys-log.txt").absolutePath}")
         }
         // Sessions never run fake root; the setup pipeline's scripted commands do (dpkg's chowns).
         assertThat(spawns.last().argv.contains("-0")).isFalse()

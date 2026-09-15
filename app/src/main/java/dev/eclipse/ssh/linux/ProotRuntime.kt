@@ -68,6 +68,12 @@ class ProotRuntime(
     val rootfsDir: File get() = storage.rootfsDir
     val tmpDir: File get() = storage.tmpDir
 
+    /**
+     * Where the proot fork's blocked-syscall log lives (`PROOT_SIGSYS_LOG`): the userspace root,
+     * not `tmp` — it must survive storage reclaim, which wipes [tmpDir] wholesale.
+     */
+    val sigsysLogFile: File get() = File(rootDir, "sigsys-log.txt")
+
     /** The proot binary, as the first argv element. */
     private val prootBinary: String get() = File(nativeLibraryDir, "libproot.so").path
 
@@ -128,6 +134,10 @@ class ProotRuntime(
         // PROOT_TMP_DIR — under filesDir, not executable — and every start dies with EACCES.
         "PROOT_LOADER=$prootLoader",
         "PROOT_TMP_DIR=${tmpDir.absolutePath}",
+        // Where the proot fork logs blocked syscalls it cannot downgrade (its built-in default
+        // is the fork's own app's cache — unwritable here, which silently disabled the
+        // diagnostic; see linux/proot-patches/0002). One line per event, append-only, small.
+        "PROOT_SIGSYS_LOG=${sigsysLogFile.absolutePath}",
         // Ubuntu-conventional values, not Android's: a login shell resolves HOME from /etc/passwd,
         // but everything non-login reads the variable.
         "HOME=$homePath",

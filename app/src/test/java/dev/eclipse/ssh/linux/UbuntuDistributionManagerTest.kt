@@ -367,6 +367,52 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a failing rung surfaces the blocked-syscall log the proot fork kept`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        // The shape the rename ENOSYS left behind: apt output that says nothing about why, and a
+        // SIGSYS log naming the syscall the fork could not downgrade (patch 0001's evidence).
+        File(harness.runtime.rootDir, "sigsys-log.txt").writeText(
+            listOf(
+                "SIGSYS: time=15:57:49 pid=1234 comm=apt-get kernel_num=82 pr=82",
+                "SIGSYS: time=15:57:50 pid=1234 comm=dpkg kernel_num=82 pr=82",
+            ).joinToString("\n"),
+        )
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update") && isScopedRung(command)) {
+                100 to "E: Failed to fetch … rename failed, Function not implemented\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+
+        // The diagnostic ring names the trapped syscall, which is the difference between
+        // "apt failed" and "rename (82) was blocked and unmapped".
+        val export = harness.distribution.diagnostics.export()
+        assertThat(export).contains("blocked-syscall log")
+        assertThat(export).contains("kernel_num=82")
+    }
+
+    @Test
+    fun `a failing rung with no blocked syscalls records no syscall-log event`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update") && isScopedRung(command)) {
+                100 to "Err:1 … Could not connect\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+
+        // No SIGSYS happened, so the event must not appear either — silence is not evidence.
+        assertThat(harness.distribution.diagnostics.export())
+            .doesNotContain("blocked-syscall log")
+    }
+
+    @Test
     fun `a rung dying with the launcher's exit code aborts the ladder as a proot failure`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
         harness.scripted.respond = { command ->

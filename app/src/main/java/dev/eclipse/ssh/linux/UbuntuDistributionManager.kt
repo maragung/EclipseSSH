@@ -427,6 +427,12 @@ class UbuntuDistributionManager(
                     durationMs = durationMs,
                 )
             }
+            // A failed rung is the one moment the proot fork's blocked-syscall log can explain
+            // the failure (an unmapped SIGSYS reads as a bare ENOSYS in apt's output). The log
+            // only grows while proot runs, so its tail right after the failure names every
+            // syscall the handler could not downgrade. Absent, empty or unreadable means no
+            // SIGSYS happened — not worth a diagnostic of its own.
+            recordSigsysTail("rung failed: ${attempt.baseUri}")
             UserspaceFailure.fromAptRun(attempt.baseUri, result?.exitCode, output, dnsServers = writtenDnsServers)
                 ?.let { classified ->
                     if (classified is UserspaceFailure.ProotLaunchFailed) {
@@ -740,6 +746,25 @@ class UbuntuDistributionManager(
         runtime.runCommand(runtime.sessionArgv(command), env = runtime.baseEnv(), timeoutMs = timeoutMs)
 
     /**
+     * Records the tail of the proot fork's blocked-syscall log ([ProotRuntime] points
+     * `PROOT_SIGSYS_LOG` at it) as one diagnostic event, after a failed proot command. One line
+     * per trapped syscall the fork could not downgrade — the difference between "apt failed with
+     * ENOSYS" and "syscall 82 (rename) was trapped and unmapped". No event when the log is
+     * missing or empty: most failures have no SIGSYS in them, and silence is not evidence.
+     */
+    private fun recordSigsysTail(when_: String) {
+        val tail = runCatching {
+            runtime.sigsysLogFile.readLines().takeLast(SIGSYS_TAIL_LINES)
+        }.getOrNull().orEmpty()
+        if (tail.isEmpty()) return
+        diagnostics.record(
+            UserspaceDiagnosticCategory.PROOT,
+            "blocked-syscall log",
+            detail = "$when_: " + tail.joinToString(" | "),
+        )
+    }
+
+    /**
      * Wraps [ProotRuntime.runCommand]'s chunk callback into "the newest line of output", which is
      * the granularity the install screen can use. A chunk boundary can split a line; the half-line
      * then shows for one chunk and is replaced by its completion — acceptable for progress text,
@@ -811,6 +836,9 @@ class UbuntuDistributionManager(
         private const val ACCOUNT_NAME = "ubuntu"
         private const val HOME_DIR = "/home/ubuntu"
         private const val PASSWD_PREFIX = "ubuntu:"
+
+        /** How many blocked-syscall log lines one diagnostic event carries. */
+        private const val SIGSYS_TAIL_LINES = 10
 
         /**
          * Fallback resolvers, used when the wiring layer does not supply the device's live ones.

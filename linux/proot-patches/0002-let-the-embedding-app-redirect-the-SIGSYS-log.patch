@@ -1,0 +1,51 @@
+let the embedding app redirect the SIGSYS log
+
+The fork's SIGSYS default case (a blocked syscall with no downgrade
+path) appends one line per event to
+/data/data/id.or.oo.pr/cache/sigsys-log.txt - the fork's own app's
+cache, unwritable for any other embedding app.  For those apps the
+fopen fails, the diagnostic silently disappears, and every future
+"blocked syscall we did not know about" investigation starts from
+zero logcat evidence.  This is exactly why the rename() ENOSYS took
+days instead of minutes: the apt failure left no SIGSYS trace at all.
+
+Read the log path from PROOT_SIGSYS_LOG instead: unset keeps the old
+default (the fork's own app is unaffected), set to a writable path
+redirects the file, set to empty disables file logging.  The app sets
+it to a file under its userspace root in ProotRuntime.baseEnv().
+
+Validated on x86_64 Linux with a seccomp filter TRAPping __NR_syslog
+(not in the downgrade table): with PROOT_SIGSYS_LOG=<writable path>,
+the event line lands in that file; without it, nothing is written;
+the ENOSYS result to the tracee is unchanged either way.
+
+Not upstreamed: no write access to oonid/pr; applied by
+fetchLinuxSource in linux/build.gradle.kts (stacks on 0001).
+--- a/src/proot/src/tracee/seccomp.c
++++ b/src/proot/src/tracee/seccomp.c
+@@ -13,6 +13,7 @@
+ #include <fcntl.h>     /* AT_FDCWD, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC */
+ #include <sched.h>     /* CLONE_*, */
+ #include <limits.h>    /* PATH_MAX, */
++#include <stdlib.h>   /* getenv(3), */
+ 
+ #include "extension/extension.h"
+ #include "cli/note.h"
+@@ -837,8 +838,15 @@
+ 	default:
+ 	{
+ 		word_t kernel_num = peek_reg(tracee, CURRENT, SYSARG_NUM);
+-		const char *log_path = "/data/data/id.or.oo.pr/cache/sigsys-log.txt";
+-		FILE *f = fopen(log_path, "a");
++		/* The default log path belongs to the fork's own app and is
++		 * unwritable for any other embedding app, which silently
++		 * disables this diagnostic. PROOT_SIGSYS_LOG lets the embedding
++		 * app redirect it (a path it can write); an empty value
++		 * disables the file logging entirely.  */
++		const char *log_path = getenv("PROOT_SIGSYS_LOG");
++		if (log_path == NULL)
++			log_path = "/data/data/id.or.oo.pr/cache/sigsys-log.txt";
++		FILE *f = (*log_path != '\0') ? fopen(log_path, "a") : NULL;
+ 		if (f) {
+ 			time_t now = time(NULL);
+ 			struct tm *tm = localtime(&now);

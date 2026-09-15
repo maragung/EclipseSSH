@@ -165,11 +165,14 @@ jobs:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
+      - name: Install patch (proot-patches are applied by fetchLinuxSource)
+        run: sudo apt-get install -y -qq patch
+
       - name: Cache the Linux userspace native build tree
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: linux/build
-          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0

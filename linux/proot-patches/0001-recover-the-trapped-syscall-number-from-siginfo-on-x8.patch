@@ -1,0 +1,104 @@
+recover the trapped syscall number from siginfo on x86
+
+Android's zygote seccomp policy for apps blocks the plain rename()
+syscall on 64-bit architectures (SECCOMP_ALLOWLIST_APP.TXT marks
+rename lp32-only), so any glibc program inside the proot rootfs that
+calls rename() - apt's FileFd::Rename, dpkg, coreutils mv - receives
+SIGSYS.  proot's SIGSYS handler already downgrades such syscalls to
+allowed equivalents (PR_rename -> PR_renameat), but on x86_64 it never
+got the chance: it recovered the syscall number from rax after
+rewinding orig_rax, and by the time the SIGSYS is observed, proot's own
+handling of the syscall-exit stop that seccomp emits right before the
+signal has already consumed rax as a result value.  Both orig_rax and
+rax read 0, which decodes as PR_read, matches no downgrade case, and
+falls into the default branch that returns -ENOSYS - the exact
+"rename failed, Function not implemented" that killed apt in the
+Ubuntu E2E run.
+
+The siginfo of a SYS_SECCOMP SIGSYS reports the trapped syscall number
+in si_syscall; it is the only reliable source at that point.  Pass it
+from the SIGSYS case in event.c into handle_seccomp_event() and use it
+to restore both the syscall-number and result register on x86.
+arm/arm64 keep the old register-based recovery: their syscall number
+lives in a register that is not the result register, so the number
+survives.  (This is why the fork never saw the bug on its own arm64
+devices.)
+
+Validated on x86_64 Linux with a seccomp filter that TRAPs __NR_rename
+exactly like the Android app policy: rename() under the filter now
+downgrades to renameat and succeeds; a trapped-but-unmapped syscall
+(syslog) still returns ENOSYS; untrapped syscalls are unaffected.
+
+Not upstreamed: no write access to oonid/pr; this patch is applied to
+the pinned fork tarball by fetchLinuxSource in linux/build.gradle.kts.
+--- a/src/proot/src/tracee/seccomp.c
++++ b/src/proot/src/tracee/seccomp.c
+@@ -71,7 +71,7 @@
+  *
+  * Return 0 to swallow signal or SIGSYS to deliver it to process.
+  */
+-int handle_seccomp_event(Tracee* tracee)
++int handle_seccomp_event(Tracee* tracee, int trapped_syscall)
+ {
+ 	int ret;
+ 
+@@ -92,13 +92,34 @@
+ 	/* Save regs so they can be restored at end of replaced call.  */
+ 	save_current_regs(tracee, ORIGINAL_SECCOMP_REWRITE);
+ 
+-	/* X86 uses orig_rax when selecting syscall,
+-	 * however at this point we are after syscall has been rejected
+-	 * and orig_rax was reset to -1.  */
++	/* X86 uses orig_rax when selecting syscall, however at this point we
++	 * are after syscall has been rejected and orig_rax was reset to -1.
++	 * The kernel rolls the result register back to the syscall number
++	 * (syscall_rollback), but PRoot's own handling of the syscall-exit
++	 * stop that seccomp emits right before the SIGSYS can already have
++	 * consumed rax as a syscall result, losing the number there too
++	 * (observed: both orig_rax and rax equal 0, i.e. PR_read).  The
++	 * siginfo of a SYS_SECCOMP SIGSYS reports the trapped syscall number
++	 * (si_syscall) and is the only reliable source, so prefer it.  */
+ #if defined(ARCH_X86_64)
+-	tracee->_regs[CURRENT].orig_rax = tracee->_regs[CURRENT].rax;
++	if (trapped_syscall >= 0) {
++		tracee->_regs[CURRENT].orig_rax = (unsigned long long) trapped_syscall;
++		tracee->_regs[CURRENT].rax = (unsigned long long) trapped_syscall;
++	} else {
++		tracee->_regs[CURRENT].orig_rax = tracee->_regs[CURRENT].rax;
++	}
+ #elif defined(ARCH_X86)
+-	tracee->_regs[CURRENT].orig_eax = tracee->_regs[CURRENT].eax;
++	if (trapped_syscall >= 0) {
++		tracee->_regs[CURRENT].orig_eax = (unsigned long long) trapped_syscall;
++		tracee->_regs[CURRENT].eax = (unsigned long long) trapped_syscall;
++	} else {
++		tracee->_regs[CURRENT].orig_eax = tracee->_regs[CURRENT].eax;
++	}
++#else
++	/* Other architectures keep the syscall number in a register that
++	 * is not the result register, so the fallback below is reliable
++	 * there.  */
++	(void) trapped_syscall;
+ #endif
+ 
+ 	print_current_regs(tracee, 3, "seccomp SIGSYS");
+--- a/src/proot/src/tracee/seccomp.h
++++ b/src/proot/src/tracee/seccomp.h
+@@ -18,5 +18,5 @@
+ 
+ void restart_syscall_after_seccomp(Tracee* tracee);
+ void set_result_after_seccomp(Tracee *tracee, word_t result);
+-int handle_seccomp_event(Tracee* tracee);
++int handle_seccomp_event(Tracee* tracee, int trapped_syscall);
+ void fix_and_restart_enosys_syscall(Tracee* tracee);
+--- a/src/proot/src/tracee/event.c
++++ b/src/proot/src/tracee/event.c
+@@ -657,7 +657,7 @@
+ 					tracee->skip_next_seccomp_signal = false;
+ 					signal = 0;
+ 				} else {
+-					signal = handle_seccomp_event(tracee);
++					signal = handle_seccomp_event(tracee, siginfo.si_syscall);
+ 				}
+ 			} else {
+ 				VERBOSE(tracee, 1, "non-seccomp SIGSYS");

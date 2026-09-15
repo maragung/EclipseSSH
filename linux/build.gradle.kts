@@ -32,7 +32,11 @@
 //
 // The proot and talloc sources never enter this repository. fetchLinuxSource
 // downloads the two pinned tarballs, checks them against published SHA256
-// sums and extracts them under linux/build/. buildLinuxNative then compiles,
+// sums and extracts them under linux/build/. proot-patches/*.patch are then
+// applied to the extracted fork (see that directory's README for why each
+// patch exists; the short version: fixes the fork needs but has not merged,
+// kept as patches so the pinned tarball stays the verifiable upstream).
+// buildLinuxNative then compiles,
 // per ABI: talloc (a single talloc.c with a hand-written config header - see
 // src/main/cpp/talloc-config.h), proot itself through its GNUmakefile, and
 // the PTY bridge with CMake. The artifacts are copied into
@@ -142,7 +146,8 @@ val fetchLinuxSource =
     tasks.register("fetchLinuxSource") {
         group = "linux"
         description =
-            "Downloads, SHA256-verifies and extracts the pinned proot fork and talloc tarballs."
+            "Downloads, SHA256-verifies and extracts the pinned proot fork and talloc tarballs, " +
+                "then applies linux/proot-patches/ to the extracted fork."
         // Same rebind-to-locals rule as :freerdp's fetch task: a task action
         // reading a script-level val captures the script class itself, which
         // the configuration cache refuses to serialize - and a refused store
@@ -156,10 +161,23 @@ val fetchLinuxSource =
         val tallocTgz = tallocTarball
         val prootRoot = prootSrcRoot
         val tallocRoot = tallocSrcRoot
+        // Patch files (repo-relative, globs resolved at configuration time).
+        val prootPatchFiles =
+            rootProject
+                .layout.projectDirectory
+                .dir("linux/proot-patches")
+                .asFileTree
+                .filter { it.isFile && it.name.endsWith(".patch") }
+                .sortedBy { it.name }
+                .toList()
         outputs.file(oonidTgz)
         outputs.file(tallocTgz)
         outputs.dir(prootRoot)
         outputs.dir(tallocRoot)
+        // So that adding/removing a patch both invalidates the configuration
+        // cache entry and re-runs this task instead of staying UP-TO-DATE.
+        inputs.files(prootPatchFiles)
+                .withPathSensitivity(PathSensitivity.NAME_ONLY)
         doLast {
             fun run(vararg command: String) {
                 logger.lifecycle("exec: ${command.joinToString(" ")}")
@@ -209,8 +227,24 @@ val fetchLinuxSource =
 
             // Extraction guards are real content, not the declared output
             // roots (Gradle pre-creates those): the proot GNUmakefile and
-            // talloc.c only ever get there by a real extraction.
+            // talloc.c only ever get there by a real extraction. The patch
+            // marker gates per-patch: the fork tarball never contains it,
+            // and each patch is applied only if the marker does not name it
+            // — so a patch added after a previous build stacks cleanly.
             val prootMakefile = File(prootRoot, "src/proot/src/GNUmakefile")
+            val prootPatchedMarker = File(prootRoot, ".patches-applied")
+            val alreadyApplied =
+                if (prootPatchedMarker.isFile) {
+                    prootPatchedMarker.readLines().filter { it.isNotBlank() }.toSet()
+                } else {
+                    emptySet()
+                }
+            val pendingPatches = prootPatchFiles.filter { it.name !in alreadyApplied }
+            if (pendingPatches.isNotEmpty()) {
+                check(prootMakefile.isFile) {
+                    "cannot patch the proot fork: no source tree at $prootRoot"
+                }
+            }
             if (!prootMakefile.isFile) {
                 srcDir.mkdirs()
                 if (!oonidTgz.isFile) {
@@ -226,6 +260,25 @@ val fetchLinuxSource =
                 check(prootMakefile.isFile) {
                     "the extracted fork has no proot makefile at $prootMakefile"
                 }
+            }
+            if (pendingPatches.isNotEmpty()) {
+                // Patch the extracted fork tree in place. The marker records which
+                // patch files were applied, per name, so a later build both skips
+                // them and can stack newly added ones.
+                pendingPatches.forEach { patchFile ->
+                    logger.lifecycle("Patching the proot fork with ${patchFile.name} ...")
+                    run(
+                        "patch",
+                        "-d", prootRoot.absolutePath,
+                        "-p1",
+                        "--batch",
+                        "--forward",
+                        "-i", patchFile.absolutePath,
+                    )
+                }
+                prootPatchedMarker.writeText(
+                    (alreadyApplied + pendingPatches.map { it.name }).sorted().joinToString("\n") { it } + "\n",
+                )
             }
             if (!File(tallocRoot, "talloc.c").isFile) {
                 srcDir.mkdirs()

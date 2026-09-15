@@ -47,17 +47,34 @@ never exec'd by the kernel: proot's loader `mmap`s them, and mmap-exec of
 The userspace runtime in `:app` is the only intended consumer. It:
 
 - spawns `nativeLibraryDir/libproot.so` through `LinuxPty.spawn`,
-- passes `PROOT_LOADER=<nativeLibraryDir>/libproot-loader.so` and
-  `PROOT_TMP_DIR=<filesDir>/linux/tmp` in the environment,
+- passes `PROOT_LOADER=<nativeLibraryDir>/libproot-loader.so`,
+  `PROOT_TMP_DIR=<filesDir>/linux/tmp` and
+  `PROOT_SIGSYS_LOG=<filesDir>/linux/sigsys-log.txt` in the environment,
 - never relies on the embedded fallback loader (it would extract into
   `filesDir` and die with EACCES).
+
+## proot-patches/
+
+Fixes the fork needs but has not merged live in `proot-patches/` as
+numbered unified diffs; `fetchLinuxSource` applies them (in name order)
+to the extracted fork tree and records the applied names in a
+`.patches-applied` marker so they never run twice and new ones stack.
+See `proot-patches/README.md` and each patch's preamble for the failure
+it fixes and the evidence. 0001 is load-bearing for amd64/x86_64
+devices and emulators: without it, every plain `rename()` inside the
+rootfs (apt, dpkg, coreutils `mv`) returns `ENOSYS` — the SIGSYS
+handler decodes the trapped syscall as 0 on x86 because both `rax` and
+`orig_rax` have already been consumed, and its `PR_rename →
+PR_renameat` downgrade never matches.
 
 ## Toolchain requirements (CI installs all of these)
 
 - NDK `29.0.13113456` via the SDK package list,
 - `cmake` and `ninja` on PATH (same as `:freerdp`),
 - `make`, `tar`, `readelf` and `awk` on PATH (standard on ubuntu runners;
-  `readelf`+`awk` generate `loader-info.c` on aarch64).
+  `readelf`+`awk` generate `loader-info.c` on aarch64),
+- `patch` on PATH for `proot-patches/` (the stock ubuntu-24.04 runner image
+  does not ship it; every CI workflow installs it explicitly).
 
 ## Supported ABIs
 
