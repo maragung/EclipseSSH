@@ -133,8 +133,11 @@ static const char *stage_name(int stage) {
  * *failure_errno when there was one). Bounded by [PTY_DIAG_BUDGET_MS]: EOF
  * means the child exec'd (or exited after reporting a failure); a timeout
  * with the pipe still open means the child is wedged - and the last stage
- * it reported names where. */
-static int report_child_progress(int fd, const char *program, int *failure_errno) {
+ * it reported names where. [pid] is the child: only the execve-report branch
+ * consults it, to tell a real execve from a signal death in the window
+ * between the report byte and the exec call - both close the pipe, but only
+ * one of them means the program is running. */
+static int report_child_progress(int fd, const char *program, int *failure_errno, pid_t pid) {
     uint8_t buf[64];
     size_t used = 0;
     int eof = 0;
@@ -206,7 +209,32 @@ static int report_child_progress(int fd, const char *program, int *failure_errno
     }
     if (last_stage >= PTY_STAGE_EXECVE) {
         /* The write end closed after the pre-execve report: execve happened.
-         * Errors past this point are the exec'd program's to report. */
+         * Errors past this point are the exec'd program's to report - except
+         * one case: the report byte precedes the execve() call, so a signal
+         * landing in that window also closes the pipe without exec'ing. The
+         * kernel closes the dying child's fds before it becomes waitable, so
+         * by the time EOF is visible here a WNOHANG probe answers; a dead
+         * child produces no output and no hangup, so name it now instead of
+         * letting the caller park on the master until its whole timeout. */
+        for (int i = 0; i < 25; i++) {
+            int status;
+            pid_t reaped = waitpid(pid, &status, WNOHANG);
+            if (reaped == pid) {
+                if (WIFSIGNALED(status)) {
+                    int sig = WTERMSIG(status);
+                    __android_log_print(
+                        ANDROID_LOG_WARN, PTY_LOG_TAG,
+                        "pty child killed by signal %d between its execve report and execve, launching %s",
+                        sig, program);
+                    *failure_errno = sig;
+                    return PTY_STAGE_EXECVE;
+                }
+                break;
+            }
+            if (reaped < 0) break; /* already reaped, or not ours anymore */
+            struct timespec nap = { 0, 2 * 1000 * 1000 };
+            nanosleep(&nap, NULL);
+        }
         __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
                             "pty child reached execve: %s", program);
         return 0;
@@ -291,6 +319,81 @@ static struct pty_slot *slot_for_master(int master) {
         if (ptys[i].in_use && ptys[i].master == master) return &ptys[i];
     }
     return NULL;
+}
+
+/* Children whose master was closed while they were still alive: close() hands
+ * them a SIGHUP, but a child mid-death or ignoring the signal outlives the
+ * WNOHANG reap there, and a freed slot loses the pid - without this list the
+ * child lingers as a zombie the day it finally exits. Each spawn and each
+ * teardown retries the reaped set, so the list drains with the app's own
+ * churn; pids are always waited on by number, never waitpid(-1), so nothing
+ * else's children (ProcessBuilder's, the installer's) can be stolen. */
+#define MAX_PENDING_REAPS MAX_PTYS
+static pid_t pending_reaps[MAX_PENDING_REAPS];
+static int pending_reap_count;
+
+static void defer_child_reap(pid_t pid) {
+    pthread_mutex_lock(&ptys_lock);
+    if (pending_reap_count < MAX_PENDING_REAPS) {
+        pending_reaps[pending_reap_count++] = pid;
+    }
+    pthread_mutex_unlock(&ptys_lock);
+}
+
+static void reap_pending_children(void) {
+    pthread_mutex_lock(&ptys_lock);
+    int kept = 0;
+    for (int i = 0; i < pending_reap_count; i++) {
+        pid_t pid = pending_reaps[i];
+        int status;
+        if (pid > 0 && waitpid(pid, &status, WNOHANG) == 0) {
+            pending_reaps[kept++] = pid; /* still alive; try again later */
+        }
+    }
+    pending_reap_count = kept;
+    pthread_mutex_unlock(&ptys_lock);
+}
+
+/* Verifies the one fact every downstream reader depends on: bytes written to
+ * the slave must arrive on the master. The API 35 E2E failure had exactly
+ * this shape - the pair opened, every acquisition route reported success, and
+ * every slave-to-master byte still vanished, so commands ran to completion
+ * while their output (and bash's own exit diagnostics) never reached the JVM.
+ * Probing it in the parent, before the fork, names the broken pair at spawn
+ * time with an errno, instead of after a whole command's timeout.
+ *
+ * The probe byte is 'A': OPOST output processing never rewrites it. Whatever
+ * arrives is drained again, so the JVM reader's first byte is the child's
+ * own. Returns 0 when the path is proven, an errno otherwise. */
+static int probe_pty_data_path(int master, int slave_fd) {
+    const uint8_t probe_byte = 0x41;
+    if (write(slave_fd, &probe_byte, 1) != 1) {
+        return errno != 0 ? errno : EIO;
+    }
+    for (;;) {
+        struct pollfd pfd = { .fd = master, .events = POLLIN, .revents = 0 };
+        int ready = poll(&pfd, 1, 250);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return errno != 0 ? errno : EIO;
+        }
+        if (ready == 0) return ETIMEDOUT;
+        if (pfd.revents & POLLNVAL) return EBADF;
+        uint8_t seen;
+        ssize_t n = read(master, &seen, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n != 1) return EIO;
+        if (seen != probe_byte) return EIO;
+        break;
+    }
+    /* Drain any residue (none is expected on a fresh pair) so the stream the
+     * JVM reads starts clean. */
+    for (;;) {
+        struct pollfd pfd = { .fd = master, .events = POLLIN, .revents = 0 };
+        if (poll(&pfd, 1, 0) <= 0) return 0;
+        uint8_t sink[32];
+        if (read(master, sink, sizeof(sink)) <= 0) return 0;
+    }
 }
 
 /* How long one lap of the read loop may park before re-checking whether the
@@ -474,19 +577,46 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
      * after setsid, so acquiring the slave pre-fork is safe), and the whole
      * child context - fork, signal mask, session - is out of the equation;
      * if a route fails here too, its errno lands in the log with no fork in
-     * the picture at all. O_NOCTTY because THIS process must not acquire a
-     * controlling terminal even if it somehow is a session leader. */
-    int slave_fd = ioctl(master, TIOCGPTPEER, O_NOCTTY);
+     * the picture at all.
+     *
+     * The flags argument of TIOCGPTPEER admits ONLY O_CLOEXEC and O_NONBLOCK
+     * - the kernel returns EINVAL for anything else, and O_NOCTTY is not on
+     * the list. The O_NOCTTY this call used to pass made the ioctl fail on
+     * every mainline kernel, so the slave silently came from the
+     * open(slave_path) fallback - the exact route that is wrong when /dev/ptmx
+     * and /dev/pts belong to different devpts instances. O_CLOEXEC is safe
+     * here: the child dup2's the fd onto 0/1/2 (dup2 clears close-on-exec on
+     * the copies) and closes the original before execve, and the parent
+     * closes its copy right after the fork. The ctty-theft O_NOCTTY guarded
+     * against cannot happen anyway: TIOCGPTPEER claims a controlling terminal
+     * only for a session leader without one, and an app process shares
+     * zygote's session - it is never a session leader. */
+    int slave_fd = ioctl(master, TIOCGPTPEER, O_CLOEXEC);
     int parent_peer_errno = slave_fd >= 0 ? 0 : errno;
     if (slave_fd < 0) {
         slave_fd = open(slave_path, O_RDWR | O_NOCTTY);
     }
+    int parent_open_errno = slave_fd >= 0 ? 0 : errno;
     __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
                         "pty parent slave probe: TIOCGPTPEER errno %d, open(slave) errno %d, %s",
-                        parent_peer_errno,
-                        (slave_fd >= 0 || parent_peer_errno == 0) ? 0 : errno,
+                        parent_peer_errno, parent_open_errno,
                         slave_fd >= 0 ? "the parent hands the slave fd to the child"
                                       : "the child must acquire one itself");
+    if (slave_fd >= 0 && probe_pty_data_path(master, slave_fd) != 0) {
+        /* A pair whose slave-to-master direction is dead cannot carry a
+         * session, whatever else about it opened cleanly; the E2E failure
+         * this names was 15 runs of "commands ran but no output arrived".
+         * Fail the spawn typed and early, before a fork exists to clean up
+         * after. */
+        close(slave_fd);
+        close(master);
+        master = -1;
+        jclass e = (*env)->FindClass(env, "java/io/IOException");
+        (*env)->ThrowNew(env, e,
+                         "pty data path verification failed: "
+                         "bytes written to the slave never reach the master");
+        goto out;
+    }
 
     pthread_mutex_lock(&ptys_lock);
     struct pty_slot *slot = NULL;
@@ -606,7 +736,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         const char *slash = strrchr(argv[0], '/');
         int failure_errno = 0;
         int failed_stage = report_child_progress(
-                diag[0], slash != NULL ? slash + 1 : argv[0], &failure_errno);
+                diag[0], slash != NULL ? slash + 1 : argv[0], &failure_errno, pid);
         close(diag[0]);
         if (failed_stage != 0) {
             /* The child named the stage it died at and is gone. A dead child
@@ -634,6 +764,8 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
             goto out;
         }
     }
+
+    reap_pending_children();
 
     pthread_mutex_lock(&ptys_lock);
     slot->pid = pid;
@@ -739,6 +871,12 @@ Java_dev_eclipse_ssh_linux_LinuxPty_read(
  * -1 on a dead pty (EIO/EPIPE: the child is gone) - including a pty whose
  * slot was already freed, which refuses rather than writing through a
  * possibly reused descriptor.
+ *
+ * Like read, the wait runs through poll() with a timeout instead of a bare
+ * blocking write: a pty whose reader is gone fills its buffer and blocks
+ * forever, and close() on the fd cannot wake a write already parked on it.
+ * Each poll timeout re-checks the slot, so a teardown by any thread
+ * un-blocks the writer within one interval.
  */
 JNIEXPORT jint JNICALL
 Java_dev_eclipse_ssh_linux_LinuxPty_write(
@@ -752,6 +890,24 @@ Java_dev_eclipse_ssh_linux_LinuxPty_write(
     jbyte buf[4096];
     jint written = 0;
     while (written < length) {
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+        int ready = poll(&pfd, 1, PTY_READ_POLL_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ready == 0) {
+            /* Writable nothing arrived for a full interval: either the pty
+             * buffer is full against a gone reader, or another thread tore
+             * the pair down while this write was parked. The slot re-check
+             * distinguishes them; a still-live slot just parks again. */
+            pthread_mutex_lock(&ptys_lock);
+            live = slot_for_master(fd) != NULL;
+            pthread_mutex_unlock(&ptys_lock);
+            if (!live) return -1;
+            continue;
+        }
+        if (pfd.revents & POLLNVAL) return -1;
         jint chunk = length - written;
         if (chunk > (jint) sizeof(buf)) chunk = (jint) sizeof(buf);
         (*env)->GetByteArrayRegion(env, buffer, offset + written, chunk, buf);
@@ -853,6 +1009,14 @@ Java_dev_eclipse_ssh_linux_LinuxPty_close(
     close(fd);
     if (pid > 0) {
         int status;
-        waitpid(pid, &status, WNOHANG);
+        if (waitpid(pid, &status, WNOHANG) == 0) {
+            /* Still alive under the SIGHUP close just delivered. Blocking
+             * here would hang a UI thread for a child that ignores or is
+             * slow to die; abandoning the pid would leak a zombie the day it
+             * does. The deferred list keeps the pid for the next spawn or
+             * teardown to reap. */
+            defer_child_reap(pid);
+        }
     }
+    reap_pending_children();
 }
