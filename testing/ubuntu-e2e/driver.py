@@ -279,16 +279,40 @@ class E2eDriver:
             raise RuntimeError("the Settings tab was not found on screen")
         time.sleep(2)
 
-    def scroll_to_linux_section(self, max_swipes=12):
+    def _scroll_swipe(self, els):
+        """One upward scroll swipe sized to the current orientation. The dump's
+        own geometry is the only coordinate system that is always right: the
+        rotation exercise runs its still-alive check while the display is
+        landscape, where the portrait-fitting y=1400 is past the screen edge
+        and the injected swipe scrolls nothing - twelve no-op swipes left the
+        Linux section off-screen and a live install was judged dead (E2E run
+        34918470332). The root node of a uiautomator dump spans the window,
+        rotation included, so the largest bounds ARE the current extent."""
+        width = height = 0
+        for el in els:
+            b = el.bounds
+            if b:
+                width = max(width, b[0] + b[2] // 2)
+                height = max(height, b[1] + b[3] // 2)
+        if width < 100 or height < 100:
+            # A sparse or failed dump has nothing to anchor on; the portrait
+            # default matches the emulator's natural orientation, which is what
+            # every other phase of the run is in.
+            width, height = 1080, 2400
+        x = width // 2
+        self.adb.swipe(x, int(height * 0.58), x, int(height * 0.21), 400)
+
+    def scroll_to_linux_section(self, max_swipes=24):
         """The Linux userspace section sits far down the settings list; swipe until
         its row is on screen. Swiping is content-anchored: stop the moment the
-        row is visible, so over-scrolling never skips past it."""
+        row is visible, so over-scrolling never skips past it. Landscape shows
+        less of the list per screen, so the cap is generous - the loop exits on
+        first sight and a higher cap costs nothing when the section is near."""
         for _ in range(max_swipes):
             els = self.dump()
             if self.find(els, "Ubuntu on this device", "Linux userspace"):
                 return True
-            # Swipe up the middle third of the screen - a scroll, not a fling.
-            self.adb.swipe(540, 1400, 540, 500, 400)
+            self._scroll_swipe(els)
             time.sleep(1.2)
         return self.visible("Ubuntu on this device", "Linux userspace")
 
@@ -302,9 +326,10 @@ class E2eDriver:
         The section is followed only by About, whose rows never say Install, so
         the first visible Install belongs to the action row."""
         for _ in range(max_swipes):
-            if self.find(self.dump(), BUTTON_INSTALL):
+            els = self.dump()
+            if self.find(els, BUTTON_INSTALL):
                 return True
-            self.adb.swipe(540, 1400, 540, 500, 400)
+            self._scroll_swipe(els)
             time.sleep(1.2)
         return self.visible(BUTTON_INSTALL)
 
@@ -381,10 +406,11 @@ class E2eDriver:
             self.results[-1].evidence.append(shot)
         self.log("the settings row reports Installed and verified")
 
-    def _reenter_settings_during_install(self):
+    def _reenter_settings_during_install(self, disturbance):
         """After any disturbance the activity may have been recreated on the host
         list; get back to the settings section and confirm the install is still
-        visibly alive (or already done)."""
+        visibly alive (or already done). The disturbance's name rides along into
+        the failure so the report says which survival check did not pass."""
         if self.visible(LABEL_INSTALLED):
             return
         self.launch()
@@ -392,23 +418,23 @@ class E2eDriver:
         self.scroll_to_linux_section()
         if not (self.visible(LABEL_INSTALLING) or self.visible(LABEL_INSTALLED)):
             raise RuntimeError(
-                "LIFECYCLE stage: after the disturbance neither Installing nor "
-                "Installed was on screen - the install did not survive it. "
-                "On screen: %s" % " | ".join(self._screen_digest()))
+                "LIFECYCLE stage: the install did not survive the %s disturbance"
+                " - neither Installing nor Installed was on screen. "
+                "On screen: %s" % (disturbance, " | ".join(self._screen_digest())))
 
     def _exercise_background_during_install(self):
         self.adb.home()
         time.sleep(20)
-        self._reenter_settings_during_install()
+        self._reenter_settings_during_install("background")
         self.log("background round trip: install still alive")
 
     def _exercise_rotation_during_install(self):
         self.adb.set_rotation(1)
         time.sleep(6)
-        self._reenter_settings_during_install()
+        self._reenter_settings_during_install("rotation")
         self.adb.set_rotation(0)
         time.sleep(3)
-        self._reenter_settings_during_install()
+        self._reenter_settings_during_install("rotation-back")
         self.log("rotation round trip: install still alive")
 
     def _exercise_screen_off_during_install(self):
@@ -419,7 +445,7 @@ class E2eDriver:
         # Waking lands on keyguard on some images; dismiss before dumping.
         self.adb.keyevent("KEYCODE_MENU")
         time.sleep(2)
-        self._reenter_settings_during_install()
+        self._reenter_settings_during_install("screen-off")
         self.log("screen-off round trip: install still alive")
 
     # ------------------------------------------------------------ instrumentation
