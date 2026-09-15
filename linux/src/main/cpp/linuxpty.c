@@ -80,6 +80,13 @@
 #ifndef TIOCGPTPEER
 #define TIOCGPTPEER 0x5414
 #endif
+/* The unix98 pty lock pair - both live in pty_unix98_ioctl's table. */
+#ifndef TIOCSPTLCK
+#define TIOCSPTLCK 0x40045431
+#endif
+#ifndef TIOCGPTLCK
+#define TIOCGPTLCK 0x80045439
+#endif
 
 static void child_stage(int fd, int stage) {
     uint8_t code = (uint8_t) stage;
@@ -395,6 +402,28 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         (*env)->ThrowNew(env, e, "open(ptmx) failed");
         goto out;
     }
+    /* pty_open refuses to hand out the slave - by path AND via TIOCGPTPEER,
+     * whose dentry_open goes through the very same pty_open - while the
+     * master carries TTY_PTY_LOCK, and that refusal is a bare EIO. The API 35
+     * GKI kernel failed BOTH parent-side routes with exactly that errno while
+     * TIOCGPTN (ptsname_r) kept working on the same master; a locked master
+     * is the one pty_open gate that produces this whole picture. ptmx_open
+     * itself sets the lock bit, and TIOCSPTLCK(0) - unlockpt(3) in libc - is
+     * the documented way to release it. Unlock every master right after
+     * opening it: on kernels that hand out unlocked pairs this is a no-op,
+     * and the get-ioctl alongside records what the device really held. */
+    int lock_state = -1;
+    ioctl(master, TIOCGPTLCK, &lock_state);
+    int zero = 0;
+    ioctl(master, TIOCSPTLCK, &zero);
+    int lock_after = -1;
+    ioctl(master, TIOCGPTLCK, &lock_after);
+    __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                        "pty lock probe: initially %s, after unlock %s",
+                        lock_state == 0 ? "unlocked"
+                          : lock_state == 1 ? "LOCKED" : "unknown",
+                        lock_after == 0 ? "unlocked"
+                          : lock_after == 1 ? "LOCKED" : "unknown");
     /* Window size set on the master applies to the pair; the child gets a
      * correct initial size before it ever reads the terminal. */
     struct winsize ws = { (unsigned short) rows, (unsigned short) cols, 0, 0 };
