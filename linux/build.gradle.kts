@@ -175,19 +175,41 @@ val fetchLinuxSource =
             }
 
             fun download(url: String, target: File) {
-                val connection = URL(url).openConnection() as HttpURLConnection
-                connection.connectTimeout = 30_000
-                connection.readTimeout = 300_000
-                connection.instanceFollowRedirects = true
-                try {
-                    val code = connection.responseCode
-                    check(code in 200..299) { "downloading $url failed: HTTP $code" }
-                    connection.inputStream.use { input ->
-                        target.outputStream().use { output -> input.copyTo(output) }
+                // samba.org sits behind a CDN that intermittently answers
+                // 504; one transient gateway error must not fail the whole
+                // native build (it cost CI a run on 2026-09-15). Same URL,
+                // bounded retries with backoff, sha256 still decides.
+                fun fetchOnce(url: String, target: File): Int {
+                    val connection = URL(url).openConnection() as HttpURLConnection
+                    connection.connectTimeout = 30_000
+                    connection.readTimeout = 300_000
+                    connection.instanceFollowRedirects = true
+                    return try {
+                        val code = connection.responseCode
+                        if (code in 200..299) {
+                            connection.inputStream.use { input ->
+                                target.outputStream().use { output ->
+                                    input.copyTo(output)
+                                }
+                            }
+                        }
+                        code
+                    } finally {
+                        connection.disconnect()
                     }
-                } finally {
-                    connection.disconnect()
                 }
+                var code = fetchOnce(url, target)
+                var retry = 0
+                while (code !in 200..299 && retry < 4) {
+                    retry++
+                    logger.warn(
+                        "downloading $url failed: HTTP $code - retry $retry/4",
+                    )
+                    target.delete()
+                    Thread.sleep(5_000L * retry)
+                    code = fetchOnce(url, target)
+                }
+                check(code in 200..299) { "downloading $url failed: HTTP $code" }
             }
 
             fun verifySha256(file: File, expected: String) {

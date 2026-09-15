@@ -235,6 +235,21 @@
 -keep class dev.eclipse.ssh.linux.ProotRuntime { *; }
 -keep class dev.eclipse.ssh.linux.LinuxUserspaceManager { *; }
 
+# E2E run 34957725850 peeled the third layer: runCommand() returns
+# ProotCommandResult, whose class survives R8 renamed (the kept ProotRuntime
+# member's descriptor references it) but whose members the suite alone calls
+# - getExitCode()/getOutput()/outputText() - R8 stripped from it. 11 of 13
+# UbuntuE2eVerificationTest failures, all NoSuchMethodError on the renamed
+# class. HealthReport is the same shape against the kept manager's
+# refreshHealth(): its healthy/describe() members are suite-only. The whole
+# LinuxUserspaceState hierarchy joins them: the manager's kept `state` member
+# carries the type, and the suite's `is Stopped` checks plus the sealed
+# subtypes' members need every variant present with its members intact.
+-keep class dev.eclipse.ssh.linux.ProotCommandResult { *; }
+-keep class dev.eclipse.ssh.linux.HealthReport { *; }
+-keep class dev.eclipse.ssh.linux.LinuxUserspaceState { *; }
+-keep class dev.eclipse.ssh.linux.LinuxUserspaceState$* { *; }
+
 # ---------------------------------------------------------------------------
 # Stage 2: androidx.compose, narrowed from the whole-namespace keep in
 # proguard-rules.pro. Same derivation as stage 1 (see the header): the
