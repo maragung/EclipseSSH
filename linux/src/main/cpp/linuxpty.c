@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -63,11 +64,20 @@
 #define PTY_STAGE_STDIO 5
 #define PTY_STAGE_CHDIR 6
 #define PTY_STAGE_EXECVE 7
+/* Reported when the TIOCGPTPEER route failed and the child fell back to
+ * opening the slave by path - the pair of facts (this plus which errno the
+ * open itself then produced) is the evidence for debugging devpts layouts. */
+#define PTY_STAGE_PEER_FALLBACK 8
 
 /* How long the parent waits for the child's verdict. A healthy child
  * reaches execve in single-digit milliseconds; only a wedged child costs
  * the full budget, and a wedged child means a failed command anyway. */
 #define PTY_DIAG_BUDGET_MS 750
+
+/* Peer-of-master slave acquisition, Linux 4.13+. */
+#ifndef TIOCGPTPEER
+#define TIOCGPTPEER 0x5414
+#endif
 
 static void child_stage(int fd, int stage) {
     uint8_t code = (uint8_t) stage;
@@ -91,6 +101,7 @@ static const char *stage_name(int stage) {
         case PTY_STAGE_CTTY: return "claiming the controlling terminal";
         case PTY_STAGE_STDIO: return "redirecting stdio";
         case PTY_STAGE_CHDIR: return "chdir";
+        case PTY_STAGE_PEER_FALLBACK: return "the slave-path fallback";
         case PTY_STAGE_EXECVE: return "execve";
         default: return "an unnamed stage";
     }
@@ -257,6 +268,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
      * over the open() below, and the pending exception there makes the -1
      * moot - but an indeterminate value would be a real bug. */
     int master = -1;
+    int used_pts_ptmx = 0;
     if (argv == NULL || child_env == NULL) {
         free(argv);
         free(child_env);
@@ -289,6 +301,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
      * mismatched; the /dev/ptmx fallback keeps real devices that only have
      * the legacy node working exactly as before. */
     master = open("/dev/pts/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    used_pts_ptmx = master >= 0;
     if (master < 0) {
         master = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
     }
@@ -308,6 +321,23 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         jclass e = (*env)->FindClass(env, "java/io/IOException");
         (*env)->ThrowNew(env, e, "ptsname_r failed");
         goto out;
+    }
+
+    /* One evidence line per spawn: which ptmx this device answered, and
+     * whether the allocated slave node is even present in the /dev/pts the
+     * child would open it from. The API 35 emulator produced open(slave) EIO
+     * with no other clue anywhere; these two facts discriminate between the
+     * "master and slave live in different devpts instances" explanation (node
+     * absent) and flag-state explanations (node present). */
+    {
+        struct stat st;
+        int slave_present = stat(slave_path, &st) == 0;
+        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                            "pty master via %s, slave %s %s",
+                            used_pts_ptmx ? "/dev/pts/ptmx" : "/dev/ptmx (legacy)",
+                            slave_path,
+                            slave_present ? "present in /dev/pts"
+                                          : "ABSENT from /dev/pts (devpts instances disagree?)");
     }
 
     pthread_mutex_lock(&ptys_lock);
@@ -359,15 +389,28 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         child_stage(diag_fd, PTY_STAGE_SIGMASK);
         setsid();
         child_stage(diag_fd, PTY_STAGE_SETSID);
-        int slave = open(slave_path, O_RDWR);
+        /* Ask the kernel for the peer of the master this child already holds,
+         * instead of resolving the /dev/pts path. The path is a guess about
+         * which devpts instance the master belongs to - on the API 35 emulator
+         * that guess is wrong (the slave open returns EIO, pty_open's
+         * !tty->link), while TIOCGPTPEER cannot be wrong about instances: it
+         * is the master fd's own peer, handed over by the kernel. Passing
+         * O_RDWR without O_NOCTTY also makes it the controlling terminal of
+         * this fresh session, exactly what open(slave) after setsid did. */
+        int slave = ioctl(master, TIOCGPTPEER, O_RDWR);
+        if (slave < 0) {
+            child_stage(diag_fd, PTY_STAGE_PEER_FALLBACK);
+            slave = open(slave_path, O_RDWR);
+        }
         if (slave < 0) {
             child_stage_failed(diag_fd, PTY_STAGE_OPEN_SLAVE, errno);
             _exit(126);
         }
         child_stage(diag_fd, PTY_STAGE_OPEN_SLAVE);
-        /* Opening a tty after setsid() already makes it the controlling
-         * terminal on Linux; the ioctl is belt-and-braces for any kernel
-         * that disagrees. */
+        /* Both slave routes already claim the controlling terminal for a
+         * session leader without one - TIOCGPTPEER by not passing O_NOCTTY,
+         * open-after-setsid by tty open semantics. The ioctl is belt-and-
+         * braces for any kernel that disagrees. */
         ioctl(slave, TIOCSCTTY, 0);
         child_stage(diag_fd, PTY_STAGE_CTTY);
         dup2(slave, 0);
