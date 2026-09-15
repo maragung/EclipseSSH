@@ -3,6 +3,7 @@ package dev.eclipse.ssh.presentation.linux
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
@@ -322,6 +323,10 @@ class LinuxUserspaceController @Inject constructor(
             } catch (t: Throwable) {
                 val detail = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
                 _error.value = "$name failed: $detail"
+                // Logcat is the one channel that outlives the screen: the settings row below is
+                // the user's copy, but a field log or an E2E artifact ships only the log, and
+                // without this line a failed install's cause dies with the row that showed it.
+                Log.w("EclipseSSH", "Linux userspace $name failed: $detail", t)
             }
         }
     }

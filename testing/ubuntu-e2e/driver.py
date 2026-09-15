@@ -141,6 +141,19 @@ class E2eDriver:
     def visible(self, *needles):
         return self.find(self.dump(), *needles) is not None
 
+    def _screen_digest(self, limit=40):
+        """Every text and content-desc on the current screen, deduplicated, for
+        failure messages. The app's own words are the evidence a screenshot
+        cannot carry: the install row's subtitle and the 'Last operation' error
+        row are the self-identifying detail of a failed install, and uiautomator
+        dumps are not otherwise uploaded."""
+        texts = []
+        for el in self.dump():
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if attr and attr not in texts:
+                    texts.append(attr)
+        return texts[:limit]
+
     def wait_visible(self, needles, timeout_s, poll=POLL_SECONDS):
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -180,6 +193,7 @@ class E2eDriver:
             shot = self.screenshot("fail-" + result.name)
             if shot:
                 result.evidence.append(shot)
+            self._save_screen(result.name)
         self._scan_crashes(result)
         self._write_results()
 
@@ -218,6 +232,31 @@ class E2eDriver:
             for crash in fresh:
                 fh.write("== %s ==\n%s\n\n" % (crash["kind"], crash.get("stack", crash["line"])))
         self.results[-1].evidence.append(path)
+
+    def _save_screen(self, tag):
+        """The dumped hierarchy's labelled nodes, as an artifact beside the
+        failure screenshot. The screenshot shows pixels; this is the app's own
+        text for what it was showing - what a diagnosis reads first."""
+        try:
+            els = self.dump()
+        except Exception as exc:  # evidence collection must never mask the verdict
+            self.log("screen capture failed: %s" % exc)
+            return None
+        path = os.path.join(self.out, "screen-%s-%s.txt" % (tag, time.strftime("%H%M%S")))
+        try:
+            with open(path, "w") as fh:
+                for el in els:
+                    text = el.attrs.get("text", "")
+                    desc = el.attrs.get("content-desc", "")
+                    if text or desc:
+                        fh.write("text=%r desc=%r bounds=%s\n" %
+                                 (text, desc, el.attrs.get("bounds", "")))
+        except OSError as exc:
+            self.log("screen capture failed: %s" % exc)
+            return None
+        self.results[-1].evidence.append(path)
+        self.log("screen dump saved: %s" % path)
+        return path
 
     def _write_results(self):
         with open(os.path.join(self.out, "phase-results.json"), "w") as fh:
@@ -354,7 +393,8 @@ class E2eDriver:
         if not (self.visible(LABEL_INSTALLING) or self.visible(LABEL_INSTALLED)):
             raise RuntimeError(
                 "LIFECYCLE stage: after the disturbance neither Installing nor "
-                "Installed was on screen - the install did not survive it")
+                "Installed was on screen - the install did not survive it. "
+                "On screen: %s" % " | ".join(self._screen_digest()))
 
     def _exercise_background_during_install(self):
         self.adb.home()
