@@ -140,7 +140,9 @@ class UbuntuE2eVerificationTest {
             environment()["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             environment()["TERM"] = "xterm-256color"
             environment()["LANG"] = "C.UTF-8"
-            directory = runtime.spawnCwd
+            // directory() returns ProcessBuilder (builder pattern), so Kotlin exposes no
+            // `directory` property - assignment does not compile, the call does.
+            directory(runtime.spawnCwd)
             redirectErrorStream(true)
         }.start()
         val finished = process.waitFor(DIRECT_EXEC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
