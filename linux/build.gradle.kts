@@ -230,21 +230,13 @@ val fetchLinuxSource =
             // talloc.c only ever get there by a real extraction. The patch
             // marker gates per-patch: the fork tarball never contains it,
             // and each patch is applied only if the marker does not name it
-            // — so a patch added after a previous build stacks cleanly.
+            // — so a patch added after a previous build stacks cleanly. The
+            // marker and pending set are read AFTER the extraction below: on
+            // a fresh runner the tree (and marker) only exist once the
+            // tarball lands, so checking first failed before the download
+            // ever ran — the ordering bug that broke the first CI run of
+            // this logic.
             val prootMakefile = File(prootRoot, "src/proot/src/GNUmakefile")
-            val prootPatchedMarker = File(prootRoot, ".patches-applied")
-            val alreadyApplied =
-                if (prootPatchedMarker.isFile) {
-                    prootPatchedMarker.readLines().filter { it.isNotBlank() }.toSet()
-                } else {
-                    emptySet()
-                }
-            val pendingPatches = prootPatchFiles.filter { it.name !in alreadyApplied }
-            if (pendingPatches.isNotEmpty()) {
-                check(prootMakefile.isFile) {
-                    "cannot patch the proot fork: no source tree at $prootRoot"
-                }
-            }
             if (!prootMakefile.isFile) {
                 srcDir.mkdirs()
                 if (!oonidTgz.isFile) {
@@ -261,7 +253,18 @@ val fetchLinuxSource =
                     "the extracted fork has no proot makefile at $prootMakefile"
                 }
             }
+            val prootPatchedMarker = File(prootRoot, ".patches-applied")
+            val alreadyApplied =
+                if (prootPatchedMarker.isFile) {
+                    prootPatchedMarker.readLines().filter { it.isNotBlank() }.toSet()
+                } else {
+                    emptySet()
+                }
+            val pendingPatches = prootPatchFiles.filter { it.name !in alreadyApplied }
             if (pendingPatches.isNotEmpty()) {
+                check(prootMakefile.isFile) {
+                    "cannot patch the proot fork: no source tree at $prootRoot"
+                }
                 // Patch the extracted fork tree in place. The marker records which
                 // patch files were applied, per name, so a later build both skips
                 // them and can stack newly added ones.
