@@ -70,6 +70,12 @@
  * opening the slave by path - the pair of facts (this plus which errno the
  * open itself then produced) is the evidence for debugging devpts layouts. */
 #define PTY_STAGE_PEER_FALLBACK 8
+/* Reported when a TIOCGPTPEER fd's access mode is not O_RDWR: the ioctl
+ * forwards its flags to the kernel's dentry_open without masking, so a flags
+ * value without the two access-mode bits opens the slave READ-ONLY, and an
+ * fd dup2'd onto stdout that cannot be written is how a healthy proot looks
+ * dead ("echo" exits 1, silent). The payload is the fd's O_ACCMODE value. */
+#define PTY_STAGE_SLAVE_ACCMODE 9
 
 /* How long the parent waits for the child's verdict. A healthy child
  * reaches execve in single-digit milliseconds; only a wedged child costs
@@ -123,6 +129,7 @@ static const char *stage_name(int stage) {
         case PTY_STAGE_STDIO: return "redirecting stdio";
         case PTY_STAGE_CHDIR: return "chdir";
         case PTY_STAGE_PEER_FALLBACK: return "the slave-path fallback";
+        case PTY_STAGE_SLAVE_ACCMODE: return "acquiring a writable slave fd";
         case PTY_STAGE_EXECVE: return "execve";
         default: return "an unnamed stage";
     }
@@ -465,28 +472,50 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
 
     log_devpts_layout_once();
 
-    /* Acquire the slave HERE, in the parent, before the fork. On the API 35
-     * emulator every in-child route failed with EIO - TIOCGPTPEER on the
-     * master AND open(slave_path) - while the same master serves TIOCGPTN and
-     * the direct-exec A/B runs proot fine. Probing both routes from the
-     * parent splits the world in two: if a route works here the child simply
-     * inherits the fd (the controlling terminal is claimed with TIOCSCTTY
-     * after setsid, so acquiring the slave pre-fork is safe), and the whole
-     * child context - fork, signal mask, session - is out of the equation;
-     * if a route fails here too, its errno lands in the log with no fork in
-     * the picture at all. O_NOCTTY because THIS process must not acquire a
-     * controlling terminal even if it somehow is a session leader. */
-    int slave_fd = ioctl(master, TIOCGPTPEER, O_NOCTTY);
-    int parent_peer_errno = slave_fd >= 0 ? 0 : errno;
+    /* Acquire the slave HERE, in the parent, before the fork - and by PATH
+     * first, read-write explicit. TIOCGPTPEER is the wrong first move: it
+     * forwards its flags argument to the kernel's dentry_open verbatim, with
+     * no masking, and the fd's access mode comes from the low two bits of
+     * those flags. O_NOCTTY (0x100) and 0 both carry no access bits, so both
+     * are O_RDONLY opens - and passing O_RDWR itself is refused with EINVAL.
+     * Run 34957725850 paid for exactly that asymmetry: the parent handed
+     * down an O_RDONLY peer fd, the child dup2'd it onto stdout and stderr,
+     * and every terminal write failed with EBADF while files and exec kept
+     * working - bash ran, `mkdir && echo > file` exited 0, but `echo` alone
+     * died exit 1 with no output, and the install read it as "proot failed
+     * to start". A plain open() names O_RDWR itself and cannot lie about it.
+     * It also needs the unlock above: the pre-unlock open(slave) EIO is what
+     * made TIOCGPTPEER attractive in the first place, and it is gone. The
+     * ioctl stays as the fallback for a devpts layout the path cannot name,
+     * but its fd is only trusted once F_GETFL proves O_RDWR - an fd that
+     * cannot be written is never handed to the child. O_NOCTTY because THIS
+     * process must not acquire a controlling terminal even if it somehow is
+     * a session leader. */
+    int slave_fd = open(slave_path, O_RDWR | O_NOCTTY);
+    int open_errno = slave_fd >= 0 ? 0 : errno;
+    int peer_route = 0;
+    int peer_errno = 0;
     if (slave_fd < 0) {
-        slave_fd = open(slave_path, O_RDWR | O_NOCTTY);
+        int peer = ioctl(master, TIOCGPTPEER, O_NOCTTY);
+        peer_errno = peer >= 0 ? 0 : errno;
+        if (peer >= 0) {
+            if ((fcntl(peer, F_GETFL) & O_ACCMODE) == O_RDWR) {
+                slave_fd = peer;
+                peer_route = 1;
+            } else {
+                close(peer);
+            }
+        }
     }
     __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
-                        "pty parent slave probe: TIOCGPTPEER errno %d, open(slave) errno %d, %s",
-                        parent_peer_errno,
-                        (slave_fd >= 0 || parent_peer_errno == 0) ? 0 : errno,
-                        slave_fd >= 0 ? "the parent hands the slave fd to the child"
-                                      : "the child must acquire one itself");
+                        "pty parent slave probe: open(slave) errno %d, TIOCGPTPEER errno %d, %s"
+                        " (route: %s)",
+                        open_errno, peer_errno,
+                        slave_fd >= 0 ? "the parent hands an O_RDWR slave fd to the child"
+                                      : "the child must acquire one itself",
+                        peer_route ? "TIOCGPTPEER, accmode verified"
+                                   : slave_fd >= 0 ? "open(slave_path)"
+                                                   : "none usable");
 
     pthread_mutex_lock(&ptys_lock);
     struct pty_slot *slot = NULL;
@@ -540,27 +569,31 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         setsid();
         child_stage(diag_fd, PTY_STAGE_SETSID);
         /* Preferred: the slave fd the parent already acquired (see the probe
-         * before the fork). Inheriting it sidesteps every acquisition route
-         * that failed on the API 35 emulator - the child only claims the
-         * controlling terminal below. */
+         * before the fork) - a verified O_RDWR one, or nothing at all.
+         * Inheriting it sidesteps every acquisition route that failed on the
+         * API 35 emulator - the child only claims the controlling terminal
+         * below. */
         int slave = slave_fd;
         if (slave < 0) {
-            /* Ask the kernel for the peer of the master this child already
-             * holds, instead of resolving the /dev/pts path. The path is a
-             * guess about which devpts instance the master belongs to - on
-             * the API 35 emulator that guess fails (the slave open returns
-             * EIO, pty_open's !tty->link), while TIOCGPTPEER cannot be wrong
-             * about instances: it is the master fd's own peer, handed over by
-             * the kernel. The flags argument admits ONLY O_CLOEXEC and
-             * O_NONBLOCK - the kernel returns EINVAL for anything else,
-             * including the O_RDWR a plain open would use (that exact mistake
-             * cost one E2E run). Zero means neither: the returned fd may
-             * become this fresh session's controlling terminal, which is
-             * exactly what open(slave) after setsid did. */
-            slave = ioctl(master, TIOCGPTPEER, 0);
+            /* Open the slave by path first, read-write explicit: TIOCGPTPEER
+             * forwards its flags to the kernel's dentry_open without masking,
+             * so a flags value without the two access-mode bits is an O_RDONLY
+             * open - the fd that cannot be written which run 34957725850's
+             * stdio was built on. The path open needs the unlock the parent
+             * performed; the ioctl remains the fallback for a devpts layout
+             * the path cannot name, but its fd is only trusted once F_GETFL
+             * proves O_RDWR (fcntl is async-signal-safe, like everything else
+             * in this child). */
+            slave = open(slave_path, O_RDWR);
             if (slave < 0) {
                 child_stage_errno(diag_fd, PTY_STAGE_PEER_FALLBACK, errno);
-                slave = open(slave_path, O_RDWR);
+                slave = ioctl(master, TIOCGPTPEER, 0);
+                if (slave >= 0 && (fcntl(slave, F_GETFL) & O_ACCMODE) != O_RDWR) {
+                    child_stage_failed(diag_fd, PTY_STAGE_SLAVE_ACCMODE,
+                                       fcntl(slave, F_GETFL) & O_ACCMODE);
+                    close(slave);
+                    slave = -1;
+                }
             }
             if (slave < 0) {
                 child_stage_failed(diag_fd, PTY_STAGE_OPEN_SLAVE, errno);
