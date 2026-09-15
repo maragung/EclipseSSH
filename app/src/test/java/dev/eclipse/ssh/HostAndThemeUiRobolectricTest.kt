@@ -190,13 +190,7 @@ class HostAndThemeUiRobolectricTest {
         assertWithMessage("the oversized Connect button is back on the card")
             .that(compose.onAllNodesWithText("Connect").fetchSemanticsNodes()).isEmpty()
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        // The menu's items compose on a later frame, and the wait is what makes their existence
-        // the precondition of touching them: a fixed pump once lost that race on a loaded
-        // runner, and the click on "Remove" then found no node at all.
-        pumpUntil(describe = { "the kebab menu never offered Connect" }) {
-            compose.onAllNodesWithText("Connect").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "Connect")
         pump()
 
         compose.onNodeWithText("Connect").assertIsDisplayed()
@@ -236,12 +230,7 @@ class HostAndThemeUiRobolectricTest {
         val host = addHost("Removable")
         val before = ShadowDialog.getShownDialogs().size
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        // Waited rather than pumped: the click below is only honest against a menu that is on
-        // screen, and on a loaded runner the items can still be a frame away.
-        pumpUntil(describe = { "the kebab menu never offered Remove" }) {
-            compose.onAllNodesWithText("Remove").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "Remove")
         compose.onNodeWithText("Remove").performClick()
         pump()
 
@@ -262,11 +251,7 @@ class HostAndThemeUiRobolectricTest {
     fun editingAHostOpensItsOwnFormPrefilled() {
         val host = addHost("Editable", hostname = "edit.example.test", username = "editor", port = 2244)
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        // Same wait as the Remove test: the click must not race the menu's composition.
-        pumpUntil(describe = { "the kebab menu never offered Edit" }) {
-            compose.onAllNodesWithText("Edit").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "Edit")
         compose.onNodeWithText("Edit").performClick()
         pump()
 
@@ -532,10 +517,7 @@ class HostAndThemeUiRobolectricTest {
     fun portForwardingInTheKebabOpensThePerHostManagerSheet() {
         val host = addHost("Forwarder", hostname = "fwd.example.test", username = "forwarder")
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pumpUntil(describe = { "the kebab never offered Port forwarding" }) {
-            compose.onAllNodesWithText("Port forwarding").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "Port forwarding")
         compose.onNodeWithText("Port forwarding").performClick()
         // Anchored on "Add rule" rather than the sheet's own "Port forwarding" title: the kebab item
         // and the title are the same string, and this way the assertion is about the manager being
@@ -566,10 +548,7 @@ class HostAndThemeUiRobolectricTest {
             viewModel().uiState.value.hosts.any { it.id == host.id && it.savedForwards.isNotBlank() }
         }
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pumpUntil(describe = { "the kebab never offered Duplicate" }) {
-            compose.onAllNodesWithText("Duplicate").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "Duplicate")
         compose.onNodeWithText("Duplicate").performClick()
         pump()
 
@@ -640,15 +619,26 @@ class HostAndThemeUiRobolectricTest {
     /**
      * Opens a host card's kebab menu and waits for the item the caller is about to tap.
      *
-     * The menu's items compose a frame or two after the kebab's click, and on a loaded runner a
-     * fixed pump can land before that composition - the Favorite test's tap once found no node at
-     * all. The earlier kebab races were fixed item by item; this helper is where the rest of them
-     * wait, and where any new menu item must wait too.
+     * Two load-shaped failures share one mechanism, and the tap is retried for both: the menu's
+     * items compose a frame or two after the kebab's click (the Favorite test's tap once found no
+     * node at all), and an injected tap can also simply miss the icon while the host list settles
+     * underneath it - a click that never landed is why one run waited 20 seconds for a menu that
+     * was never going to open. Each attempt re-finds the kebab for fresh coordinates; a menu that
+     * does open is still asserted to hold the item, so a missing item stays a failure.
      */
     private fun openKebabMenu(hostName: String, offering: String) {
-        compose.onNodeWithContentDescription("More actions for $hostName").performClick()
-        pumpUntil(describe = { "the kebab menu never offered $offering" }) {
-            compose.onAllNodesWithText(offering).fetchSemanticsNodes().isNotEmpty()
+        val kebab = "More actions for $hostName"
+        repeat(KEBAB_OPEN_ATTEMPTS) {
+            compose.onNodeWithContentDescription(kebab).performClick()
+            if (waitFor(KEBAB_OPEN_WAIT_MS) {
+                    compose.onAllNodesWithText(offering).fetchSemanticsNodes().isNotEmpty()
+                }
+            ) {
+                return
+            }
+        }
+        check(false) {
+            "the kebab menu never offered $offering after $KEBAB_OPEN_ATTEMPTS taps on $kebab"
         }
     }
 
@@ -660,18 +650,29 @@ class HostAndThemeUiRobolectricTest {
      * DataStore and Room flows come due.
      */
     private fun pumpUntil(timeoutMs: Long = 20_000, describe: () -> String, condition: () -> Boolean) {
+        check(waitFor(timeoutMs, condition)) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /** [pumpUntil]'s loop without the failure, for callers that retry rather than give up. */
+    private fun waitFor(timeoutMs: Long, condition: () -> Boolean): Boolean {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
         while (System.nanoTime() < deadline && !condition()) {
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
-        check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+        return condition()
     }
 
     private companion object {
         /** Prefix on every host this class creates, so the cleanup can find them and leave others. */
         const val ID_PREFIX = "ui-qa-"
+
+        /** How many times [openKebabMenu] taps the kebab before giving up on the menu. */
+        const val KEBAB_OPEN_ATTEMPTS = 3
+
+        /** Per-tap wait for the menu's items; one tap's wait is ~180 frames at 16ms. */
+        const val KEBAB_OPEN_WAIT_MS = 3_000L
 
         /** Mirrors `SETTING_TRAILING_MAX_WIDTH`, which is private to the UI. */
         const val TRAILING_MAX_WIDTH_DP = 156f
