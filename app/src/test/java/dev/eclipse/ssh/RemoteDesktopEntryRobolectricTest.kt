@@ -409,10 +409,7 @@ class RemoteDesktopEntryRobolectricTest {
         // doing — peeking does not consume, so a stale intent would mask the viewer's.
         while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pumpUntil(describe = { "the kebab menu never offered Remote desktop" }) {
-            compose.onAllNodesWithText("Remote desktop").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "Remote desktop")
         compose.onNodeWithText("Remote desktop").performClick()
         pump()
     }
@@ -423,12 +420,35 @@ class RemoteDesktopEntryRobolectricTest {
         // doing — peeking does not consume, so a stale intent would mask the viewer's.
         while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pumpUntil(describe = { "the kebab menu never offered RDP desktop" }) {
-            compose.onAllNodesWithText("RDP desktop").fetchSemanticsNodes().isNotEmpty()
-        }
+        openKebabMenu(host.name, "RDP desktop")
         compose.onNodeWithText("RDP desktop").performClick()
         pump()
+    }
+
+    /**
+     * Opens a host card's kebab menu and waits for the item the caller is about to tap.
+     *
+     * The tap is retried because on a loaded runner it can simply miss the icon while the host
+     * list settles underneath it - a click that never landed is why one CI run waited 20 seconds
+     * for an RDP desktop menu that was never going to open (the same mechanism the host-and-theme
+     * suite's copy of this helper retries for). Each attempt re-finds the kebab for fresh
+     * coordinates; a menu that does open is still asserted to hold the item, so a missing item
+     * stays a failure.
+     */
+    private fun openKebabMenu(hostName: String, offering: String) {
+        val kebab = "More actions for $hostName"
+        repeat(KEBAB_OPEN_ATTEMPTS) {
+            compose.onNodeWithContentDescription(kebab).performClick()
+            if (waitFor(KEBAB_OPEN_WAIT_MS) {
+                    compose.onAllNodesWithText(offering).fetchSemanticsNodes().isNotEmpty()
+                }
+            ) {
+                return
+            }
+        }
+        check(false) {
+            "the kebab menu never offered $offering after $KEBAB_OPEN_ATTEMPTS taps on $kebab"
+        }
     }
 
     /**
@@ -486,18 +506,29 @@ class RemoteDesktopEntryRobolectricTest {
      * copied from `HostAndThemeUiRobolectricTest` so this class owns its own clock.
      */
     private fun pumpUntil(timeoutMs: Long = 20_000, describe: () -> String, condition: () -> Boolean) {
+        check(waitFor(timeoutMs, condition)) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /** [pumpUntil]'s loop without the failure, for callers that retry rather than give up. */
+    private fun waitFor(timeoutMs: Long, condition: () -> Boolean): Boolean {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
         while (System.nanoTime() < deadline && !condition()) {
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
-        check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+        return condition()
     }
 
     private companion object {
         /** Prefix on every host this class creates, so the cleanup can find them and leave others. */
         const val ID_PREFIX = "rd-qa-"
+
+        /** How many times [openKebabMenu] taps the kebab before giving up on the menu. */
+        const val KEBAB_OPEN_ATTEMPTS = 3
+
+        /** Per-tap wait for the menu's items; one tap's wait is ~180 frames at 16ms. */
+        const val KEBAB_OPEN_WAIT_MS = 3_000L
 
         private var nextId = 0
     }
