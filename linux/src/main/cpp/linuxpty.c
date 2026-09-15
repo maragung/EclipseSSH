@@ -32,7 +32,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -226,6 +228,57 @@ struct pty_slot {
 static struct pty_slot ptys[MAX_PTYS];
 static pthread_mutex_t ptys_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* One-per-process dump of the device-side pty landscape: kernel release, what
+ * /dev/ptmx actually is (symlink target or major:minor+mode), the mode of the
+ * devpts-internal ptmx, and every devpts line of this process's mountinfo.
+ * The API 35 emulator failed BOTH slave-acquisition routes with EIO while
+ * serving TIOCGPTN on the same master; every hypothesis that is left needs
+ * these facts to be checkable. Logged once so a spawn loop stays readable. */
+static void log_devpts_layout_once(void) {
+    static volatile int done = 0;
+    if (done) return;
+    done = 1;
+    struct utsname uts;
+    if (uname(&uts) == 0) {
+        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                            "pty landscape: kernel %s (%s)", uts.release, uts.machine);
+    }
+    char link_target[128];
+    ssize_t n = readlink("/dev/ptmx", link_target, sizeof(link_target) - 1);
+    if (n >= 0) {
+        link_target[n] = '\0';
+        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                            "pty landscape: /dev/ptmx is a symlink to %s", link_target);
+    } else {
+        struct stat st;
+        if (stat("/dev/ptmx", &st) == 0) {
+            __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                                "pty landscape: /dev/ptmx is device %u:%u mode %o",
+                                major(st.st_rdev), minor(st.st_rdev), st.st_mode & 0777);
+        }
+    }
+    struct stat st;
+    if (stat("/dev/pts/ptmx", &st) == 0) {
+        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                            "pty landscape: /dev/pts/ptmx is device %u:%u mode %o",
+                            major(st.st_rdev), minor(st.st_rdev), st.st_mode & 0777);
+    }
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (f != NULL) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f) != NULL) {
+            if (strstr(line, "devpts") == NULL) continue;
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+                line[--len] = '\0';
+            }
+            __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                                "pty landscape: mountinfo: %s", line);
+        }
+        fclose(f);
+    }
+}
+
 static struct pty_slot *slot_for_master(int master) {
     for (int i = 0; i < MAX_PTYS; i++) {
         if (ptys[i].in_use && ptys[i].master == master) return &ptys[i];
@@ -381,6 +434,31 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         }
     }
 
+    log_devpts_layout_once();
+
+    /* Acquire the slave HERE, in the parent, before the fork. On the API 35
+     * emulator every in-child route failed with EIO - TIOCGPTPEER on the
+     * master AND open(slave_path) - while the same master serves TIOCGPTN and
+     * the direct-exec A/B runs proot fine. Probing both routes from the
+     * parent splits the world in two: if a route works here the child simply
+     * inherits the fd (the controlling terminal is claimed with TIOCSCTTY
+     * after setsid, so acquiring the slave pre-fork is safe), and the whole
+     * child context - fork, signal mask, session - is out of the equation;
+     * if a route fails here too, its errno lands in the log with no fork in
+     * the picture at all. O_NOCTTY because THIS process must not acquire a
+     * controlling terminal even if it somehow is a session leader. */
+    int slave_fd = ioctl(master, TIOCGPTPEER, O_NOCTTY);
+    int parent_peer_errno = slave_fd >= 0 ? 0 : errno;
+    if (slave_fd < 0) {
+        slave_fd = open(slave_path, O_RDWR | O_NOCTTY);
+    }
+    __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                        "pty parent slave probe: TIOCGPTPEER errno %d, open(slave) errno %d, %s",
+                        parent_peer_errno,
+                        (slave_fd >= 0 || parent_peer_errno == 0) ? 0 : errno,
+                        slave_fd >= 0 ? "the parent hands the slave fd to the child"
+                                      : "the child must acquire one itself");
+
     pthread_mutex_lock(&ptys_lock);
     struct pty_slot *slot = NULL;
     for (int i = 0; i < MAX_PTYS; i++) {
@@ -388,6 +466,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
     }
     if (slot == NULL) {
         pthread_mutex_unlock(&ptys_lock);
+        if (slave_fd >= 0) close(slave_fd);
         close(master);
         jclass e = (*env)->FindClass(env, "java/io/IOException");
         (*env)->ThrowNew(env, e, "too many open local terminals");
@@ -415,6 +494,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         pthread_mutex_lock(&ptys_lock);
         slot->in_use = 0;
         pthread_mutex_unlock(&ptys_lock);
+        if (slave_fd >= 0) close(slave_fd);
         close(master);
         jclass e = (*env)->FindClass(env, "java/io/IOException");
         (*env)->ThrowNew(env, e, "fork failed");
@@ -430,25 +510,33 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         child_stage(diag_fd, PTY_STAGE_SIGMASK);
         setsid();
         child_stage(diag_fd, PTY_STAGE_SETSID);
-        /* Ask the kernel for the peer of the master this child already holds,
-         * instead of resolving the /dev/pts path. The path is a guess about
-         * which devpts instance the master belongs to - on the API 35
-         * emulator that guess fails (the slave open returns EIO, pty_open's
-         * !tty->link), while TIOCGPTPEER cannot be wrong about instances: it
-         * is the master fd's own peer, handed over by the kernel. The flags
-         * argument admits ONLY O_CLOEXEC and O_NOCTTY - the kernel returns
-         * EINVAL for anything else, including the O_RDWR a plain open would
-         * use (that exact mistake cost one E2E run). Zero means neither: the
-         * returned fd may become this fresh session's controlling terminal,
-         * which is exactly what open(slave) after setsid did. */
-        int slave = ioctl(master, TIOCGPTPEER, 0);
+        /* Preferred: the slave fd the parent already acquired (see the probe
+         * before the fork). Inheriting it sidesteps every acquisition route
+         * that failed on the API 35 emulator - the child only claims the
+         * controlling terminal below. */
+        int slave = slave_fd;
         if (slave < 0) {
-            child_stage_errno(diag_fd, PTY_STAGE_PEER_FALLBACK, errno);
-            slave = open(slave_path, O_RDWR);
-        }
-        if (slave < 0) {
-            child_stage_failed(diag_fd, PTY_STAGE_OPEN_SLAVE, errno);
-            _exit(126);
+            /* Ask the kernel for the peer of the master this child already
+             * holds, instead of resolving the /dev/pts path. The path is a
+             * guess about which devpts instance the master belongs to - on
+             * the API 35 emulator that guess fails (the slave open returns
+             * EIO, pty_open's !tty->link), while TIOCGPTPEER cannot be wrong
+             * about instances: it is the master fd's own peer, handed over by
+             * the kernel. The flags argument admits ONLY O_CLOEXEC and
+             * O_NONBLOCK - the kernel returns EINVAL for anything else,
+             * including the O_RDWR a plain open would use (that exact mistake
+             * cost one E2E run). Zero means neither: the returned fd may
+             * become this fresh session's controlling terminal, which is
+             * exactly what open(slave) after setsid did. */
+            slave = ioctl(master, TIOCGPTPEER, 0);
+            if (slave < 0) {
+                child_stage_errno(diag_fd, PTY_STAGE_PEER_FALLBACK, errno);
+                slave = open(slave_path, O_RDWR);
+            }
+            if (slave < 0) {
+                child_stage_failed(diag_fd, PTY_STAGE_OPEN_SLAVE, errno);
+                _exit(126);
+            }
         }
         child_stage(diag_fd, PTY_STAGE_OPEN_SLAVE);
         /* Both slave routes already claim the controlling terminal for a
@@ -474,6 +562,14 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         execve(argv[0], argv, child_env);
         child_stage_failed(diag_fd, PTY_STAGE_EXECVE, errno);
         _exit(127);
+    }
+
+    /* Parent. The child holds its own inherited copy of the slave (or dup2'd
+     * one it acquired itself); this copy must go, or the pair would never
+     * hang up on the master side when the child exits - the reader would see
+     * neither EOF nor EIO, exactly the old install-hang shape. */
+    if (slave_fd >= 0) {
+        close(slave_fd);
     }
 
     if (have_diag) {
