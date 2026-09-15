@@ -62,29 +62,52 @@ internal fun openTarStream(file: File, bufferSize: Int): TarArchiveInputStream {
  * entry itself must resolve inside [root] (checked separately), and where the link *points* must
  * resolve inside [root] too.
  *
+ * The target is resolved **lexically** — [linkName]'s own components walked from the entry's
+ * parent (or from the root when the target is absolute), never a filesystem lookup. That is not
+ * just an implementation choice: `canonicalFile` answers about the *device's* filesystem, and an
+ * absolute link an earlier entry already extracted (`etc/alternatives/pager -> /bin/more`) walks,
+ * on the device, to `/bin/more` — an "escape" the rootfs never meant, because inside a rootfs
+ * that link means the rootfs's own /bin/more and proot translates it at runtime. The question
+ * this guard can honestly ask is whether the linkName's own path, component by component, stays
+ * under the root; what it cannot do is judge a chain through already-extracted links, whose
+ * meaning only exists inside the rootfs. The pinned rootfs carries its own guarantee (the
+ * sha256 pin), so this guard is defense in depth there — for the app-written backup it still
+ * refuses every link that declares an outside target.
+ *
  * A relative [linkName] is resolved against the entry's parent directory — `../../bin/bash` from
  * `usr/bin/env` lands inside the root and is fine; the same climb from a deeper directory escapes
  * and is refused. An absolute [linkName] is mapped onto the root, because that is what it means
  * inside a rootfs: the pinned Ubuntu Base images ship 21 absolute links (`var/run -> /run`,
- * `usr/bin/pidof -> /sbin/killall5`, …), all of them rootfs-internal, and proot translates them
- * at runtime. What is refused — either way — is a link whose resolved target lands outside the
- * extraction tree, which is the one an app-side writer or walker could follow out.
+ * `usr/bin/pager -> /etc/alternatives/pager`, …). Refused — either way — is a target whose
+ * components climb above the root.
  */
 internal fun resolveLinkInsideRoot(root: File, name: String, linkName: String) {
     if (linkName.isEmpty()) {
         throw IOException("Archive entry is a symlink with an empty target: $name")
     }
-    val target =
-        if (linkName.startsWith("/")) {
-            File(root, linkName.removePrefix("/"))
-        } else {
-            val entryParent = resolveInsideRoot(root, name).parentFile
-                ?: throw IOException("Archive entry has no parent directory: $name")
-            File(entryParent, linkName)
+    val entryParent = resolveInsideRoot(root, name).parentFile
+        ?: throw IOException("Archive entry has no parent directory: $name")
+    // Where the link lives, as components relative to the root. resolveInsideRoot hands back a
+    // canonical path under the root's, so the relativize is well-defined; empty is the root itself.
+    val where =
+        root.canonicalFile.toPath().relativize(entryParent.toPath()).map { it.toString() }
+    val stack = ArrayDeque(where)
+    if (linkName.startsWith("/")) {
+        // An absolute target means the rootfs's root: the walk starts there, discarding the
+        // entry's own location.
+        stack.clear()
+    }
+    for (part in linkName.split('/')) {
+        when (part) {
+            "", "." -> {}
+            ".." ->
+                if (stack.removeLastOrNull() == null) {
+                    throw IOException(
+                        "Archive symlink points outside the extraction directory: $name -> $linkName"
+                    )
+                }
+            else -> stack.addLast(part)
         }
-    val resolved = target.canonicalFile
-    if (!resolved.path.startsWith(root.canonicalPath + File.separator)) {
-        throw IOException("Archive symlink points outside the extraction directory: $name -> $linkName")
     }
 }
 

@@ -54,6 +54,23 @@ class TarSafetyTest {
     }
 
     @Test
+    fun `an absolute link whose target is another extracted absolute link is accepted`() {
+        val root = newRoot()
+        File(root, "etc/alternatives").mkdirs()
+        // The pinned jammy image's pager chain, in extraction order: the alternatives link lands
+        // on disk first, so usr/bin/pager's target *exists* as a device-side symlink to /bin/more
+        // when it is checked. Walking that on-disk graph rejects the link as an escape (the
+        // device really does resolve it to /bin/more), which aborted every real install at
+        // usr/bin/pager; the guard must judge the linkName's own components instead, because
+        // only inside the rootfs does /etc/alternatives/pager mean the rootfs's own file.
+        Files.createSymbolicLink(
+            File(root, "etc/alternatives/pager").toPath(),
+            File("/bin/more").toPath(),
+        )
+        resolveLinkInsideRoot(root, "usr/bin/pager", "/etc/alternatives/pager")
+    }
+
+    @Test
     fun `an absolute link that still escapes after mapping is refused`() {
         val root = newRoot()
         var thrown: IOException? = null
