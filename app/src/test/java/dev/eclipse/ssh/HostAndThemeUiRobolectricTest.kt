@@ -292,8 +292,7 @@ class HostAndThemeUiRobolectricTest {
         val host = addHost("Connectable")
         val before = ShadowDialog.getShownDialogs().size
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        openKebabMenu(host.name, "Connect")
         compose.onNodeWithText("Connect").performClick()
         pump()
 
@@ -427,8 +426,7 @@ class HostAndThemeUiRobolectricTest {
     fun detailsFromTheMenuOpensTheSheetAndLeavesTheMenuActionsToTheMenu() {
         val host = addHost("Detailed", hostname = "details.example.test", username = "reader", port = 2022)
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        openKebabMenu(host.name, "Details")
         compose.onNodeWithText("Details").performClick()
         pumpUntil(describe = { "the details sheet never composed" }) {
             compose.onAllNodesWithText("Authentication").fetchSemanticsNodes().isNotEmpty()
@@ -461,16 +459,14 @@ class HostAndThemeUiRobolectricTest {
     fun favoriteFromTheMenuTogglesTheStarOnTheCard() {
         val host = addHost("Starred", hostname = "star.example.test", username = "starer")
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        openKebabMenu(host.name, "Favorite")
         compose.onNodeWithText("Favorite").performClick()
         pumpUntil(describe = { "the star never appeared" }) {
             viewModel().uiState.value.hosts.firstOrNull { it.id == host.id }?.isFavorite == true
         }
 
         // And back off, through the item's other label.
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        openKebabMenu(host.name, "Unfavorite")
         compose.onNodeWithText("Unfavorite").performClick()
         pumpUntil(describe = { "the star never left" }) {
             viewModel().uiState.value.hosts.firstOrNull { it.id == host.id }?.isFavorite == false
@@ -494,8 +490,7 @@ class HostAndThemeUiRobolectricTest {
         val host = addHost("Exportable", hostname = "export.example.test", username = "exporter")
         val before = ShadowDialog.getShownDialogs().size
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        openKebabMenu(host.name, "Export account")
         compose.onNodeWithText("Export account").performClick()
         pump()
 
@@ -517,8 +512,7 @@ class HostAndThemeUiRobolectricTest {
     fun duplicateFromTheMenuSavesAnIndependentCopy() {
         val host = addHost("Original", hostname = "dup.example.test", username = "duper", port = 2222)
 
-        compose.onNodeWithContentDescription("More actions for ${host.name}").performClick()
-        pump()
+        openKebabMenu(host.name, "Duplicate")
         compose.onNodeWithText("Duplicate").performClick()
         pumpUntil(describe = { "the copy never appeared" }) {
             compose.onAllNodesWithContentDescription("More actions for Original (copy)").fetchSemanticsNodes().isNotEmpty()
@@ -640,6 +634,21 @@ class HostAndThemeUiRobolectricTest {
             Snapshot.sendApplyNotifications()
             compose.mainClock.advanceTimeByFrame()
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
+        }
+    }
+
+    /**
+     * Opens a host card's kebab menu and waits for the item the caller is about to tap.
+     *
+     * The menu's items compose a frame or two after the kebab's click, and on a loaded runner a
+     * fixed pump can land before that composition - the Favorite test's tap once found no node at
+     * all. The earlier kebab races were fixed item by item; this helper is where the rest of them
+     * wait, and where any new menu item must wait too.
+     */
+    private fun openKebabMenu(hostName: String, offering: String) {
+        compose.onNodeWithContentDescription("More actions for $hostName").performClick()
+        pumpUntil(describe = { "the kebab menu never offered $offering" }) {
+            compose.onAllNodesWithText(offering).fetchSemanticsNodes().isNotEmpty()
         }
     }
 
