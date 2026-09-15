@@ -157,7 +157,18 @@ class UbuntuE2eVerificationTest {
                     "ABI/emulator, not in the pty bridge"
             }
         }
-        val output = process.inputStream.readBytes().toString(Charsets.UTF_8)
+        // Plain java.io reads, not readBytes(): the minified app APK carries only the
+        // kotlin.io symbols the app itself uses, and the instrumentation APK resolves
+        // against it at runtime - readBytes() was stripped once already (NoClassDefFoundError:
+        // kotlin/io/ByteStreamsKt) and took the A/B verdict down with it.
+        val collected = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(8192)
+        while (true) {
+            val n = process.inputStream.read(chunk)
+            if (n < 0) break
+            collected.write(chunk, 0, n)
+        }
+        val output = String(collected.toByteArray(), Charsets.UTF_8)
         check(process.exitValue() == 0 && "DIRECT_EXEC_OK" in output) {
             "DIRECT-EXEC A/B stage: proot exec'd without the pty bridge exited " +
                 "${process.exitValue()} without the marker (output: ${output.take(2000)})"

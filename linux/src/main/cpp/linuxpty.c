@@ -27,6 +27,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -95,11 +96,13 @@ static const char *stage_name(int stage) {
     }
 }
 
-/* Reads the child's progress report and logs the verdict. Bounded by
- * [PTY_DIAG_BUDGET_MS]: EOF means the child exec'd (or exited after
- * reporting a failure); a timeout with the pipe still open means the child
- * is wedged - and the last stage it reported names where. */
-static void report_child_progress(int fd, const char *program) {
+/* Reads the child's progress report, logs the verdict, and returns the
+ * failing stage (0 when the child reported no failure - the errno lands in
+ * *failure_errno when there was one). Bounded by [PTY_DIAG_BUDGET_MS]: EOF
+ * means the child exec'd (or exited after reporting a failure); a timeout
+ * with the pipe still open means the child is wedged - and the last stage
+ * it reported names where. */
+static int report_child_progress(int fd, const char *program, int *failure_errno) {
     uint8_t buf[64];
     size_t used = 0;
     int eof = 0;
@@ -133,12 +136,12 @@ static void report_child_progress(int fd, const char *program) {
     /* Parse: stage bytes in order, possibly ending in a fail marker. */
     int last_stage = 0;
     int failed_stage = 0;
-    int failure_errno = 0;
+    int failure_errno_ = 0;
     for (size_t i = 0; i < used; i++) {
         if (buf[i] >= 0x80) {
             failed_stage = buf[i] & 0x7f;
             if (i + 1 + sizeof(int32_t) <= used) {
-                memcpy(&failure_errno, buf + i + 1, sizeof(int32_t));
+                memcpy(&failure_errno_, buf + i + 1, sizeof(int32_t));
             }
             break;
         }
@@ -147,28 +150,30 @@ static void report_child_progress(int fd, const char *program) {
     if (failed_stage != 0) {
         __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
                             "pty child failed at %s (errno %d) launching %s",
-                            stage_name(failed_stage), failure_errno, program);
-        return;
+                            stage_name(failed_stage), failure_errno_, program);
+        *failure_errno = failure_errno_;
+        return failed_stage;
     }
     if (last_stage >= PTY_STAGE_EXECVE) {
         /* The write end closed after the pre-execve report: execve happened.
          * Errors past this point are the exec'd program's to report. */
         __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
                             "pty child reached execve: %s", program);
-        return;
+        return 0;
     }
     if (!eof) {
         __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
                             "pty child stalled before execve at %s, launching %s",
                             last_stage == 0 ? "its first instruction" : stage_name(last_stage),
                             program);
-        return;
+        return 0;
     }
     /* EOF with stages but no execve report and no failure record: the child
      * died between stages - a signal, since every _exit path reports. */
     __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
                         "pty child died silently after %s, launching %s (killed by a signal?)",
                         last_stage == 0 ? "fork" : stage_name(last_stage), program);
+    return 0;
 }
 
 struct pty_slot {
@@ -271,10 +276,25 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
     if (converted_cwd == NULL) goto convert_failed;
     cwd = converted_cwd;
 
-    master = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    /* Open the master INSIDE the devpts instance the child will open slaves
+     * from. /dev/ptmx can be the legacy misc device, tied to the kernel's
+     * initial devpts mount - a different instance than the one at /dev/pts.
+     * On the API 35 emulator that is exactly the split: opening /dev/ptmx
+     * succeeds, ptsname_r dutifully reports /dev/pts/N, and the child's
+     * open() of that path returns EIO because in ITS instance that slave
+     * belongs to no master (pty_open's !tty->link). Every proot spawn died
+     * there, silently - the child exits before the slave is ever opened, so
+     * the master never hangs up and the JVM read parks until its timeout.
+     * /dev/pts/ptmx is the ptmx of the instance itself, which cannot be
+     * mismatched; the /dev/ptmx fallback keeps real devices that only have
+     * the legacy node working exactly as before. */
+    master = open("/dev/pts/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (master < 0) {
+        master = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    }
     if (master < 0) {
         jclass e = (*env)->FindClass(env, "java/io/IOException");
-        (*env)->ThrowNew(env, e, "open(/dev/ptmx) failed");
+        (*env)->ThrowNew(env, e, "open(ptmx) failed");
         goto out;
     }
     /* Window size set on the master applies to the pair; the child gets a
@@ -372,8 +392,35 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
     if (have_diag) {
         close(diag[1]);
         const char *slash = strrchr(argv[0], '/');
-        report_child_progress(diag[0], slash != NULL ? slash + 1 : argv[0]);
+        int failure_errno = 0;
+        int failed_stage = report_child_progress(
+                diag[0], slash != NULL ? slash + 1 : argv[0], &failure_errno);
         close(diag[0]);
+        if (failed_stage != 0) {
+            /* The child named the stage it died at and is gone. A dead child
+             * produces no output and no hangup, so waiting would only burn
+             * the caller's whole timeout - fail now, typed, instead. The
+             * child _exits immediately after writing its fail record; reap
+             * it briefly so it does not linger as a zombie. */
+            for (int i = 0; i < 50; i++) {
+                int status;
+                if (waitpid(pid, &status, WNOHANG) == pid) break;
+                struct timespec nap = { 0, 2 * 1000 * 1000 };
+                nanosleep(&nap, NULL);
+            }
+            pthread_mutex_lock(&ptys_lock);
+            slot->in_use = 0;
+            pthread_mutex_unlock(&ptys_lock);
+            close(master);
+            master = -1;
+            char message[128];
+            snprintf(message, sizeof(message),
+                     "the pty child failed at %s (errno %d)",
+                     stage_name(failed_stage), failure_errno);
+            jclass e = (*env)->FindClass(env, "java/io/IOException");
+            (*env)->ThrowNew(env, e, message);
+            goto out;
+        }
     }
 
     pthread_mutex_lock(&ptys_lock);
