@@ -96,4 +96,65 @@ class RootfsValidatorTest {
         assertThat(findings.map { it.path }).contains("<the whole tree>")
         assertThat(findings.single { it.path == "<the whole tree>" }.problem).contains("floor")
     }
+
+    @Test
+    fun `the pinned architecture's linker satisfies the manifest`() {
+        val validator = RootfsValidator(minExtractedBytes = 1, expectedArch = "arm64")
+        assertThat(validator.validate(validTree())).isEmpty()
+    }
+
+    @Test
+    fun `a linker for a different architecture is named as a mismatch`() {
+        // The shape the architecture check exists for: an x86 tarball that downloaded and
+        // extracted perfectly onto an arm64 device. Without the check it passes every existence
+        // test and dies at the first exec, with only proot's word for why.
+        val validator = RootfsValidator(minExtractedBytes = 1, expectedArch = "arm64")
+        val root = validTree()
+        assertThat(File(root, "lib/ld-linux-aarch64.so.1").delete()).isTrue()
+        File(root, "lib/ld-linux-x86-64.so.2").apply {
+            writeText("wrong-arch linker\n")
+            setExecutable(true, true)
+        }
+
+        val findings = validator.validate(root)
+        assertThat(findings.single().path).isEqualTo("/lib/ld-linux-x86-64.so.2")
+        assertThat(findings.single().problem).contains("different architecture")
+        assertThat(findings.single().problem).contains("ld-linux-aarch64.so.1")
+    }
+
+    @Test
+    fun `a missing linker under a pinned architecture names the one that was expected`() {
+        val validator = RootfsValidator(minExtractedBytes = 1, expectedArch = "amd64")
+        val root = validTree()
+        assertThat(File(root, "lib/ld-linux-aarch64.so.1").delete()).isTrue()
+
+        val findings = validator.validate(root)
+        assertThat(findings.single().path).isEqualTo("lib/ld-linux-x86-64.so.2")
+        assertThat(findings.single().problem).contains("no dynamic linker")
+    }
+
+    @Test
+    fun `a linker in the multiarch position satisfies the pinned architecture`() {
+        // Modern Ubuntu puts the linker under lib/<triplet>/; the exact-name search must walk
+        // there too, or every current image would be refused.
+        val validator = RootfsValidator(minExtractedBytes = 1, expectedArch = "arm64")
+        val root = validTree()
+        assertThat(File(root, "lib/ld-linux-aarch64.so.1").delete()).isTrue()
+        val multiarch = File(root, "lib/aarch64-linux-gnu")
+        multiarch.mkdirs()
+        File(multiarch, "ld-linux-aarch64.so.1").apply {
+            writeText("linker\n")
+            setExecutable(true, true)
+        }
+
+        assertThat(validator.validate(root)).isEmpty()
+    }
+
+    @Test
+    fun `an unrecognized architecture falls back to accepting any linker`() {
+        // expectedArch is a string from the catalog, not an enum; an unknown value must degrade
+        // to the prefix search, not refuse every rootfs ever after.
+        val validator = RootfsValidator(minExtractedBytes = 1, expectedArch = "riscv64")
+        assertThat(validator.validate(validTree())).isEmpty()
+    }
 }

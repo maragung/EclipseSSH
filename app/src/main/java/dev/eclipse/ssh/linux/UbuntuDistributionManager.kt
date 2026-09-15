@@ -198,7 +198,38 @@ class UbuntuDistributionManager(
     private fun rewriteKeepingOthers(file: File, prefix: String, line: String) {
         check(file.isFile) { "the rootfs has no ${file.path}" }
         val kept = file.readLines().filterNot { it.startsWith(prefix) }
-        file.writeText((kept + line).joinToString("\n", postfix = "\n"))
+        writeAtomically(file, (kept + line).joinToString("\n", postfix = "\n"))
+    }
+
+    /**
+     * Replaces [file]'s content in one step: the new bytes land in a sibling temporary file, which
+     * is renamed onto the target. A rename within one directory is atomic on Linux, so whatever
+     * reads these files next — the shell a repair spawns, apt mid-run, or the app itself after a
+     * crash killed setup mid-write — sees either the old complete file or the new complete one,
+     * never a truncated `/etc/passwd`. A torn account file is not a repairable state: registerUser
+     * is idempotent only while the file parses.
+     *
+     * The rename also replaces a symlink *as a link* rather than writing through it, which is how
+     * [configureDns] swaps Ubuntu Base's `resolv.conf -> /run/systemd/resolve` stub for a real
+     * file without a delete-then-write window in which no resolv.conf exists at all.
+     *
+     * A crash between the write and the rename strands one `.name.new-<nanos>` file instead —
+     * inert, unparseable by nothing, and swept by nothing because nothing reads that name.
+     */
+    private fun writeAtomically(file: File, content: String) {
+        val parent = file.parentFile
+        check(parent != null && parent.isDirectory) { "the rootfs has no ${parent?.path ?: file.path}" }
+        val temp = File(parent, ".${file.name}.new-${System.nanoTime()}")
+        try {
+            temp.writeText(content)
+            if (!temp.renameTo(file)) {
+                throw IOException("could not replace ${file.path}: the rename in ${parent.path} failed")
+            }
+        } finally {
+            // After a successful rename the temp is the target now; this only cleans up when the
+            // rename never happened, so a failed write leaves no debris behind.
+            temp.delete()
+        }
     }
 
     private fun prepareWorkspace() {
@@ -214,9 +245,10 @@ class UbuntuDistributionManager(
         writtenDnsServers = servers
         val resolv = File(rootfs, "etc/resolv.conf")
         // Ubuntu Base ships this as a symlink into /run/systemd/resolve, which does not exist
-        // under proot; replace it with a real file or every name lookup fails.
-        resolv.delete()
-        resolv.writeText(
+        // under proot; the atomic replace writes a real file over the symlink (a rename replaces
+        // the link itself, not its target), so every name lookup does not fail.
+        writeAtomically(
+            resolv,
             buildString {
                 servers.forEach { append("nameserver $it\n") }
                 append("options timeout:2 attempts:3\n")
@@ -597,9 +629,10 @@ class UbuntuDistributionManager(
         try {
             val dir = File(rootfs, "etc/sudoers.d")
             dir.mkdirs()
-            // 0440, owner-only: sudo ignores a sudoers file it considers writable by others.
+            // 0440, owner-only: sudo ignores a sudoers file it considers writable by others —
+            // and refuses to parse a torn one, so the write is atomic like the other config files.
             val file = File(dir, "90-eclipse-ubuntu")
-            file.writeText("$ACCOUNT_NAME ALL=(ALL) NOPASSWD: ALL\n")
+            writeAtomically(file, "$ACCOUNT_NAME ALL=(ALL) NOPASSWD: ALL\n")
             file.setExecutable(false, false)
             file.setWritable(false, false)
             file.setReadable(true, false)
@@ -721,7 +754,7 @@ class UbuntuDistributionManager(
     }
 
     private fun writeSourcesList(baseUri: String) {
-        File(rootfs, "etc/apt/sources.list").writeText(sourcesListContent(distro, baseUri))
+        writeAtomically(File(rootfs, "etc/apt/sources.list"), sourcesListContent(distro, baseUri))
     }
 
     /**

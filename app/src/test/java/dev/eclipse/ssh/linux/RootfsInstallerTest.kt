@@ -304,6 +304,34 @@ class RootfsInstallerTest {
     }
 
     @Test
+    fun `a tarball for the wrong architecture is refused before it is moved into place`() = runBlocking {
+        val root = newRoot()
+        // A structurally complete x86-64 rootfs, hash-pinned correctly, downloaded and extracted
+        // cleanly — onto an arm64 distro. The installer's default validator derives the expected
+        // architecture from the distro, so the mismatch is caught at the staging directory rather
+        // than at the first exec inside proot.
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+            linkerName = "ld-linux-x86-64.so.2",
+        )
+        val installer = installInto(root, fixture)
+
+        var thrown: IOException? = null
+        try {
+            installer.install { }
+        } catch (e: IOException) {
+            thrown = e
+        }
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).contains("failed validation")
+        assertThat(thrown!!.message).contains("different architecture")
+        // The mismatched tree was reclaimed, and nothing looks installed.
+        assertThat(root.resolve("rootfs").exists()).isFalse()
+        assertThat(root.resolve("rootfs.staging").exists()).isFalse()
+        assertThat(installer.isExtracted()).isFalse()
+    }
+
+    @Test
     fun `a verified tarball left by a failed install is not downloaded again`() = runBlocking {
         val root = newRoot()
         val escapeParent = Files.createTempDirectory("linux-escape").toFile()

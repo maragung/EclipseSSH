@@ -24,8 +24,11 @@ internal object TestTarballs {
      * The trailing pad of zeros exists solely to carry the fixture past [RootfsValidator]'s
      * extracted-size floor: it gzip-compresses to almost nothing on disk but unpacks to more
      * bytes than a real rootfs would ever be mistaken for.
+     *
+     * @param linkerName which architecture's dynamic linker to ship; the wrong one on purpose is
+     *   how the validator's architecture check is tested
      */
-    fun writeRootfsFixture(target: File): File {
+    fun writeRootfsFixture(target: File, linkerName: String = "ld-linux-aarch64.so.1"): File {
         target.parentFile?.mkdirs()
         GZIPOutputStream(target.outputStream().buffered()).use { gzip ->
             TarArchiveOutputStream(gzip).use { tar ->
@@ -40,7 +43,7 @@ internal object TestTarballs {
                 putSymlink(tar, "bin/sh", "bash")
                 putSymlink(tar, "usr/bin/env", "../../bin/bash")
                 putFile(tar, "usr/bin/apt-get", "fake apt\n".toByteArray(), mode = 0b111_101_101)
-                putFile(tar, "lib/ld-linux-aarch64.so.1", "fake linker\n".toByteArray(), mode = 0b111_101_101)
+                putFile(tar, "lib/$linkerName", "fake linker\n".toByteArray(), mode = 0b111_101_101)
                 putFile(tar, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n".toByteArray())
                 putFile(tar, "etc/group", "root:x:0:\ndaemon:x:1:\n".toByteArray())
                 putFile(tar, "etc/shadow", "root:*:19850:0:99999:7:::\ndaemon:*:19850:0:99999:7:::\n".toByteArray())
@@ -99,12 +102,17 @@ internal object TestTarballs {
      * defaults to 0 — "unknown", which skips the size gates — because most tests only care about
      * the extraction; the gate tests pass a real number.
      */
-    fun fixtureDistro(url: String, sha256: String, rootfsSizeBytes: Long = 0L): LinuxDistro =
+    fun fixtureDistro(
+        url: String,
+        sha256: String,
+        rootfsSizeBytes: Long = 0L,
+        ubuntuArch: String = "arm64",
+    ): LinuxDistro =
         LinuxDistro(
             id = "ubuntu-22.04",
             displayName = "Ubuntu 22.04 LTS",
             release = "jammy",
-            ubuntuArch = "arm64",
+            ubuntuArch = ubuntuArch,
             rootfsTarballUrl = url,
             rootfsSha256 = sha256,
             rootfsSizeBytes = rootfsSizeBytes,

@@ -36,7 +36,7 @@ class RootfsInstaller(
     private val distro: LinuxDistro,
     private val downloader: HttpDownloader = UrlConnectionDownloader(),
     private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
-    private val validator: RootfsValidator = RootfsValidator(),
+    private val validator: RootfsValidator = RootfsValidator(expectedArch = distro.ubuntuArch),
 ) {
     /** Where the tarball is downloaded to before verification. */
     val tarballFile: File get() = File(storage.downloadsDir, "rootfs-${distro.ubuntuArch}.tar.gz")

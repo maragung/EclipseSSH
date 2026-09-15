@@ -21,6 +21,15 @@ class RootfsValidator(
      * without ever arguing about what a real image weighs.
      */
     private val minExtractedBytes: Long = DEFAULT_MIN_EXTRACTED_BYTES,
+    /**
+     * The Ubuntu architecture the tarball was pinned for ("arm64", "amd64", "armhf"). The rootfs's
+     * dynamic linker carries the ABI in its name, so the validation is a name match: an arm64
+     * tarball on an x86 device extracts cleanly, passes every existence check, and then dies at
+     * the first exec with only proot's word for why — here it is refused at the staging directory,
+     * named as an architecture mismatch. Null (or an unrecognized value) accepts any `ld-linux*`,
+     * the pre-architecture behavior, for callers with no expectation to state.
+     */
+    private val expectedArch: String? = null,
 ) {
     /** One broken expectation: [path] on disk does not satisfy [problem]. */
     data class Finding(val path: String, val problem: String)
@@ -40,8 +49,28 @@ class RootfsValidator(
                     findings += Finding(required, "is not executable")
             }
         }
-        if (findDynamicLinker(root) == null) {
-            findings += Finding("lib/ld-linux*", "no dynamic linker was found under lib/ or usr/lib/")
+        val expectedLinker = expectedArch?.let { LINKER_BY_ARCH[it] }
+        when {
+            // The architecture is pinned, so the linker must be that architecture's — and when a
+            // *different* one is present, saying so ("an x86-64 linker in an arm64 rootfs") beats
+            // the generic missing-file finding, because it names the actual mistake: the tarball
+            // does not match the device it was installed on.
+            expectedLinker != null && findFileNamed(root, expectedLinker) == null -> {
+                val present = findDynamicLinker(root)
+                findings +=
+                    if (present != null) {
+                        Finding(
+                            pathInsideRoot(root, present),
+                            "is the dynamic linker for a different architecture; " +
+                                "an $expectedArch rootfs needs $expectedLinker — the tarball " +
+                                "does not match this device",
+                        )
+                    } else {
+                        Finding("lib/$expectedLinker", "no dynamic linker was found under lib/ or usr/lib/")
+                    }
+            }
+            expectedLinker == null && findDynamicLinker(root) == null ->
+                findings += Finding("lib/ld-linux*", "no dynamic linker was found under lib/ or usr/lib/")
         }
         val total = extractedBytes(root)
         if (total < minExtractedBytes) {
@@ -61,12 +90,22 @@ class RootfsValidator(
      * Ubuntu filesystem hierarchy puts it in.
      */
     private fun findDynamicLinker(root: File): File? =
+        findNamed(root) { it.startsWith("ld-linux") }
+
+    /** The one file the manifest wants when the architecture is pinned: the linker by exact name. */
+    private fun findFileNamed(root: File, name: String): File? = findNamed(root) { it == name }
+
+    private fun findNamed(root: File, matches: (String) -> Boolean): File? =
         listOf(File(root, "lib"), File(root, "usr/lib"))
             .asSequence()
             .filter { it.isDirectory }
             .flatMap { it.walkTopDown() }
-            .filter { it.isFile && it.name.startsWith("ld-linux") }
+            .filter { it.isFile && matches(it.name) }
             .firstOrNull()
+
+    /** A rootfs-inside path ("/lib/ld-linux-aarch64.so.1"), the form findings name paths in. */
+    private fun pathInsideRoot(root: File, file: File): String =
+        "/" + root.toPath().relativize(file.toPath()).joinToString("/")
 
     private fun extractedBytes(root: File): Long =
         if (root.isDirectory) {
@@ -92,5 +131,17 @@ class RootfsValidator(
 
         /** A real image unpacks to tens of MB; anything under this did not really unpack. */
         const val DEFAULT_MIN_EXTRACTED_BYTES = 2L * 1024 * 1024
+
+        /**
+         * The dynamic linker each Ubuntu architecture ships, by the exact name it carries. The
+         * name is ABI-specific (a kernel execs only its own), which is what makes it an
+         * architecture check that needs no ELF parsing.
+         */
+        internal val LINKER_BY_ARCH =
+            mapOf(
+                "amd64" to "ld-linux-x86-64.so.2",
+                "arm64" to "ld-linux-aarch64.so.1",
+                "armhf" to "ld-linux-armhf.so.3",
+            )
     }
 }
