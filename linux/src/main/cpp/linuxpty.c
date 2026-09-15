@@ -93,6 +93,18 @@ static void child_stage_failed(int fd, int stage, int error) {
     (void) n;
 }
 
+/* An informational stage report that carries an errno - used by
+ * PTY_STAGE_PEER_FALLBACK so the parent can log WHY the ioctl route was
+ * skipped, not just that it was. The parser knows this one stage is followed
+ * by an int32 payload. */
+static void child_stage_errno(int fd, int stage, int error) {
+    uint8_t code = (uint8_t) stage;
+    int32_t reported = error;
+    ssize_t n = write(fd, &code, 1);
+    n = write(fd, &reported, sizeof(reported));
+    (void) n;
+}
+
 static const char *stage_name(int stage) {
     switch (stage) {
         case PTY_STAGE_SIGMASK: return "unblocking the signal mask";
@@ -144,10 +156,14 @@ static int report_child_progress(int fd, const char *program, int *failure_errno
         }
         used += (size_t) n;
     }
-    /* Parse: stage bytes in order, possibly ending in a fail marker. */
+    /* Parse: stage bytes in order, possibly ending in a fail marker. The
+     * PEER_FALLBACK stage byte is followed by an int32 - the errno the
+     * TIOCGPTPEER ioctl itself returned - so that even a successful fallback
+     * leaves the ioctl's own failure reason in the log. */
     int last_stage = 0;
     int failed_stage = 0;
     int failure_errno_ = 0;
+    int peer_errno = 0;
     for (size_t i = 0; i < used; i++) {
         if (buf[i] >= 0x80) {
             failed_stage = buf[i] & 0x7f;
@@ -156,7 +172,21 @@ static int report_child_progress(int fd, const char *program, int *failure_errno
             }
             break;
         }
+        if (buf[i] == PTY_STAGE_PEER_FALLBACK) {
+            if (i + 1 + sizeof(int32_t) <= used) {
+                memcpy(&peer_errno, buf + i + 1, sizeof(int32_t));
+                i += sizeof(int32_t);
+            }
+            last_stage = buf[i];
+            continue;
+        }
         last_stage = buf[i];
+    }
+    if (peer_errno != 0) {
+        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                            "pty child's TIOCGPTPEER failed with errno %d; "
+                            "it fell back to opening the slave by path",
+                            peer_errno);
     }
     if (failed_stage != 0) {
         __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
@@ -269,6 +299,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
      * moot - but an indeterminate value would be a real bug. */
     int master = -1;
     int used_pts_ptmx = 0;
+    int pts_ptmx_errno = 0;
     if (argv == NULL || child_env == NULL) {
         free(argv);
         free(child_env);
@@ -303,6 +334,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
     master = open("/dev/pts/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
     used_pts_ptmx = master >= 0;
     if (master < 0) {
+        pts_ptmx_errno = errno;
         master = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
     }
     if (master < 0) {
@@ -323,21 +355,30 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         goto out;
     }
 
-    /* One evidence line per spawn: which ptmx this device answered, and
-     * whether the allocated slave node is even present in the /dev/pts the
-     * child would open it from. The API 35 emulator produced open(slave) EIO
-     * with no other clue anywhere; these two facts discriminate between the
-     * "master and slave live in different devpts instances" explanation (node
-     * absent) and flag-state explanations (node present). */
+    /* One evidence line per spawn: which ptmx this device answered, why the
+     * instance-local one was skipped when it was, and whether the allocated
+     * slave node is even present in the /dev/pts the child would open it
+     * from. The API 35 emulator produced open(slave) EIO with no other clue
+     * anywhere; these facts discriminate between the "master and slave live
+     * in different devpts instances" explanation (node absent) and
+     * flag-state explanations (node present). */
     {
         struct stat st;
         int slave_present = stat(slave_path, &st) == 0;
-        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
-                            "pty master via %s, slave %s %s",
-                            used_pts_ptmx ? "/dev/pts/ptmx" : "/dev/ptmx (legacy)",
-                            slave_path,
-                            slave_present ? "present in /dev/pts"
-                                          : "ABSENT from /dev/pts (devpts instances disagree?)");
+        if (used_pts_ptmx) {
+            __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                                "pty master via /dev/pts/ptmx, slave %s %s",
+                                slave_path,
+                                slave_present ? "present in /dev/pts"
+                                              : "ABSENT from /dev/pts (devpts instances disagree?)");
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                                "pty master via /dev/ptmx (legacy; open(/dev/pts/ptmx) errno %d), "
+                                "slave %s %s",
+                                pts_ptmx_errno, slave_path,
+                                slave_present ? "present in /dev/pts"
+                                              : "ABSENT from /dev/pts (devpts instances disagree?)");
+        }
     }
 
     pthread_mutex_lock(&ptys_lock);
@@ -391,15 +432,18 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
         child_stage(diag_fd, PTY_STAGE_SETSID);
         /* Ask the kernel for the peer of the master this child already holds,
          * instead of resolving the /dev/pts path. The path is a guess about
-         * which devpts instance the master belongs to - on the API 35 emulator
-         * that guess is wrong (the slave open returns EIO, pty_open's
+         * which devpts instance the master belongs to - on the API 35
+         * emulator that guess fails (the slave open returns EIO, pty_open's
          * !tty->link), while TIOCGPTPEER cannot be wrong about instances: it
-         * is the master fd's own peer, handed over by the kernel. Passing
-         * O_RDWR without O_NOCTTY also makes it the controlling terminal of
-         * this fresh session, exactly what open(slave) after setsid did. */
-        int slave = ioctl(master, TIOCGPTPEER, O_RDWR);
+         * is the master fd's own peer, handed over by the kernel. The flags
+         * argument admits ONLY O_CLOEXEC and O_NOCTTY - the kernel returns
+         * EINVAL for anything else, including the O_RDWR a plain open would
+         * use (that exact mistake cost one E2E run). Zero means neither: the
+         * returned fd may become this fresh session's controlling terminal,
+         * which is exactly what open(slave) after setsid did. */
+        int slave = ioctl(master, TIOCGPTPEER, 0);
         if (slave < 0) {
-            child_stage(diag_fd, PTY_STAGE_PEER_FALLBACK);
+            child_stage_errno(diag_fd, PTY_STAGE_PEER_FALLBACK, errno);
             slave = open(slave_path, O_RDWR);
         }
         if (slave < 0) {
