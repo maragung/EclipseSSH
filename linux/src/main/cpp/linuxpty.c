@@ -23,10 +23,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
@@ -54,20 +56,35 @@ static struct pty_slot *slot_for_master(int master) {
     return NULL;
 }
 
-/* Resets every catchable signal to its default and unblocks all masks. ART
- * installs handlers and blocks signals on its own threads; dispositions set
- * to SIG_IGN survive execve(), so a plain fork without this would leave the
- * child ignoring signals proot and the rootfs programs rely on. */
-static void reset_signals(void) {
-    sigset_t empty;
-    sigemptyset(&empty);
-    sigprocmask(SIG_SETMASK, &empty, NULL);
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = SIG_DFL;
-    for (int sig = 1; sig < 64; sig++) {
-        sigaction(sig, &sa, NULL);
-    }
+/* How long one lap of the read loop may park before re-checking whether the
+ * pty is still alive. Purely an upper bound on teardown-detection latency;
+ * data still arrives the moment poll() sees it. */
+#define PTY_READ_POLL_MS 250
+
+/* Un-blocks every signal the forking thread had blocked, through the RAW
+ * syscall. Both libc signal entry points - sigaction(3) and sigprocmask(3) -
+ * are interposed by ART's libsigchain, and the interposer is not fork-safe:
+ * it takes its own locks and unwinds stacks, and a fork inherits only the
+ * calling thread, so any lock another thread held at fork() is held forever.
+ * In the half-forked child that is where a spawn wedges or dies - and the
+ * death is silent, because the disposition change under discussion (SIGSEGV
+ * to SIG_DFL) removes the very handler that would have reported it. That was
+ * the 2026-09 emulator install hang: every first proot spawn stopped inside
+ * the interposer before open(slave) or execve ever ran, the master side
+ * never saw a hangup, and the install sat on "Configuring DNS" until the
+ * harness's own timeout. The raw syscall enters no interposer, and needs no
+ * ABI guesswork: rt_sigprocmask's only nonstandard argument is the sigset
+ * size, which for the kernel is always 8 bytes (64 signals, one long).
+ *
+ * Nothing else is reset because nothing else needs it: execve(2) itself
+ * resets every *caught* handler to SIG_DFL, and only dispositions set to
+ * SIG_IGN (plus the blocked mask) can survive an exec - ART installs
+ * handlers, never SIG_IGN, for the signals it manages. The mask is the one
+ * thing worth fixing, and this is the only fork-safe way to do it. */
+static void unblock_all_signals(void) {
+    unsigned long empty_mask = 0;
+    syscall(SYS_rt_sigprocmask, SIG_SETMASK, &empty_mask, NULL,
+            sizeof(empty_mask));
 }
 
 /*
@@ -172,7 +189,7 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
 
     if (pid == 0) {
         /* Child. Async-signal-safe calls only. */
-        reset_signals();
+        unblock_all_signals();
         setsid();
         int slave = open(slave_path, O_RDWR);
         if (slave < 0) _exit(126);
@@ -220,13 +237,20 @@ out:
  * Class:     dev_eclipse_ssh_linux_LinuxPty
  * Method:    read
  *
- * Blocking read from the master side, into a stack buffer that is then
- * copied into the Java array (at most 4096 bytes per call - a read is
- * allowed to return short; callers looping until their buffer is full is
- * normal stream semantics). Returns the byte count, or -1 on
- * end-of-stream: when the child side exits, reads fail with EIO (Linux pty
- * semantics), which is the signal the JVM read loop treats as EOF. EINTR is
- * retried internally.
+ * Read from the master side, into a stack buffer that is then copied into
+ * the Java array (at most 4096 bytes per call - a read is allowed to return
+ * short; callers looping until their buffer is full is normal stream
+ * semantics). Returns the byte count, or -1 on end-of-stream: when the child
+ * side exits, reads fail with EIO (Linux pty semantics), which is the signal
+ * the JVM read loop treats as EOF. EINTR is retried internally.
+ *
+ * The wait runs through poll() with a timeout, not a bare blocking read,
+ * because a blocked read is un-interruptible by anything but the pty itself:
+ * close() on the descriptor does not wake it, and a child that died before
+ * ever opening the slave generates no master-side hangup at all - both
+ * shapes left the reader parked forever (the 2026-09 install hang). Each
+ * poll timeout re-checks the slot, so a teardown by any thread becomes an
+ * end-of-stream within one interval, whatever state the pty pair is in.
  *
  * A pty whose slot is already freed was closed or reaped by another thread;
  * it reports end-of-stream rather than reading through a descriptor number
@@ -246,10 +270,37 @@ Java_dev_eclipse_ssh_linux_LinuxPty_read(
     jbyte buf[4096];
     jint chunk = length < (jint) sizeof(buf) ? length : (jint) sizeof(buf);
     ssize_t n;
-    do {
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int ready = poll(&pfd, 1, PTY_READ_POLL_MS);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ready == 0) {
+            /* A full interval with nothing readable. The pty may have been
+             * torn down by another thread while this read was parked - the
+             * re-check below is the only thing that turns that teardown into
+             * an end-of-stream for a reader the pty itself cannot wake. */
+            pthread_mutex_lock(&ptys_lock);
+            live = slot_for_master(fd) != NULL;
+            pthread_mutex_unlock(&ptys_lock);
+            if (!live) return -1;
+            continue;
+        }
+        if (pfd.revents & POLLNVAL) {
+            /* The descriptor number is closed - only our own teardown closes
+             * it. Reading through the number now could hit a descriptor
+             * another thread has since reused. */
+            return -1;
+        }
+        /* Data or hangup readable; a hangup reads as the EIO below, the
+         * documented end-of-stream for a pty master. */
         n = read(fd, buf, (size_t) chunk);
-    } while (n < 0 && errno == EINTR);
-    if (n <= 0) return -1;
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        break;
+    }
     (*env)->SetByteArrayRegion(env, buffer, offset, (jsize) n, buf);
     return (jint) n;
 }

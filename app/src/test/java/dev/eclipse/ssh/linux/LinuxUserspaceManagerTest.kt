@@ -317,6 +317,31 @@ class LinuxUserspaceManagerTest {
     }
 
     @Test
+    fun `a reader that no close can wake is abandoned, not awaited forever`() = runBlocking {
+        val root = Files.createTempDirectory("proot-abandon").toFile().apply { deleteOnExit() }
+        val process = UnwakeablePtyProcess()
+        val runtime = ProotRuntime(
+            root,
+            "/fake/native/lib",
+            spawner = { _, _, _, _, _ -> process },
+            readerDrainTimeoutMs = 200,
+        )
+
+        // The kernel-truth worst case: the timeout closed the pty but the parked read never
+        // returned — the 2026-09 install hang's exact shape, a child that died before opening
+        // the slave so no hangup ever came. The call must still come back (bounded failure)
+        // instead of holding the install on "Configuring DNS". The parked reader thread leaks
+        // for the rest of the JVM — accepted in production (a log line, not a hang) and
+        // harmless in a test.
+        val result = kotlinx.coroutines.withTimeout(10_000) {
+            runtime.runCommand(listOf("proot"), timeoutMs = 200)
+        }
+
+        assertThat(result).isNull()
+        assertThat(process.closed).isTrue()
+    }
+
+    @Test
     fun `scripted commands are visible and killable while in flight`() = runBlocking {
         val root = Files.createTempDirectory("proot-kill").toFile().apply { deleteOnExit() }
         val process = BlockingPtyProcess()
@@ -449,5 +474,34 @@ internal class BlockingPtyProcess : PtyProcess {
     override fun close() {
         closed = true
         wake.countDown()
+    }
+}
+
+/**
+ * The wedge even a well-behaved close cannot fix: a child that died before opening the slave
+ * generates no master-side hangup, so the parked read stays parked forever. Unlike
+ * [BlockingPtyProcess], close() marks itself but never wakes the read — the kernel's own
+ * behavior when the slave end was never opened.
+ */
+private class UnwakeablePtyProcess : PtyProcess {
+    private val never = CountDownLatch(1)
+
+    var closed = false
+        private set
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        // No wake exists. The reader's only exits are the runtime abandoning it or the JVM dying.
+        never.await()
+        return -1
+    }
+
+    override fun write(buffer: ByteArray, offset: Int, length: Int): Int = length
+
+    override fun resize(rows: Int, columns: Int) = Unit
+
+    override fun awaitExit(): Int = 0
+
+    override fun close() {
+        closed = true
     }
 }

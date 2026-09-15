@@ -1,9 +1,12 @@
 package dev.eclipse.ssh.linux
 
+import android.util.Log
 import dev.eclipse.ssh.ssh.TerminalChannel
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -51,12 +54,16 @@ data class ProotCommandResult(
  * @param storage the one owner of every userspace path; defaults to one for this root, but the
  *   graph passes its shared instance so runtime and installer can never disagree about where the
  *   rootfs lives
+ * @param readerDrainTimeoutMs how long a timed-out command waits for its reader to wake after the
+ *   pty close, before the reader is abandoned; injectable so a test can exercise the abandonment
+ *   without sleeping the production budget
  */
 class ProotRuntime(
     val rootDir: File,
     private val nativeLibraryDir: String,
     private val spawner: PtySpawner,
     private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
+    private val readerDrainTimeoutMs: Long = READER_DRAIN_TIMEOUT_MS,
 ) {
     val rootfsDir: File get() = storage.rootfsDir
     val tmpDir: File get() = storage.tmpDir
@@ -166,6 +173,19 @@ class ProotRuntime(
      * the blocked read and SIGHUPs the child — which is why the close lives on the timeout path
      * and in the catch, not only in a finally the timeout could not reach.
      *
+     * The wake itself is not assumed: a child that died before opening the slave never generates
+     * the hangup, and a close on an fd never interrupts a read already parked on it — the native
+     * read loop re-checks liveness so a teardown still ends the read, but the drain here carries
+     * its own short budget too. A reader still parked past it is abandoned with a log line rather
+     * than awaited forever (the 2026-09 emulator hang: a first-spawn child wedged inside
+     * libsigchain's sigaction interposer left exactly such a reader, and the install sat on
+     * "Configuring DNS" until the harness's own timeout). For that abandonment to be possible
+     * at all, the reader runs *detached* from this method's scope — a child coroutine would make
+     * the return itself wait on the read being abandoned. Bounded failure, never a silent wedge.
+     *
+     * Every spawn and outcome is logged under the shared [UserspaceDiagnostics.TAG], because the
+     * one fact a wedged install cannot otherwise name is *which* command never answered.
+     *
      * [onOutput], when given, sees each chunk as it arrives instead of only at the end. It exists
      * for the minutes-long setup commands: an `apt-get update` whose output nobody sees until it
      * finishes is indistinguishable from a wedged one on the install screen. Called on
@@ -174,7 +194,7 @@ class ProotRuntime(
      *
      * @param timeoutMs the whole command — output, exit, everything — must finish within this
      * @return the exit code and output, or null when the command did not finish in time (the
-     *   child has been SIGHUPed by then, not leaked)
+     *   child has been SIGHUPed by then, and the reader woken or abandoned)
      */
     suspend fun runCommand(
         argv: List<String>,
@@ -183,10 +203,21 @@ class ProotRuntime(
         onOutput: ((ByteArray) -> Unit)? = null,
     ): ProotCommandResult? = withContext(Dispatchers.IO) {
         storage.requireReady()
+        // The tail of argv is the command itself for scripted runs (`… bash --login -c getent …`)
+        // and the shell path for sessions — either way, the one token that names what this spawn is.
+        val command = (argv.lastOrNull() ?: "proot").take(COMMAND_LOG_CHARS)
+        val startedAt = System.currentTimeMillis()
+        Log.i(UserspaceDiagnostics.TAG, "proot command started: $command")
         val process = spawner.spawn(argv, env, spawnCwd.absolutePath, rows = 24, columns = 80)
         liveScripted += process
+        // The reader is deliberately NOT a child of this scope. It parks in a blocking JNI
+        // read that no cancellation can reach, and structured concurrency would make this
+        // whole call wait for it before returning - the exact wedge the drain budget below
+        // exists to bound. Detached, the timeout path can abandon it and return; the close()
+        // is what ends the read in every case the pty itself can cooperate with.
+        val reader = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+            .async { readToCompletion(process, onOutput) }
         try {
-            val reader = async { readToCompletion(process, onOutput) }
             val output = withTimeoutOrNull(timeoutMs) { reader.await() }
             if (output == null) {
                 // Timed out: the reader is still parked in a blocking read no cancellation can
@@ -194,12 +225,29 @@ class ProotRuntime(
                 // child. The reader's read then errors — the expected face of a torn-down pty,
                 // which readToCompletion treats as end-of-stream.
                 runCatching { process.close() }
-                runCatching { reader.await() }
+                val drained = withTimeoutOrNull(readerDrainTimeoutMs) { reader.await() }
+                if (drained == null) {
+                    Log.w(
+                        UserspaceDiagnostics.TAG,
+                        "proot command abandoned: $command did not wake " +
+                            "${readerDrainTimeoutMs / 1000}s after its ${timeoutMs / 1000}s timeout close",
+                    )
+                    // Cancelled, not left quietly half-alive: if the read ever does return,
+                    // the job ends instead of idling, and debug tooling shows it as cancelled.
+                    reader.cancel()
+                }
+                Log.w(UserspaceDiagnostics.TAG, "proot command timed out after ${timeoutMs / 1000}s: $command")
                 null
             } else {
                 // After end-of-stream the child has exited; the reap is quick and race-free by
                 // design (see linuxpty.c: awaitExit waits on a child that has already terminated).
-                ProotCommandResult(process.awaitExit(), output)
+                val exitCode = process.awaitExit()
+                Log.i(
+                    UserspaceDiagnostics.TAG,
+                    "proot command finished: exit=$exitCode" +
+                        " dur=${(System.currentTimeMillis() - startedAt) / 1000}s: $command",
+                )
+                ProotCommandResult(exitCode, output)
             }
         } catch (t: Throwable) {
             // Cancellation and reader failure both land here: either way the child is SIGHUPed
@@ -246,6 +294,18 @@ class ProotRuntime(
     companion object {
         /** Long enough for `apt-get update` over a slow link; most commands finish far sooner. */
         const val DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000L
+
+        /**
+         * How long a timed-out command's reader gets to wake after the pty close before it is
+         * abandoned. The native read loop ends a torn-down pty's read within a poll interval, so
+         * the drain virtually always succeeds; the budget exists for whatever the kernel and the
+         * child conspire to leave un-wakeable, where the choice is a leaked reader coroutine or
+         * a wedged install — and a leaked coroutine is a line in the log, not a hang.
+         */
+        const val READER_DRAIN_TIMEOUT_MS = 5_000L
+
+        /** The command token's cap for log lines: enough to name it, never enough to be a transcript. */
+        private const val COMMAND_LOG_CHARS = 120
 
         private const val READ_CHUNK = 4096
     }

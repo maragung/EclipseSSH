@@ -56,6 +56,28 @@ LABEL_LOCAL_CARD = "Local Ubuntu"
 BUTTON_INSTALL = "Install"
 BUTTON_REPAIR = "Repair"
 
+# The install screen's step subtitles (MainActivity's describeInstallStep /
+# describeSetupStep) - the line under the title that says WHERE the install is.
+# Matched with startswith so the title ("Installing Ubuntu 22.04 LTS") never
+# poses as a step; the driver logs the pair so a hang names its step
+# ("Configuring DNS") instead of only the state it never left - the gap that
+# made the 2026-09 hung run read as a title-only timeout.
+STEP_SUBTITLES = (
+    "Downloading",
+    "Verifying the download",
+    "Verifying",
+    "Extracting",
+    "Creating the ubuntu account",
+    "Preparing the workspace",
+    "Configuring DNS",
+    "Configuring package sources",
+    "Updating package lists",
+    "Installing the base packages",
+    "Installing Node.js",
+    "Installing pnpm and the OpenCode CLI",
+    "Running the health check",
+)
+
 POLL_SECONDS = 10
 PROGRESS_SHOT_EVERY = 60
 
@@ -122,6 +144,22 @@ class E2eDriver:
                     if (attr == needle) if exact else (needle in attr):
                         return el
         return None
+
+    def install_label(self, elements):
+        """The Installing state's on-screen label: the title, plus the step
+        subtitle when one is showing - so a stuck install names its step, not
+        just the state it never left."""
+        installing = self.find(elements, LABEL_INSTALLING)
+        if not installing:
+            return None
+        title = installing.attrs.get("text", "")[:120]
+        subtitle = None
+        for el in elements:
+            text = el.attrs.get("text", "")
+            if text and any(text.startswith(prefix) for prefix in STEP_SUBTITLES):
+                subtitle = text[:120]
+                break
+        return "%s | %s" % (title, subtitle) if subtitle else title
 
     def tap(self, element):
         x, y = element.center
@@ -368,9 +406,8 @@ class E2eDriver:
                     (repair.attrs.get("text", "")[:200]))
             if self.find(els, LABEL_INSTALLED):
                 return LABEL_INSTALLED
-            installing = self.find(els, LABEL_INSTALLING)
-            if installing:
-                label = installing.attrs.get("text", "")[:120]
+            label = self.install_label(els)
+            if label:
                 if label != last_label:
                     self.log("install progress: %s" % label)
                     last_label = label
@@ -640,6 +677,7 @@ class E2eDriver:
         # The recovery contract: NotInstalled (clean) or NeedsRepair (named) -
         # never Installed, never a wedged Installing forever.
         state = None
+        last_label = ""
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline and state is None:
             els = self.dump()
@@ -651,11 +689,19 @@ class E2eDriver:
                 state = "needs-repair"
             elif self.find(els, LABEL_INSTALL_ROW):
                 state = "not-installed"
+            else:
+                # Still Installing for whatever reason - name the step, so a wedge
+                # here is diagnosable from the log alone.
+                label = self.install_label(els)
+                if label and label != last_label:
+                    self.log("post-kill screen: %s" % label)
+                    last_label = label
             time.sleep(5)
         if state is None:
             raise RuntimeError(
                 "INTERRUPT stage: after relaunch the userspace row settled on no "
-                "recognizable state within 2 minutes")
+                "recognizable state within 2 minutes (last: %s)"
+                % (last_label or "nothing observed"))
         self.log("post-kill state: %s (the honest recovery state)" % state)
         shot = self.screenshot("interrupt-recovery")
         if shot:
@@ -686,6 +732,7 @@ class E2eDriver:
         # honest failure state within a bounded window - never wedge, never
         # claim success.
         state = None
+        last_label = ""
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline and state is None:
             els = self.dump()
@@ -697,6 +744,12 @@ class E2eDriver:
                 state = "needs-repair"
             elif self.find(els, LABEL_INSTALL_ROW):
                 state = "not-installed"
+            else:
+                # Still Installing under a dead network - name the step it is stuck on.
+                label = self.install_label(els)
+                if label and label != last_label:
+                    self.log("network-cut screen: %s" % label)
+                    last_label = label
             time.sleep(POLL_SECONDS)
         shot = self.screenshot("network-cut")
         if shot:
@@ -704,7 +757,8 @@ class E2eDriver:
         if state is None:
             raise RuntimeError(
                 "NETWORK stage: with the network cut the install neither failed "
-                "nor finished within 15 minutes")
+                "nor finished within 15 minutes (last: %s)"
+                % (last_label or "nothing observed"))
         if not self.adb.airplane_mode(False):
             raise RuntimeError("NETWORK stage: could not disable airplane mode")
         self.log("airplane mode off; the install failed honestly as %s" % state)
