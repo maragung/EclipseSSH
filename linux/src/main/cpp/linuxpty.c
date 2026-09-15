@@ -21,24 +21,155 @@
 
 #include <jni.h>
 
+#include <android/log.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <pthread.h>
+
+/* The logcat tag the Kotlin side's UserspaceDiagnostics already owns; the
+ * E2E pipeline greps this tag, so the pty bridge reports under it too. */
+#define PTY_LOG_TAG "EclipseSSH"
 
 /* Hard cap on simultaneously open local terminals. The userspace opens at
  * most a handful; a runaway leak hits this ceiling and fails loudly instead
  * of exhausting the fd table. */
 #define MAX_PTYS 16
+
+/* Child progress reporting, through a pipe whose write end is CLOEXEC:
+ * the child writes one byte per stage it passes, and a fail marker
+ * (0x80 | stage) plus the errno when a stage fails. The write end closing
+ * (EOF at the parent) without a fail marker means execve() happened - the
+ * one fact nothing else can prove, because a child that dies before
+ * open(slave) produces no hangup, and one that dies by SIG_DFL signal
+ * leaves no tombstone. That silence was three E2E runs of "the proot
+ * child vanished": this pipe turns it into a named stage and errno. */
+#define PTY_STAGE_SIGMASK 1
+#define PTY_STAGE_SETSID 2
+#define PTY_STAGE_OPEN_SLAVE 3
+#define PTY_STAGE_CTTY 4
+#define PTY_STAGE_STDIO 5
+#define PTY_STAGE_CHDIR 6
+#define PTY_STAGE_EXECVE 7
+
+/* How long the parent waits for the child's verdict. A healthy child
+ * reaches execve in single-digit milliseconds; only a wedged child costs
+ * the full budget, and a wedged child means a failed command anyway. */
+#define PTY_DIAG_BUDGET_MS 750
+
+static void child_stage(int fd, int stage) {
+    uint8_t code = (uint8_t) stage;
+    ssize_t n = write(fd, &code, 1);
+    (void) n;
+}
+
+static void child_stage_failed(int fd, int stage, int error) {
+    uint8_t code = (uint8_t) (0x80 | stage);
+    int32_t reported = error;
+    ssize_t n = write(fd, &code, 1);
+    n = write(fd, &reported, sizeof(reported));
+    (void) n;
+}
+
+static const char *stage_name(int stage) {
+    switch (stage) {
+        case PTY_STAGE_SIGMASK: return "unblocking the signal mask";
+        case PTY_STAGE_SETSID: return "setsid";
+        case PTY_STAGE_OPEN_SLAVE: return "opening the slave pty";
+        case PTY_STAGE_CTTY: return "claiming the controlling terminal";
+        case PTY_STAGE_STDIO: return "redirecting stdio";
+        case PTY_STAGE_CHDIR: return "chdir";
+        case PTY_STAGE_EXECVE: return "execve";
+        default: return "an unnamed stage";
+    }
+}
+
+/* Reads the child's progress report and logs the verdict. Bounded by
+ * [PTY_DIAG_BUDGET_MS]: EOF means the child exec'd (or exited after
+ * reporting a failure); a timeout with the pipe still open means the child
+ * is wedged - and the last stage it reported names where. */
+static void report_child_progress(int fd, const char *program) {
+    uint8_t buf[64];
+    size_t used = 0;
+    int eof = 0;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    while (used < sizeof(buf)) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+                             (now.tv_nsec - start.tv_nsec) / 1000000;
+        int remaining_ms = (int) (PTY_DIAG_BUDGET_MS - elapsed_ms);
+        if (remaining_ms <= 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int ready = poll(&pfd, 1, remaining_ms);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ready == 0) break;
+        ssize_t n = read(fd, buf + used, sizeof(buf) - used);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) {
+            eof = 1;
+            break;
+        }
+        used += (size_t) n;
+    }
+    /* Parse: stage bytes in order, possibly ending in a fail marker. */
+    int last_stage = 0;
+    int failed_stage = 0;
+    int failure_errno = 0;
+    for (size_t i = 0; i < used; i++) {
+        if (buf[i] >= 0x80) {
+            failed_stage = buf[i] & 0x7f;
+            if (i + 1 + sizeof(int32_t) <= used) {
+                memcpy(&failure_errno, buf + i + 1, sizeof(int32_t));
+            }
+            break;
+        }
+        last_stage = buf[i];
+    }
+    if (failed_stage != 0) {
+        __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
+                            "pty child failed at %s (errno %d) launching %s",
+                            stage_name(failed_stage), failure_errno, program);
+        return;
+    }
+    if (last_stage >= PTY_STAGE_EXECVE) {
+        /* The write end closed after the pre-execve report: execve happened.
+         * Errors past this point are the exec'd program's to report. */
+        __android_log_print(ANDROID_LOG_INFO, PTY_LOG_TAG,
+                            "pty child reached execve: %s", program);
+        return;
+    }
+    if (!eof) {
+        __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
+                            "pty child stalled before execve at %s, launching %s",
+                            last_stage == 0 ? "its first instruction" : stage_name(last_stage),
+                            program);
+        return;
+    }
+    /* EOF with stages but no execve report and no failure record: the child
+     * died between stages - a signal, since every _exit path reports. */
+    __android_log_print(ANDROID_LOG_WARN, PTY_LOG_TAG,
+                        "pty child died silently after %s, launching %s (killed by a signal?)",
+                        last_stage == 0 ? "fork" : stage_name(last_stage), program);
+}
 
 struct pty_slot {
     int master;
@@ -176,8 +307,20 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
     slot->pid = -1;
     pthread_mutex_unlock(&ptys_lock);
 
+    /* The child's progress pipe, created last so no earlier failure path has
+     * to clean it up. O_CLOEXEC on both ends is the whole trick: the child's
+     * write end closes itself the moment execve succeeds, so EOF at this side
+     * IS the proof the exec happened. Degrades to yesterday's silence if the
+     * pipe cannot be created - a missing diagnostic never breaks a spawn. */
+    int diag[2];
+    int have_diag = pipe2(diag, O_CLOEXEC) == 0;
+
     pid_t pid = fork();
     if (pid < 0) {
+        if (have_diag) {
+            close(diag[0]);
+            close(diag[1]);
+        }
         pthread_mutex_lock(&ptys_lock);
         slot->in_use = 0;
         pthread_mutex_unlock(&ptys_lock);
@@ -188,25 +331,49 @@ Java_dev_eclipse_ssh_linux_LinuxPty_spawn(
     }
 
     if (pid == 0) {
-        /* Child. Async-signal-safe calls only. */
+        /* Child. Async-signal-safe calls only - write(2) included, which is
+         * what the stage reports below use. */
+        if (have_diag) close(diag[0]);
+        int diag_fd = have_diag ? diag[1] : -1;
         unblock_all_signals();
+        child_stage(diag_fd, PTY_STAGE_SIGMASK);
         setsid();
+        child_stage(diag_fd, PTY_STAGE_SETSID);
         int slave = open(slave_path, O_RDWR);
-        if (slave < 0) _exit(126);
+        if (slave < 0) {
+            child_stage_failed(diag_fd, PTY_STAGE_OPEN_SLAVE, errno);
+            _exit(126);
+        }
+        child_stage(diag_fd, PTY_STAGE_OPEN_SLAVE);
         /* Opening a tty after setsid() already makes it the controlling
          * terminal on Linux; the ioctl is belt-and-braces for any kernel
          * that disagrees. */
         ioctl(slave, TIOCSCTTY, 0);
+        child_stage(diag_fd, PTY_STAGE_CTTY);
         dup2(slave, 0);
         dup2(slave, 1);
         dup2(slave, 2);
         if (slave > 2) close(slave);
         close(master);
+        child_stage(diag_fd, PTY_STAGE_STDIO);
         if (cwd[0] != '\0') {
-            if (chdir(cwd) != 0) _exit(126);
+            if (chdir(cwd) != 0) {
+                child_stage_failed(diag_fd, PTY_STAGE_CHDIR, errno);
+                _exit(126);
+            }
         }
+        child_stage(diag_fd, PTY_STAGE_CHDIR);
+        child_stage(diag_fd, PTY_STAGE_EXECVE);
         execve(argv[0], argv, child_env);
+        child_stage_failed(diag_fd, PTY_STAGE_EXECVE, errno);
         _exit(127);
+    }
+
+    if (have_diag) {
+        close(diag[1]);
+        const char *slash = strrchr(argv[0], '/');
+        report_child_progress(diag[0], slash != NULL ? slash + 1 : argv[0]);
+        close(diag[0]);
     }
 
     pthread_mutex_lock(&ptys_lock);

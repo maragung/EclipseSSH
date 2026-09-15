@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.eclipse.ssh.di.LinuxUserspaceGraphProvider
+import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import org.junit.Assume.assumeTrue
@@ -68,14 +69,25 @@ class UbuntuE2eVerificationTest {
     /**
      * One real session command, run to completion with a per-command timeout. The message names
      * the stage so the pipeline's failure report can attribute the break to a phase, not just a
-     * stack trace.
+     * stack trace — and carries whatever the command printed before going silent, because "no
+     * output" and "started printing then died" are different diagnoses (proot errors, shell
+     * errors and DNS messages all live in that partial output).
      */
     private fun session(command: String, timeoutMs: Long = COMMAND_TIMEOUT_MS): ProotCommandResult {
         val runtime = graph.runtime
+        val partial = StringBuilder()
         val result = runBlocking {
-            runtime.runCommand(runtime.sessionArgv(command), env = runtime.baseEnv(), timeoutMs = timeoutMs)
+            runtime.runCommand(runtime.sessionArgv(command), env = runtime.baseEnv(),
+                timeoutMs = timeoutMs) { chunk ->
+                synchronized(partial) { partial.append(chunk.toString(Charsets.UTF_8)) }
+            }
         }
-        checkNotNull(result) { "UBUNTU SHELL stage: '$command' did not answer within ${timeoutMs / 1000}s" }
+        checkNotNull(result) {
+            val printed = synchronized(partial) { partial.toString() }
+            "UBUNTU SHELL stage: '$command' did not answer within ${timeoutMs / 1000}s" +
+                (if (printed.isBlank()) " and printed nothing at all"
+                else " but printed this before going silent: ${printed.take(2000)}")
+        }
         return result
     }
 
@@ -94,6 +106,59 @@ class UbuntuE2eVerificationTest {
         val state = manager.state.value
         check(state is LinuxUserspaceState.Stopped) {
             "STATE stage: expected Stopped (installed and health-probed), was $state"
+        }
+    }
+
+    /**
+     * The A/B for a wedged pty path: the very same libproot.so, rootfs and environment the
+     * sessions use, but exec'd straight through [ProcessBuilder] — no pty pair, no fork of our
+     * own, nothing of [LinuxPty] in the process. When pty-backed commands hang but this passes,
+     * the break is in the pty bridge's child (the fork-side code path); when this hangs too,
+     * proot itself does not run on this ABI/emulator combination. Either verdict names the next
+     * fix precisely, which is why it lives here rather than in a one-off manual probe.
+     */
+    @Test
+    fun prootExecsOutsideThePtyBridge() {
+        assumeWritePhase()
+        val runtime = graph.runtime
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val nativeLibraryDir = File(context.applicationInfo.nativeLibraryDir)
+        val argv = listOf(
+            File(nativeLibraryDir, "libproot.so").absolutePath,
+            "--rootfs=${runtime.rootfsDir.absolutePath}",
+            "-b", "/dev",
+            "-b", "/proc",
+            "-b", "/sys",
+            "-w", runtime.homePath,
+            "/bin/bash", "--login", "-c", "echo DIRECT_EXEC_OK",
+        )
+        val process = ProcessBuilder(argv).apply {
+            environment().clear()
+            environment()["PROOT_LOADER"] = File(nativeLibraryDir, "libproot-loader.so").absolutePath
+            environment()["PROOT_TMP_DIR"] = runtime.tmpDir.absolutePath
+            environment()["HOME"] = runtime.homePath
+            environment()["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            environment()["TERM"] = "xterm-256color"
+            environment()["LANG"] = "C.UTF-8"
+            directory = runtime.spawnCwd
+            redirectErrorStream(true)
+        }.start()
+        val finished = process.waitFor(DIRECT_EXEC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        if (!finished) {
+            // Kill first: reading the output stream of a live process blocks until it exits,
+            // and a wedged proot would turn the diagnostic itself into the hang it diagnoses.
+            process.destroy()
+            process.waitFor(5, TimeUnit.SECONDS)
+            check(false) {
+                "DIRECT-EXEC A/B stage: proot exec'd without the pty bridge also failed to answer " +
+                    "within ${DIRECT_EXEC_TIMEOUT_SECONDS}s - the defect is in proot on this " +
+                    "ABI/emulator, not in the pty bridge"
+            }
+        }
+        val output = process.inputStream.readBytes().toString(Charsets.UTF_8)
+        check(process.exitValue() == 0 && "DIRECT_EXEC_OK" in output) {
+            "DIRECT-EXEC A/B stage: proot exec'd without the pty bridge exited " +
+                "${process.exitValue()} without the marker (output: ${output.take(2000)})"
         }
     }
 
@@ -196,5 +261,6 @@ class UbuntuE2eVerificationTest {
         private val DNS_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(60)
         private val APT_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(180)
         private val HTTP_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(90)
+        private const val DIRECT_EXEC_TIMEOUT_SECONDS = 30L
     }
 }
