@@ -276,16 +276,32 @@ class UbuntuE2eVerificationTest {
             "LINK stage: the shell does not see the two names as one file, so shadow(1) would read " +
                 "its own lock as held: ${probe.take(500)}"
         }
+        // Printed as well as asserted: the assertion is the verdict, but the device's own numbers
+        // belong in the artifact, where a reader can check them without trusting this test. The
+        // instrumentation transcript (instrument-write.txt) is the only surviving output of a run.
+        println("LINK PROBE: ${probe.trim()}")
 
+        // Plain String operations, not Regex(...).find(...) + MatchResult.groupValues: the test APK
+        // resolves its Kotlin stdlib against the MINIFIED app APK, which carries only the members
+        // the app itself reaches (proguard-instrumentation.pro lists exactly which), and
+        // MatchResult.getGroupValues was not among them - every app call site had been devirtualized,
+        // so R8 removed it from the interface. The call threw NoSuchMethodError on run 35106576845,
+        // at the line below, AFTER the probe above had already succeeded; the same class of strip
+        // the readBytes() note further up this file records.
         val rows = probe.lines()
             .map { it.trim() }
             .filter { it.startsWith("links=") }
-            .map { Regex("links=(\\d+) inode=(\\d+)").find(it) }
-        check(rows.size == 2 && rows.all { it != null }) {
+        check(rows.size == 2) {
             "LINK stage: expected 'stat' to report two 'links=<n> inode=<n>' rows, got: ${probe.take(500)}"
         }
-        val links = rows.map { it!!.groupValues[1] }
-        val inodes = rows.map { it!!.groupValues[2] }
+        // The numbers stay strings - only equality is asserted (same inode, two links each), and an
+        // inode is not obliged to fit in an Int on every filesystem. toLongOrNull is just the
+        // shape check: a row that is not a number must fail here, not compare unequal later.
+        val links = rows.map { it.removePrefix("links=").substringBefore(' ') }
+        val inodes = rows.map { it.substringAfter("inode=") }
+        check(links.all { it.toLongOrNull() != null } && inodes.all { it.toLongOrNull() != null }) {
+            "LINK stage: 'stat' printed rows this probe cannot read: ${probe.take(500)}"
+        }
         check(links[0] == "2" && links[1] == "2") {
             "LINK stage: the two names report ${links[0]} and ${links[1]} links, expected 2 each — " +
                 "the link was emulated as a byte copy, so shadow(1) would read its own lock as held: ${probe.take(500)}"

@@ -74,6 +74,17 @@ BUTTON_REPAIR = "Repair"
 LABEL_INSTALL_LOG = "Install log"
 BUTTON_VIEW = "View"
 
+# Exceptions that mean this driver is broken, not the device or the app. The
+# failure report's stage column is a claim about WHERE a failure lives, and its
+# unattributed fallback is "UI" - so a bug in this file would be published as an
+# app UI failure, which is the one attribution a driver must never get wrong.
+# Run 35106576845's storage gate is the worked example: a precedence slip in the
+# filler cleanup (`"..." % x // 1024`) raised TypeError from the driver's own
+# line, and the report read "fail at UI" while the device had in fact refused
+# the install and named the missing megabytes.
+DRIVER_BUG_KINDS = (TypeError, AttributeError, NameError, UnboundLocalError,
+                    KeyError, IndexError, ZeroDivisionError)
+
 # The install screen's step subtitles (MainActivity's describeInstallStep /
 # describeSetupStep) - the line under the title that says WHERE the install is.
 # Matched with startswith so the title ("Installing Ubuntu 22.04 LTS") never
@@ -285,7 +296,7 @@ class E2eDriver:
             result.status = "fail"
             kind, err, tb = exc_info
             result.detail = "%s: %s" % (kind.__name__, err)
-            result.stage = self._stage_from_error(str(err))
+            result.stage = self._stage_from_error(str(err), kind)
             self.log("PHASE %s: FAIL at %s - %s" % (result.name, result.stage, result.detail))
             shot = self.screenshot("fail-" + result.name)
             if shot:
@@ -294,8 +305,14 @@ class E2eDriver:
         self._scan_crashes(result)
         self._write_results()
 
-    def _stage_from_error(self, message):
+    def _stage_from_error(self, message, kind=None):
         """The coarse stage attribution the failure report's table wants."""
+        # Before the message is read: a driver bug's own text can mention
+        # anything (that TypeError says "unsupported operand type(s) for //",
+        # with no stage word at all), and no keyword in it may be allowed to
+        # dress a driver bug as a device finding.
+        if kind is not None and issubclass(kind, DRIVER_BUG_KINDS):
+            return "DRIVER"
         m = re.search(r"([A-Z-]+(?: [A-Z-]+)*) stage", message)
         if m:
             return m.group(1)
@@ -427,24 +444,36 @@ class E2eDriver:
             time.sleep(1.2)
         return self.visible("Ubuntu on this device", "Linux userspace")
 
-    def scroll_to_install_button(self, max_swipes=6):
-        """The section's action row sits below the NotInstalled row, and since the
-        version chooser that row also carries a dropdown - so on a fresh install
-        the section is taller than one screen and the Install button lands below
-        the fold. scroll_to_linux_section stops at the section title, and a
-        uiautomator dump only contains on-screen nodes, so tapping without this
-        walk fails with 'the Install button was not found' (E2E run 34869834710).
-        The section is followed only by About, whose rows never say Install, so
-        the first visible Install belongs to the action row - but the match must
-        be exact: the "Install log" row's View button also contains the word, and
-        a substring match finds that row first whenever it is on screen."""
+    def scroll_to_action_button(self, button=BUTTON_INSTALL, max_swipes=8):
+        """Swipe until the section's action-row button (`button`) is on screen.
+
+        The action row sits below the state row, and in every installed state
+        three more rows (Storage used, Workspace, Health check) sit between them -
+        so it lands below the fold, and a uiautomator dump only contains on-screen
+        nodes. scroll_to_linux_section stops at the section TITLE, which is not
+        enough for that: on a fresh install it made a tap fail with 'the Install
+        button was not found' (E2E run 34869834710), and in NeedsRepair - the
+        tallest the section ever gets, and the state both interruption phases land
+        in - it made "the Repair button was not offered after recovery" (run
+        35106576845), while the screen behind that failure read "Needs repair - a
+        previous install was interrupted". This walk knows Repair as well as
+        Install now, because only knowing "Install" is how that phase failed.
+
+        The match must be exact: for Install, the "Install log" row's View button
+        and the "Installing ..." title both contain the word, so a substring match
+        finds something that cannot be tapped. Repair's own row ("Needs repair -
+        ...") differs from the button only by case today, which is not a
+        guarantee worth resting a tap on.
+
+        Call this after scroll_to_linux_section: the walk only ever swipes
+        forward, so it has to start above the button it is looking for."""
         for _ in range(max_swipes):
             els = self.dump()
-            if self.find(els, BUTTON_INSTALL, exact=True):
+            if self.find(els, button, exact=True):
                 return True
             self._scroll_swipe(els)
             time.sleep(1.2)
-        return self.find(self.dump(), BUTTON_INSTALL, exact=True) is not None
+        return self.find(self.dump(), button, exact=True) is not None
 
     def start_install_via_ui(self):
         """Settings -> Linux userspace -> Install -> the confirmation dialog's
@@ -454,7 +483,7 @@ class E2eDriver:
             raise RuntimeError("the Linux userspace settings section was never visible")
         if not self.find(self.dump(), LABEL_INSTALL_ROW, LABEL_NEEDS_REPAIR, LABEL_INSTALLED):
             raise RuntimeError("no Ubuntu row to install from - unexpected section state")
-        if not self.scroll_to_install_button():
+        if not self.scroll_to_action_button():
             raise RuntimeError("the Install button was not found")
         if not self.tap_last(self.dump(), BUTTON_INSTALL, exact=True):
             raise RuntimeError("the Install row's Install button could not be tapped")
@@ -1044,7 +1073,16 @@ class E2eDriver:
 
     def _remove_filler(self):
         self.adb.shell("rm -f /data/local/tmp/e2e-filler", timeout=120)
-        self.log("filler removed, /data free again: %dMB" % (self._data_avail_kb() or 0) // 1024)
+        # Parenthesised, and never allowed to raise. This runs from storage_gate's
+        # finally, so an exception here REPLACES the phase's own verdict - and it
+        # did: `"..." % x // 1024` binds as `("..." % x) // 1024` (a str // int
+        # TypeError), which turned run 35106576845's storage gate into "fail at UI"
+        # even though the device had just refused the install and named the need.
+        try:
+            free_mb = (self._data_avail_kb() or 0) // 1024
+            self.log("filler removed, /data free again: %dMB" % free_mb)
+        except Exception as exc:  # cleanup must not mask what the phase found
+            self.log("filler removed, but reading /data back failed: %s" % exc)
 
     def _data_avail_kb(self):
         rc, out = self.adb.shell("df /data", timeout=30)
@@ -1125,6 +1163,11 @@ class E2eDriver:
             self.results[-1].evidence.append(shot)
         # The retry: whatever honest state it landed in offers a way forward.
         button = BUTTON_REPAIR if state == "needs-repair" else BUTTON_INSTALL
+        # NeedsRepair is the tallest the section gets - three installed-state rows
+        # sit above the action row - so the button is below the fold, and the walk
+        # is the whole difference between "the button was not offered" and "the
+        # button is not in this dump".
+        self.scroll_to_action_button(button)
         if not self.tap_last(self.dump(), button, exact=True):
             raise RuntimeError("INTERRUPT stage: the %s button was not offered after recovery" % button)
         time.sleep(1.5)
@@ -1184,6 +1227,7 @@ class E2eDriver:
         self.launch()
         self.open_settings()
         self.scroll_to_linux_section()
+        self.scroll_to_action_button(button)
         if not self.tap_last(self.dump(), button, exact=True):
             raise RuntimeError("NETWORK stage: the %s button was not offered after the failure" % button)
         time.sleep(1.5)

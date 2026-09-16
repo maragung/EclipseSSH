@@ -252,6 +252,151 @@ class OpenSettingsRecovery(unittest.TestCase):
         self.assertEqual(1, len(self.adb.starts))
 
 
+class StorageGateCleanup(unittest.TestCase):
+    """_remove_filler runs from storage_gate's `finally`, so anything it raises
+    REPLACES the phase's own verdict - and a precedence slip did exactly that:
+    `"..." % x // 1024` parses as `("..." % x) // 1024`, a str // int TypeError
+    (run 35106576845). The storage gate was published as "fail at UI" while
+    logcat carried the device doing precisely what the phase asserts: "Ubuntu
+    needs about 743 MB of free storage to install ... but only about 166 MB is
+    free. Free up storage and try again." """
+
+    # device-state.txt from run 35100526297, verbatim (as DataAvailParsing above).
+    REAL = ("Filesystem       1K-blocks   Used Available Use% Mounted on\n"
+            "/dev/block/dm-43   6082144 319032   5763112   6% /mnt/pass_through/0/emulated")
+
+    def _driver(self, out, rc=0):
+        d = driver.E2eDriver.__new__(driver.E2eDriver)
+        d.adb = _DfAdb(out, rc)
+        d.lines = []
+        d.log = d.lines.append
+        return d
+
+    def test_the_cleanup_reports_the_free_space_in_megabytes(self):
+        d = self._driver(self.REAL)
+        d._remove_filler()
+        self.assertEqual(1, len(d.lines))
+        self.assertIn("5628MB", d.lines[0])  # 5763112 KB // 1024
+
+    def test_a_failing_df_still_does_not_raise_from_the_cleanup(self):
+        # The reason the try/except is there: this runs in a finally, so a raise
+        # here would take the phase's real finding down with it.
+        d = self._driver("", rc=1)
+        d._remove_filler()
+        self.assertIn("0MB", d.lines[0])
+
+
+class StageAttribution(unittest.TestCase):
+    """The failure report's stage column says WHERE a failure lives, so a bug in
+    this driver must never be published as a device finding. The unattributed
+    fallback is "UI" - which is how run 35106576845's TypeError (the precedence
+    slip above, raised by the driver's own line) reached the report as a UI
+    failure while the app had refused the install exactly as designed."""
+
+    TYPE_ERROR = "unsupported operand type(s) for //: 'str' and 'int'"
+
+    def _stage(self, message, kind=None):
+        d = driver.E2eDriver.__new__(driver.E2eDriver)
+        return d._stage_from_error(message, kind)
+
+    def test_a_driver_bug_is_attributed_to_the_driver(self):
+        self.assertEqual("DRIVER", self._stage(self.TYPE_ERROR, TypeError))
+
+    def test_without_the_kind_the_blind_fallback_would_have_called_it_ui(self):
+        # Pinned, not endorsed: this is what the run published, and the reason
+        # the kind is now passed in.
+        self.assertEqual("UI", self._stage(self.TYPE_ERROR))
+
+    def test_the_stages_the_phases_name_are_unchanged(self):
+        for message, expected in (
+            ("INTERRUPT stage: the Repair button was not offered after recovery", "INTERRUPT"),
+            ("NETWORK stage: could not enable airplane mode", "NETWORK"),
+            ("STORAGE stage: could not adb root the emulator (rc=1)", "STORAGE"),
+            ("VERIFY stage: instrumentation phase 'write' - hardLinksShareOneInode", "VERIFY"),
+        ):
+            self.assertEqual(expected, self._stage(message, RuntimeError))
+
+
+class ActionButtonWalk(unittest.TestCase):
+    """The walk that brings the action row into the dump. scroll_to_linux_section
+    stops at the section TITLE, and the action row sits below it - furthest below
+    in NeedsRepair, where three installed-state rows stand between them. Both
+    interruption phases tapped straight after the section walk, so in run
+    35106576845 the Repair button the screen was showing was never in the dump
+    they searched, and the phase reported "the Repair button was not offered
+    after recovery"."""
+
+    # screen-interrupt-process-144052.txt, verbatim for the Linux userspace
+    # section: title and state row on screen, no action row anywhere in the dump.
+    TOP = [
+        Element({"text": "LINUX USERSPACE", "bounds": "[32,1177][345,1219]"}),
+        Element({"text": "Ubuntu on this device", "bounds": "[155,1277][588,1340]"}),
+        Element({"text": "Needs repair · a previous install was interrupted",
+                 "bounds": "[155,1340][881,1382]"}),
+        Element({"text": "Storage used", "bounds": "[155,1456][421,1519]"}),
+        Element({"text": "394.9 MB", "bounds": "[155,1519][302,1561]"}),
+        Element({"text": "Health check", "bounds": "[155,1867][417,1930]"}),
+        Element({"text": "healthy", "bounds": "[155,1930][265,1938]"}),
+        Element({"text": "Verify", "bounds": "[888,1893][985,1938]"}),
+        Element({"text": "Settings", "bounds": "[917,2190][1043,2232]"}),
+    ]
+
+    # One swipe further up the same list: the action row has arrived.
+    SWIPED = TOP + [
+        Element({"text": "Repair", "bounds": "[153,1990][452,2110]"}),
+        Element({"text": "Uninstall", "bounds": "[845,1990][1063,2110]"}),
+    ]
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self._sleep = driver.time.sleep
+        # Each swipe in the walk waits 1.2s, and this class swipes several times.
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def test_the_dump_that_failed_holds_no_repair_button(self):
+        self.assertIsNone(self.driver.find(self.TOP, driver.BUTTON_REPAIR, exact=True))
+
+    def test_the_section_walk_stops_at_the_title_without_swiping(self):
+        # The precondition both interrupt phases satisfied, and the reason the
+        # button was never in the dump they searched: the section walk is not
+        # the action walk.
+        self.driver.adb = _ScrollingAdb([self.TOP])
+        self.assertTrue(self.driver.scroll_to_linux_section())
+        self.assertEqual([], self.driver.adb.swipes)
+
+    def test_the_walk_brings_repair_into_the_dump(self):
+        self.driver.adb = _ScrollingAdb([self.TOP, self.SWIPED])
+        self.assertTrue(self.driver.scroll_to_action_button(driver.BUTTON_REPAIR))
+        self.assertEqual(1, len(self.driver.adb.swipes))
+
+    def test_the_walk_still_finds_install_the_way_it_always_did(self):
+        top = [Element({"text": "Ubuntu on this device", "bounds": "[155,700][588,760]"}),
+               Element({"text": "Not installed · real bash, apt, Node.js and Python",
+                        "bounds": "[155,760][991,844]"}),
+               Element({"text": "Settings", "bounds": "[917,2190][1043,2232]"})]
+        self.driver.adb = _ScrollingAdb([top, top + [
+            Element({"text": "Install", "bounds": "[153,1635][400,1755]"})]])
+        self.assertTrue(self.driver.scroll_to_action_button())
+        self.assertEqual(1, len(self.driver.adb.swipes))
+
+    def test_a_button_that_is_really_gone_stays_a_failure(self):
+        # A real regression must not be swallowed by the walk: it gives up.
+        self.driver.adb = _ScrollingAdb([self.TOP])
+        self.assertFalse(self.driver.scroll_to_action_button(driver.BUTTON_REPAIR, max_swipes=3))
+        self.assertEqual(3, len(self.driver.adb.swipes))
+
+    def test_the_exact_match_taps_the_button_not_the_row_that_names_it(self):
+        # The state row says "Needs repair - ..." and the button says "Repair":
+        # only the exact match is tappable, and it must land on the button.
+        self.driver.adb = _ScrollingAdb([self.SWIPED])
+        self.assertTrue(self.driver.tap_last(self.SWIPED, driver.BUTTON_REPAIR, exact=True))
+        x, y = self.driver.adb.taps[0]
+        self.assertTrue(1990 <= y <= 2110, y)
+
+
 class _DfAdb:
     def __init__(self, out, rc=0):
         self.out = out
@@ -295,6 +440,29 @@ class _RecordingAdb:
 
     def __init__(self, taps):
         self.taps = taps
+
+    def tap(self, x, y):
+        self.taps.append((x, y))
+        return True
+
+
+class _ScrollingAdb:
+    """A settings list that hands over the next screenful only when swiped, like
+    the LazyColumn behind the app's settings tab: a uiautomator dump holds
+    on-screen nodes, so the action row below the fold is absent until a swipe
+    brings it up. The frames are the dumps, in swipe order."""
+
+    def __init__(self, frames):
+        self.frames = frames
+        self.swipes = []
+        self.taps = []
+
+    def ui_dump(self):
+        return self.frames[min(len(self.swipes), len(self.frames) - 1)]
+
+    def swipe(self, x1, y1, x2, y2, duration):
+        self.swipes.append((x1, y1, x2, y2, duration))
+        return True
 
     def tap(self, x, y):
         self.taps.append((x, y))

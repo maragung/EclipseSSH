@@ -146,6 +146,18 @@
 -keep class kotlin.RuntimeException { *; }
 -keep class kotlin.sequences.Sequence { *; }
 -keep class kotlin.sequences.SequencesKt { *; }
+# MatchResult as well as Regex, and for a reason Regex alone does not cover: the
+# suite reads a match's captures through this INTERFACE (MatchResult.getGroupValues),
+# and R8 removed that member from it because every reference in the app itself had
+# been devirtualized onto the concrete impl - so the app kept working while the
+# instrumentation APK died with "NoSuchMethodError: No interface method
+# getGroupValues()" (run 35106576845, a single line in the LINK probe). Keeping the
+# class with all members is this file's rule for a surviving class; the probe no
+# longer needs it, and this is what stops the next Regex user in androidTest from
+# finding out the same way. If the list is ever regenerated, MatchResult must stay:
+# a derivation that walks referenced classes sees Regex, not the interface a match
+# is read through.
+-keep class kotlin.text.MatchResult { *; }
 -keep class kotlin.text.Regex { *; }
 -keep class kotlin.text.StringBuilder { *; }
 -keep class kotlin.text.StringsKt { *; }
