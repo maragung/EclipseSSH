@@ -249,13 +249,6 @@ jobs:
             echo "avdmanager reported success but the emulator cannot see ci-ubuntu-e2e"
             exit 1
           fi
-          # FULL mode's storage-failure phase fills /data and reads it back as
-          # root; the default (AOSP) system image allows adb root, and a refusal
-          # here is exactly the misconfiguration that phase would trip over
-          # later - fail it now, with a name.
-          if [ "$MODE" = "FULL" ]; then
-            "$ADB" root || { echo "FULL mode needs adb root on the emulator image"; exit 1; }
-          fi
           nohup "$ANDROID_HOME/emulator/emulator" -avd ci-ubuntu-e2e \
             -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
             -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
@@ -279,6 +272,25 @@ jobs:
             echo "emulator did not finish booting"
             tail -200 /tmp/emulator.log
             exit 1
+          fi
+          # FULL mode's storage-failure phase fills /data and reads it back as
+          # root; the default (AOSP) system image allows adb root, and a refusal
+          # here is exactly the misconfiguration that phase would trip over
+          # later - fail it now, with a name.
+          #
+          # After boot, not before the launch: adb cannot talk to an emulator
+          # that does not exist yet, so the same check up there failed on every
+          # FULL run with "get-state error: no devices/emulators found" and the
+          # run never reached the device at all. It stayed hidden while only
+          # FAST/SMOKE ran, since nothing else enters this branch.
+          if [ "$MODE" = "FULL" ]; then
+            "$ADB" root || { echo "FULL mode needs adb root on the emulator image"; exit 1; }
+            # root restarts adbd and the connection drops with it; wait for the
+            # root shell to come back, or the next step's first adb call races it
+            if ! timeout 120 "$ADB" wait-for-device; then
+              echo "adb lost the emulator after adb root"
+              exit 1
+            fi
           fi
 
       - name: Install the app and test APKs
