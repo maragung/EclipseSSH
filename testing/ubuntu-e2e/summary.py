@@ -24,6 +24,7 @@ PHASE_LABELS = {
     "preflight": "APK install + launch",
     "storage-gate": "Storage failure handling",
     "install": "Ubuntu install (UI flow)",
+    "install-log": "Install log (app trace, on device)",
     "verify": "Ubuntu usable (shell, apt, DNS, HTTP)",
     "terminal-ui": "Terminal through the app",
     "persistence-restart": "Persistence after app restart",

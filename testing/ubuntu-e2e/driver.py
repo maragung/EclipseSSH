@@ -67,6 +67,12 @@ CARD_TITLE = "Ubuntu on this device"
 DEAD_INSTALL_LABELS = (LABEL_NEEDS_REPAIR, LABEL_INSTALL_ROW)
 BUTTON_INSTALL = "Install"
 BUTTON_REPAIR = "Repair"
+# The install trace's row and the two strings that reach it (MainActivity's
+# LinuxUserspaceSection / InstallLogDialog). The row's button carries the row's
+# own name as its content-desc, because three "View" buttons now sit on that
+# screen; the driver matches on that pair rather than on "View" alone.
+LABEL_INSTALL_LOG = "Install log"
+BUTTON_VIEW = "View"
 
 # The install screen's step subtitles (MainActivity's describeInstallStep /
 # describeSetupStep) - the line under the title that says WHERE the install is.
@@ -102,6 +108,14 @@ PROGRESS_SHOT_EVERY = 60
 # opinion when the screen cannot say whether an install is alive or over.
 LOG_ACTION_FAILED = "Linux userspace %s failed: "
 LOG_INSTALL_ACTIONS = ("Install", "Repair")
+
+# One line of the install trace as the dialog renders it (InstallLogDialog):
+# UserspaceDiagnosticEvent.line() with its leading epoch millis dropped in favour
+# of a clock, so "[apt] bulk base-package install failed exit=100 detail=...". The
+# category is the whole discriminator: the dialog's own chrome ("Install log",
+# "Copy", the header sentence) never matches it, so a dump of the dialog yields
+# the events and nothing else.
+INSTALL_LOG_LINE = re.compile(r"^\[(storage|rootfs|download|proot|dns|apt)\] ")
 
 
 class PhaseResult:
@@ -146,6 +160,9 @@ class E2eDriver:
         # The device's clock when the install was started: the log window the
         # install's own outcome is read from (see _install_log_verdict).
         self._install_log_mark = None
+        # What the last read of the app's install-log row saw: the row's presence,
+        # the dialog's own event count, and the event lines it rendered.
+        self._install_log_read = {"opened": False, "header": None, "events": []}
 
     # ------------------------------------------------------------ plumbing
 
@@ -189,11 +206,25 @@ class E2eDriver:
             return False
         return self.adb.tap(x, y)
 
-    def tap_last(self, elements, needle):
+    def tap_last(self, elements, needle, exact=False):
         """Tap the LAST match: dialogs render after the screen behind them, so the
-        dialog's button is the trailing one when both are in the hierarchy."""
-        matches = [el for el in elements
-                   if needle in (el.attrs.get("text", "") + el.attrs.get("content-desc", ""))]
+        dialog's button is the trailing one when both are in the hierarchy.
+
+        `exact` compares the whole text or content-desc instead of looking for a
+        substring, and the action buttons need it: the Linux userspace section now
+        carries an "Install log" row whose View button names its row, so a
+        substring match for "Install" can tap that row instead of the action row
+        - which is what E2E run 35061538315 did, opening the trace dialog, leaving
+        the install never started, and reporting it as a missing confirmation
+        dialog. The app's own labels are unchanged; the matcher was too loose."""
+        matches = []
+        for el in elements:
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if not attr:
+                    continue
+                if (attr == needle) if exact else (needle in attr):
+                    matches.append(el)
+                    break
         if not matches:
             return False
         return self.tap(matches[-1])
@@ -394,14 +425,16 @@ class E2eDriver:
         uiautomator dump only contains on-screen nodes, so tapping without this
         walk fails with 'the Install button was not found' (E2E run 34869834710).
         The section is followed only by About, whose rows never say Install, so
-        the first visible Install belongs to the action row."""
+        the first visible Install belongs to the action row - but the match must
+        be exact: the "Install log" row's View button also contains the word, and
+        a substring match finds that row first whenever it is on screen."""
         for _ in range(max_swipes):
             els = self.dump()
-            if self.find(els, BUTTON_INSTALL):
+            if self.find(els, BUTTON_INSTALL, exact=True):
                 return True
             self._scroll_swipe(els)
             time.sleep(1.2)
-        return self.visible(BUTTON_INSTALL)
+        return self.find(self.dump(), BUTTON_INSTALL, exact=True) is not None
 
     def start_install_via_ui(self):
         """Settings -> Linux userspace -> Install -> the confirmation dialog's
@@ -413,14 +446,14 @@ class E2eDriver:
             raise RuntimeError("no Ubuntu row to install from - unexpected section state")
         if not self.scroll_to_install_button():
             raise RuntimeError("the Install button was not found")
-        if not self.tap_last(self.dump(), BUTTON_INSTALL):
+        if not self.tap_last(self.dump(), BUTTON_INSTALL, exact=True):
             raise RuntimeError("the Install row's Install button could not be tapped")
         time.sleep(1.5)
         # The confirmation dialog. Its Install button is the trailing match - the
         # row's button is still in the hierarchy behind the dialog.
         if not self.find(self.dump(), "root filesystem", LABEL_NEEDS_REPAIR):
             raise RuntimeError("the install confirmation dialog did not appear")
-        if not self.tap_last(self.dump(), BUTTON_INSTALL):
+        if not self.tap_last(self.dump(), BUTTON_INSTALL, exact=True):
             raise RuntimeError("the confirmation dialog's Install button was not found")
         time.sleep(2)
 
@@ -635,6 +668,130 @@ class E2eDriver:
                     # again reports the failure that ended it.
                     verdict = line.split(needle, 1)[1].strip() or action + " failed"
         return verdict
+
+    def _scroll_to_install_log_row(self, max_swipes=8):
+        """Swipe the settings list until the "Install log" row's View button is on
+        screen. The row sits below the action row and below the version chooser,
+        and a uiautomator dump only holds on-screen nodes, so reaching it needs a
+        walk of its own - the same reason scroll_to_install_button exists. The
+        button is matched on its (text, content-desc) pair: three rows on this
+        screen end in a "View" button, and only this one names its row."""
+        for _ in range(max_swipes):
+            els = self.dump()
+            button = self._install_log_button(els)
+            if button:
+                return button
+            self._scroll_swipe(els)
+            time.sleep(1.2)
+        return self._install_log_button(self.dump())
+
+    def _install_log_button(self, elements):
+        """The "Install log" row's tappable node, or None.
+
+        The row's button carries the row's name as its content-desc - the app
+        gave it one because three "View" buttons now sit on that screen (Connection
+        diagnostics, About, Install log) and a screen reader heard all three as
+        just "View" - so content-desc is what identifies this row. A merged a11y
+        node for the whole row is accepted too, because it carries the same name
+        and taps through to the same dialog; what must not happen is tapping
+        another row's View button, which matching on the label alone rules out.
+        The "View"-labelled candidate wins when both are present."""
+        candidates = [el for el in elements
+                      if LABEL_INSTALL_LOG in el.attrs.get("content-desc", "")]
+        for el in candidates:
+            if el.attrs.get("text") == BUTTON_VIEW:
+                return el
+        return candidates[0] if candidates else None
+
+    def _read_install_log(self, tag):
+        """The install trace the app itself kept, read through the row that shows
+        it: Settings -> Linux userspace -> "Install log" -> View.
+
+        This is the channel the ring was built for and, until this reader, the
+        only one nobody had exercised. `UserspaceDiagnostics` writes to logcat
+        as well, but logcat is a wrapping buffer read after the fact by whoever
+        has `adb` - and the person holding a failed install has neither. The
+        dialog is the app's own answer to "why did it fail", so the pipeline
+        drives it the way a user would and keeps the text as the run's evidence.
+
+        Never raises: a repair of the trace UI is not what this run is testing,
+        and a failure here must not become the reported cause of an install that
+        failed for its own reasons. It records what it saw in
+        [self._install_log_read] - `opened`, `header`, `events` - so the caller
+        that IS testing the row (exercise_install_log) can tell a row that is
+        missing from a row that opened onto an empty trace. The events come back
+        newest first, the order the dialog renders them in; a LazyColumn dump
+        holds only the newest screenful, which for a failed install is the part
+        that says why.
+        """
+        events = []
+        self._install_log_read = {"opened": False, "header": None, "events": events}
+        try:
+            self.launch()
+            self.open_settings()
+            if not self.scroll_to_linux_section():
+                self.log("install log: the Linux userspace section was never visible")
+                return events
+            button = self._scroll_to_install_log_row()
+            if not button:
+                self.log("install log: the row's View button was not on screen")
+                return events
+            if not self.tap(button):
+                self.log("install log: the View button could not be tapped")
+                return events
+            time.sleep(2)
+            texts = self._texts(self.dump())
+            header = next((t for t in texts if "event(s) ·" in t), None)
+            events.extend(t for t in texts if INSTALL_LOG_LINE.match(t))
+            self._install_log_read["opened"] = True
+            self._install_log_read["header"] = header
+            path = os.path.join(self.out, "install-log-%s.txt" % tag)
+            with open(path, "w") as fh:
+                fh.write("# %s\n# opened from Settings -> Linux userspace -> %s\n" %
+                         (time.strftime("%Y-%m-%d %H:%M:%S"), LABEL_INSTALL_LOG))
+                if header:
+                    fh.write("# the app reports: %s\n" % header)
+                fh.write("\n".join(events) + "\n")
+            if self.results:
+                self.results[-1].evidence.append(path)
+            self.log("install log (%s): %d line(s) on screen, %s"
+                     % (tag, len(events), header or "no header"))
+            self.adb.back()
+            time.sleep(1)
+        except Exception as exc:  # never the reported cause of the phase
+            self.log("install log (%s) unreadable: %s" % (tag, exc))
+        return events
+
+    def exercise_install_log(self):
+        """The row as its own check, on a device, after a successful install.
+
+        The trace exists so that a user whose install failed can send the reason
+        without `adb`, and a trace nobody can open is worth nothing: this is the
+        end-to-end proof that the row is reachable, that the dialog reads the ring
+        back, and that the ring holds the install that just ran - the app's own
+        count and its own event lines, not an empty state.
+
+        Two verdicts, kept apart because they mean different things: a row that was
+        never reached (the UI does not offer the trace), and a dialog that opened
+        onto nothing (the ring was never written - the failure this whole channel
+        is supposed to make impossible). The categories actually seen are logged
+        rather than asserted one by one: the dialog shows the newest screenful
+        only, so which subsystems appear depends on how far back a screenful
+        reaches, and an assertion that named one would fail on a trace that is
+        perfectly good."""
+        events = self._read_install_log("installed")
+        read = self._install_log_read
+        if not read["opened"]:
+            raise RuntimeError(
+                "the install log row could not be opened after a successful install -"
+                " the trace is unreachable from the UI")
+        if not events:
+            raise RuntimeError(
+                "the install log dialog opened onto an empty trace (%s) - nothing the"
+                " install did reached the ring" % (read["header"] or "no header"))
+        categories = sorted({t[1:t.index("]")] for t in events})
+        self.log("the install log row reads back %d event(s) from the install: %s"
+                 % (len(events), ", ".join(categories)))
 
     def _inconclusive_note(self):
         """Why the screen could not answer, appended to the failure it caused."""
@@ -944,12 +1101,12 @@ class E2eDriver:
             self.results[-1].evidence.append(shot)
         # The retry: whatever honest state it landed in offers a way forward.
         button = BUTTON_REPAIR if state == "needs-repair" else BUTTON_INSTALL
-        if not self.tap_last(self.dump(), button):
+        if not self.tap_last(self.dump(), button, exact=True):
             raise RuntimeError("INTERRUPT stage: the %s button was not offered after recovery" % button)
         time.sleep(1.5)
         # The repair path re-runs setup; the fresh install path asks for
         # confirmation again. Either way, wait it out.
-        self.tap_last(self.dump(), BUTTON_INSTALL)
+        self.tap_last(self.dump(), BUTTON_INSTALL, exact=True)
         self.wait_install_done(install_timeout_min)
         self.log("the retry install completed after the interruption")
 
@@ -1003,10 +1160,10 @@ class E2eDriver:
         self.launch()
         self.open_settings()
         self.scroll_to_linux_section()
-        if not self.tap_last(self.dump(), button):
+        if not self.tap_last(self.dump(), button, exact=True):
             raise RuntimeError("NETWORK stage: the %s button was not offered after the failure" % button)
         time.sleep(1.5)
-        self.tap_last(self.dump(), BUTTON_INSTALL)
+        self.tap_last(self.dump(), BUTTON_INSTALL, exact=True)
         self.wait_install_done(install_timeout_min)
         self.log("the retry install completed after the network cut")
 
@@ -1028,7 +1185,18 @@ class E2eDriver:
                 self.storage_gate()
 
         with self.phase("install", requires=("preflight",)):
-            self.install_via_ui(self.install_timeout_min, exercises=self.mode in ("STANDARD", "FULL"))
+            try:
+                self.install_via_ui(self.install_timeout_min,
+                                    exercises=self.mode in ("STANDARD", "FULL"))
+            except Exception:
+                # The trace before the re-raise: this is the evidence a user with
+                # a failed install would send, collected by the driver doing what
+                # that user would do - opening the row and reading the dialog.
+                self._read_install_log("install-failed")
+                raise
+
+        with self.phase("install-log", requires=("install",)):
+            self.exercise_install_log()
 
         with self.phase("verify", requires=("install",)):
             self.run_verification("write")

@@ -115,6 +115,15 @@ jobs:
           java-version: '17.0.13'
           check-latest: false
 
+      - name: Check the driver's own matchers
+        # Seconds, and before the emulator: the driver's element matchers are its
+        # eyes, and when one is loose the run reports a *driver* mistake as an app
+        # failure twenty minutes later (E2E run 35061538315: a substring match for
+        # "Install" was satisfied by the new "Install log" row, so the run tapped
+        # the trace row and blamed a missing confirmation dialog). The test is
+        # device-free by design, which is why it can run here at all.
+        run: python3 testing/ubuntu-e2e/test_driver_matchers.py
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
