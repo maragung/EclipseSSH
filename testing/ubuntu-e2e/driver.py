@@ -93,6 +93,16 @@ STEP_SUBTITLES = (
 POLL_SECONDS = 10
 PROGRESS_SHOT_EVERY = 60
 
+# The app's own failure line for a lifecycle action it ran (LinuxUserspaceController's
+# act(), which writes it from the service the moment the action fails, whatever the
+# screen is showing): "Linux userspace Install failed: <cause>". The install's cause
+# is also the line its settings row shows, but the row can be below the fold - and a
+# uiautomator dump only holds on-screen nodes - while this line is always readable.
+# It is the log channel the E2E artifacts already collect, used here as the second
+# opinion when the screen cannot say whether an install is alive or over.
+LOG_ACTION_FAILED = "Linux userspace %s failed: "
+LOG_INSTALL_ACTIONS = ("Install", "Repair")
+
 
 class PhaseResult:
     def __init__(self, name):
@@ -130,6 +140,12 @@ class E2eDriver:
         self.shot_dir = os.path.join(out_dir, "screenshots")
         os.makedirs(self.shot_dir, exist_ok=True)
         self._last_progress_shot = 0.0
+        # Set by _walk_linux_section: the settings list would not scroll, so what
+        # is below the fold is unknowable from the screen.
+        self._walk_stuck = False
+        # The device's clock when the install was started: the log window the
+        # install's own outcome is read from (see _install_log_verdict).
+        self._install_log_mark = None
 
     # ------------------------------------------------------------ plumbing
 
@@ -329,28 +345,32 @@ class E2eDriver:
             raise RuntimeError("the Settings tab was not found on screen")
         time.sleep(2)
 
-    def _scroll_swipe(self, els):
-        """One upward scroll swipe sized to the current orientation. The dump's
-        own geometry is the only coordinate system that is always right: the
-        rotation exercise runs its still-alive check while the display is
-        landscape, where the portrait-fitting y=1400 is past the screen edge
-        and the injected swipe scrolls nothing - twelve no-op swipes left the
-        Linux section off-screen and a live install was judged dead (E2E run
-        34918470332). The root node of a uiautomator dump spans the window,
-        rotation included, so the largest bounds ARE the current extent."""
+    def _window_extent(self, els):
+        """The window's extent as the current dump reports it: the largest right
+        and bottom edge any node reaches. The root node of a uiautomator dump
+        spans the window, rotation included, so this IS the current display
+        size - which is why the swipe below is sized from a dump rather than
+        from a constant (portrait-fitting y=1400 is past the screen edge in
+        landscape, and an injected swipe off-screen scrolls nothing)."""
         width = height = 0
         for el in els:
             b = el.bounds
             if b:
-                width = max(width, b[0] + b[2] // 2)
-                height = max(height, b[1] + b[3] // 2)
+                width = max(width, b[2])
+                height = max(height, b[3])
+        return width, height
+
+    def _scroll_swipe(self, els, span=(0.58, 0.21)):
+        """One upward scroll swipe across the current screen's own extent,
+        from `span`'s top fraction to its bottom one."""
+        width, height = self._window_extent(els)
         if width < 100 or height < 100:
             # A sparse or failed dump has nothing to anchor on; the portrait
             # default matches the emulator's natural orientation, which is what
             # every other phase of the run is in.
             width, height = 1080, 2400
         x = width // 2
-        self.adb.swipe(x, int(height * 0.58), x, int(height * 0.21), 400)
+        self.adb.swipe(x, int(height * span[0]), x, int(height * span[1]), 400)
 
     def scroll_to_linux_section(self, max_swipes=24):
         """The Linux userspace section sits far down the settings list; swipe until
@@ -446,6 +466,10 @@ class E2eDriver:
         """The full user install, optionally with the lifecycle exercises fired
         DURING it (background, rotation, screen off) - the moments a foreground
         service must survive, tested where a bug would actually show."""
+        # Before the first tap: everything the app logs from here on is this
+        # install's, which is what makes the log a usable second opinion on
+        # whether it is still running (see _install_log_verdict).
+        self._install_log_mark = self._device_time()
         self.start_install_via_ui()
         if not self.wait_visible((LABEL_INSTALLING,), 120, poll=5):
             raise RuntimeError("INSTALL stage: the Installing state never appeared")
@@ -505,8 +529,16 @@ class E2eDriver:
         title found no state word and the check blamed the disturbance that
         revealed the dead install (E2E run 35051269460 - the install had exited at
         the dpkg repair pass two minutes earlier). Stops at the first recognized
-        state reading; returns every text seen, in order, and that dump."""
+        state reading; returns every text seen, in order, and that dump.
+
+        A swipe that reveals nothing is retried across the window's full height
+        before it is believed, and a run of three leaves [self._walk_stuck] set:
+        a row that is below the fold because the list will not move is a
+        different fault from a row that is not there, and the caller's failure
+        message has to be able to tell a reader which one it hit."""
         seen = []
+        self._walk_stuck = False
+        no_ops = 0
         els = self.dump()
         for _ in range(max_swipes + 1):
             for text in self._texts(els):
@@ -514,9 +546,18 @@ class E2eDriver:
                     seen.append(text)
             if self.install_state_kind(*self.install_state(els)) != "unknown":
                 break
-            self._scroll_swipe(els)
+            before = set(self._texts(els))
+            self._scroll_swipe(els, span=(0.85, 0.15) if no_ops else (0.58, 0.21))
             time.sleep(1.2)
             els = self.dump()
+            after = set(self._texts(els))
+            if after and after == before:
+                no_ops += 1
+                if no_ops >= 3:
+                    self._walk_stuck = True
+                    break
+            else:
+                no_ops = 0
         return seen, els
 
     def _install_failure_detail(self, seen):
@@ -532,6 +573,75 @@ class E2eDriver:
             if text.startswith(LABEL_NEEDS_REPAIR):
                 return text
         return None
+
+    def _device_time(self):
+        """The device's own clock in logcat's stamp format, for scoping a log
+        read to one install. The emulator shares the host's clock, but asking
+        the device is what makes the comparison true on any device at any skew."""
+        ok, out = self.adb.shell("date '+%m-%d %H:%M:%S'")
+        out = (out or "").strip()
+        return out if ok and out else None
+
+    @staticmethod
+    def _stamp(line):
+        """A logcat line's own stamp as a comparable tuple, or None when the line
+        has none (a continuation line, or a header like 'beginning of main')."""
+        m = re.match(r"(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", line)
+        return tuple(int(g) for g in m.groups()) if m else None
+
+    @staticmethod
+    def _after(stamp, mark):
+        """Whether a log stamp is at or after the mark. The year is not in either
+        stamp; a different day is read as the wrap past midnight, because the
+        buffer cannot hold a previous day's line (the E2E clears logcat before
+        the app is launched and the install follows within minutes), so crossing
+        into another day is the only way to see one. A stamped-less line is not
+        evidence about this install either way."""
+        if stamp is None:
+            return False
+        m = re.match(r"(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", mark or "")
+        if not m:
+            return True
+        limit = tuple(int(g) for g in m.groups())
+        if stamp[:2] == limit[:2]:
+            return stamp >= limit
+        return True
+
+    def _install_log_verdict(self):
+        """What the app's own log says about the install started at
+        [self._install_log_mark]: the cause string when an install or repair
+        action failed, else None.
+
+        This is the check's second opinion, used only when the screen is
+        inconclusive. In E2E run 35056615874 the install died at the base
+        packages (apt exit 100) and the app's log said so at 05:08:01, while the
+        driver's screen reading of the same minute saw only the section title:
+        the row's state line was below the fold and the settings list would not
+        scroll, so the run blamed the rotation disturbance that happened to be
+        the exercise in flight. The app's log has no such blind spot."""
+        mark = self._install_log_mark
+        if not mark:
+            return None
+        log = self.adb.logcat(lines=4000)
+        verdict = None
+        for line in log.splitlines():
+            stamp = self._stamp(line)
+            if stamp is None or not self._after(stamp, mark):
+                continue
+            for action in LOG_INSTALL_ACTIONS:
+                needle = LOG_ACTION_FAILED % action
+                if needle in line:
+                    # Newest wins: an install that failed, was repaired and failed
+                    # again reports the failure that ended it.
+                    verdict = line.split(needle, 1)[1].strip() or action + " failed"
+        return verdict
+
+    def _inconclusive_note(self):
+        """Why the screen could not answer, appended to the failure it caused."""
+        if self._walk_stuck:
+            return " (the settings list would not scroll, so the rows below the fold" \
+                   " could not be read)"
+        return ""
 
     def _reenter_settings_during_install(self, disturbance):
         """After any disturbance the activity may have been recreated on the host
@@ -567,11 +677,23 @@ class E2eDriver:
                    ("the row reads %s" % line[:120]) if kind == "ended" else "the app reports",
                    (": %s" % detail) if detail and detail != line else "",
                    " | ".join(seen[:40])))
+        # The screen could not say. The app's own log can: it records the failure
+        # the moment it happens, from the service, whatever is on screen.
+        logged = self._install_log_verdict()
+        if logged:
+            raise RuntimeError(
+                "INSTALL stage: the install had already ended when the %s disturbance was"
+                " checked - the app's log reports: %s%s. On screen: %s"
+                % (disturbance, logged[:200], self._inconclusive_note(),
+                   " | ".join(seen[:40])))
         raise RuntimeError(
             "LIFECYCLE stage: the install did not survive the %s disturbance"
-            " - neither Installing nor Installed was on screen%s. "
+            " - neither Installing nor Installed was on screen%s%s. "
             "On screen: %s"
-            % (disturbance, (": %s" % detail) if detail else "", " | ".join(seen[:40])))
+            % (disturbance,
+               (": %s" % detail) if detail else "",
+               self._inconclusive_note(),
+               " | ".join(seen[:40])))
 
     def _exercise_background_during_install(self):
         self.adb.home()
