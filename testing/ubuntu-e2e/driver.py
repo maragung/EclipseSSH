@@ -52,7 +52,19 @@ LABEL_INSTALL_ROW = "Not installed"  # the NotInstalled row's subtitle prefix
 LABEL_INSTALLING = "Installing"
 LABEL_INSTALLED = "Installed and verified"
 LABEL_NEEDS_REPAIR = "Needs repair"
+LABEL_LAST_OPERATION = "Last operation"  # the app's own error row: why the install ended
 LABEL_LOCAL_CARD = "Local Ubuntu"
+# The install row's title in every settled state (MainActivity's
+# LinuxUserspaceSection); mid-install the title is "Installing <distro>" instead.
+# Read as a title, not searched for as a word: the app's error row can begin with
+# "Installing" ("Installing base packages failed (exit 100)"), so a substring
+# search for the Installing label can read a dead install as a live one.
+CARD_TITLE = "Ubuntu on this device"
+# The states that mean the install is over and did not succeed. Seeing one of
+# these mid-install is the install's own failure, which a disturbance merely
+# revealed - not a lifecycle failure, which is what blaming the disturbance for
+# it reads as.
+DEAD_INSTALL_LABELS = (LABEL_NEEDS_REPAIR, LABEL_INSTALL_ROW)
 BUTTON_INSTALL = "Install"
 BUTTON_REPAIR = "Repair"
 
@@ -148,18 +160,12 @@ class E2eDriver:
     def install_label(self, elements):
         """The Installing state's on-screen label: the title, plus the step
         subtitle when one is showing - so a stuck install names its step, not
-        just the state it never left."""
-        installing = self.find(elements, LABEL_INSTALLING)
-        if not installing:
+        just the state it never left. Reads the row through install_state() so
+        the 'Last operation' error row cannot pose as the install row."""
+        title, line = self.install_state(elements)
+        if not title or not title.startswith(LABEL_INSTALLING):
             return None
-        title = installing.attrs.get("text", "")[:120]
-        subtitle = None
-        for el in elements:
-            text = el.attrs.get("text", "")
-            if text and any(text.startswith(prefix) for prefix in STEP_SUBTITLES):
-                subtitle = text[:120]
-                break
-        return "%s | %s" % (title, subtitle) if subtitle else title
+        return "%s | %s" % (title[:120], line[:120]) if line else title[:120]
 
     def tap(self, element):
         x, y = element.center
@@ -179,18 +185,24 @@ class E2eDriver:
     def visible(self, *needles):
         return self.find(self.dump(), *needles) is not None
 
+    def _texts(self, elements):
+        """Every text and content-desc of the given dump, in dump order,
+        deduplicated. The order is the screen's own order, which is what lets a
+        row's title and its subtitle be read as a pair."""
+        texts = []
+        for el in elements:
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if attr and attr not in texts:
+                    texts.append(attr)
+        return texts
+
     def _screen_digest(self, limit=40):
         """Every text and content-desc on the current screen, deduplicated, for
         failure messages. The app's own words are the evidence a screenshot
         cannot carry: the install row's subtitle and the 'Last operation' error
         row are the self-identifying detail of a failed install, and uiautomator
         dumps are not otherwise uploaded."""
-        texts = []
-        for el in self.dump():
-            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
-                if attr and attr not in texts:
-                    texts.append(attr)
-        return texts[:limit]
+        return self._texts(self.dump())[:limit]
 
     def wait_visible(self, needles, timeout_s, poll=POLL_SECONDS):
         deadline = time.monotonic() + timeout_s
@@ -394,7 +406,10 @@ class E2eDriver:
 
     def wait_install_done(self, timeout_min, on_progress=None):
         """Polls the settings screen until the install finishes. Returns the
-        ending state's label evidence: the row's subtitle. Raises on repair."""
+        ending state's label evidence: the row's subtitle. Raises on repair, and
+        on the row going back to Not installed - the install ended, and waiting
+        out the remaining timeout for a state that will not change again is how a
+        finished failure gets reported as a stall."""
         deadline = time.monotonic() + timeout_min * 60
         last_label = ""
         while time.monotonic() < deadline:
@@ -406,6 +421,10 @@ class E2eDriver:
                     (repair.attrs.get("text", "")[:200]))
             if self.find(els, LABEL_INSTALLED):
                 return LABEL_INSTALLED
+            if self.find(els, LABEL_INSTALL_ROW):
+                raise RuntimeError(
+                    "INSTALL stage: the install ended and the row is back to Not"
+                    " installed (last progress: %s)" % (last_label or "nothing observed"))
             label = self.install_label(els)
             if label:
                 if label != last_label:
@@ -443,21 +462,116 @@ class E2eDriver:
             self.results[-1].evidence.append(shot)
         self.log("the settings row reports Installed and verified")
 
+    def install_state(self, elements):
+        """The install row's state as (title, line under it), read structurally:
+        the row is either the card title 'Ubuntu on this device' (every settled
+        state) or 'Installing <distro>' (mid-install), and its state line is the
+        text that follows it in dump order.
+
+        Two things rule out the obvious keyword match, and both were seen in E2E
+        run 35051269460: the row's state line can be below the fold while its
+        title is on screen (a dump holds only on-screen nodes), and the app's
+        'Last operation' error row can read 'Installing base packages failed
+        (exit 100)' - text that begins with the Installing label, which would
+        report a dead install as alive."""
+        texts = self._texts(elements)
+        values = {texts[i + 1] for i, t in enumerate(texts)
+                  if t == LABEL_LAST_OPERATION and i + 1 < len(texts)}
+        for i, text in enumerate(texts):
+            if text in values:
+                continue
+            if text == CARD_TITLE or text.startswith("Installing "):
+                return text, (texts[i + 1] if i + 1 < len(texts) else "")
+        return None, ""
+
+    def install_state_kind(self, title, line):
+        """'alive', 'ended' or 'unknown' for an install_state() reading. Only a
+        recognized reading ends the section walk: an unrecognized line is the row
+        half-visible or a screen the section has scrolled away from, not a
+        verdict about the install."""
+        if title and title.startswith(LABEL_INSTALLING):
+            return "alive"
+        if line.startswith(LABEL_INSTALLED):
+            return "alive"
+        if line.startswith(DEAD_INSTALL_LABELS):
+            return "ended"
+        return "unknown"
+
+    def _walk_linux_section(self, max_swipes=10):
+        """Read the Linux userspace section by scrolling through it, not from one
+        snapshot. The state row and the app's 'Last operation' error row sit at
+        different scroll offsets, and a uiautomator dump only holds on-screen
+        nodes: a single dump after scroll_to_linux_section stopped at the section
+        title found no state word and the check blamed the disturbance that
+        revealed the dead install (E2E run 35051269460 - the install had exited at
+        the dpkg repair pass two minutes earlier). Stops at the first recognized
+        state reading; returns every text seen, in order, and that dump."""
+        seen = []
+        els = self.dump()
+        for _ in range(max_swipes + 1):
+            for text in self._texts(els):
+                if text not in seen:
+                    seen.append(text)
+            if self.install_state_kind(*self.install_state(els)) != "unknown":
+                break
+            self._scroll_swipe(els)
+            time.sleep(1.2)
+            els = self.dump()
+        return seen, els
+
+    def _install_failure_detail(self, seen):
+        """The app's own words for why an install ended: the 'Last operation'
+        row's text, which the pipeline fills with the failing step and its exit
+        code. Without it the report can only name the disturbance that happened
+        to be the first to notice."""
+        if LABEL_LAST_OPERATION in seen:
+            index = seen.index(LABEL_LAST_OPERATION)
+            if index + 1 < len(seen):
+                return seen[index + 1]
+        for text in seen:
+            if text.startswith(LABEL_NEEDS_REPAIR):
+                return text
+        return None
+
     def _reenter_settings_during_install(self, disturbance):
         """After any disturbance the activity may have been recreated on the host
-        list; get back to the settings section and confirm the install is still
-        visibly alive (or already done). The disturbance's name rides along into
-        the failure so the report says which survival check did not pass."""
+        list; get back to the settings section and read what the install row says
+        now. Three outcomes, kept apart because they call for different
+        responses: alive (Installing or Installed), ended (the row is back to Not
+        installed, or Needs repair - the install's own failure, which the
+        disturbance only surfaced), or nothing about the install on screen at all
+        (the lifecycle failure this check exists to catch). The disturbance's name
+        rides along into the failure so the report says which survival check did
+        not pass."""
         if self.visible(LABEL_INSTALLED):
             return
         self.launch()
         self.open_settings()
         self.scroll_to_linux_section()
-        if not (self.visible(LABEL_INSTALLING) or self.visible(LABEL_INSTALLED)):
+        seen, els = self._walk_linux_section()
+        title, line = self.install_state(els)
+        kind = self.install_state_kind(title, line)
+        if kind == "alive":
+            return
+        detail = self._install_failure_detail(seen)
+        if kind == "ended" or detail:
+            # Either the state row itself says the install is over, or the app's
+            # own error row is on screen (the app sets it only when an operation
+            # failed). Both mean the install ended and this check merely got
+            # there after it did - which is the install's failure to report, not
+            # the lifecycle loss the disturbance's name would imply.
             raise RuntimeError(
-                "LIFECYCLE stage: the install did not survive the %s disturbance"
-                " - neither Installing nor Installed was on screen. "
-                "On screen: %s" % (disturbance, " | ".join(self._screen_digest())))
+                "INSTALL stage: the install had already ended when the %s disturbance was"
+                " checked: %s%s. On screen: %s"
+                % (disturbance,
+                   ("the row reads %s" % line[:120]) if kind == "ended" else "the app reports",
+                   (": %s" % detail) if detail and detail != line else "",
+                   " | ".join(seen[:40])))
+        raise RuntimeError(
+            "LIFECYCLE stage: the install did not survive the %s disturbance"
+            " - neither Installing nor Installed was on screen%s. "
+            "On screen: %s"
+            % (disturbance, (": %s" % detail) if detail else "", " | ".join(seen[:40])))
 
     def _exercise_background_during_install(self):
         self.adb.home()
