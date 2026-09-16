@@ -1,183 +1,521 @@
-emulate link(2) under a double SIGSYS, and stop the linkat emulation from moving the file
+emulate link() and linkat() correctly under the app seccomp filter
 
-Android's zygote seccomp policy for apps traps plain link() *and*
-linkat().  dpkg creates its /var/lib/dpkg/status-old backup with a plain
-link(status, status-old), so under the app policy the flow is:
+dpkg rotates its status database by hard-linking the current file to
+/var/lib/dpkg/status-old before writing a new one, so the Ubuntu E2E run
+35035691404 died on
 
-  link() SIGSYS -> handler rewrites the registers to the linkat layout
-  and restarts -> the restarted linkat SIGSYSes too -> handler runs the
-  PR_linkat emulation with the wrong registers.
+    dpkg: error: error creating new backup file
+    '/var/lib/dpkg/status-old': Permission denied
 
-At that second SIGSYS the registers CURRENT hold the *restored link()
-layout* (push_specific_regs restored them from ORIGINAL_SECCOMP_REWRITE
-at the syscall-exit stop of the rewritten call), so the emulation read
-newdirfd from SYSARG_3 = a stack pointer, newpath from SYSARG_4 =
-whatever the caller of link() happened to leave there, and translate_path
-returned -EBADF.  dpkg died on "status-old: Permission denied" and
-apt-get install exited 100 - the failure that ended the Ubuntu E2E run
-35035691404 after apt-get update had finally passed.
+and apt-get install exited 100 with the rootfs's dpkg database left
+untouched (no status-old at all, status unmodified).
 
-The olddirfd = peek_reg(tracee, ORIGINAL, SYSARG_1) read was equally
-wrong: for a direct guest linkat() the SIGSYS arrives with no prior
-sysenter stop of that call, so ORIGINAL holds whatever syscall ran
-before, and even for the rewritten link() ORIGINAL holds the linkat
-layout saved at the restart's sysenter - which is not what a link-layout
-SYSARG_1 means.
+The call arrives in PRoot as linkat(2), not link(2): glibc implements
+link(3) as linkat(AT_FDCWD, ...).  linkat(2) *is* on the app policy's
+allowlist (it is in bionic's SYSCALLS.TXT and not in
+SECCOMP_BLOCKLIST_APP.TXT, whereas plain link(2) has no entry at all and
+is trapped), so unlike PR_link it reaches PRoot's ordinary enter stage
+rather than the SIGSYS handler.  There the paths were translated and the
+kernel was left to run the call for real, in the tracee's app-domain
+process, where the platform refuses hard links in app data - EACCES, from
+SELinux's app-data rules and/or from the storage layer, which PRoot
+cannot tell apart and does not need to.  The guest saw that bare EACCES as
+the "Permission denied" above.  Translating the paths cannot help; the
+operation has to be performed by PRoot itself.
 
-Two more defects in the same emulation, found while fixing the first:
+The first version of this patch read the failure as a double SIGSYS
+(link() rewritten to linkat() and restarted, the restarted linkat trapping
+too) and fixed the wrong thing: under the real policy the restarted
+linkat is *allowed*, so it ran for real and produced the same EACCES while
+the emulation read its arguments from a register layout that no longer
+matched the call.  Two facts settle the design:
 
-  1. It called renameat() and, on the EXDEV/EACCES fallback path,
-     unlink()ed the source - it *moved* the file instead of hardlinking
-     it.  Every emulated link() destroyed its source: dpkg would have
-     lost /var/lib/dpkg/status itself once the register bug was fixed.
-     The kernel runs this code inside the same seccomp filter that
-     trapped linkat, so the host link(2) would SIGSYS-kill proot; a byte
-     copy is the only emulation that can run.  O_CREAT|O_EXCL reproduces
-     link(2)'s EEXIST-on-existing-target errno.
-  2. flags was read from a register that is garbage in both flows (it
-     was never used, so this is cosmetic).
+  - The fork never installs a seccomp filter of its own.
+    tracee/event.c's launch_process() replaced the
+    enable_syscall_filtering(tracee) call with a no-op, and the function
+    has no caller left anywhere, so nothing PRoot adds to
+    syscall/seccomp.c's filter can ever be reached.  (The filter a
+    tracee runs under is the platform's, inherited from zygote.)
+  - A SECCOMP_RET_TRAPped syscall kills the process that makes it even
+    with SIG_IGN installed, and with a no-op handler the syscall returns
+    the syscall number as its result (measured on this host).  So PRoot's
+    own process must only ever call syscalls the app policy allows, and a
+    trapped one is a loud death, not something to be caught.
 
-The fix: PR_link sets tracee->link_rewrite_pending before restarting;
-PR_linkat consumes the flag to know CURRENT holds the link() layout
-(SYSARG_1/2 = old/new path) versus a real linkat() layout, and both
-flows then translate the paths and byte-copy the source to the target,
-keeping the source and failing EEXIST when the target exists.
+The fix, then, is to do the link in PRoot's own process in whichever stage
+the call actually arrives:
 
-Validated on x86_64 Linux with a seccomp filter that TRAPs __NR_link and
-__NR_linkat exactly like the Android app policy: link() creates
-status-old with identical bytes and keeps the source; link() onto an
-existing name fails EEXIST; a missing source fails ENOENT; a direct
-linkat(AT_FDCWD,...) creates the target and keeps the source; linkat()
-onto an existing name fails EEXIST; untrapped link/linkat still work
-natively; the rename-SIGSYS fix from patch 0001 is unregressed.  Under
-the same trap, in a jammy rootfs: dpkg --configure -a exits 0 and
-"apt-get install -y hello" unpacks and configures the package with
-status-old created and hello running - the exact flow that failed in
-the E2E run.
+  - syscall/enter.c handles PR_linkat and PR_link by translating both
+    paths, calling emulate_link(), and - on success - voiding the syscall
+    (set_sysnum(PR_void)) and poking SYSARG_RESULT with 0, so the exit
+    stage hands the guest 0 and the kernel never sees the call.  On
+    failure it returns -errno, which syscall.c turns into the guest's
+    error.  PR_linkat keeps linkat semantics (AT_EMPTY_PATH is left to the
+    kernel; AT_SYMLINK_FOLLOW decides whether the source's final symlink
+    is resolved) and PR_link keeps link(2)'s (no flags, never follows a
+    symbolic source).
+  - tracee/seccomp.c's PR_link and PR_linkat SIGSYS cases call the same
+    emulate_link(), so a platform that *does* trap them behaves exactly
+    like one that does not.
+  - emulate_link() tries the real linkat() first: where the platform
+    permits hard links the guest gets one, with the shared inode, and
+    nothing is copied.  Only when the platform refuses with EACCES, EPERM,
+    EXDEV, ENOSYS or EOPNOTSUPP does it emulate - a symbolic source is
+    recreated with symlinkat(), anything else is copied byte for byte
+    through an O_CREAT|O_EXCL target (so an existing target still yields
+    link(2)'s EEXIST) and the partial target is unlinked if the copy
+    fails.  Every other errno (EEXIST, ENOENT, EISDIR, ...) is the
+    guest's answer and is returned untouched.
+  - Every syscall in emulate_link() runs in PRoot's own process, under the
+    same app policy, so only linkat/readlinkat/symlinkat/unlinkat/openat/
+    fstat/read/write/close appear there - all allowlisted.  unlinkat(2),
+    not unlink(2); link(2) and unlink(2) have no allowlist entry and would
+    kill PRoot outright.
+  - This also fixes the two defects of that first version: it read
+    olddirfd from ORIGINAL (garbage for a direct guest linkat), and its
+    fallback called renameat() and then unlink()ed the source - it *moved*
+    the file, so every emulated link destroyed its source and dpkg would
+    have lost /var/lib/dpkg/status itself.
+  - link_diag() lines (to PROOT_SIGSYS_LOG, see 0002) name what the
+    emulation decided and why.  This is the one place PRoot invents the
+    errno the guest sees, and "Permission denied" with no indication of
+    which step produced it is what made this take a device run to find.
 
-Not upstreamed: no write access to oonid/pr; this patch is applied to
-the pinned fork tarball by fetchLinuxSource in linux/build.gradle.kts
-on top of 0001 and 0002.
---- a/src/proot/src/tracee/tracee.h
-+++ b/src/proot/src/tracee/tracee.h
-@@ -161,6 +161,11 @@
- 	bool _regs_were_changed;
- 	bool restore_original_regs;
- 	bool restore_original_regs_after_seccomp_event;
-+	/* True between a PR_link SIGSYS rewritten to linkat and the SIGSYS
-+	 * of that rewritten linkat (Android traps both).  It tells the
-+	 * PR_linkat emulation that CURRENT holds the restored link() layout,
-+	 * not a linkat() layout.  */
-+	bool link_rewrite_pending;
+Validated on x86_64 Linux against a jammy rootfs, with proot -i 0:0, in
+three modes - A: no interference (the kernel allows hard links); B: the
+tracer's linkat() forced to EACCES, which is the device's refusal; C: a
+harness that installs a filter trapping __NR_link and allowing everything
+else, i.e. the app policy exactly.  In all three, dpkg --configure -a
+exits 0 and creates status-old (A and C as a true hard link sharing
+status's inode, B as a byte copy of it), apt-get install --reinstall -y
+hello exits 0 and the installed hello runs.  Under the trap harness the
+guest's glibc ln, a raw trapped link(2) and a raw linkat(2) all produce
+genuinely hard-linked files with identical inodes, and EEXIST/ENOENT/
+ENOTDIR still come from the kernel.  In mode B a symbolic source is
+recreated as a symlink rather than followed.
+
+Not upstreamed: no write access to oonid/pr; applied by fetchLinuxSource
+in linux/build.gradle.kts (stacks on 0001 and 0002).
+--- a/src/proot/src/syscall/enter.c
++++ b/src/proot/src/syscall/enter.c
+@@ -44,6 +44,7 @@
+ #include "tracee/reg.h"
+ #include "tracee/mem.h"
+ #include "tracee/abi.h"
++#include "tracee/seccomp.h"
+ #include "path/path.h"
+ #include "path/canon.h"
+ #include "arch.h"
+@@ -107,6 +108,8 @@
+ 	char path[PATH_MAX];
+ 	char oldpath[PATH_MAX];
+ 	char newpath[PATH_MAX];
++	char old_host_path[PATH_MAX];
++	char new_host_path[PATH_MAX];
  
- 	/* State for the special handling of SIGSTOP.  */
- 	enum {
---- a/src/proot/src/tracee/seccomp.c
-+++ b/src/proot/src/tracee/seccomp.c
-@@ -205,6 +205,10 @@
- 		poke_reg(tracee, SYSARG_1, AT_FDCWD);
- 		poke_reg(tracee, SYSARG_3, AT_FDCWD);
- 		poke_reg(tracee, SYSARG_5, 0);
-+		/* Android traps linkat too, so this rewrite SIGSYSes again.
-+		 * Flag it so the PR_linkat emulation knows the register
-+		 * banks hold the link() layout when that second trap lands.  */
-+		tracee->link_rewrite_pending = true;
- 		restart_syscall_after_seccomp(tracee);
+ 	word_t syscall_number;
+ 	bool special = false;
+@@ -506,6 +509,12 @@
+ 		newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
+ 		flags    = peek_reg(tracee, CURRENT, SYSARG_5);
+ 
++		/* With AT_EMPTY_PATH the source is @olddirfd itself: there
++		 * is no path to translate or to emulate, so let the kernel
++		 * have the call.  */
++		if ((flags & AT_EMPTY_PATH) != 0)
++			break;
++
+ 		status = get_sysarg_path(tracee, oldpath, SYSARG_2);
+ 		if (status < 0)
+ 			break;
+@@ -514,14 +523,35 @@
+ 		if (status < 0)
+ 			break;
+ 
+-		if ((flags & AT_SYMLINK_FOLLOW) != 0)
+-			status = translate_path2(tracee, olddirfd, oldpath, SYSARG_2, REGULAR);
+-		else
+-			status = translate_path2(tracee, olddirfd, oldpath, SYSARG_2, SYMLINK);
++		/* Same "nothing to translate" case as translate_path2().  */
++		if (oldpath[0] == '\0' || newpath[0] == '\0')
++			break;
++
++		status = translate_path(tracee, old_host_path, olddirfd, oldpath,
++					(flags & AT_SYMLINK_FOLLOW) != 0);
++		if (status < 0)
++			break;
++
++		status = translate_path(tracee, new_host_path, newdirfd, newpath, false);
+ 		if (status < 0)
+ 			break;
+ 
+-		status = translate_path2(tracee, newdirfd, newpath, SYSARG_4, SYMLINK);
++		/* This is where the guest's glibc link(3) lands: glibc
++		 * implements link() as linkat(AT_FDCWD, ...) on 64-bit, and
++		 * unlike link(2) -- which bionic's SYSCALLS.TXT omits, so
++		 * the app policy traps it -- linkat(2) is on the allowlist,
++		 * so this call reaches PRoot's ordinary "enter" stage
++		 * instead of the SIGSYS handler.  The kernel would refuse it
++		 * in app data (see emulate_link()), and dpkg(1) cannot
++		 * install anything without its link(status, status-old)
++		 * backup.  Make the link here, in PRoot's own process, and
++		 * keep the kernel out of it.  */
++		status = emulate_link(tracee, old_host_path, new_host_path, flags);
++		if (status < 0)
++			break;
++
++		set_sysnum(tracee, PR_void);
++		poke_reg(tracee, SYSARG_RESULT, 0);
  		break;
  
-@@ -664,17 +668,36 @@
+ 	case PR_mount:
+@@ -567,6 +597,37 @@
+ 		break;
+ 
+ 	case PR_link:
++		/* Emulated for the same reason as PR_linkat below, and so
++		 * that a platform which does let link(2) through behaves
++		 * exactly like one which traps it.  link(2) takes no flags
++		 * and never follows a symbolic source.  */
++		status = get_sysarg_path(tracee, oldpath, SYSARG_1);
++		if (status < 0)
++			break;
++
++		status = get_sysarg_path(tracee, newpath, SYSARG_2);
++		if (status < 0)
++			break;
++
++		if (oldpath[0] == '\0' || newpath[0] == '\0')
++			break;
++
++		status = translate_path(tracee, old_host_path, AT_FDCWD, oldpath, false);
++		if (status < 0)
++			break;
++
++		status = translate_path(tracee, new_host_path, AT_FDCWD, newpath, false);
++		if (status < 0)
++			break;
++
++		status = emulate_link(tracee, old_host_path, new_host_path, 0);
++		if (status < 0)
++			break;
++
++		set_sysnum(tracee, PR_void);
++		poke_reg(tracee, SYSARG_RESULT, 0);
++		break;
++
+ 	case PR_rename:
+ 		status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
+ 		if (status < 0)
+--- a/src/proot/src/tracee/seccomp.c
++++ b/src/proot/src/tracee/seccomp.c
+@@ -14,6 +14,7 @@
+ #include <sched.h>     /* CLONE_*, */
+ #include <limits.h>    /* PATH_MAX, */
+ #include <stdlib.h>   /* getenv(3), */
++#include <stdarg.h>   /* va_list, vsnprintf(3), */
+ 
+ #include "extension/extension.h"
+ #include "cli/note.h"
+@@ -27,6 +28,159 @@
+ static int handle_seccomp_event_common(Tracee *tracee);
+ 
+ /**
++ * Append one diagnostic line to the blocked-syscall log (the file named by
++ * PROOT_SIGSYS_LOG, defaulting to the fork's own app cache; an empty value
++ * disables it).
++ *
++ * The link emulation is the one place where PRoot itself invents the errno
++ * the guest sees, and the device failure this log exists for was a bare
++ * "Permission denied" from dpkg's status-db backup with nothing to say
++ * which step produced it: the trap, the path translation, the platform's
++ * hard-link attempt, or the byte copy.  Every decision is named here, so
++ * the answer arrives with the next run instead of the next theory.
++ */
++static void link_diag(const char *fmt, ...)
++{
++	char line[512];
++	va_list ap;
++	const char *log_path = getenv("PROOT_SIGSYS_LOG");
++	FILE *f;
++
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++
++	if (log_path == NULL)
++		log_path = "/data/data/id.or.oo.pr/cache/sigsys-log.txt";
++	if (*log_path == '\0')
++		return;
++
++	f = fopen(log_path, "a");
++	if (f == NULL)
++		return;
++	fprintf(f, "LINK: %s\n", line);
++	fclose(f);
++}
++
++/**
++ * Make @new_translated a hard link to @old_translated on behalf of the
++ * tracee, and return 0 or a negative errno for the guest.  @flags is the
++ * guest's linkat(2) flags; link(2) has none.  The work happens in PRoot's
++ * own process, on the already-translated host paths, exactly like the path
++ * translations PRoot performs everywhere else.
++ *
++ * The real linkat(2) is tried first, so wherever the platform permits hard
++ * links the guest keeps hard-link semantics: one inode, one copy of the
++ * data, and -- for a symbolic source -- a second name for the link itself
++ * rather than a second link.  Android permits none of that: SELinux denies
++ * file:link in app data with EACCES and a dontaudit rule, so the kernel
++ * refuses and says nothing.  dpkg(1) makes its /var/lib/dpkg/status backup
++ * with link(status, status-old) and cannot install anything without it, so
++ * the refusals are emulated instead:
++ *
++ *   - a symbolic source that is not to be followed becomes a symbolic
++ *     destination with the same target, since a byte copy cannot express
++ *     "a second name for this link" (opening it with O_NOFOLLOW is ELOOP);
++ *   - anything else is byte-copied: same content, same mode, source kept.
++ *
++ * O_CREAT|O_EXCL reproduces link(2)'s EEXIST for an existing target, and a
++ * failed copy is removed again with unlinkat(2).
++ *
++ * Every syscall in here is made by PRoot's own process, which runs under
++ * the app seccomp policy just like its tracees do: it may only use the
++ * syscalls that policy allows (bionic's SYSCALLS.TXT lists linkat,
++ * readlinkat, symlinkat, unlinkat, openat, fstat, read, write and close,
++ * and neither app blocklist removes any of them), because a trapped syscall
++ * kills the process -- SIG_IGN does not save it.  link(2) and unlink(2) are
++ * not on that list, which is why neither one appears here.
++ */
++int emulate_link(Tracee *tracee, const char *old_translated,
++			const char *new_translated, int flags)
++{
++	char target[PATH_MAX];
++	int src_fd, dst_fd;
++	struct stat st;
++	char cpbuf[8192];
++	ssize_t n;
++	int saved;
++
++	if (linkat(AT_FDCWD, old_translated, AT_FDCWD, new_translated,
++		   flags & AT_SYMLINK_FOLLOW) == 0)
++		return 0;
++
++	/* Distinguish "the kernel refused" from "nothing ran": a syscall
++	 * that never executed leaves errno untouched.  */
++	saved = errno != 0 ? errno : ENOSYS;
++	if (saved != EACCES && saved != EPERM && saved != EXDEV
++	    && saved != ENOSYS && saved != EOPNOTSUPP)
++		return -saved;	/* EEXIST, ENOENT, EISDIR, ... are the answer */
++
++	link_diag("native linkat refused (%d), emulating: %s -> %s",
++		saved, old_translated, new_translated);
++	VERBOSE(tracee, 3, "link: native linkat refused (%d), emulating: %s -> %s",
++		saved, old_translated, new_translated);
++
++	if ((flags & AT_SYMLINK_FOLLOW) == 0) {
++		n = readlinkat(AT_FDCWD, old_translated, target, sizeof(target) - 1);
++		if (n >= 0) {
++			target[n] = '\0';
++			link_diag("symbolic source, recreating target: %s -> %s (%s)",
++				old_translated, new_translated, target);
++			if (symlinkat(target, AT_FDCWD, new_translated) == 0)
++				return 0;
++			return -errno;
++		}
++	}
++
++	src_fd = open(old_translated,
++		      O_RDONLY | (((flags & AT_SYMLINK_FOLLOW) != 0) ? 0 : O_NOFOLLOW));
++	if (src_fd < 0)
++		return -errno;
++
++	if (fstat(src_fd, &st) < 0) {
++		saved = errno;
++		close(src_fd);
++		return -saved;
++	}
++
++	dst_fd = open(new_translated, O_WRONLY | O_CREAT | O_EXCL, st.st_mode & 07777);
++	if (dst_fd < 0) {
++		saved = errno;
++		close(src_fd);
++		return -saved;
++	}
++
++	while ((n = read(src_fd, cpbuf, sizeof(cpbuf))) > 0) {
++		ssize_t written = 0;
++
++		while (written < n) {
++			ssize_t w = write(dst_fd, cpbuf + written, n - written);
++
++			if (w < 0) {
++				saved = errno;
++				close(dst_fd);
++				close(src_fd);
++				unlinkat(AT_FDCWD, new_translated, 0);
++				return -saved;
++			}
++			written += w;
++		}
++	}
++	if (n < 0) {
++		saved = errno;
++		close(dst_fd);
++		close(src_fd);
++		unlinkat(AT_FDCWD, new_translated, 0);
++		return -saved;
++	}
++
++	close(dst_fd);
++	close(src_fd);
++	VERBOSE(tracee, 3, "link: copied %s -> %s", old_translated, new_translated);
++	return 0;
++}
++
++/**
+  * Restart syscall that caused seccomp event
+  * after changing it in tracee registers
+  *
+@@ -199,14 +353,49 @@
+ 		break;
+ 
+ 	case PR_link:
+-		set_sysnum(tracee, PR_linkat);
+-		poke_reg(tracee, SYSARG_4, peek_reg(tracee, CURRENT, SYSARG_2));
+-		poke_reg(tracee, SYSARG_2, peek_reg(tracee, CURRENT, SYSARG_1));
+-		poke_reg(tracee, SYSARG_1, AT_FDCWD);
+-		poke_reg(tracee, SYSARG_3, AT_FDCWD);
+-		poke_reg(tracee, SYSARG_5, 0);
+-		restart_syscall_after_seccomp(tracee);
++	{
++		char oldpath[PATH_MAX];
++		char newpath[PATH_MAX];
++		char old_translated[PATH_MAX];
++		char new_translated[PATH_MAX];
++		int size;
++
++		/* bionic's SYSCALLS.TXT has no link(2) entry, so the generated
++		 * app policy traps it; linkat(2) *is* on the allowlist.  This
++		 * case used to rewrite the registers to the linkat layout and
++		 * restart, which handed the call straight back to the kernel
++		 * (linkat is allowed) and to SELinux's refusal of hard links in
++		 * app data -- the EACCES dpkg reported.  Emulate it here
++		 * instead, in PRoot's own process: the kernel is never asked.
++		 * link(2) has no flags and never follows a symbolic source.  */
++		size = read_string(tracee, oldpath, peek_reg(tracee, CURRENT, SYSARG_1), PATH_MAX);
++		if (size < 0) {
++			set_result_after_seccomp(tracee, size);
++			break;
++		}
++		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, SYSARG_2), PATH_MAX);
++		if (size < 0) {
++			set_result_after_seccomp(tracee, size);
++			break;
++		}
++
++		status = translate_path(tracee, old_translated, AT_FDCWD, oldpath, false);
++		if (status < 0) {
++			set_result_after_seccomp(tracee, status);
++			break;
++		}
++		status = translate_path(tracee, new_translated, AT_FDCWD, newpath, false);
++		if (status < 0) {
++			set_result_after_seccomp(tracee, status);
++			break;
++		}
++
++		link_diag("link(%s, %s)", oldpath, newpath);
++		status = emulate_link(tracee, old_translated, new_translated, 0);
++		link_diag("link(%s, %s) -> %d", oldpath, newpath, status);
++		set_result_after_seccomp(tracee, status);
+ 		break;
++	}
+ 
+ 	case PR_chmod:
+ 		set_sysnum(tracee, PR_fchmodat);
+@@ -664,7 +853,7 @@
  		char newpath[PATH_MAX];
  		char old_translated[PATH_MAX];
  		char new_translated[PATH_MAX];
 -		int olddirfd = peek_reg(tracee, ORIGINAL, SYSARG_1);
--		int newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
--		int flags = peek_reg(tracee, CURRENT, SYSARG_5);
--		int size;
-+		/* A rewritten link() arrives here after its own SIGSYS was
-+		 * restored to the link() layout in CURRENT (SYSARG_1/2 =
-+		 * old/new path), while a direct linkat() keeps the linkat
-+		 * layout in CURRENT.  Android traps both syscalls, so both
-+		 * flows must work.  */
-+		int olddirfd, newdirfd, flags, size;
-+		bool from_link_rewrite = tracee->link_rewrite_pending;
-+		if (from_link_rewrite) {
-+			tracee->link_rewrite_pending = false;
-+			olddirfd = AT_FDCWD;
-+			newdirfd = AT_FDCWD;
-+			flags = 0;
-+		} else {
-+			olddirfd = peek_reg(tracee, CURRENT, SYSARG_1);
-+			newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
-+			flags = peek_reg(tracee, CURRENT, SYSARG_5);
-+		}
- 
--		size = read_string(tracee, oldpath, peek_reg(tracee, CURRENT, SYSARG_2), PATH_MAX);
-+		size = read_string(tracee, oldpath,
-+				from_link_rewrite ? peek_reg(tracee, CURRENT, SYSARG_1)
-+				                  : peek_reg(tracee, CURRENT, SYSARG_2),
-+				PATH_MAX);
- 		if (size < 0) {
- 			set_result_after_seccomp(tracee, size);
- 			break;
- 		}
--		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, SYSARG_4), PATH_MAX);
-+		size = read_string(tracee, newpath,
-+				from_link_rewrite ? peek_reg(tracee, CURRENT, SYSARG_2)
-+				                  : peek_reg(tracee, CURRENT, SYSARG_4),
-+				PATH_MAX);
- 		if (size < 0) {
- 			set_result_after_seccomp(tracee, size);
- 			break;
-@@ -691,21 +714,34 @@
++		int olddirfd = peek_reg(tracee, CURRENT, SYSARG_1);
+ 		int newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
+ 		int flags = peek_reg(tracee, CURRENT, SYSARG_5);
+ 		int size;
+@@ -680,51 +869,25 @@
  			break;
  		}
  
-+		/* The kernel runs this code under the same seccomp filter
-+		 * that trapped linkat, so the host link() would SIGSYS-kill
-+		 * proot itself; a byte copy is the only emulation that can
-+		 * run.  The old code called renameat() and unlinked the
-+		 * source - that moved the file instead of hardlinking it,
-+		 * destroying dpkg's /var/lib/dpkg/status on every backup.  */
- 		errno = 0;
+-		status = translate_path(tracee, old_translated, olddirfd, oldpath, true);
++		status = translate_path(tracee, old_translated, olddirfd, oldpath,
++					(flags & AT_SYMLINK_FOLLOW) != 0);
+ 		if (status < 0) {
+ 			set_result_after_seccomp(tracee, status);
+ 			break;
+ 		}
+-		status = translate_path(tracee, new_translated, newdirfd, newpath, true);
++		status = translate_path(tracee, new_translated, newdirfd, newpath, false);
+ 		if (status < 0) {
+ 			set_result_after_seccomp(tracee, status);
+ 			break;
+ 		}
+ 
+-		errno = 0;
 -		if (renameat(AT_FDCWD, old_translated, AT_FDCWD, new_translated) == 0) {
 -			set_result_after_seccomp(tracee, 0);
 -		} else if (errno == EXDEV || errno == EACCES) {
 -			int src_fd = open(old_translated, O_RDONLY);
-+		{
-+			int src_fd = open(old_translated, O_RDONLY | O_NOFOLLOW);
- 			if (src_fd < 0) {
- 				set_result_after_seccomp(tracee, -errno);
- 				break;
- 			}
- 			struct stat st;
+-			if (src_fd < 0) {
+-				set_result_after_seccomp(tracee, -errno);
+-				break;
+-			}
+-			struct stat st;
 -			fstat(src_fd, &st);
 -			int dst_fd = open(new_translated, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode);
-+			if (fstat(src_fd, &st) < 0) {
-+				int saved = errno;
-+				close(src_fd);
-+				set_result_after_seccomp(tracee, -saved);
-+				break;
-+			}
-+			int dst_fd = open(new_translated, O_WRONLY | O_CREAT | O_EXCL, st.st_mode & 07777);
- 			if (dst_fd < 0) {
-+				int saved = errno;
- 				close(src_fd);
+-			if (dst_fd < 0) {
+-				close(src_fd);
 -				set_result_after_seccomp(tracee, -errno);
-+				/* link(2) fails with EEXIST when the target
-+				 * name already exists; O_EXCL reproduces
-+				 * that errno from open(2) already.  */
-+				set_result_after_seccomp(tracee, -saved);
- 				break;
- 			}
- 			char cpbuf[8192];
-@@ -720,10 +756,7 @@
- 			}
- 			close(dst_fd);
- 			close(src_fd);
+-				break;
+-			}
+-			char cpbuf[8192];
+-			ssize_t n;
+-			while ((n = read(src_fd, cpbuf, sizeof(cpbuf))) > 0) {
+-				ssize_t w = 0;
+-				while (w < n) {
+-					ssize_t wn = write(dst_fd, cpbuf + w, n - w);
+-					if (wn < 0) break;
+-					w += wn;
+-				}
+-			}
+-			close(dst_fd);
+-			close(src_fd);
 -			unlink(old_translated);
- 			set_result_after_seccomp(tracee, 0);
+-			set_result_after_seccomp(tracee, 0);
 -		} else {
 -			set_result_after_seccomp(tracee, -errno);
- 		}
+-		}
++		/* The guest's glibc link(3) lands here, not in PR_link: glibc
++		 * implements link() as linkat(AT_FDCWD, …) on 64-bit.  See
++		 * emulate_link() for why the kernel is not asked to do it.  */
++		link_diag("linkat(%s, %s, flags=%d)", oldpath, newpath, flags);
++		status = emulate_link(tracee, old_translated, new_translated, flags);
++		link_diag("linkat(%s, %s) -> %d", oldpath, newpath, status);
++		set_result_after_seccomp(tracee, status);
  		break;
  	}
+ 
+--- a/src/proot/src/tracee/seccomp.h
++++ b/src/proot/src/tracee/seccomp.h
+@@ -16,6 +16,11 @@
+ 	int f_spare[4];
+ };
+ 
++/* Make @new_translated a hard link to @old_translated on behalf of the
++ * tracee; the work happens in PRoot's own process.  See tracee/seccomp.c.  */
++int emulate_link(Tracee *tracee, const char *old_translated,
++		const char *new_translated, int flags);
++
+ void restart_syscall_after_seccomp(Tracee* tracee);
+ void set_result_after_seccomp(Tracee *tracee, word_t result);
+ int handle_seccomp_event(Tracee* tracee, int trapped_syscall);
