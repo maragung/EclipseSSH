@@ -253,23 +253,45 @@ class UbuntuE2eVerificationTest {
         // verify by counting links) reads that copy as a lock already held. Two names, one inode,
         // two links is what a real link looks like, and it is what let openssh-client's postinst
         // lock /etc/group at all.
-        sessionSucceeds("rm -rf /tmp/link-probe && mkdir -p /tmp/link-probe && printf x > /tmp/link-probe/a")
-        sessionSucceeds("ln /tmp/link-probe/a /tmp/link-probe/b")
-        // -ef is the shell's own answer to "same file" (device and inode are equal), so it reads the
-        // pair through a different question than stat's link count.
-        sessionSucceeds("test /tmp/link-probe/a -ef /tmp/link-probe/b")
+        //
+        // ONE session, not four. The patch's record of the pair lives in the proot process that made
+        // the link, so a stat(2) served by the *next* proot invocation finds an empty table and
+        // answers with the kernel's copy — one link each. Splitting these commands into separate
+        // sessions is how this test first failed (run 35100526297: "test a -ef b exited 1"), and the
+        // failure was the test's, not the patch's: shadow takes its lock and verifies it inside one
+        // process, which is the case the patch is built for and the only one it claims.
+        //
+        // `test -ef` and `stat -c '%h %i'` are deliberately both asked: -ef goes through the shell's
+        // own stat (glibc's newfstatat) and coreutils' stat goes through statx, so the two syscall
+        // paths the patch corrects are both exercised.
+        val probe = sessionSucceeds(
+            "rm -rf /tmp/link-probe && mkdir -p /tmp/link-probe && printf x > /tmp/link-probe/a && " +
+                "ln /tmp/link-probe/a /tmp/link-probe/b && " +
+                // Not chained with &&: a 'no' answer must still reach the stat below, so the failure
+                // message can carry what the filesystem actually said instead of an empty output.
+                "{ test /tmp/link-probe/a -ef /tmp/link-probe/b && echo same-file=yes || echo same-file=no; } && " +
+                "stat -c 'links=%h inode=%i' /tmp/link-probe/a /tmp/link-probe/b",
+        )
+        check(probe.contains("same-file=yes")) {
+            "LINK stage: the shell does not see the two names as one file, so shadow(1) would read " +
+                "its own lock as held: ${probe.take(500)}"
+        }
 
-        val counted = sessionSucceeds("stat -c '%h %i' /tmp/link-probe/a /tmp/link-probe/b")
-        val rows = counted.lines().map { it.trim() }.filter { it.isNotEmpty() }.map { it.split(Regex("\\s+")) }
-        check(rows.size == 2 && rows.all { it.size == 2 }) {
-            "LINK stage: expected 'stat' to report two '<links> <inode>' rows, got: ${counted.take(500)}"
+        val rows = probe.lines()
+            .map { it.trim() }
+            .filter { it.startsWith("links=") }
+            .map { Regex("links=(\\d+) inode=(\\d+)").find(it) }
+        check(rows.size == 2 && rows.all { it != null }) {
+            "LINK stage: expected 'stat' to report two 'links=<n> inode=<n>' rows, got: ${probe.take(500)}"
         }
-        check(rows[0][0] == "2" && rows[1][0] == "2") {
-            "LINK stage: the two names report ${rows[0][0]} and ${rows[1][0]} links, expected 2 each — " +
-                "the link was emulated as a byte copy, so shadow(1) would read its own lock as held: ${counted.take(500)}"
+        val links = rows.map { it!!.groupValues[1] }
+        val inodes = rows.map { it!!.groupValues[2] }
+        check(links[0] == "2" && links[1] == "2") {
+            "LINK stage: the two names report ${links[0]} and ${links[1]} links, expected 2 each — " +
+                "the link was emulated as a byte copy, so shadow(1) would read its own lock as held: ${probe.take(500)}"
         }
-        check(rows[0][1] == rows[1][1]) {
-            "LINK stage: the two names report inodes ${rows[0][1]} and ${rows[1][1]}, expected one inode: ${counted.take(500)}"
+        check(inodes[0] == inodes[1]) {
+            "LINK stage: the two names report inodes ${inodes[0]} and ${inodes[1]}, expected one inode: ${probe.take(500)}"
         }
     }
 

@@ -50,6 +50,20 @@ second caller rather than a second implementation: this fork's statx
 emulation fills that structure itself (tracee/statx.c), so it is corrected
 there, before it is written back to the guest.
 
+The record lives in the PRoot process that made the link, and that is the
+whole of its scope.  A later PRoot invocation finds an empty table and
+answers with the kernel's copy -- one link each -- because the app runs one
+PRoot process per command.  This is enough for what the patch is for, and
+nothing here pretends to be more: shadow takes its lock and verifies it
+inside a single process, and every tool with that protocol does the same, so
+the question is always asked in the run that made the link.  A guest that
+links in one command and stats in the next gets the truth about the copy,
+which is the right answer to a question this patch never claimed to answer.
+It is why the E2E probe links, stats and asks `test -ef` inside ONE session
+(UbuntuE2eVerificationTest.hardLinksShareOneInode): the first version of that
+probe split the three commands into three sessions and failed on run
+35100526297, and the failure was the test's, not this patch's.
+
 The correction is skipped for a 32-bit tracee.  Its struct stat64 is not the
 64-bit structure this reads and writes whole, and poking it anyway would
 write past the guest's buffer and corrupt its memory; abi.h carries offsets
@@ -76,7 +90,17 @@ linkat(2)/link(2) for PRoot and every tracee:
   - stat and ls of an emulated pair both report 2 links and the same inode,
     and test a -ef b succeeds.  link(a,b); link(b,c) reports 3 links on all
     three names.  After either name is replaced by rename(2), the survivor
-    reports 1 link again.
+    reports 1 link again.  (Every one of these ran inside a single PRoot
+    process, which is the only scope the record has -- see above.)
+  - On the device (E2E run 35100526297, API 35): the install phase passed for
+    the first time, 304s, apt-get install exit 0 with no lock failure, where
+    run 35086244789 had died in the same phase on groupadd's exit 10.  The
+    install log the app records shows the dpkg repair pass exiting 0 with
+    nothing to do, which is what a clean lock leaves behind.  This is what
+    the patch was written for, but it is correlation, not proof: the same
+    run carried the app-side dpkg repair and storage-gate changes, and
+    attributing the pass to any one of them would need an A/B the E2E does
+    not run.
   - A genuinely stale /etc/group.lock is still refused, with shadow's own
     "existing lock file ... with an invalid PID" and exit 10: the EEXIST is
     passed through rather than overwritten, so a byte copy can never clobber

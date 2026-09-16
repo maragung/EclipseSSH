@@ -22,6 +22,15 @@ Each patch's preamble documents the failure it fixes, the evidence, and why
 it is not upstream. When a patch is superseded by a new fork pin that
 includes it upstream, delete the patch and bump the pin in the same change.
 
+One boundary is worth knowing before relying on any of this: 0004's record of
+an emulated hard link lives in the proot process that made the link, so its
+answer holds inside one command, not across the guest's filesystem. The app
+runs one proot process per command, so a tool that links in one command and
+stats in the next gets the kernel's answer — a byte copy with one link. That
+covers the lock protocol it was written for (shadow links and verifies inside
+one process) and nothing wider; the patch's preamble says so, and so does the
+E2E probe, which is why the probe asks its questions in a single session.
+
 The build needs GNU `patch` on PATH (not in the stock ubuntu-24.04 runner
 image — every CI workflow installs it alongside the native cache step), and
 the `linux-native-*` cache keys hash this directory's `*.patch` files so a
