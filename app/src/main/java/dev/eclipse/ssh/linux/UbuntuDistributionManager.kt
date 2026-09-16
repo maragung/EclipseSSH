@@ -103,6 +103,10 @@ class UbuntuDistributionManager(
     ): SetupReport {
         val warnings = mutableListOf<String>()
         requireOnline("starting setup")
+        // One run, one blocked-syscall log: the fork appends to it for as long as it runs, so
+        // without this the evidence for a failure at minute twelve is buried under the traps of
+        // every previous run this device has done.
+        runtime.resetSigsysLog()
         onStep(SetupStep.REGISTER_USER)
         registerUbuntuUser()
         onStep(SetupStep.PREPARE_WORKSPACE)
@@ -485,6 +489,13 @@ class UbuntuDistributionManager(
      * that can clear a half-configured dpkg state. Tolerated — its failure is captured and
      * reported as a warning, because the ladder below is the step's real verdict and a fresh
      * rootfs has nothing to configure anyway.
+     *
+     * Tolerated is not the same as unexamined: this pass failing is what leaves dpkg interrupted
+     * for every command after it (apt then exits 100 without touching a mirror, and the install
+     * dies at the base packages with an error that names neither dpkg nor this pass). So its
+     * failure is recorded with both ends of the evidence — the app's own error line, the dpkg
+     * database the host sees, and the fork's log — and the warning carries dpkg's line, which is
+     * the sentence the user can act on.
      */
     private suspend fun repairPackageState(warnings: MutableList<String>, onProgress: (String) -> Unit) {
         val startedAt = System.currentTimeMillis()
@@ -495,15 +506,47 @@ class UbuntuDistributionManager(
             "dpkg repair pass",
             exitCode = result?.exitCode,
             durationMs = System.currentTimeMillis() - startedAt,
-            detail = if (ok) null else result?.outputText()?.take(200),
+            detail = failureTail(result?.outputText(), lines = 1, maxChars = 160),
         )
+        // The fork's own record of what it did about hard links: on a device where the kernel
+        // refuses them in app data, the emulation is the reason this pass can now succeed — and
+        // where it still fails, the log says which decision it made before the failure.
+        recordSigsysTail("dpkg repair pass")
         if (!ok) {
+            // The state the failed pass leaves behind, which is what every later apt run trips
+            // over, and the one reading that distinguishes "nothing to configure" from "the
+            // database is interrupted and no mirror can help".
+            diagnostics.record(
+                UserspaceDiagnosticCategory.APT,
+                "dpkg database",
+                detail = dpkgDatabaseSummary(),
+                exitCode = result?.exitCode,
+            )
             warnings +=
                 "the dpkg repair pass did not fully succeed" +
-                    (result?.outputText()?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                    (failureTail(result?.outputText(), lines = 1)
                         ?.let { ": $it" } ?: ": the pass did not answer in time")
         }
     }
+
+    /**
+     * The end of a failed command's output, cleaned of terminal escapes and capped — where the
+     * line that names a failure is. dpkg colours its errors whenever stderr is a terminal, and
+     * under a pty it always is, so the same "error creating new backup file …: Permission denied"
+     * arrives carrying `ESC[1m` sequences that would otherwise reach the diagnostics export and
+     * the user's warning list. [lines] is how many of the last non-blank lines to join; the cap
+     * keeps a wall of apt progress from becoming the message.
+     */
+    private fun failureTail(output: String?, lines: Int = 2, maxChars: Int = 300): String? =
+        output
+            ?.lineSequence()
+            ?.map { stripEscapes(it).trim() }
+            ?.filter { it.isNotBlank() }
+            ?.toList()
+            ?.takeLast(lines)
+            ?.joinToString(" | ")
+            ?.take(maxChars)
+            ?.takeIf { it.isNotBlank() }
 
     /**
      * The runtime smoke step: `echo <marker>` under the same argv every scripted command uses.
@@ -639,11 +682,23 @@ class UbuntuDistributionManager(
             } else {
                 warnings +=
                     "package '$pkg' was not installed" +
-                        (result?.outputText()?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                        (failureTail(result?.outputText(), lines = 1)
                             ?.let { ": $it" } ?: ": the install did not answer in time")
             }
         }
         if (installed == 0) {
+            // Every package failing is apt itself refusing, not a missing package: record what
+            // the apt phase cannot say about itself - dpkg's database as the host sees it (an
+            // interrupted one is the common cause and the message the user can act on) and the
+            // fork's log - before the verdict is thrown.
+            val dpkgState = dpkgDatabaseSummary()
+            diagnostics.record(
+                UserspaceDiagnosticCategory.APT,
+                "every base package failed",
+                detail = dpkgState,
+                exitCode = first?.exitCode ?: retry?.exitCode,
+            )
+            recordSigsysTail("base packages failed")
             throw UserspaceFailure.fromCommandOutput(
                 "Installing base packages",
                 first?.exitCode ?: retry?.exitCode,
@@ -651,7 +706,9 @@ class UbuntuDistributionManager(
                 dnsServers = writtenDnsServers,
             ) ?: IOException(
                 "Installing base packages failed (exit ${first?.exitCode ?: retry?.exitCode}): " +
-                    (first?.outputText() ?: retry?.outputText() ?: "").take(2000),
+                    (failureTail(first?.outputText() ?: retry?.outputText(), lines = 3, maxChars = 2000)
+                        ?: "") +
+                    " (" + dpkgState + ")",
             )
         }
     }
@@ -716,7 +773,7 @@ class UbuntuDistributionManager(
         if (result == null || result.exitCode != 0) {
             warnings +=
                 "Node.js was not installed" +
-                    (result?.outputText()?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                    (failureTail(result?.outputText(), lines = 1)
                         ?.let { ": $it" } ?: ": the install timed out")
         }
     }
@@ -731,7 +788,7 @@ class UbuntuDistributionManager(
             if (result == null || result.exitCode != 0) {
                 warnings +=
                     "npm package '$tool' was not installed" +
-                        (result?.outputText()?.lineSequence()?.lastOrNull { it.isNotBlank() }
+                        (failureTail(result?.outputText(), lines = 1)
                             ?.let { ": $it" } ?: ": the install timed out")
             }
         }
@@ -785,17 +842,42 @@ class UbuntuDistributionManager(
      * per trapped syscall the fork could not downgrade — the difference between "apt failed with
      * ENOSYS" and "syscall 82 (rename) was trapped and unmapped". No event when the log is
      * missing or empty: most failures have no SIGSYS in them, and silence is not evidence.
+     *
+     * The fork also writes its *decisions* here, not only its traps: patch 0003 logs every link
+     * it emulated and why, which is the one record of the platform refusing a hard link in app
+     * data that no amount of guest-side output can carry.
      */
     private fun recordSigsysTail(when_: String) {
-        val tail = runCatching {
-            runtime.sigsysLogFile.readLines().takeLast(SIGSYS_TAIL_LINES)
-        }.getOrNull().orEmpty()
+        val tail = runtime.sigsysLogTail()
         if (tail.isEmpty()) return
         diagnostics.record(
             UserspaceDiagnosticCategory.PROOT,
             "blocked-syscall log",
             detail = "$when_: " + tail.joinToString(" | "),
         )
+    }
+
+    /**
+     * dpkg's database as the host filesystem holds it, in one line: the two files the status
+     * backup rotates between, and how many update records are still pending. A non-empty
+     * `updates/` is the exact state that makes every later apt run print "dpkg was interrupted,
+     * you must manually run 'dpkg --configure -a'" and exit 100 — read here from the host side,
+     * where it costs one directory listing and needs no working guest at all, which matters when
+     * the failure under investigation is proot failing to write that directory.
+     *
+     * `status-old` is recorded with its size and not only its presence: the app-level fix for
+     * Android's refusal of hard links recreates the backup as a copy, and a copy is what a
+     * healthy install looks like here.
+     */
+    private fun dpkgDatabaseSummary(): String {
+        val dpkgDir = File(rootfs, "var/lib/dpkg")
+        fun describe(name: String): String {
+            val file = File(dpkgDir, name)
+            return if (file.isFile) "$name=${file.length()}B" else "$name=absent"
+        }
+        val pending = File(dpkgDir, "updates").listFiles()?.count { it.isFile } ?: 0
+        return listOf(describe("status"), describe("status-old"), "updates=$pending pending record(s)")
+            .joinToString(", ")
     }
 
     /**
@@ -896,9 +978,6 @@ class UbuntuDistributionManager(
         private const val ACCOUNT_NAME = "ubuntu"
         private const val HOME_DIR = "/home/ubuntu"
         private const val PASSWD_PREFIX = "ubuntu:"
-
-        /** How many blocked-syscall log lines one diagnostic event carries. */
-        private const val SIGSYS_TAIL_LINES = 10
 
         /**
          * Fallback resolvers, used when the wiring layer does not supply the device's live ones.

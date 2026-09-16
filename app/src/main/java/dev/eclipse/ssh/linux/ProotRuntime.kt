@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import android.util.Log
 import dev.eclipse.ssh.ssh.TerminalChannel
 import java.io.File
+import java.io.RandomAccessFile
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -73,6 +74,47 @@ class ProotRuntime(
      * not `tmp` — it must survive storage reclaim, which wipes [tmpDir] wholesale.
      */
     val sigsysLogFile: File get() = File(rootDir, "sigsys-log.txt")
+
+    /**
+     * Empties the blocked-syscall log, so what it holds describes the run about to start rather
+     * than every install this device has ever done. The pipeline calls this once per setup; the
+     * fork appends to the file for as long as it runs, and the log otherwise only ever grows —
+     * each trapped syscall in an apt install adds a line, which makes an unbounded file under the
+     * userspace root that a reader has to walk to find the ten lines that matter.
+     */
+    fun resetSigsysLog() {
+        runCatching { sigsysLogFile.delete() }
+    }
+
+    /**
+     * The newest entries of the blocked-syscall log, oldest first, or an empty list when the file
+     * is missing or empty. Read from the end: only the last [SIGSYS_TAIL_BYTES] are held in
+     * memory, because the log is append-only and its early lines describe syscalls from an hour
+     * ago while the useful ones are the ones just written (patch 0003's link decisions arrive
+     * immediately before the command that reported the failure). The byte before the window is
+     * what tells a fragment apart from a whole line at its start, so the read never reports half
+     * a record as one.
+     */
+    fun sigsysLogTail(): List<String> {
+        val length = runCatching { sigsysLogFile.length() }.getOrDefault(0L)
+        if (length <= 0L) return emptyList()
+        val from = (length - SIGSYS_TAIL_BYTES).coerceAtLeast(0L)
+        // Whether the window opens mid-record: the byte before it decides, since a read that
+        // starts right after a line ending has a whole line first.
+        var startsMidRecord = false
+        val body =
+            runCatching {
+                RandomAccessFile(sigsysLogFile, "r").use { file ->
+                    file.seek((from - 1).coerceAtLeast(0L))
+                    val bytes = ByteArray((length - file.filePointer).toInt())
+                    file.readFully(bytes)
+                    startsMidRecord = from > 0L && bytes[0] != '\n'.code.toByte()
+                    String(bytes, Charsets.UTF_8)
+                }
+            }.getOrNull() ?: return emptyList()
+        val lines = body.lineSequence().filter { it.isNotBlank() }.toList()
+        return (if (startsMidRecord) lines.drop(1) else lines).takeLast(SIGSYS_TAIL_LINES)
+    }
 
     /**
      * Free bytes at the userspace root, or 0 when unknown — the setup pipeline re-checks this
@@ -323,6 +365,10 @@ class ProotRuntime(
 
         /** The command token's cap for log lines: enough to name it, never enough to be a transcript. */
         private const val COMMAND_LOG_CHARS = 120
+
+        /** How much of the blocked-syscall log's end [sigsysLogTail] reads, and how much it returns. */
+        private const val SIGSYS_TAIL_BYTES = 64 * 1024
+        private const val SIGSYS_TAIL_LINES = 10
 
         private const val READ_CHUNK = 4096
     }

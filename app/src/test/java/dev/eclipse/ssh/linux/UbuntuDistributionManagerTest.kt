@@ -398,14 +398,17 @@ class UbuntuDistributionManagerTest {
         val harness = Harness(distro(arch = "arm64"))
         // The shape the rename ENOSYS left behind: apt output that says nothing about why, and a
         // SIGSYS log naming the syscall the fork could not downgrade (patch 0001's evidence).
-        File(harness.runtime.rootDir, "sigsys-log.txt").writeText(
-            listOf(
-                "SIGSYS: time=15:57:49 pid=1234 comm=apt-get kernel_num=82 pr=82",
-                "SIGSYS: time=15:57:50 pid=1234 comm=dpkg kernel_num=82 pr=82",
-            ).joinToString("\n"),
-        )
+        // Written while the run is in flight, which is where the log comes from: setup empties it
+        // at the start, so anything written before it is another run's evidence and is dropped.
+        val log = File(harness.runtime.rootDir, "sigsys-log.txt")
         harness.scripted.respond = { command ->
             if (command.startsWith("apt-get update") && isScopedRung(command)) {
+                log.appendText(
+                    listOf(
+                        "SIGSYS: time=15:57:49 pid=1234 comm=apt-get kernel_num=82 pr=82",
+                        "SIGSYS: time=15:57:50 pid=1234 comm=dpkg kernel_num=82 pr=82",
+                    ).joinToString("\n") + "\n",
+                )
                 100 to "E: Failed to fetch … rename failed, Function not implemented\n"
             } else {
                 baseline(command)
@@ -725,6 +728,90 @@ class UbuntuDistributionManagerTest {
         // so the step must not run at all — and must not fail the install over it.
         assertThat(harness.scripted.commandsWith.map { it.second }.none { "nodesource" in it }).isTrue()
         assertThat(report.warnings.any { "armhf" in it }).isTrue()
+    }
+
+    @Test
+    fun `a failing repair pass records dpkg's database and its own error line`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        // The state the device was actually left in: a status the pass could not back up, a
+        // stale status-old and one unconsumed update record — what makes every later apt run
+        // print "dpkg was interrupted" and exit 100 without touching a mirror.
+        val dpkgDir = File(harness.runtime.rootfsDir, "var/lib/dpkg")
+        File(dpkgDir, "updates").mkdirs()
+        File(dpkgDir, "status").writeText("Package: bash\n")
+        File(dpkgDir, "status-old").writeText("Package: bash\n")
+        File(File(dpkgDir, "updates"), "0001").writeText("record")
+        harness.scripted.respond = { command ->
+            if (command.startsWith("dpkg --configure -a")) {
+                // dpkg colours its errors whenever stderr is a terminal, and under proot it is.
+                2 to "\u001B[1mdpkg:\u001B[0m \u001B[1;31merror:\u001B[0m error creating new" +
+                    " backup file '/var/lib/dpkg/status-old': Permission denied\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup()
+        val export = harness.distribution.diagnostics.export()
+
+        assertThat(export).contains("dpkg repair pass")
+        assertThat(export).contains("exit=2")
+        // The evidence that the pass left the database interrupted, read from the host side.
+        assertThat(export).contains("dpkg database")
+        assertThat(export).contains("status-old=14B")
+        assertThat(export).contains("updates=1 pending record(s)")
+        // Terminal escapes are presentation, and a diagnostic that quotes dpkg's own line must
+        // not push `ESC[1;31m` into the export the user reads.
+        assertThat(export).doesNotContain("\u001B")
+        assertThat(export).contains("error creating new backup file")
+        // The user-facing warning carries the same sentence, without the escapes.
+        val warning = report.warnings.first { it.contains("did not fully succeed") }
+        assertThat(warning).contains("Permission denied")
+        assertThat(warning).doesNotContain("\u001B")
+    }
+
+    @Test
+    fun `the repair pass surfaces what the fork logged about hard links`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        // A stale line from an earlier run, which the run's own reset must drop: evidence for a
+        // failure at minute twelve is not evidence if it is buried under last week's install.
+        File(harness.runtime.rootDir, "sigsys-log.txt").writeText(
+            "SIGSYS: time=09:00:00 pid=1 comm=apt-get kernel_num=82 pr=82\n",
+        )
+        harness.scripted.respond = { command ->
+            if (command.startsWith("dpkg --configure -a")) {
+                // What the fork writes while the pass runs: patch 0003's decision line, then the
+                // failure dpkg reported when the emulation was refused anyway.
+                File(harness.runtime.rootDir, "sigsys-log.txt").appendText(
+                    "LINK: linkat(/var/lib/dpkg/status, /var/lib/dpkg/status-old, flags=0)\n" +
+                        "LINK: native linkat refused (13), emulating: /var/lib/dpkg/status ->" +
+                        " /var/lib/dpkg/status-old\n",
+                )
+                2 to "dpkg: error: error creating new backup file: Permission denied\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        harness.distribution.setup()
+
+        val export = harness.distribution.diagnostics.export()
+        assertThat(export).contains("blocked-syscall log")
+        assertThat(export).contains("native linkat refused (13)")
+        // And the stale line is gone: the log describes this run.
+        assertThat(export).doesNotContain("kernel_num=82")
+    }
+
+    @Test
+    fun `a clean run leaves no blocked-syscall event behind`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        File(harness.runtime.rootDir, "sigsys-log.txt").writeText("SIGSYS: stale\n")
+
+        harness.distribution.setup()
+
+        // Nothing was trapped, so nothing is reported — silence is not evidence.
+        assertThat(harness.distribution.diagnostics.export()).doesNotContain("blocked-syscall log")
+        assertThat(File(harness.runtime.rootDir, "sigsys-log.txt").exists()).isFalse()
     }
 
     // ------------------------------------------------------------------ fixtures
