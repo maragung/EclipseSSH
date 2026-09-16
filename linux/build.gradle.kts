@@ -174,10 +174,17 @@ val fetchLinuxSource =
         outputs.file(tallocTgz)
         outputs.dir(prootRoot)
         outputs.dir(tallocRoot)
-        // So that adding/removing a patch both invalidates the configuration
-        // cache entry and re-runs this task instead of staying UP-TO-DATE.
+        // So that adding, removing or *rewriting* a patch all invalidate the
+        // configuration cache entry and re-run this task instead of staying
+        // UP-TO-DATE. RELATIVE, not NAME_ONLY: the patch's content is exactly
+        // what the tree is built from, and NAME_ONLY keys the input on the
+        // file's name, so a patch rewritten under the same name left the task
+        // UP-TO-DATE — with 0003 rewritten after a build, that is how the
+        // tree the next patch was told to expect stopped being the tree on
+        // disk. The paths are relative to the patch directory and identical
+        // on every machine, so this costs no relocatability.
         inputs.files(prootPatchFiles)
-                .withPathSensitivity(PathSensitivity.NAME_ONLY)
+                .withPathSensitivity(PathSensitivity.RELATIVE)
         doLast {
             fun run(vararg command: String) {
                 logger.lifecycle("exec: ${command.joinToString(" ")}")
@@ -208,7 +215,7 @@ val fetchLinuxSource =
                 }
             }
 
-            fun verifySha256(file: File, expected: String) {
+            fun sha256Of(file: File): String {
                 val digest = MessageDigest.getInstance("SHA-256")
                 file.inputStream().use { input ->
                     val buffer = ByteArray(64 * 1024)
@@ -218,8 +225,11 @@ val fetchLinuxSource =
                         digest.update(buffer, 0, read)
                     }
                 }
-                val actual =
-                    digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
+                return digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it) }
+            }
+
+            fun verifySha256(file: File, expected: String) {
+                val actual = sha256Of(file)
                 check(actual == expected) {
                     "sha256 mismatch for ${file.name}: expected $expected, got $actual"
                 }
@@ -227,17 +237,42 @@ val fetchLinuxSource =
 
             // Extraction guards are real content, not the declared output
             // roots (Gradle pre-creates those): the proot GNUmakefile and
-            // talloc.c only ever get there by a real extraction. The patch
-            // marker gates per-patch: the fork tarball never contains it,
-            // and each patch is applied only if the marker does not name it
-            // — so a patch added after a previous build stacks cleanly. The
-            // marker and pending set are read AFTER the extraction below: on
-            // a fresh runner the tree (and marker) only exist once the
-            // tarball lands, so checking first failed before the download
-            // ever ran — the ordering bug that broke the first CI run of
-            // this logic.
+            // talloc.c only ever get there by a real extraction.
+            //
+            // The patch marker is a fingerprint of the whole patch set --
+            // every name and every byte -- and it gates the tree as a whole
+            // rather than patch by patch. A name-only marker cannot be sound:
+            // when a patch is rewritten its name still reads as applied, so
+            // the next patch stacks onto a tree that the rewritten patch no
+            // longer describes. That is not hypothetical. 0003 was rewritten
+            // after this fork had been extracted, and the patch that followed
+            // it applied two of its hunks with fuzz onto the old revision --
+            // a tree that is neither revision, which would have built and
+            // shipped silently. Re-extracting costs a 3.4 MB tar that is
+            // already on disk and a second of `patch`; a tree that is not
+            // exactly what this patch set produces is not worth keeping.
+            //
+            // The check reads the tree's own contents, so it needs no care about
+            // ordering: an absent tree is not a current one, and the download
+            // and extraction below are what make it current. (An earlier
+            // revision checked "already extracted?" and returned early, which
+            // on a fresh runner skipped the download entirely — the bug that
+            // broke the first CI run of this logic.)
             val prootMakefile = File(prootRoot, "src/proot/src/GNUmakefile")
-            if (!prootMakefile.isFile) {
+            val prootPatchedMarker = File(prootRoot, ".patches-applied")
+            val patchFingerprint =
+                prootPatchFiles.joinToString("\n") { patchFile ->
+                    "${patchFile.name} ${sha256Of(patchFile)}"
+                }
+            val treeIsCurrent =
+                prootMakefile.isFile &&
+                    prootPatchedMarker.isFile &&
+                    prootPatchedMarker.readText().trim() == patchFingerprint
+            if (!treeIsCurrent) {
+                // Whatever is there is either absent, half-extracted, or
+                // patched by a different patch set; none of the three can be
+                // patched forward into a tree this patch set describes.
+                if (prootRoot.isDirectory) prootRoot.deleteRecursively()
                 srcDir.mkdirs()
                 if (!oonidTgz.isFile) {
                     logger.lifecycle("Downloading the proot fork @ $prootCommit ...")
@@ -252,23 +287,8 @@ val fetchLinuxSource =
                 check(prootMakefile.isFile) {
                     "the extracted fork has no proot makefile at $prootMakefile"
                 }
-            }
-            val prootPatchedMarker = File(prootRoot, ".patches-applied")
-            val alreadyApplied =
-                if (prootPatchedMarker.isFile) {
-                    prootPatchedMarker.readLines().filter { it.isNotBlank() }.toSet()
-                } else {
-                    emptySet()
-                }
-            val pendingPatches = prootPatchFiles.filter { it.name !in alreadyApplied }
-            if (pendingPatches.isNotEmpty()) {
-                check(prootMakefile.isFile) {
-                    "cannot patch the proot fork: no source tree at $prootRoot"
-                }
-                // Patch the extracted fork tree in place. The marker records which
-                // patch files were applied, per name, so a later build both skips
-                // them and can stack newly added ones.
-                pendingPatches.forEach { patchFile ->
+                // Filename order, which is what the patch numbers promise.
+                prootPatchFiles.forEach { patchFile ->
                     logger.lifecycle("Patching the proot fork with ${patchFile.name} ...")
                     run(
                         "patch",
@@ -279,9 +299,7 @@ val fetchLinuxSource =
                         "-i", patchFile.absolutePath,
                     )
                 }
-                prootPatchedMarker.writeText(
-                    (alreadyApplied + pendingPatches.map { it.name }).sorted().joinToString("\n") { it } + "\n",
-                )
+                prootPatchedMarker.writeText("$patchFingerprint\n")
             }
             if (!File(tallocRoot, "talloc.c").isFile) {
                 srcDir.mkdirs()

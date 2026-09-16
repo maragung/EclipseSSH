@@ -57,8 +57,12 @@ The userspace runtime in `:app` is the only intended consumer. It:
 
 Fixes the fork needs but has not merged live in `proot-patches/` as
 numbered unified diffs; `fetchLinuxSource` applies them (in name order)
-to the extracted fork tree and records the applied names in a
-`.patches-applied` marker so they never run twice and new ones stack.
+to the extracted fork tree and records a fingerprint of the whole patch
+set — every name and every byte — in a `.patches-applied` marker. The
+tree on disk is only kept when that fingerprint matches, so a patch
+rewritten after a build makes the next one re-extract and re-apply all
+of them rather than stacking the rest onto a tree the rewrite no longer
+describes.
 See `proot-patches/README.md` and each patch's preamble for the failure
 it fixes and the evidence. 0001 is load-bearing for amd64/x86_64
 devices and emulators: without it, every plain `rename()` inside the
