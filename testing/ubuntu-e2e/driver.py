@@ -1047,9 +1047,43 @@ class E2eDriver:
                 self.interrupt_network(self.install_timeout_min)
 
         self._final_logcat()
+        self._write_device_state()
         self._write_results()
         failed = [r for r in self.results if r.status == "fail"]
         return 1 if failed else 0
+
+    def _write_device_state(self):
+        """The device's own answer to the two questions a failed install raises and
+        the log cannot settle afterwards: how much storage was left, and which
+        syscalls this API level lets the app make at all.
+
+        Both are cheap to ask and expensive to reconstruct. An install that dies
+        with apt exiting 100 is either out of space or making a call the platform
+        traps, and the two look identical in apt's own output - the storage
+        reading only holds at the moment it is taken, and the seccomp policy is a
+        property of the API level the run happened on, which no later run on a
+        different image reproduces (E2E run 35056615874: an apt failure whose
+        cause could not be told apart from either).
+        """
+        commands = (
+            ("date", "date"),
+            ("model", "getprop ro.product.model"),
+            ("sdk", "getprop ro.build.version.sdk"),
+            ("df /data", "df /data"),
+            ("df /data/local/tmp", "df /data/local/tmp"),
+            ("seccomp app policy", "cat /system/etc/seccomp_policy/app.seccomp-policy 2>&1 | head -400"),
+            ("seccomp app allowlist", "cat /system/etc/seccomp_policy/app.seccomp-allowlist 2>&1 | head -400"),
+            ("seccomp common policy", "cat /system/etc/seccomp_policy/common.seccomp-policy 2>&1 | head -400"),
+        )
+        lines = []
+        for label, command in commands:
+            rc, out = self.adb.shell(command, timeout=30)
+            lines.append("## %s (rc=%d)" % (label, rc))
+            lines.append((out or "").strip())
+            lines.append("")
+        with open(os.path.join(self.out, "device-state.txt"), "w") as fh:
+            fh.write("\n".join(lines))
+        self.log("device state written: %s" % ", ".join(label for label, _ in commands))
 
     def _final_logcat(self):
         rc, out, _ = self.adb.run(["logcat", "-d", "-v", "time"], timeout=60)
