@@ -4,6 +4,7 @@ import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import org.junit.Assume
 import org.junit.Test
 
 /**
@@ -117,5 +118,68 @@ class TarSafetyTest {
     @Test
     fun `deleting a nonexistent tree reports success`() {
         assertThat(deleteTreeNoFollow(File(newRoot(), "absent"))).isTrue()
+    }
+
+    @Test
+    fun `walking a tree yields a symlinked directory as a link, never as its target`() {
+        val root = newRoot()
+        val outside = Files.createTempDirectory("tar-safety-walk-outside").toFile().apply { deleteOnExit() }
+        File(outside, "elsewhere.txt").writeText("another tree's data\n")
+        val tree = File(root, "tree").apply { mkdirs() }
+        File(tree, "own.txt").writeText("own data\n")
+        Files.createSymbolicLink(File(tree, "link-to-outside").toPath(), outside.toPath())
+
+        val entries = walkTreeNoFollow(tree).map { it.name }.toList()
+
+        // The link is yielded as itself and not descended into, which is the difference between
+        // measuring this tree and measuring this tree plus whatever it points at.
+        assertThat(entries).containsExactly("own.txt", "link-to-outside")
+    }
+
+    @Test
+    fun `a symlink to a directory is not a directory of its own`() {
+        val root = newRoot()
+        val real = File(root, "real").apply { mkdirs() }
+        val link = File(root, "link").also {
+            Files.createSymbolicLink(it.toPath(), real.toPath())
+        }
+        val linkToFile = File(root, "link-to-file").also {
+            File(root, "file.txt").writeText("content\n")
+            Files.createSymbolicLink(it.toPath(), File(root, "file.txt").toPath())
+        }
+
+        // Followed, both links answer as what they point at - which is exactly why the no-follow
+        // pair exists, and why they disagree here.
+        assertThat(link.isDirectory).isTrue()
+        assertThat(linkToFile.isFile).isTrue()
+        assertThat(link.isDirectoryNoFollow()).isFalse()
+        assertThat(linkToFile.isRegularFileNoFollow()).isFalse()
+        assertThat(real.isDirectoryNoFollow()).isTrue()
+        assertThat(File(root, "file.txt").isRegularFileNoFollow()).isTrue()
+    }
+
+    @Test
+    fun `a walk that loses a directory to a permissions error still yields what it has`() {
+        val root = newRoot()
+        val tree = File(root, "tree").apply { mkdirs() }
+        File(tree, "own.txt").writeText("own data\n")
+        val locked = File(tree, "locked").apply { mkdirs() }
+        File(locked, "secret.txt").writeText("unreadable\n")
+        // Directories need both bits off to be unreadable: 0o644 still lists. Running as root (CI
+        // containers) defeats the premise rather than the walk — there is no permission to lose —
+        // so the test states its premise and steps aside where it does not hold.
+        val denied = locked.setReadable(false) && locked.setExecutable(false)
+        Assume.assumeTrue(denied && !locked.canRead())
+        try {
+            val entries = walkTreeNoFollow(tree).map { it.name }.toList()
+
+            // Losing one directory must not end the walk: what was already yielded is still true,
+            // and every caller here measures rather than accounts.
+            assertThat(entries).containsAtLeast("own.txt", "locked")
+            assertThat(entries).doesNotContain("secret.txt")
+        } finally {
+            locked.setReadable(true)
+            locked.setExecutable(true)
+        }
     }
 }

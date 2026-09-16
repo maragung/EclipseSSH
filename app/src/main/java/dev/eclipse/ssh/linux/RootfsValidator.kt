@@ -98,8 +98,14 @@ class RootfsValidator(
     private fun findNamed(root: File, matches: (String) -> Boolean): File? =
         listOf(File(root, "lib"), File(root, "usr/lib"))
             .asSequence()
+            // isDirectory follows deliberately: on a merged-/usr rootfs `lib` *is* a link to
+            // `usr/lib`, and the linker is still inside it.
             .filter { it.isDirectory }
-            .flatMap { it.walkTopDown() }
+            // walkTreeNoFollow past that point: a crafted rootfs with `usr/lib/loop -> usr/lib`
+            // would otherwise make this search during validation never return.
+            .flatMap { walkTreeNoFollow(it) }
+            // isFile follows deliberately too — the question is whether the linker is *reachable*
+            // under this name, which is what exec will ask, not whether the name is a plain file.
             .filter { it.isFile && matches(it.name) }
             .firstOrNull()
 
@@ -107,9 +113,17 @@ class RootfsValidator(
     private fun pathInsideRoot(root: File, file: File): String =
         "/" + root.toPath().relativize(file.toPath()).joinToString("/")
 
+    /**
+     * Bytes of real content under [root], for the floor that notices a truncated extraction.
+     *
+     * walkTreeNoFollow, not walkTopDown: the rootfs is merged-/usr, so `bin -> usr/bin`,
+     * `lib -> usr/lib` and `sbin -> usr/sbin` made every file under them count twice, roughly
+     * doubling the measured size. The floor is a fraction of the expected size, so the inflation
+     * pushed it above what a genuinely truncated extraction produces — the check passed anyway.
+     */
     private fun extractedBytes(root: File): Long =
         if (root.isDirectory) {
-            root.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+            walkTreeNoFollow(root).filter { it.isRegularFileNoFollow() }.sumOf { it.length() }
         } else {
             0L
         }

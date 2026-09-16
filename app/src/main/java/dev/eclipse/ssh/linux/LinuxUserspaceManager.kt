@@ -67,9 +67,21 @@ class LinuxUserspaceManager(
 
     val sessionCount: StateFlow<Int> get() = processes.sessionCount
 
-    /** Total bytes under the userspace root — rootfs, tmp and the workspace together. */
+    /**
+     * Total bytes under the userspace root — rootfs, tmp and the workspace together.
+     *
+     * walkTreeNoFollow, not walkTopDown: the rootfs is merged-/usr, so its own `bin -> usr/bin`,
+     * `lib -> usr/lib` and `sbin -> usr/sbin` links made every file beneath them count twice, and
+     * the settings screen's storage line read roughly double what the userspace actually occupies.
+     * A link is not content, so it counts nothing here — the files it names are already counted,
+     * once apiece.
+     */
     fun storageUsedBytes(): Long =
-        if (rootDir.isDirectory) rootDir.walkTopDown().filter { it.isFile }.sumOf { it.length() } else 0L
+        if (rootDir.isDirectory) {
+            walkTreeNoFollow(rootDir).filter { it.isRegularFileNoFollow() }.sumOf { it.length() }
+        } else {
+            0L
+        }
 
     /** A workspace snapshot from a previous keep-workspace uninstall exists, awaiting reinstall. */
     fun hasPendingWorkspaceBackup(): Boolean = backupFile.isFile
