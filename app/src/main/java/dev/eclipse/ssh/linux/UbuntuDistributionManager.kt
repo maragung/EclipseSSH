@@ -569,6 +569,15 @@ class UbuntuDistributionManager(
      * base packages, every later apt command then failed in one to two seconds (dpkg retries the
      * half-configured package before anything else), and the report carried only the summary
      * block — leaving "which of the postinst's steps failed" unanswerable from the evidence.
+     *
+     * Which verdict matters is the whole subtlety, and it is not the last one. A failed maintainer
+     * script makes dpkg fail *every* package that depends on it in the same run ("dependency
+     * problems prevent configuration of openssh-sftp-server: … however: Package openssh-client is
+     * not configured yet"), each with its own `dpkg: error processing package` line — so taking the
+     * last verdict describes a consequence and buries the cause several lines above it. The verdict
+     * wanted is the first one whose script failed, recognized by dpkg's own sentence for it; only
+     * when no verdict names a script does the last one stand in, which is the shape of an error
+     * that is not a maintainer script's at all (a bad dependency, an unpack failure).
      */
     private fun failureReason(output: String?, maxChars: Int = UserspaceDiagnostics.MAX_DETAIL): String? {
         val lines = output
@@ -577,9 +586,13 @@ class UbuntuDistributionManager(
             ?.filter { it.isNotBlank() }
             ?.toList()
             ?: return null
-        // Everything up to dpkg's own verdict, minus apt's and dpkg's progress chatter; the last
-        // two survivors are the script's message and the verdict that follows it.
-        val verdict = lines.indexOfLast { it.startsWith("dpkg: error") }
+        val verdicts = lines.indices.filter { lines[it].startsWith(DPKG_VERDICT_PREFIX) }
+        val scriptFailure = verdicts.firstOrNull { index ->
+            lines.getOrNull(index + 1)?.let { next -> SCRIPT_FAILURE_MARKERS.any { next.contains(it) } } == true
+        }
+        val verdict = scriptFailure ?: verdicts.lastOrNull() ?: -1
+        // Everything up to that verdict, minus apt's and dpkg's progress chatter; the last two
+        // survivors are the script's message and the verdict that follows it.
         val window = (if (verdict >= 0) lines.subList(0, verdict + 1) else lines)
             .filterNot { line -> FAILURE_REASON_NOISE.any { line.startsWith(it) } }
             .takeLast(FAILURE_REASON_LINES)
@@ -1012,8 +1025,58 @@ class UbuntuDistributionManager(
             return if (file.isFile) "$name=${file.length()}B" else "$name=absent"
         }
         val pending = File(dpkgDir, "updates").listFiles()?.count { it.isFile } ?: 0
-        return listOf(describe("status"), describe("status-old"), "updates=$pending pending record(s)")
-            .joinToString(", ")
+        val stuck = dpkgStuckPackages()
+        return listOf(
+            describe("status"),
+            describe("status-old"),
+            "updates=$pending pending record(s)",
+            // The package names, not just the counts: a half-configured package is the thing every
+            // later apt command dies on, and its name is the one fact that tells a reader where to
+            // look — dpkg's database says it outright, so nothing has to be inferred from apt's
+            // output. E2E run 35058820878 named the state ("status=169537B, updates=0") and not the
+            // package, which left "which package, and therefore which script" unanswerable.
+            if (stuck.isEmpty()) "no half-configured package" else "half-configured=" + stuck.joinToString(","),
+        ).joinToString(", ")
+    }
+
+    /**
+     * The packages dpkg is stuck on, read from its own database: a package whose `Status:` ends in
+     * `half-configured` (its maintainer script failed, so the package is unpacked but not set up)
+     * or `half-installed` (an unpack that was interrupted).
+     *
+     * The status file is plain text and each entry is a paragraph starting with `Package:`, so this
+     * is a scan rather than a parser — bounded by [limit], and tolerant of a file that is missing or
+     * being rewritten underneath it (a failure here yields no names, never an exception: this runs
+     * while reporting another failure, and a diagnostic that could throw would replace the evidence
+     * with itself).
+     */
+    private fun dpkgStuckPackages(limit: Int = 3): List<String> {
+        val status = File(rootfs, "var/lib/dpkg/status")
+        if (!status.isFile) return emptyList()
+        val stuck = mutableListOf<String>()
+        var current: String? = null
+        runCatching {
+            status.bufferedReader().use { reader ->
+                reader.lineSequence().forEach { line ->
+                    when {
+                        line.startsWith("Package: ") -> current = line.removePrefix("Package: ").trim()
+                        line.startsWith("Status: ") && stuck.size < limit -> {
+                            val state = line.removePrefix("Status: ").trim()
+                            val half = state.substringAfterLast(' ')
+                            if (half == "half-configured" || half == "half-installed") {
+                                // The state the database is in is the field's own name
+                                // (half-configured), so it is not repeated per package; a
+                                // half-*installed* one is marked, because it is a different fault
+                                // (an unpack that was interrupted, not a script that refused).
+                                stuck += (current ?: "?") +
+                                    if (half == "half-installed") " (half-installed)" else ""
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return stuck
     }
 
     /**
@@ -1165,6 +1228,24 @@ class UbuntuDistributionManager(
 
         /** How many lines of a failed command's output [failureReason] keeps — see its doc. */
         private const val FAILURE_REASON_LINES = 2
+
+        /** How dpkg opens its verdict on a package it could not configure. */
+        private const val DPKG_VERDICT_PREFIX = "dpkg: error"
+
+        /**
+         * What dpkg says on the line under its verdict when the failure was the package's own
+         * script rather than, say, an unpack or a dependency. This is the marker [failureReason]
+         * picks its verdict by: a script that failed is the cause, and every verdict after it —
+         * "dependency problems prevent configuration of …" — is a package reporting the damage.
+         */
+        private val SCRIPT_FAILURE_MARKERS = listOf(
+            "post-installation script",
+            "pre-installation script",
+            "pre-removal script",
+            "post-removal script",
+            "maintainer script",
+            "subprocess returned error exit status",
+        )
 
         /**
          * The lines apt and dpkg emit around a failure without being it: their own progress

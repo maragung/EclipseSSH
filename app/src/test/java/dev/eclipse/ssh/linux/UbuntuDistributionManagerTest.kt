@@ -688,6 +688,50 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `the cause is recorded, not the dependents that report it`() = runTest {
+        // The shape the real failure has and the single-package fixture above does not: a failed
+        // maintainer script is followed by *every* package that depends on it, each with its own
+        // dpkg verdict, so the last verdict in the output describes a consequence. Run 35058820878
+        // died configuring openssh-client; ssh and openssh-sftp-server then reported that they
+        // cannot be configured because of it. The verdict that diagnoses is the first one whose
+        // script failed, and dpkg says so on the line under it.
+        val harness = Harness(distro(arch = "arm64"))
+        val cascade =
+            "Setting up openssh-client (1:8.9p1-3ubuntu0.17) ...\n" +
+                "chgrp: invalid group: '_ssh'\n" +
+                "dpkg: error processing package openssh-client (--configure):\n" +
+                " installed openssh-client package post-installation script subprocess returned error exit status 1\n" +
+                "dpkg: dependency problems prevent configuration of openssh-sftp-server:\n" +
+                " openssh-sftp-server depends on openssh-client (>= 1:8.9p1-3); however:\n" +
+                "  Package openssh-client is not configured yet.\n" +
+                "dpkg: error processing package openssh-sftp-server (--configure):\n" +
+                " dependency problems - leaving unconfigured\n" +
+                "Errors were encountered while processing:\n" +
+                " openssh-client\n" +
+                " openssh-sftp-server\n" +
+                "E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> 100 to cascade
+                command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to cascade
+                else -> baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+        val export = harness.distribution.diagnostics.export()
+        val reason = export.lines()
+            .first { it.contains("bulk base-package install failed") }
+
+        // The step Android refused, and the verdict naming the package it belonged to.
+        assertThat(reason).contains("chgrp: invalid group: '_ssh'")
+        assertThat(reason).contains("dpkg: error processing package openssh-client")
+        // Not the cascade: a dependent's complaint is not the reason the install died, and a
+        // report that leads with it sends the reader to the wrong package.
+        assertThat(reason).doesNotContain("dependency problems")
+    }
+
+    @Test
     fun `a failed bulk install is repaired before the per-package fallback`() = runTest {
         // A bulk install that dies part-way is what interrupts dpkg, and apt then refuses every
         // command for about a second without touching a mirror. The per-package fallback is such
@@ -812,6 +856,41 @@ class UbuntuDistributionManagerTest {
         // so the step must not run at all — and must not fail the install over it.
         assertThat(harness.scripted.commandsWith.map { it.second }.none { "nodesource" in it }).isTrue()
         assertThat(report.warnings.any { "armhf" in it }).isTrue()
+    }
+
+    @Test
+    fun `the failed install names the package dpkg is stuck on`() = runTest {
+        // The other half of the diagnosis, and the half apt's own output does not carry: which
+        // package every later command is dying on. Run 35058820878 recorded the database's *shape*
+        // (status=169537B, updates=0) and nothing else, so the one thing a reader needs — the name,
+        // and through it the maintainer script that refused — had to be inferred.
+        val harness = Harness(distro(arch = "arm64"))
+        val dpkgDir = File(harness.runtime.rootfsDir, "var/lib/dpkg")
+        dpkgDir.mkdirs()
+        File(dpkgDir, "status").writeText(
+            "Package: bash\n" +
+                "Status: install ok installed\n" +
+                "\n" +
+                "Package: openssh-client\n" +
+                "Status: install ok half-configured\n" +
+                "\n" +
+                "Package: openssh-sftp-server\n" +
+                "Status: install ok half-installed\n",
+        )
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> 100 to "dpkg: error processing package openssh-client (--configure):\n"
+                command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to "E: dpkg was interrupted\n"
+                else -> baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+        val export = harness.distribution.diagnostics.export()
+
+        assertThat(export).contains("half-configured=openssh-client,openssh-sftp-server (half-installed)")
+        // The installed package is not named: this line is about what is stuck, not what is fine.
+        assertThat(export.lines().first { it.contains("half-configured=") }).doesNotContain("bash")
     }
 
     @Test
