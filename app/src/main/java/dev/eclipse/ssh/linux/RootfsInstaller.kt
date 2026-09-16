@@ -58,8 +58,12 @@ class RootfsInstaller(
         /** Verifying the tarball's SHA256. */
         data object Verifying : Progress
 
-        /** Extracting; [entries] unpacked so far. */
-        data class Extracting(val entries: Int) : Progress
+        /**
+         * Extracting; [entries] unpacked so far. [warnings] carries extraction events the rootfs
+         * can live without but the setup report should name (a forward hardlink is the classic
+         * one: a link whose target entry arrives later in the same tarball, skipped by design).
+         */
+        data class Extracting(val entries: Int, val warnings: List<String> = emptyList()) : Progress
     }
 
     /**
@@ -92,9 +96,15 @@ class RootfsInstaller(
      * The full rootfs install: download → verify → extract → move into place.
      *
      * @param onProgress invoked on [Dispatchers.IO] with each progress update; must be cheap
+     * @param onExtractionWarnings invoked once, after extraction, with events the rootfs can live
+     *   without but the setup report should name (forward hardlinks skipped, and whatever else
+     *   [extract] records from here on)
      * @throws IOException on any network, verification or extraction failure
      */
-    suspend fun install(onProgress: (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
+    suspend fun install(
+        onProgress: (Progress) -> Unit = {},
+        onExtractionWarnings: (List<String>) -> Unit = {},
+    ): File = withContext(Dispatchers.IO) {
         // Storage first: the download lands under downloads/ and the probe inside ensureReady()
         // fails here — with a name — rather than as a mid-download EACCES. The sweep then clears
         // fragments a crashed attempt left pinning the space this one needs.
@@ -104,7 +114,7 @@ class RootfsInstaller(
         download(onProgress)
         onProgress(Progress.Verifying)
         verify()
-        extract(onProgress)
+        onExtractionWarnings(extract(onProgress))
         validateStaging()
         moveIntoPlace()
         rootfsDir
@@ -235,12 +245,13 @@ class RootfsInstaller(
      * Extracts the tarball into staging, then swaps staging into place. A rootfs that exists is
      * therefore always complete — see the class doc.
      */
-    private suspend fun extract(onProgress: (Progress) -> Unit) {
+    private suspend fun extract(onProgress: (Progress) -> Unit): List<String> {
         onProgress(Progress.Extracting(0))
         deleteTreeNoFollow(stagingDir)
         stagingDir.mkdirs()
         var entries = 0
         var written = 0L
+        val extractionWarnings = mutableListOf<String>()
         val budget = extractionBudgetBytes()
         openTarStream(tarballFile, DOWNLOAD_BUFFER).use { tar ->
             while (true) {
@@ -268,10 +279,15 @@ class RootfsInstaller(
                         target.parentFile?.mkdirs()
                         val source = resolveInside(stagingDir, entry.linkName)
                         // Hardlinks inside one tarball are duplicates of an earlier entry; copying
-                        // is the portable equivalent and costs one file.
+                        // is the portable equivalent and costs one file. A link whose target has
+                        // not arrived yet (a forward link) is skipped — the tree works, but the
+                        // gap is recorded so the setup report can name it instead of a later
+                        // "file not found" standing in for it.
                         if (source.isFile) {
                             source.copyTo(target, overwrite = true)
                             written += target.length()
+                        } else {
+                            extractionWarnings += "hardlink ${entry.name} skipped: its target ${entry.linkName} was not extracted"
                         }
                     }
                     TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
@@ -298,11 +314,12 @@ class RootfsInstaller(
                 entries++
                 if (entries % PROGRESS_EVERY_ENTRIES == 0) {
                     coroutineContext.ensureActive()
-                    onProgress(Progress.Extracting(entries))
+                    onProgress(Progress.Extracting(entries, extractionWarnings.toList()))
                 }
             }
         }
-        onProgress(Progress.Extracting(entries))
+        onProgress(Progress.Extracting(entries, extractionWarnings.toList()))
+        return extractionWarnings
     }
 
     /**

@@ -111,11 +111,15 @@ class LinuxUserspaceManager(
                 workspace.snapshotTo(backupFile)
             }
             try {
+                var extractionWarnings: List<String> = emptyList()
                 if (!installer.isExtracted()) {
                     storage.updateInstallLockPhase("download")
-                    installer.install { progress ->
-                        _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
-                    }
+                    installer.install(
+                        onProgress = { progress ->
+                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+                        },
+                        onExtractionWarnings = { extractionWarnings = it },
+                    )
                 }
                 // The belt under the installer's own promise: an extraction that produced nothing
                 // must fail here — an install failure the UI can name — rather than deep inside
@@ -143,7 +147,7 @@ class LinuxUserspaceManager(
                 check(health.healthy) { "Ubuntu installed but failed its health check: ${health.describe()}" }
 
                 writeInstalledState()
-                val warnings = report.warnings.toMutableList()
+                val warnings = (extractionWarnings + report.warnings).toMutableList()
                 if (backupFile.isFile) {
                     val restored = runCatching { workspace.restoreFrom(backupFile) }.isSuccess
                     if (restored) {
@@ -240,11 +244,15 @@ class LinuxUserspaceManager(
                 workspace.snapshotTo(backupFile)
             }
             try {
+                var extractionWarnings: List<String> = emptyList()
                 if (!installer.isExtracted()) {
                     storage.updateInstallLockPhase("download")
-                    installer.install { progress ->
-                        _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
-                    }
+                    installer.install(
+                        onProgress = { progress ->
+                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+                        },
+                        onExtractionWarnings = { extractionWarnings = it },
+                    )
                 }
                 // Same belt as install(): a repair whose re-extraction still left nothing must fail
                 // as a repair, not as setup's missing-file error.
@@ -266,7 +274,7 @@ class LinuxUserspaceManager(
                 _lastHealth.value = health
                 check(health.healthy) { "Ubuntu was repaired but still fails its health check: ${health.describe()}" }
                 writeInstalledState()
-                val warnings = report.warnings.toMutableList()
+                val warnings = (extractionWarnings + report.warnings).toMutableList()
                 if (backupFile.isFile) {
                     val restored = runCatching { workspace.restoreFrom(backupFile) }.isSuccess
                     if (restored) {

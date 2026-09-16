@@ -367,6 +367,33 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a feed whose body is not a plausible mirror list is named as too large`() = runTest {
+        // Past the 256 KiB ceiling: not a mirror list but a misredirect or hostile body, refused
+        // before it can be buffered — and named as "too large", which is a different fact from
+        // "unreachable" when someone reads the exhaustion message.
+        val feed =
+            File.createTempFile("mirrors", ".txt").apply {
+                deleteOnExit()
+                writeText(buildString {
+                    repeat(64 * 1024) { append("http://mirror.example/ubuntu-ports\n") } // 2 MiB
+                })
+            }
+        val harness = Harness(distro(arch = "arm64"), mirrorListUrl = "file://${feed.absolutePath}")
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update")) {
+                100 to "Err:1 … Could not connect"
+            } else {
+                baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.MirrorUnreachable::class.java)
+        assertThat(thrown!!.message).contains("mirror feed: too large (over 256 KiB)")
+    }
+
+    @Test
     fun `a failing rung surfaces the blocked-syscall log the proot fork kept`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
         // The shape the rename ENOSYS left behind: apt output that says nothing about why, and a
@@ -555,6 +582,42 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a full disk fails the apt phase before the first archive is asked`() = runTest {
+        // The installer's gate passed (the rootfs got this far), but the disk filled since —
+        // or the budget was spent on the extraction itself. The re-check must refuse before
+        // apt burns minutes downloading into a disk that cannot hold the packages.
+        val harness = Harness(
+            distro(arch = "arm64"),
+            // 0 means "unknown" everywhere else in this cluster; a small positive number is
+            // "known, and below every budget".
+            freeBytes = { 100L * 1024 * 1024 },
+        )
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        // The DiskFull contract: the gate's own message, mapped by the "Ubuntu needs" prefix.
+        assertThat(thrown).isInstanceOf(UserspaceFailure.DiskFull::class.java)
+        assertThat(thrown!!.message).contains("only about 100 MB is free")
+        // No rung ran: the refusal happened before the ladder, not inside it.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it.startsWith("apt-get update") },
+        ).isTrue()
+    }
+
+    @Test
+    fun `an unknown free-space answer never blocks the apt phase`() = runTest {
+        // 0 is "the probe could not answer", never "full" — the same contract as the
+        // installer's gate. Setup must run to completion on an unmeasurable disk.
+        val harness = Harness(distro(arch = "arm64"), freeBytes = { 0L })
+
+        val report = harness.distribution.setup()
+
+        assertThat(report.warnings).isEmpty()
+    }
+
+    @Test
     fun `one unavailable base package is a warning, not a failed install`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
         var fullListAttempts = 0
@@ -681,6 +744,7 @@ class UbuntuDistributionManagerTest {
         networkOnline: () -> Boolean = { true },
         mirrorListUrl: String = "http://127.0.0.1:1/mirrors.txt",
         aptUpdateAttemptTimeoutMs: Long = 10 * 60_000L,
+        freeBytes: () -> Long = { 0L },
     ) {
         /** The scripted fake every non-wedged spawn lands in, even when [wedgeOn] wraps it. */
         val scripted: ScriptedPtySpawner = scripted.apply { respond = { baseline(it) } }
@@ -690,6 +754,7 @@ class UbuntuDistributionManagerTest {
                 rootDir,
                 "/fake/native/lib",
                 if (wedgeOn != null) WedgingPtySpawner(scripted, wedgeOn) else scripted,
+                storage = RuntimeStorageManager(rootDir, freeBytesProbe = { freeBytes() }),
             )
         val distribution =
             UbuntuDistributionManager(

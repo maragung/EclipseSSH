@@ -1,7 +1,9 @@
 package dev.eclipse.ssh.linux
 
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
@@ -124,6 +126,11 @@ class UbuntuDistributionManager(
         // the real verdict, this pass only clears what it can).
         repairPackageState(warnings, onProgress)
         requireOnline("updating package lists")
+        // The installer's disk gate ran before the download; since then the tarball and the
+        // extracted rootfs have consumed what it budgeted, and the apt phase is the next big
+        // write. Re-checking here turns "apt dies on ENOSPC twenty minutes in" into a named
+        // refusal before a single package byte is fetched.
+        requireAptDiskSpace()
         aptUpdate(onProgress)
         onStep(SetupStep.INSTALL_BASE_PACKAGES)
         installBasePackages(onProgress, warnings)
@@ -538,6 +545,33 @@ class UbuntuDistributionManager(
     }
 
     /**
+     * The apt phase's own disk gate. The installer's gate ([RootfsInstaller.checkFreeSpace])
+     * budgeted the tarball plus the unpacked system *and* apt's working space — but it ran before
+     * any of that was written, and the disk may also have moved underneath the install since
+     * (other apps, storage reclaim). The budget here is only what the packages themselves need;
+     * 0 free bytes means "unknown" and never blocks, same contract as the installer's gate.
+     *
+     * The message starts with the [DISK_FULL_PREFIX] contract ("Ubuntu needs") so the error
+     * taxonomy maps it to [UserspaceFailure.DiskFull] instead of a generic apt failure.
+     */
+    private fun requireAptDiskSpace() {
+        val free = runtime.freeBytes()
+        if (free <= 0L) return
+        val needed = distro.rootfsSizeBytes * APT_TARBALL_MULTIPLE + APT_HEADROOM_BYTES
+        if (free < needed) {
+            throw IOException(
+                "Ubuntu needs about ${needed / MIB} MB of free storage to install the packages " +
+                    "(the base system is already on disk), but only about ${free / MIB} MB is free. " +
+                    "Free up storage and try again.",
+            ).let { e ->
+                // The same "Ubuntu needs" → DiskFull mapping runRootCommand applies to the
+                // runtime's worded refusals, so both disk gates surface the same verdict.
+                UserspaceFailure.fromMessage(e.message ?: "", e) ?: e
+            }
+        }
+    }
+
+    /**
      * Persists the winning mirror base to this manager's own sidecar — not the userspace state
      * file, whose lifecycle is the manager-above's — so a later exhausted ladder has something
      * known-good to restore.
@@ -799,6 +833,9 @@ class UbuntuDistributionManager(
         val body = outcome.getOrNull()
         val mirrors = body?.let { parseMirrorList(it, primaryArchiveUrl(distro)) } ?: emptyList()
         mirrorFeedStatus = when {
+            // Not "unreachable": the endpoint answered, its answer just cannot be trusted to be a
+            // mirror list — a misrired or hostile response serving an unbounded body.
+            outcome.exceptionOrNull() is MirrorFeedTooLarge -> "too large (over ${MIRROR_FEED_MAX_BYTES / 1024} KiB)"
             outcome.isFailure ->
                 "unreachable" + outcome.exceptionOrNull()
                     ?.let { " (${(it.message ?: it.javaClass.simpleName).take(100)})" }
@@ -815,7 +852,7 @@ class UbuntuDistributionManager(
 
     private fun fetchFeedBody(): String {
         if (mirrorListUrl.startsWith("file:")) {
-            return File(URI(mirrorListUrl).path).readText()
+            return File(URI(mirrorListUrl).path).inputStream().use { readBodyBounded(it) }
         }
         val connection = URL(mirrorListUrl).openConnection() as HttpURLConnection
         connection.connectTimeout = MIRROR_FETCH_TIMEOUT_MS
@@ -823,10 +860,33 @@ class UbuntuDistributionManager(
         return try {
             val code = connection.responseCode
             check(code in 200..299) { "HTTP $code" }
-            connection.inputStream.bufferedReader().use { it.readText() }
+            // Fail before reading a byte when the server names an oversized length; the streaming
+            // bound below is the backstop for the chunked/no-length case.
+            connection.contentLengthLong
+                .takeIf { it > MIRROR_FEED_MAX_BYTES }
+                ?.let { throw MirrorFeedTooLarge() }
+            connection.inputStream.use { readBodyBounded(it) }
         } finally {
             connection.disconnect()
         }
+    }
+
+    /**
+     * Reads at most [MIRROR_FEED_MAX_BYTES]: the feed is a list of plain-text URLs — a few KiB —
+     * and anything past that is not a mirror list, so it is refused rather than held in memory.
+     */
+    private fun readBodyBounded(input: InputStream): String {
+        val buffer = ByteArray(16 * 1024)
+        val body = ByteArrayOutputStream()
+        var total = 0
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > MIRROR_FEED_MAX_BYTES) throw MirrorFeedTooLarge()
+            body.write(buffer, 0, read)
+        }
+        return body.toString(Charsets.UTF_8.name())
     }
 
     private val networkHost: String
@@ -944,8 +1004,31 @@ class UbuntuDistributionManager(
         // HttpURLConnection's timeouts are Int milliseconds, so the constant stays Int even though
         // every other timeout in this class is a Long.
         private const val MIRROR_FETCH_TIMEOUT_MS = 10_000
+
+        /**
+         * The feed body's hard ceiling. The real feed is a list of plain-text URLs — a few KiB —
+         * so anything measured in MiB is not a mirror list (a misredirect, or a hostile endpoint),
+         * and is refused rather than buffered.
+         */
+        private const val MIRROR_FEED_MAX_BYTES = 256 * 1024
+
+        /**
+         * The apt phase's disk budget: the base system is already on disk, so this is the
+         * packages' unpacked size plus apt's own working space, as a multiple of the tarball the
+         * same way the installer's gate budgets. Base + toolchain + Node.js unpacked is a few
+         * multiples of the ~30 MB Base tarball in practice.
+         */
+        private const val APT_TARBALL_MULTIPLE = 4L
+
+        /** Headroom above the packages: apt's lists and archives under /var. */
+        private const val APT_HEADROOM_BYTES = 300L * 1024 * 1024
+
+        private const val MIB = 1024L * 1024
     }
 }
+
+/** The mirror feed answered, but its body exceeds any plausible mirror list. */
+private class MirrorFeedTooLarge : IOException("mirror feed body exceeds 256 KiB")
 
 /**
  * One rung of the apt-update ladder. [forceIpv4] exists because the classic "apt update hangs on a

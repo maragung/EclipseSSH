@@ -74,6 +74,13 @@ class ProotRuntime(
      */
     val sigsysLogFile: File get() = File(rootDir, "sigsys-log.txt")
 
+    /**
+     * Free bytes at the userspace root, or 0 when unknown — the setup pipeline re-checks this
+     * before the apt phase, long after the installer's own gate ran and the rootfs itself
+     * consumed the space it budgeted for.
+     */
+    fun freeBytes(): Long = storage.freeBytes()
+
     /** The proot binary, as the first argv element. */
     private val prootBinary: String get() = File(nativeLibraryDir, "libproot.so").path
 

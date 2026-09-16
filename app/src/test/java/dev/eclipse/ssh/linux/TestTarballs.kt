@@ -162,4 +162,51 @@ internal object TestTarballs {
         tar.putArchiveEntry(entry)
         tar.closeArchiveEntry()
     }
+
+    /**
+     * A hardlink entry whose target appears *later* in the same tarball. GNU tar emits these for
+     * files that were hardlinked at packaging time but ordered after their link names; the
+     * installer copies from an already-extracted target, so a forward link is skipped — and the
+     * skip must be named, not silent.
+     */
+    private fun putForwardHardlink(tar: TarArchiveOutputStream, name: String, notYetExtractedTarget: String) {
+        val entry = TarArchiveEntry(name, TarArchiveEntry.LF_LINK)
+        entry.linkName = notYetExtractedTarget
+        entry.size = 0
+        tar.putArchiveEntry(entry)
+        tar.closeArchiveEntry()
+    }
+
+    /**
+     * The rootfs fixture with one forward hardlink added before the entry it names — the shape
+     * [RootfsInstaller]'s warning path exists for.
+     */
+    fun writeRootfsFixtureWithForwardHardlink(target: File): File {
+        target.parentFile?.mkdirs()
+        GZIPOutputStream(target.outputStream().buffered()).use { gzip ->
+            TarArchiveOutputStream(gzip).use { tar ->
+                putDirectory(tar, "bin")
+                putDirectory(tar, "etc")
+                putDirectory(tar, "etc/apt")
+                putDirectory(tar, "lib")
+                putDirectory(tar, "usr")
+                putDirectory(tar, "usr/bin")
+                putDirectory(tar, "var/lib")
+                putFile(tar, "bin/bash", "fake shell\n".toByteArray(), mode = 0b111_101_101)
+                putSymlink(tar, "bin/sh", "bash")
+                putSymlink(tar, "usr/bin/env", "../../bin/bash")
+                // The link precedes its target: extraction sees it before bin/later-entry exists.
+                putForwardHardlink(tar, "bin/hardlinked-later", "bin/later-entry")
+                putFile(tar, "bin/later-entry", "later\n".toByteArray())
+                putFile(tar, "usr/bin/apt-get", "fake apt\n".toByteArray(), mode = 0b111_101_101)
+                putFile(tar, "lib/ld-linux-aarch64.so.1", "fake linker\n".toByteArray(), mode = 0b111_101_101)
+                putFile(tar, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n".toByteArray())
+                putFile(tar, "etc/group", "root:x:0:\ndaemon:x:1:\n".toByteArray())
+                putFile(tar, "etc/shadow", "root:*:19850:0:99999:7:::\ndaemon:*:19850:0:99999:7:::\n".toByteArray())
+                putFile(tar, "etc/apt/sources.list", "deb https://fixtures.invalid/ubuntu jammy main\n".toByteArray())
+                putFile(tar, "var/lib/rootfs-fixture.pad", ByteArray(3 * 1024 * 1024))
+            }
+        }
+        return target
+    }
 }
