@@ -244,6 +244,36 @@ class UbuntuE2eVerificationTest {
     }
 
     @Test
+    fun hardLinksShareOneInode() {
+        assumeWritePhase()
+        // Patch 0004's contract, probed the way shadow(1) probes it: hard-link two names together
+        // and ask each how many links it has. Android's app seccomp filter refuses link(2), so the
+        // fork emulates it by copying the bytes — two inodes of one link each — and every tool that
+        // takes a lock with a hard link (adduser, groupadd, passwd: they link <db> to <db>.lock and
+        // verify by counting links) reads that copy as a lock already held. Two names, one inode,
+        // two links is what a real link looks like, and it is what let openssh-client's postinst
+        // lock /etc/group at all.
+        sessionSucceeds("rm -rf /tmp/link-probe && mkdir -p /tmp/link-probe && printf x > /tmp/link-probe/a")
+        sessionSucceeds("ln /tmp/link-probe/a /tmp/link-probe/b")
+        // -ef is the shell's own answer to "same file" (device and inode are equal), so it reads the
+        // pair through a different question than stat's link count.
+        sessionSucceeds("test /tmp/link-probe/a -ef /tmp/link-probe/b")
+
+        val counted = sessionSucceeds("stat -c '%h %i' /tmp/link-probe/a /tmp/link-probe/b")
+        val rows = counted.lines().map { it.trim() }.filter { it.isNotEmpty() }.map { it.split(Regex("\\s+")) }
+        check(rows.size == 2 && rows.all { it.size == 2 }) {
+            "LINK stage: expected 'stat' to report two '<links> <inode>' rows, got: ${counted.take(500)}"
+        }
+        check(rows[0][0] == "2" && rows[1][0] == "2") {
+            "LINK stage: the two names report ${rows[0][0]} and ${rows[1][0]} links, expected 2 each — " +
+                "the link was emulated as a byte copy, so shadow(1) would read its own lock as held: ${counted.take(500)}"
+        }
+        check(rows[0][1] == rows[1][1]) {
+            "LINK stage: the two names report inodes ${rows[0][1]} and ${rows[1][1]}, expected one inode: ${counted.take(500)}"
+        }
+    }
+
+    @Test
     fun persistenceMarkersAreWritten() {
         assumeWritePhase()
         // Two markers on purpose: /tmp proves the rootfs tree itself persists across an app
