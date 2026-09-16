@@ -147,6 +147,149 @@ class InstallLogLines(unittest.TestCase):
             self.assertIsNone(driver.INSTALL_LOG_LINE.match(text), text)
 
 
+class DataAvailParsing(unittest.TestCase):
+    """What `df /data` actually prints, exactly as run 35100526297's evidence
+    captured it. The storage-failure phase aborted on this line, on every FULL
+    run, because the parse anchored on a "/data" mount point that this image
+    never prints."""
+
+    # device-state.txt from run 35100526297, verbatim.
+    REAL = ("Filesystem       1K-blocks   Used Available Use% Mounted on\n"
+            "/dev/block/dm-43   6082144 319032   5763112   6% /mnt/pass_through/0/emulated")
+
+    def _avail(self, out, rc=0):
+        d = driver.E2eDriver.__new__(driver.E2eDriver)
+        d.adb = _DfAdb(out, rc)
+        return d._data_avail_kb()
+
+    def test_the_emulators_own_output_is_read(self):
+        self.assertEqual(5763112, self._avail(self.REAL))
+
+    def test_a_data_mount_point_still_reads(self):
+        # An image that resolves /data to itself must not stop working.
+        self.assertEqual(5763112, self._avail(
+            "Filesystem     1K-blocks    Used Available Use% Mounted on\n"
+            "/dev/block/dm-43  6082144 319032   5763112   6% /data"))
+
+    def test_human_units_are_converted(self):
+        self.assertEqual(int(5.6 * 1024 * 1024), self._avail(
+            "Filesystem  1K-blocks  Used Available Use% Mounted on\n"
+            "/dev/block/dm-43  6G  310M  5.6G  6% /data"))
+
+    def test_an_unreadable_df_is_zero_not_a_wrong_number(self):
+        self.assertEqual(0, self._avail("", rc=1))
+        self.assertEqual(0, self._avail("df: /data: No such file or directory"))
+        # The Available column itself, not the 1K-blocks one: corrupting the
+        # wrong column is exactly the mistake this case first made.
+        self.assertEqual(0, self._avail(self.REAL.replace("5763112", "abc")))
+
+
+class SuiteParsing(unittest.TestCase):
+    """The counts the driver prints for an instrumentation phase. A failing run
+    ends "Tests run: 14,  Failures: 1" rather than "OK (14 tests)", so reading
+    only the OK line reported it as "0 tests, 1 failed" - a phase that ran
+    fourteen tests looked like one that ran none."""
+
+    # instrument-write.txt from run 35100526297, abridged in the middle.
+    FAILING = (
+        "dev.eclipse.ssh.linux.UbuntuE2eVerificationTest:.....\n"
+        "Error in hardLinksShareOneInode(dev.eclipse.ssh.linux.UbuntuE2eVerificationTest):\n"
+        "java.lang.IllegalStateException: UBUNTU SHELL stage: 'test /tmp/link-probe/a "
+        "-ef /tmp/link-probe/b' exited 1: \n"
+        "\tat dev.eclipse.ssh.linux.UbuntuE2eVerificationTest.sessionSucceeds(unknown:66)\n"
+        ".......\n\nTime: 5.356\nThere was 1 failure:\n"
+        "1) hardLinksShareOneInode(dev.eclipse.ssh.linux.UbuntuE2eVerificationTest)\n"
+        "java.lang.IllegalStateException: UBUNTU SHELL stage: 'test /tmp/link-probe/a "
+        "-ef /tmp/link-probe/b' exited 1: \n"
+        "\tat dev.eclipse.ssh.linux.UbuntuE2eVerificationTest.sessionSucceeds(unknown:66)\n"
+        "\nFAILURES!!!\nTests run: 14,  Failures: 1\n")
+
+    def test_a_failing_run_reports_the_tests_that_ran(self):
+        total, failed, failures = driver._parse_suite(self.FAILING)
+        self.assertEqual(14, total)
+        self.assertEqual(1, failed)
+        self.assertIn("hardLinksShareOneInode", failures[0]["test"])
+
+    def test_a_passing_run_still_reads_the_ok_line(self):
+        total, failed, failures = driver._parse_suite(
+            "dev.eclipse.ssh.linux.UbuntuE2eVerificationTest:..............\n"
+            "\nOK (14 tests)\n")
+        self.assertEqual(14, total)
+        self.assertEqual(0, failed)
+        self.assertEqual([], failures)
+
+
+class OpenSettingsRecovery(unittest.TestCase):
+    """open_settings when the app is not on screen. The interruption phases call
+    it right after pm clear, so the dump shows the launcher - which is what run
+    35100526297 reported as "the Settings tab was not found on screen" while the
+    app was simply not running."""
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.package = "dev.eclipse.ssh"
+        self.adb = _LauncherThenAppAdb()
+        self.driver.adb = self.adb
+        self._sleep = driver.time.sleep
+        # launch() waits four seconds and open_settings two; the pacing is not
+        # what this test is about, and the waits are additive per case.
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def test_the_app_is_put_back_and_settings_opened(self):
+        self.driver.open_settings()
+        self.assertEqual([("dev.eclipse.ssh", ".MainActivity")], self.adb.starts)
+        self.assertEqual(1, len(self.adb.taps))
+
+    def test_a_settings_tab_that_is_really_gone_still_fails(self):
+        self.adb.shows_settings = False
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_settings()
+        self.assertIn("Settings tab was not found", str(caught.exception))
+        # Relaunched once, not in a loop: a real UI regression must stay a failure.
+        self.assertEqual(1, len(self.adb.starts))
+
+
+class _DfAdb:
+    def __init__(self, out, rc=0):
+        self.out = out
+        self.rc = rc
+
+    def shell(self, cmd, timeout=30):
+        return self.rc, self.out
+
+
+class _LauncherThenAppAdb:
+    """A screen that is the launcher until the app is started, like the dump from
+    run 35100526297's interruption phase (Search, Gallery, Phone, ... no app)."""
+
+    LAUNCHER = [Element({"text": "Phone", "content-desc": "Phone", "bounds": "[23,2106][230,2272]"}),
+                Element({"text": "Camera", "content-desc": "Camera", "bounds": "[851,2106][1057,2272]"})]
+    APP = [Element({"text": "Settings", "content-desc": "Settings", "bounds": "[900,2272][1080,2400]"})]
+
+    def __init__(self):
+        self.starts = []
+        self.taps = []
+        self.launched = False
+        self.shows_settings = True
+
+    def ui_dump(self):
+        if self.launched and self.shows_settings:
+            return self.APP
+        return self.LAUNCHER
+
+    def am_start(self, package, activity):
+        self.starts.append((package, activity))
+        self.launched = True
+        return True, "Status: ok"
+
+    def tap(self, x, y):
+        self.taps.append((x, y))
+        return True
+
+
 class _RecordingAdb:
     """An Adb stand-in that records taps instead of sending them."""
 

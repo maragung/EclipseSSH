@@ -371,9 +371,19 @@ class E2eDriver:
         time.sleep(4)
 
     def open_settings(self):
-        """Settings is a bottom tab; always one tap away from anywhere."""
+        """Settings is a bottom tab; one tap away from anywhere the app is on
+        screen. When it is not, put the app back and ask again: several phases
+        reach here with the app stopped (pm clear) or just torn down by an
+        `am instrument` run, and the dump then shows whatever Android put in
+        front - the launcher, in run 35100526297, where the interruption phases
+        failed with "the Settings tab was not found on screen" while the app
+        was simply not running. A relaunch is idempotent (am start on a live
+        app only brings it forward), and a Settings tab that is genuinely gone
+        still fails here, one relaunch later."""
         if not self.tap_last(self.dump(), "Settings"):
-            raise RuntimeError("the Settings tab was not found on screen")
+            self.launch()
+            if not self.tap_last(self.dump(), "Settings"):
+                raise RuntimeError("the Settings tab was not found on screen")
         time.sleep(2)
 
     def _window_extent(self, els):
@@ -1040,18 +1050,32 @@ class E2eDriver:
         rc, out = self.adb.shell("df /data", timeout=30)
         if rc != 0:
             return 0
-        # toybox df prints human units ("57G", "512M"), so the available column
-        # needs its unit read, not just its digits.
-        match = re.search(r"/data\s+\S+\s+\S+\s+(\d+(?:\.\d+)?)([KMGT]?)\s+\d+%\s+/data\s*$",
-                          out.strip(), re.M)
-        if not match:
-            return 0
-        try:
-            value = float(match.group(1))
-        except ValueError:
-            return 0
-        factor = {"": 1.0, "K": 1.0, "M": 1024.0, "G": 1024.0 * 1024.0, "T": 1024.0 ** 3}[match.group(2)]
-        return int(value * factor)
+        # The row is found by shape, not by its mount point. `df /data` reports
+        # the mount the path resolves to, and on API 35 that is not "/data":
+        #
+        #   Filesystem       1K-blocks   Used Available Use% Mounted on
+        #   /dev/block/dm-43   6082144 319032   5763112   6% /mnt/pass_through/0/emulated
+        #
+        # The first version anchored the match on "/data" as the last field, so
+        # it never matched on this image and the whole storage-failure phase
+        # aborted with "could not read /data free space" (run 35100526297) --
+        # on every FULL run, since FULL is the only mode that reaches it.
+        # toybox prints plain 1K-blocks here but human units ("57G") elsewhere,
+        # so the unit is read rather than assumed.
+        for line in out.strip().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 6 or not fields[0].startswith("/"):
+                continue
+            match = re.match(r"(\d+(?:\.\d+)?)([KMGT]?)$", fields[3])
+            if not match:
+                continue
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                return 0
+            factor = {"": 1.0, "K": 1.0, "M": 1024.0, "G": 1024.0 * 1024.0, "T": 1024.0 ** 3}[match.group(2)]
+            return int(value * factor)
+        return 0
 
     def interrupt_process(self, install_timeout_min):
         """Kill the app mid-download, then prove recovery: the relaunched app
@@ -1300,6 +1324,13 @@ def _parse_suite(stdout_text):
     m = re.search(r"^OK \((\d+) tests?\)", stdout_text, flags=re.M)
     if m:
         total = int(m.group(1))
+    else:
+        # A run with failures ends "Tests run: 14,  Failures: 1" instead of
+        # "OK (14 tests)", so reading only the OK line reported a failing suite
+        # as "0 tests, 1 failed" and hid how much had actually run.
+        m = re.search(r"^Tests run: (\d+)", stdout_text, flags=re.M)
+        if m:
+            total = int(m.group(1))
     return total, len(failures), failures
 
 
