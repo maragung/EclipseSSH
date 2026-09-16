@@ -555,52 +555,12 @@ class UbuntuDistributionManager(
             ?.takeIf { it.isNotBlank() }
 
     /**
-     * The one or two lines of a failed dpkg command that say *why*, for the diagnostics ring.
-     *
-     * [failureTail] answers "what was the last thing apt said", and for a failed maintainer script
-     * that is the summary block — `Errors were encountered while processing: | openssh-client | E:
-     * Sub-process /usr/bin/dpkg returned an error code (1)`. All of it true, none of it a
-     * diagnosis: dpkg prints the failing script's own message *above* that block, then its own
-     * verdict. So the reason is the verdict line (`dpkg: error processing package <pkg>
-     * (--configure): …`) and the non-noise line in front of it, which is whatever the script said
-     * before dying — the sentence that names the step Android refused.
-     *
-     * This is the difference E2E run 35058820878 turned on: the install died 70 seconds into the
-     * base packages, every later apt command then failed in one to two seconds (dpkg retries the
-     * half-configured package before anything else), and the report carried only the summary
-     * block — leaving "which of the postinst's steps failed" unanswerable from the evidence.
-     *
-     * Which verdict matters is the whole subtlety, and it is not the last one. A failed maintainer
-     * script makes dpkg fail *every* package that depends on it in the same run ("dependency
-     * problems prevent configuration of openssh-sftp-server: … however: Package openssh-client is
-     * not configured yet"), each with its own `dpkg: error processing package` line — so taking the
-     * last verdict describes a consequence and buries the cause several lines above it. The verdict
-     * wanted is the first one whose script failed, recognized by dpkg's own sentence for it; only
-     * when no verdict names a script does the last one stand in, which is the shape of an error
-     * that is not a maintainer script's at all (a bad dependency, an unpack failure).
+     * The up-to-three lines of a failed dpkg command that say *why*, for the diagnostics ring.
+     * [dpkgFailureReason] is the whole of it, kept a top-level function so it can be tested against
+     * transcripts this class can only produce on a device.
      */
-    private fun failureReason(output: String?, maxChars: Int = UserspaceDiagnostics.MAX_DETAIL): String? {
-        val lines = output
-            ?.lineSequence()
-            ?.map { stripEscapes(it).trim() }
-            ?.filter { it.isNotBlank() }
-            ?.toList()
-            ?: return null
-        val verdicts = lines.indices.filter { lines[it].startsWith(DPKG_VERDICT_PREFIX) }
-        val scriptFailure = verdicts.firstOrNull { index ->
-            lines.getOrNull(index + 1)?.let { next -> SCRIPT_FAILURE_MARKERS.any { next.contains(it) } } == true
-        }
-        val verdict = scriptFailure ?: verdicts.lastOrNull() ?: -1
-        // Everything up to that verdict, minus apt's and dpkg's progress chatter; the last two
-        // survivors are the script's message and the verdict that follows it.
-        val window = (if (verdict >= 0) lines.subList(0, verdict + 1) else lines)
-            .filterNot { line -> FAILURE_REASON_NOISE.any { line.startsWith(it) } }
-            .takeLast(FAILURE_REASON_LINES)
-        return window
-            .joinToString(" | ")
-            .take(maxChars)
-            .takeIf { it.isNotBlank() }
-    }
+    private fun failureReason(output: String?, maxChars: Int = UserspaceDiagnostics.MAX_DETAIL): String? =
+        dpkgFailureReason(output, maxChars)
 
     /**
      * The runtime smoke step: `echo <marker>` under the same argv every scripted command uses.
@@ -1226,19 +1186,32 @@ class UbuntuDistributionManager(
             "zip",
         )
 
-        /** How many lines of a failed command's output [failureReason] keeps — see its doc. */
-        private const val FAILURE_REASON_LINES = 2
+        /**
+         * How many lines of a failed command's output [dpkgFailureReason] keeps — see its doc.
+         *
+         * Three, not two, because a failing maintainer script's own diagnosis is not one line.
+         * shadow(1) reports a lock it could not take in two, and the second is the one that reads
+         * as the cause while the first is the one that says which lock and whose:
+         *
+         *     groupadd: /etc/group.2500379: lock file already used
+         *     groupadd: cannot lock /etc/group; try again later.
+         *
+         * With two kept, the pair lost its first line and the report read as a bare failure to
+         * lock — the PID and the file named in the evidence were the ones dropped. The verdict dpkg
+         * appends is the third.
+         */
+        internal const val FAILURE_REASON_LINES = 3
 
         /** How dpkg opens its verdict on a package it could not configure. */
-        private const val DPKG_VERDICT_PREFIX = "dpkg: error"
+        internal const val DPKG_VERDICT_PREFIX = "dpkg: error"
 
         /**
          * What dpkg says on the line under its verdict when the failure was the package's own
-         * script rather than, say, an unpack or a dependency. This is the marker [failureReason]
+         * script rather than, say, an unpack or a dependency. This is the marker [dpkgFailureReason]
          * picks its verdict by: a script that failed is the cause, and every verdict after it —
          * "dependency problems prevent configuration of …" — is a package reporting the damage.
          */
-        private val SCRIPT_FAILURE_MARKERS = listOf(
+        internal val SCRIPT_FAILURE_MARKERS = listOf(
             "post-installation script",
             "pre-installation script",
             "pre-removal script",
@@ -1249,10 +1222,10 @@ class UbuntuDistributionManager(
 
         /**
          * The lines apt and dpkg emit around a failure without being it: their own progress
-         * reports. Filtered out of [failureReason]'s window so that the two lines it keeps are the
-         * failing script's message and dpkg's verdict, which are the only two that diagnose.
+         * reports. Filtered out of [dpkgFailureReason]'s window so that the lines it keeps are the
+         * failing script's own output and dpkg's verdict, which are the only ones that diagnose.
          */
-        private val FAILURE_REASON_NOISE = listOf(
+        internal val FAILURE_REASON_NOISE = listOf(
             "Setting up ",
             "Preparing to unpack ",
             "Unpacking ",
@@ -1361,6 +1334,58 @@ class UbuntuDistributionManager(
 
 /** The mirror feed answered, but its body exceeds any plausible mirror list. */
 private class MirrorFeedTooLarge : IOException("mirror feed body exceeds 256 KiB")
+
+/**
+ * The lines of a failed dpkg command that say *why*, for the diagnostics ring.
+ *
+ * [UbuntuDistributionManager]'s failure tail answers "what was the last thing apt said", and for a
+ * failed maintainer script that is the summary block — `Errors were encountered while processing: |
+ * openssh-client | E: Sub-process /usr/bin/dpkg returned an error code (1)`. All of it true, none of
+ * it a diagnosis: dpkg prints the failing script's own message *above* that block, then its own
+ * verdict. So the reason is the verdict line (`dpkg: error processing package <pkg> (--configure):
+ * …`) and the non-noise lines in front of it, which are whatever the script said before dying — the
+ * sentences that name the step Android refused.
+ *
+ * This is the difference E2E run 35058820878 turned on: the install died 70 seconds into the base
+ * packages, every later apt command then failed in one to two seconds (dpkg retries the
+ * half-configured package before anything else), and the report carried only the summary block —
+ * leaving "which of the postinst's steps failed" unanswerable from the evidence.
+ *
+ * Which verdict matters is the whole subtlety, and it is not the last one. A failed maintainer
+ * script makes dpkg fail *every* package that depends on it in the same run ("dependency problems
+ * prevent configuration of openssh-sftp-server: … however: Package openssh-client is not configured
+ * yet"), each with its own `dpkg: error processing package` line — so taking the last verdict
+ * describes a consequence and buries the cause several lines above it. The verdict wanted is the
+ * first one whose script failed, recognized by dpkg's own sentence for it; only when no verdict
+ * names a script does the last one stand in, which is the shape of an error that is not a maintainer
+ * script's at all (a bad dependency, an unpack failure).
+ */
+internal fun dpkgFailureReason(
+    output: String?,
+    maxChars: Int = UserspaceDiagnostics.MAX_DETAIL,
+): String? {
+    val lines = output
+        ?.lineSequence()
+        ?.map { stripEscapes(it).trim() }
+        ?.filter { it.isNotBlank() }
+        ?.toList()
+        ?: return null
+    val verdicts = lines.indices.filter { lines[it].startsWith(UbuntuDistributionManager.DPKG_VERDICT_PREFIX) }
+    val scriptFailure = verdicts.firstOrNull { index ->
+        val next = lines.getOrNull(index + 1)
+        next != null && UbuntuDistributionManager.SCRIPT_FAILURE_MARKERS.any { next.contains(it) }
+    }
+    val verdict = scriptFailure ?: verdicts.lastOrNull() ?: -1
+    // Everything up to that verdict, minus apt's and dpkg's progress chatter; the survivors at the
+    // end are the failing script's own output and the verdict that follows it.
+    val window = (if (verdict >= 0) lines.subList(0, verdict + 1) else lines)
+        .filterNot { line -> UbuntuDistributionManager.FAILURE_REASON_NOISE.any { line.startsWith(it) } }
+        .takeLast(UbuntuDistributionManager.FAILURE_REASON_LINES)
+    return window
+        .joinToString(" | ")
+        .take(maxChars)
+        .takeIf { it.isNotBlank() }
+}
 
 /**
  * One rung of the apt-update ladder. [forceIpv4] exists because the classic "apt update hangs on a

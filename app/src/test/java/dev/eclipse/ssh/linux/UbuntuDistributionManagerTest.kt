@@ -1098,6 +1098,79 @@ class UbuntuDistributionManagerTest {
         override fun close() = wake.countDown()
     }
 
+    @Test
+    fun `the reason for a failed postinst keeps both lines shadow needed to name the lock`() {
+        // The transcript E2E run 35086244789 died on, verbatim: shadow reports a lock it could not
+        // take in two lines, and the two are a pair — the second says what failed, the first says
+        // which file and whose PID. Keeping two lines kept the second and the verdict, so the
+        // evidence named neither the lock file nor the process that held it.
+        val reason = dpkgFailureReason(
+            """
+            Setting up openssh-client (1:8.9p1-3ubuntu0.10) ...
+            groupadd: /etc/group.2500379: lock file already used
+            groupadd: cannot lock /etc/group; try again later.
+            dpkg: error processing package openssh-client (--configure):
+             installed openssh-client package post-installation script subprocess returned error exit status 10
+            dpkg: dependency problems prevent configuration of openssh-sftp-server:
+            Errors were encountered while processing:
+             openssh-client
+            E: Sub-process /usr/bin/dpkg returned an error code (1)
+            """.trimIndent(),
+        )
+
+        assertThat(reason).isNotNull()
+        assertThat(reason!!).contains("/etc/group.2500379")
+        assertThat(reason).contains("cannot lock /etc/group")
+        assertThat(reason).contains("dpkg: error processing package openssh-client")
+    }
+
+    @Test
+    fun `the reason prefers the script that failed over the packages that report the damage`() {
+        // The whole cascade, in dpkg's order: the maintainer script's verdict first, then one
+        // verdict per package that depended on it. The last verdict describes a consequence; the
+        // first names the cause.
+        val reason = dpkgFailureReason(
+            """
+            dpkg: error processing package openssh-client (--configure):
+             installed openssh-client package post-installation script subprocess returned error exit status 10
+            dpkg: dependency problems prevent configuration of openssh-sftp-server:
+             openssh-sftp-server depends on openssh-client (>= 1:8.9p1-3); however:
+              Package openssh-client is not configured yet.
+            Errors were encountered while processing:
+             openssh-client
+             openssh-sftp-server
+            """.trimIndent(),
+        )
+
+        assertThat(reason!!).contains("openssh-client")
+        assertThat(reason).doesNotContain("sftp-server")
+    }
+
+    @Test
+    fun `a failure with no maintainer script falls back to the last verdict`() {
+        // An unpack failure, which dpkg reports the same way but with nothing of the package's own
+        // to say. There is no script verdict to prefer, so the last one stands — and the noise
+        // filter still leaves the report reading as a cause rather than as a progress log.
+        val reason = dpkgFailureReason(
+            """
+            Unpacking libssl3:amd64 (3.0.2-0ubuntu1.10) ...
+            dpkg-deb: error: archive './libssl3.deb' is not a debian format archive
+            dpkg: error processing archive ./libssl3.deb (--unpack):
+             dpkg-deb --control subprocess returned error exit status 2
+            """.trimIndent(),
+        )
+
+        assertThat(reason!!).contains("dpkg: error processing archive")
+        assertThat(reason).doesNotContain("Unpacking libssl3")
+    }
+
+    @Test
+    fun `a failed command with no output has no reason to report`() {
+        assertThat(dpkgFailureReason(null)).isNull()
+        assertThat(dpkgFailureReason("")).isNull()
+        assertThat(dpkgFailureReason("\n \n")).isNull()
+    }
+
     private fun distro(arch: String, release: String = "jammy") =
         LinuxDistro(
             id = "ubuntu-22.04",
