@@ -1,0 +1,183 @@
+emulate link(2) under a double SIGSYS, and stop the linkat emulation from moving the file
+
+Android's zygote seccomp policy for apps traps plain link() *and*
+linkat().  dpkg creates its /var/lib/dpkg/status-old backup with a plain
+link(status, status-old), so under the app policy the flow is:
+
+  link() SIGSYS -> handler rewrites the registers to the linkat layout
+  and restarts -> the restarted linkat SIGSYSes too -> handler runs the
+  PR_linkat emulation with the wrong registers.
+
+At that second SIGSYS the registers CURRENT hold the *restored link()
+layout* (push_specific_regs restored them from ORIGINAL_SECCOMP_REWRITE
+at the syscall-exit stop of the rewritten call), so the emulation read
+newdirfd from SYSARG_3 = a stack pointer, newpath from SYSARG_4 =
+whatever the caller of link() happened to leave there, and translate_path
+returned -EBADF.  dpkg died on "status-old: Permission denied" and
+apt-get install exited 100 - the failure that ended the Ubuntu E2E run
+35035691404 after apt-get update had finally passed.
+
+The olddirfd = peek_reg(tracee, ORIGINAL, SYSARG_1) read was equally
+wrong: for a direct guest linkat() the SIGSYS arrives with no prior
+sysenter stop of that call, so ORIGINAL holds whatever syscall ran
+before, and even for the rewritten link() ORIGINAL holds the linkat
+layout saved at the restart's sysenter - which is not what a link-layout
+SYSARG_1 means.
+
+Two more defects in the same emulation, found while fixing the first:
+
+  1. It called renameat() and, on the EXDEV/EACCES fallback path,
+     unlink()ed the source - it *moved* the file instead of hardlinking
+     it.  Every emulated link() destroyed its source: dpkg would have
+     lost /var/lib/dpkg/status itself once the register bug was fixed.
+     The kernel runs this code inside the same seccomp filter that
+     trapped linkat, so the host link(2) would SIGSYS-kill proot; a byte
+     copy is the only emulation that can run.  O_CREAT|O_EXCL reproduces
+     link(2)'s EEXIST-on-existing-target errno.
+  2. flags was read from a register that is garbage in both flows (it
+     was never used, so this is cosmetic).
+
+The fix: PR_link sets tracee->link_rewrite_pending before restarting;
+PR_linkat consumes the flag to know CURRENT holds the link() layout
+(SYSARG_1/2 = old/new path) versus a real linkat() layout, and both
+flows then translate the paths and byte-copy the source to the target,
+keeping the source and failing EEXIST when the target exists.
+
+Validated on x86_64 Linux with a seccomp filter that TRAPs __NR_link and
+__NR_linkat exactly like the Android app policy: link() creates
+status-old with identical bytes and keeps the source; link() onto an
+existing name fails EEXIST; a missing source fails ENOENT; a direct
+linkat(AT_FDCWD,...) creates the target and keeps the source; linkat()
+onto an existing name fails EEXIST; untrapped link/linkat still work
+natively; the rename-SIGSYS fix from patch 0001 is unregressed.  Under
+the same trap, in a jammy rootfs: dpkg --configure -a exits 0 and
+"apt-get install -y hello" unpacks and configures the package with
+status-old created and hello running - the exact flow that failed in
+the E2E run.
+
+Not upstreamed: no write access to oonid/pr; this patch is applied to
+the pinned fork tarball by fetchLinuxSource in linux/build.gradle.kts
+on top of 0001 and 0002.
+--- a/src/proot/src/tracee/tracee.h
++++ b/src/proot/src/tracee/tracee.h
+@@ -161,6 +161,11 @@
+ 	bool _regs_were_changed;
+ 	bool restore_original_regs;
+ 	bool restore_original_regs_after_seccomp_event;
++	/* True between a PR_link SIGSYS rewritten to linkat and the SIGSYS
++	 * of that rewritten linkat (Android traps both).  It tells the
++	 * PR_linkat emulation that CURRENT holds the restored link() layout,
++	 * not a linkat() layout.  */
++	bool link_rewrite_pending;
+ 
+ 	/* State for the special handling of SIGSTOP.  */
+ 	enum {
+--- a/src/proot/src/tracee/seccomp.c
++++ b/src/proot/src/tracee/seccomp.c
+@@ -205,6 +205,10 @@
+ 		poke_reg(tracee, SYSARG_1, AT_FDCWD);
+ 		poke_reg(tracee, SYSARG_3, AT_FDCWD);
+ 		poke_reg(tracee, SYSARG_5, 0);
++		/* Android traps linkat too, so this rewrite SIGSYSes again.
++		 * Flag it so the PR_linkat emulation knows the register
++		 * banks hold the link() layout when that second trap lands.  */
++		tracee->link_rewrite_pending = true;
+ 		restart_syscall_after_seccomp(tracee);
+ 		break;
+ 
+@@ -664,17 +668,36 @@
+ 		char newpath[PATH_MAX];
+ 		char old_translated[PATH_MAX];
+ 		char new_translated[PATH_MAX];
+-		int olddirfd = peek_reg(tracee, ORIGINAL, SYSARG_1);
+-		int newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
+-		int flags = peek_reg(tracee, CURRENT, SYSARG_5);
+-		int size;
++		/* A rewritten link() arrives here after its own SIGSYS was
++		 * restored to the link() layout in CURRENT (SYSARG_1/2 =
++		 * old/new path), while a direct linkat() keeps the linkat
++		 * layout in CURRENT.  Android traps both syscalls, so both
++		 * flows must work.  */
++		int olddirfd, newdirfd, flags, size;
++		bool from_link_rewrite = tracee->link_rewrite_pending;
++		if (from_link_rewrite) {
++			tracee->link_rewrite_pending = false;
++			olddirfd = AT_FDCWD;
++			newdirfd = AT_FDCWD;
++			flags = 0;
++		} else {
++			olddirfd = peek_reg(tracee, CURRENT, SYSARG_1);
++			newdirfd = peek_reg(tracee, CURRENT, SYSARG_3);
++			flags = peek_reg(tracee, CURRENT, SYSARG_5);
++		}
+ 
+-		size = read_string(tracee, oldpath, peek_reg(tracee, CURRENT, SYSARG_2), PATH_MAX);
++		size = read_string(tracee, oldpath,
++				from_link_rewrite ? peek_reg(tracee, CURRENT, SYSARG_1)
++				                  : peek_reg(tracee, CURRENT, SYSARG_2),
++				PATH_MAX);
+ 		if (size < 0) {
+ 			set_result_after_seccomp(tracee, size);
+ 			break;
+ 		}
+-		size = read_string(tracee, newpath, peek_reg(tracee, CURRENT, SYSARG_4), PATH_MAX);
++		size = read_string(tracee, newpath,
++				from_link_rewrite ? peek_reg(tracee, CURRENT, SYSARG_2)
++				                  : peek_reg(tracee, CURRENT, SYSARG_4),
++				PATH_MAX);
+ 		if (size < 0) {
+ 			set_result_after_seccomp(tracee, size);
+ 			break;
+@@ -691,21 +714,34 @@
+ 			break;
+ 		}
+ 
++		/* The kernel runs this code under the same seccomp filter
++		 * that trapped linkat, so the host link() would SIGSYS-kill
++		 * proot itself; a byte copy is the only emulation that can
++		 * run.  The old code called renameat() and unlinked the
++		 * source - that moved the file instead of hardlinking it,
++		 * destroying dpkg's /var/lib/dpkg/status on every backup.  */
+ 		errno = 0;
+-		if (renameat(AT_FDCWD, old_translated, AT_FDCWD, new_translated) == 0) {
+-			set_result_after_seccomp(tracee, 0);
+-		} else if (errno == EXDEV || errno == EACCES) {
+-			int src_fd = open(old_translated, O_RDONLY);
++		{
++			int src_fd = open(old_translated, O_RDONLY | O_NOFOLLOW);
+ 			if (src_fd < 0) {
+ 				set_result_after_seccomp(tracee, -errno);
+ 				break;
+ 			}
+ 			struct stat st;
+-			fstat(src_fd, &st);
+-			int dst_fd = open(new_translated, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode);
++			if (fstat(src_fd, &st) < 0) {
++				int saved = errno;
++				close(src_fd);
++				set_result_after_seccomp(tracee, -saved);
++				break;
++			}
++			int dst_fd = open(new_translated, O_WRONLY | O_CREAT | O_EXCL, st.st_mode & 07777);
+ 			if (dst_fd < 0) {
++				int saved = errno;
+ 				close(src_fd);
+-				set_result_after_seccomp(tracee, -errno);
++				/* link(2) fails with EEXIST when the target
++				 * name already exists; O_EXCL reproduces
++				 * that errno from open(2) already.  */
++				set_result_after_seccomp(tracee, -saved);
+ 				break;
+ 			}
+ 			char cpbuf[8192];
+@@ -720,10 +756,7 @@
+ 			}
+ 			close(dst_fd);
+ 			close(src_fd);
+-			unlink(old_translated);
+ 			set_result_after_seccomp(tracee, 0);
+-		} else {
+-			set_result_after_seccomp(tracee, -errno);
+ 		}
+ 		break;
+ 	}
