@@ -16,8 +16,10 @@ import kotlinx.coroutines.flow.StateFlow
  *  - [Log] with the single stable tag, so `adb logcat -s EclipseSSH` is a complete trace;
  *  - an in-memory ring the app can export, because a user whose install failed has no `adb`.
  *
- * Wiring the export into the settings screen's copy/save path is a later pass; the ring exists
- * and is filled from the day the install code can record into it.
+ * The export runs through [LinuxUserspaceController.installLog] and the Settings → Linux Userspace
+ * "Install log" row, which offers the ring to Copy, Save and Clear — the same three actions the
+ * session trace's own dialog offers, for the same reason: the person who needs the evidence is the
+ * one whose install just failed, and that person has no `adb`.
  *
  * ## What must never appear here
  * The same rules the session trace holds: passwords, keys, tokens, terminal contents. Every
@@ -104,8 +106,10 @@ internal fun stripEscapes(text: String): String = ANSI_ESCAPES.replace(text, "")
 private val ANSI_ESCAPES = Regex("\\u001B\\[[0-9;?]*[ -/]*[@-~]")
 
 /**
- * The category prefix every line carries: the four subsystems of an install, so a trace can be
- * `grep`ed by subsystem rather than read whole.
+ * The category prefix every line carries: the subsystems of an install — storage, the rootfs
+ * download and extraction, proot itself, DNS, and apt — so a trace can be `grep`ed by subsystem
+ * rather than read whole. Every one of the six is recorded by something: [RootfsInstaller] owns
+ * storage, download and rootfs, [UbuntuDistributionManager] the rest.
  */
 enum class UserspaceDiagnosticCategory(val tag: String) {
     STORAGE("storage"),

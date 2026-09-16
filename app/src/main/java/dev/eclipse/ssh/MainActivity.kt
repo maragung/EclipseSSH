@@ -57,6 +57,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -227,6 +228,7 @@ import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceUiState
 import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
 import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
@@ -1460,6 +1462,12 @@ private fun EclipseWorkspace(
                         textExportPicker.launch("eclipse-diagnostics.log")
                     },
                     onClearDiagnostics = viewModel::clearDiagnostics,
+                    onCopyInstallLog = { viewModel.copyToClipboard(it) },
+                    onSaveInstallLog = {
+                        pendingTextExport = it.toByteArray()
+                        pickerActive = true
+                        textExportPicker.launch("eclipse-ubuntu-install.log")
+                    },
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1650,6 +1658,12 @@ private fun EclipseWorkspace(
                         textExportPicker.launch("eclipse-diagnostics.log")
                     },
                     onClearDiagnostics = viewModel::clearDiagnostics,
+                    onCopyInstallLog = { viewModel.copyToClipboard(it) },
+                    onSaveInstallLog = {
+                        pendingTextExport = it.toByteArray()
+                        pickerActive = true
+                        textExportPicker.launch("eclipse-ubuntu-install.log")
+                    },
                     // The shell is the one screen that must not be inset by this Scaffold. Its own
                     // padding comes from `safeDrawingPadding` inside the terminal, and applying both
                     // would inset the grid twice - once for a navigation bar that is not there and
@@ -2362,6 +2376,13 @@ private fun WorkspaceScaffold(
     onCopyDiagnostics: () -> Unit = {},
     onSaveDiagnostics: () -> Unit = {},
     onClearDiagnostics: () -> Unit = {},
+    /**
+     * The userspace install log's export pair, for the Settings section's "Install log" row. Handled
+     * here for the same reason the diagnostics pair is: the clipboard and the SAF picker belong to
+     * [EclipseWorkspace], which owns this scaffold, and neither is reachable from a screen below it.
+     */
+    onCopyInstallLog: (String) -> Unit = {},
+    onSaveInstallLog: (String) -> Unit = {},
 ) {
     // A shell owns the whole window, so it composes outside the Scaffold entirely: no top bar, no
     // Scaffold insets, nothing above the grid but the session strip. This is the branch the app enters
@@ -2531,6 +2552,8 @@ private fun WorkspaceScaffold(
                     onCopyDiagnostics = onCopyDiagnostics,
                     onSaveDiagnostics = onSaveDiagnostics,
                     onClearDiagnostics = onClearDiagnostics,
+                    onCopyInstallLog = onCopyInstallLog,
+                    onSaveInstallLog = onSaveInstallLog,
                 )
             }
         }
@@ -5076,6 +5099,13 @@ private fun SettingsScreen(
     onCopyDiagnostics: () -> Unit = {},
     onSaveDiagnostics: () -> Unit = {},
     onClearDiagnostics: () -> Unit = {},
+    /**
+     * The userspace install log's export pair, passed down to [LinuxUserspaceSection]. The clipboard
+     * and the SAF document picker both live in the scaffold that owns this screen, not here, so the
+     * section cannot reach them itself; defaulted because the screen is also built without them.
+     */
+    onCopyInstallLog: (String) -> Unit = {},
+    onSaveInstallLog: (String) -> Unit = {},
 ) {
     var showForwardDialog by remember { mutableStateOf(false) }
     var showKeepAliveDialog by remember { mutableStateOf(false) }
@@ -5243,7 +5273,11 @@ private fun SettingsScreen(
         ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
     }
     Spacer(Modifier.height(14.dp))
-    LinuxUserspaceSection(linuxUserspace)
+    LinuxUserspaceSection(
+        linuxUserspace = linuxUserspace,
+        onCopyInstallLog = onCopyInstallLog,
+        onSaveInstallLog = onSaveInstallLog,
+    )
     Spacer(Modifier.height(14.dp))
     SettingsSection("About") {
         SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
@@ -5905,10 +5939,16 @@ private fun ForwardDialog(onDismiss: () -> Unit, onConfirm: (ForwardType, Int, S
  * screen with Stop still armed would be a lie about what is already happening.
  */
 @Composable
-private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
+private fun LinuxUserspaceSection(
+    linuxUserspace: LinuxUserspaceController,
+    onCopyInstallLog: (String) -> Unit,
+    onSaveInstallLog: (String) -> Unit,
+) {
     val ui by linuxUserspace.uiState.collectAsStateWithLifecycle()
+    val installLog by linuxUserspace.installLog.collectAsStateWithLifecycle(emptyList())
     var confirmInstall by remember { mutableStateOf(false) }
     var confirmUninstall by remember { mutableStateOf(false) }
+    var showInstallLog by remember { mutableStateOf(false) }
 
     SettingsSection("Linux userspace") {
         if (!ui.supported) {
@@ -6060,6 +6100,27 @@ private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
             }
         }
 
+        // The install and repair trace, reachable at last. It sits outside the installed-states
+        // guard above for the reason it exists: a failed install ends at Not installed, so the
+        // evidence of what went wrong is wanted in exactly the state that had no rows to show it.
+        SettingRow(
+            Icons.Default.Article,
+            "Install log",
+            if (installLog.isEmpty()) {
+                "Records every install and repair step · no secrets"
+            } else {
+                "${installLog.size} event(s) recorded · no secrets"
+            },
+        ) {
+            TextButton(
+                onClick = { showInstallLog = true },
+                // Three "View" buttons now sit on this screen, and a screen reader hears all of
+                // them as just "View" — so the button carries the row it belongs to, the same
+                // "setting, action" shape the Connection diagnostics and About rows use.
+                modifier = Modifier.semantics { contentDescription = "Install log" },
+            ) { Text("View") }
+        }
+
         // The last operation's failure, verbatim, with a way to clear it — an error line that
         // could not be dismissed would outlive the fix it described.
         if (ui.error != null) {
@@ -6133,6 +6194,98 @@ private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
             },
         )
     }
+    if (showInstallLog) {
+        InstallLogDialog(
+            events = installLog,
+            onDismiss = { showInstallLog = false },
+            // Read from the ring at the moment of the tap, not from the list the dialog was composed
+            // with: an export must carry what the app knows right now, including anything recorded
+            // while the dialog was open — which for an install still running is most of it.
+            onCopy = { onCopyInstallLog(linuxUserspace.exportInstallLog()) },
+            onSave = { onSaveInstallLog(linuxUserspace.exportInstallLog()) },
+            onClear = { linuxUserspace.clearInstallLog() },
+        )
+    }
+}
+
+/**
+ * The install and repair trace, newest first — the userspace counterpart of [DiagnosticsDialog],
+ * and the answer to a question that dialog cannot answer at all.
+ *
+ * The two traces are separate rings and stay separate: this one is written by the Linux userspace's
+ * own subsystems (storage, rootfs, download, proot, dns, apt) and describes one install's life, not
+ * one SSH session's. Until this dialog existed the ring was written and never read — every event a
+ * failed install produced went to logcat, which a user without `adb` does not have, so the one
+ * person who needed the evidence was the only one who could not get it ([UserspaceDiagnostics] even
+ * documented the export as a later pass; this is that pass).
+ *
+ * Newest first on screen, oldest first in the copy: on screen the answer wanted is the last thing
+ * that happened, and in a pasted report the reader has to follow the install forwards.
+ */
+@Composable
+private fun InstallLogDialog(
+    events: List<UserspaceDiagnosticEvent>,
+    onDismiss: () -> Unit,
+    onCopy: () -> Unit,
+    onSave: () -> Unit,
+    onClear: () -> Unit,
+) {
+    val ordered = remember(events) { events.asReversed() }
+    val clock = remember {
+        DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Install log") },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f)),
+            ) {
+                if (events.isEmpty()) {
+                    Text(
+                        "Nothing recorded yet. Install or repair Ubuntu on this device and this " +
+                            "becomes a timestamped trace of every download, extraction and apt step.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Text(
+                        "${events.size} event(s) · every line is a subsystem step or an error's own " +
+                            "text, scrubbed before it was recorded, so this is safe to attach to a " +
+                            "bug report.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // The line() form starts with the epoch millis, which the exported text
+                        // needs and a reader does not; the row shows a clock and drops the number.
+                        items(ordered, key = { it.sequence }) { entry ->
+                            Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                    Text(
+                                        clock.format(Instant.ofEpochMilli(entry.atMs)),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        entry.line().substringAfter(' '),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontFamily = FontFamily.Monospace,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = onCopy) { Text("Copy") }
+                        TextButton(onClick = onSave) { Text("Save") }
+                        TextButton(onClick = onClear) { Text("Clear", color = MaterialTheme.colorScheme.error) }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 /** The distro's display name, or a neutral title on a device where none is supported. */
