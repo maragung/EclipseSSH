@@ -641,9 +641,93 @@ class UbuntuDistributionManagerTest {
 
         val report = harness.distribution.setup()
 
-        // The list ran whole, then once more with --fix-missing, before the per-package fallback.
-        assertThat(fullListAttempts).isEqualTo(2)
+        // The list ran whole, once more with --fix-missing, and once more after the recovery
+        // repair pass cleared the interruption that the failed install itself left behind —
+        // before the per-package fallback got its turn.
+        assertThat(fullListAttempts).isEqualTo(3)
         assertThat(report.warnings.any { it.contains("package 'git' was not installed") }).isTrue()
+    }
+
+    @Test
+    fun `a failed maintainer script is recorded with the line that names its cause`() = runTest {
+        // E2E run 35058820878, in the shape the app saw it: the bulk install got seventy seconds
+        // in and died configuring openssh-client — whose postinst runs addgroup, a setgid chmod and
+        // update-alternatives, the steps Android is likeliest to refuse — and then every later apt
+        // command failed in a second or two, because dpkg retries a half-configured package before
+        // it does anything else and dies on it again. All of them print the same sentence, and what
+        // the report carried was dpkg's summary block, which names no step at all: "Errors were
+        // encountered while processing: openssh-client". The line that diagnoses it is the one
+        // dpkg prints *above* that block, and the ring is where it has to land.
+        val harness = Harness(distro(arch = "arm64"))
+        val refused =
+            "Setting up openssh-client (1:8.9p1-3ubuntu0.17) ...\n" +
+                "update-alternatives: error: cannot create /etc/alternatives/rsh: Permission denied\n" +
+                "dpkg: error processing package openssh-client (--configure):\n" +
+                " installed openssh-client package post-installation script subprocess returned error exit status 2\n" +
+                "Errors were encountered while processing:\n" +
+                " openssh-client\n" +
+                "E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> 100 to refused
+                command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to refused
+                else -> baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+        val export = harness.distribution.diagnostics.export()
+
+        assertThat(thrown).isNotNull()
+        assertThat(export).contains("update-alternatives: error: cannot create /etc/alternatives/rsh")
+        assertThat(export).contains("dpkg: error processing package openssh-client")
+        // The fourteen per-package refusals are one fact, not fourteen entries: they all said the
+        // same sentence, because it is the same half-configured package every apt command trips on.
+        assertThat(export.lines().count { it.contains("base packages refused one by one") }).isEqualTo(1)
+        assertThat(export).contains("14/14 refused")
+    }
+
+    @Test
+    fun `a failed bulk install is repaired before the per-package fallback`() = runTest {
+        // A bulk install that dies part-way is what interrupts dpkg, and apt then refuses every
+        // command for about a second without touching a mirror. The per-package fallback is such
+        // a command, so without a repair pass between them it measures the database rather than
+        // the packages and loses all of them — E2E run 35056615874: 33 packages, every one
+        // refused in 1-2s, while `apt-get check` exited 0 before and after.
+        val harness = Harness(distro(arch = "arm64"))
+        var bulkAttempts = 0
+        var repairPasses = 0
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> {
+                    bulkAttempts++
+                    // The attempt after the recovery pass is the one that works, and it is the
+                    // only reason three attempts are spent: the retry is one command where the
+                    // fallback is one per package.
+                    if (bulkAttempts == 3) 0 to "" else 100 to "E: dpkg was interrupted, you must manually run 'dpkg --configure -a'"
+                }
+                command.startsWith("dpkg --configure -a") -> {
+                    repairPasses++
+                    0 to ""
+                }
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup()
+
+        // The prologue's pass and the recovery pass. The third bulk attempt exists only because
+        // the second of those ran and exited 0, which is also what makes the order a fact rather
+        // than a coincidence of the fake.
+        assertThat(repairPasses).isEqualTo(2)
+        assertThat(bulkAttempts).isEqualTo(3)
+        assertThat(report.warnings).contains("the base packages needed a dpkg repair pass to install")
+        // And the fallback never ran: the recovery rung answered first.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it == "apt-get install -y --no-install-recommends git" },
+        ).isTrue()
     }
 
     @Test

@@ -54,9 +54,15 @@ class UbuntuDistributionManager(
     private val mirrorListUrl: String = DEFAULT_MIRROR_LIST_URL,
     private val networkOnline: () -> Boolean = { true },
     private val aptUpdateAttemptTimeoutMs: Long = APT_UPDATE_ATTEMPT_TIMEOUT_MS,
+    /**
+     * The ring every event of an install is filed into, and the one the "Install log" row reads.
+     * A constructor parameter rather than a property this class makes for itself, because the
+     * install is more than this class: [RootfsInstaller] downloads, verifies and extracts the rootfs
+     * before any of the work below starts, and one log has to hold both halves. The DI graph passes
+     * a single instance to both; the default is for the tests that build one of the two alone.
+     */
+    val diagnostics: UserspaceDiagnostics = UserspaceDiagnostics(),
 ) {
-    /** Structured trace of everything this manager does; the export path is wired in a later pass. */
-    val diagnostics = UserspaceDiagnostics()
 
     private val rootfs: File get() = runtime.rootfsDir
 
@@ -549,6 +555,41 @@ class UbuntuDistributionManager(
             ?.takeIf { it.isNotBlank() }
 
     /**
+     * The one or two lines of a failed dpkg command that say *why*, for the diagnostics ring.
+     *
+     * [failureTail] answers "what was the last thing apt said", and for a failed maintainer script
+     * that is the summary block — `Errors were encountered while processing: | openssh-client | E:
+     * Sub-process /usr/bin/dpkg returned an error code (1)`. All of it true, none of it a
+     * diagnosis: dpkg prints the failing script's own message *above* that block, then its own
+     * verdict. So the reason is the verdict line (`dpkg: error processing package <pkg>
+     * (--configure): …`) and the non-noise line in front of it, which is whatever the script said
+     * before dying — the sentence that names the step Android refused.
+     *
+     * This is the difference E2E run 35058820878 turned on: the install died 70 seconds into the
+     * base packages, every later apt command then failed in one to two seconds (dpkg retries the
+     * half-configured package before anything else), and the report carried only the summary
+     * block — leaving "which of the postinst's steps failed" unanswerable from the evidence.
+     */
+    private fun failureReason(output: String?, maxChars: Int = UserspaceDiagnostics.MAX_DETAIL): String? {
+        val lines = output
+            ?.lineSequence()
+            ?.map { stripEscapes(it).trim() }
+            ?.filter { it.isNotBlank() }
+            ?.toList()
+            ?: return null
+        // Everything up to dpkg's own verdict, minus apt's and dpkg's progress chatter; the last
+        // two survivors are the script's message and the verdict that follows it.
+        val verdict = lines.indexOfLast { it.startsWith("dpkg: error") }
+        val window = (if (verdict >= 0) lines.subList(0, verdict + 1) else lines)
+            .filterNot { line -> FAILURE_REASON_NOISE.any { line.startsWith(it) } }
+            .takeLast(FAILURE_REASON_LINES)
+        return window
+            .joinToString(" | ")
+            .take(maxChars)
+            .takeIf { it.isNotBlank() }
+    }
+
+    /**
      * The runtime smoke step: `echo <marker>` under the same argv every scripted command uses.
      * The whole point is that this is the first proot execution in the pipeline — before it, the
      * ladder's apt rung was, and a runtime that could not launch at all reported itself as an
@@ -601,6 +642,15 @@ class UbuntuDistributionManager(
         val free = runtime.freeBytes()
         if (free <= 0L) return
         val needed = distro.rootfsSizeBytes * APT_TARBALL_MULTIPLE + APT_HEADROOM_BYTES
+        // Recorded whether or not it blocks. The gate only ever fires when the disk is already
+        // too small; the failure this reading exists for is the one that arrives with the gate
+        // passed — packages growing past the estimate, or storage reclaim from another app
+        // mid-install — and by the time apt dies of it the number that would prove it is gone.
+        diagnostics.record(
+            UserspaceDiagnosticCategory.STORAGE,
+            "apt disk gate",
+            detail = "free=${free / MIB}MB, needed=${needed / MIB}MB",
+        )
         if (free < needed) {
             throw IOException(
                 "Ubuntu needs about ${needed / MIB} MB of free storage to install the packages " +
@@ -660,9 +710,11 @@ class UbuntuDistributionManager(
      *
      * Not all-or-nothing: the whole list is asked for first; a failure retries once with
      * `--fix-missing` (a partially-populated cache from an interrupted earlier run is exactly
-     * what it exists for); a second failure falls back to installing the list package by
-     * package, so one unavailable package becomes a warning, not a failed install. Only every
-     * single package failing ends the step — that is a broken apt, not a missing one.
+     * what it exists for); a second failure clears the dpkg interruption the failure itself
+     * caused and retries the list once more; and only then does it fall back to installing the
+     * list package by package, so one unavailable package becomes a warning, not a failed
+     * install. Only every single package failing ends the step — that is a broken apt, not a
+     * missing one.
      */
     private suspend fun installBasePackages(onProgress: (String) -> Unit, warnings: MutableList<String>) {
         requireOnline("installing the base packages")
@@ -674,17 +726,73 @@ class UbuntuDistributionManager(
             warnings += "base packages needed a --fix-missing retry to install"
             return
         }
+        // Both bulk attempts are down, and this is the moment to read the three things the failure
+        // itself cannot report: why dpkg refused, the disk it was writing to, and the dpkg database
+        // it left behind. The fallback below overwrites the last two — every apt run it starts
+        // appends to updates/, and its output is what a later reading of the database would be
+        // reading — so they are recorded before it, as separate events: two facts of 200 characters
+        // each stay readable where one event carrying both would have been truncated into neither.
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            "bulk base-package install failed",
+            detail = failureReason(first?.outputText() ?: retry?.outputText())
+                ?: failureTail(first?.outputText() ?: retry?.outputText(), lines = 2),
+            exitCode = first?.exitCode ?: retry?.exitCode,
+        )
+        diagnostics.record(
+            UserspaceDiagnosticCategory.STORAGE,
+            "disk and dpkg state after the failed install",
+            detail = "free=${freeSpaceReading()}, " + dpkgDatabaseSummary(),
+        )
+        recordSigsysTail("bulk base-package install failed")
+        // A bulk install that failed is the usual cause of an *interrupted* dpkg: the packages it
+        // was unpacking left their records in /var/lib/dpkg/updates, and apt refuses every command
+        // while that state stands — in about a second, without contacting a mirror. The
+        // per-package fallback below is exactly such a command, so without this pass it measures
+        // the database rather than the packages: E2E run 35056615874 lost all 33 of them to 1-2s
+        // refusals, while `apt-get check` exited 0 before and after. Clear the interruption
+        // first, then retry `--fix-missing` — the one combination not yet tried, since the flag's
+        // own attempt above was spent on the interrupted database — because one command that
+        // installs the list is a better rung than 33 that each install one package.
+        if (clearInterruptedDpkgState(onProgress)) {
+            val afterRepair = runRootCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+            if (afterRepair != null && afterRepair.exitCode == 0) {
+                warnings += "the base packages needed a dpkg repair pass to install"
+                return
+            }
+        }
         var installed = 0
+        // The refusals, not just their count: what each one said is the evidence, and it belongs in
+        // the ring rather than only in the warning sentence the UI shows one line of.
+        val refusals = mutableListOf<Pair<String, ProotCommandResult?>>()
         for (pkg in BASE_PACKAGES) {
             val result = runRootCommand("apt-get install -y --no-install-recommends $pkg", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
             if (result != null && result.exitCode == 0) {
                 installed++
             } else {
+                refusals += pkg to result
                 warnings +=
                     "package '$pkg' was not installed" +
                         (failureTail(result?.outputText(), lines = 1)
                             ?.let { ": $it" } ?: ": the install did not answer in time")
             }
+        }
+        if (refusals.isNotEmpty()) {
+            // Grouped by what apt said, not listed per package: a half-configured dependency makes
+            // every remaining command refuse with the same sentence, so 33 identical entries would
+            // be one fact written 33 times — and the ring is read by a person, not a counter. The
+            // reason leads, because the cap trims the tail and the package list is the tail.
+            refusals
+                .groupBy { failureReason(it.second?.outputText()) ?: "no output before the timeout" }
+                .forEach { (reason, group) ->
+                    diagnostics.record(
+                        UserspaceDiagnosticCategory.APT,
+                        "base packages refused one by one",
+                        detail = "$reason | ${group.size}/${BASE_PACKAGES.size} refused: " +
+                            group.joinToString(", ") { it.first },
+                        exitCode = group.first().second?.exitCode,
+                    )
+                }
         }
         if (installed == 0) {
             // Every package failing is apt itself refusing, not a missing package: record what
@@ -711,6 +819,34 @@ class UbuntuDistributionManager(
                     " (" + dpkgState + ")",
             )
         }
+    }
+
+    /**
+     * The same repair pass [repairPackageState] runs as the prologue, run again *after* a failed
+     * bulk install — because that failure is what interrupts the database, so the prologue cannot
+     * have cleared it. Returns whether the pass exited 0, the only condition under which the
+     * caller's bulk retry is worth spending.
+     *
+     * The database is read either side of it and recorded as one event: `updates=` going from
+     * non-zero to zero is the pass having done its job, and the pair is what distinguishes "there
+     * was nothing to configure and the packages are genuinely unavailable" from "the database was
+     * interrupted, which is why nothing could be installed".
+     */
+    private suspend fun clearInterruptedDpkgState(onProgress: (String) -> Unit): Boolean {
+        val before = dpkgDatabaseSummary()
+        val startedAt = System.currentTimeMillis()
+        val result = runRootCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        val ok = result != null && result.exitCode == 0
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            if (ok) "recovery repair pass" else "recovery repair pass failed",
+            exitCode = result?.exitCode,
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = "$before -> " + dpkgDatabaseSummary() +
+                (failureTail(result?.outputText(), lines = 1)?.let { ": $it" } ?: ""),
+        )
+        recordSigsysTail("recovery repair pass")
+        return ok
     }
 
     private fun basePackagesCommand(): String =
@@ -881,6 +1017,16 @@ class UbuntuDistributionManager(
     }
 
     /**
+     * The userspace volume's free space in one word for a diagnostic: MB, or "unknown" when the
+     * platform will not say — 0 is the runtime's "no answer" contract and never means "no space",
+     * and a reading of "free=0MB" in an export would read as the opposite of what it is.
+     */
+    private fun freeSpaceReading(): String {
+        val free = runtime.freeBytes()
+        return if (free > 0L) "${free / MIB}MB" else "unknown"
+    }
+
+    /**
      * Wraps [ProotRuntime.runCommand]'s chunk callback into "the newest line of output", which is
      * the granularity the install screen can use. A chunk boundary can split a line; the half-line
      * then shows for one chunk and is replaced by its completion — acceptable for progress text,
@@ -1015,6 +1161,32 @@ class UbuntuDistributionManager(
             "unzip",
             "wget",
             "zip",
+        )
+
+        /** How many lines of a failed command's output [failureReason] keeps — see its doc. */
+        private const val FAILURE_REASON_LINES = 2
+
+        /**
+         * The lines apt and dpkg emit around a failure without being it: their own progress
+         * reports. Filtered out of [failureReason]'s window so that the two lines it keeps are the
+         * failing script's message and dpkg's verdict, which are the only two that diagnose.
+         */
+        private val FAILURE_REASON_NOISE = listOf(
+            "Setting up ",
+            "Preparing to unpack ",
+            "Unpacking ",
+            "Selecting previously unselected",
+            "Processing triggers for ",
+            "Reading database",
+            "Reading package lists",
+            "Building dependency tree",
+            "Reading state information",
+            "Get:",
+            "Ign:",
+            "Hit:",
+            "Fetched ",
+            "update-alternatives: using",
+            "update-alternatives: warning",
         )
 
         /**
