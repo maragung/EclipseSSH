@@ -234,6 +234,22 @@
 -keep class dev.eclipse.ssh.di.LinuxUserspaceGraph { *; }
 -keep class dev.eclipse.ssh.linux.ProotRuntime { *; }
 -keep class dev.eclipse.ssh.linux.LinuxUserspaceManager { *; }
+#
+# E2E run 35035691404 peeled the layer under those: the value types the
+# suite's own helpers consume. ProotRuntime.runCommand returns
+# ProotCommandResult, whose exitCode getter and outputText() the app never
+# calls (the app's setup pipeline checks the result of the whole session
+# helper, not the result object) - R8 kept the class renamed (t33) but
+# stripped the members, so sessionSucceeds() died with NoSuchMethodError:
+# No virtual method getExitCode()I in class Lt33 - 11 failures across every
+# test that runs a session command. HealthReport is kept defensively: its
+# healthy/describe() members are app-referenced today (so R8 would keep
+# them anyway), but the suite reads the object through the kept manager
+# facade and a future app refactor dropping those members would otherwise
+# break the pair silently - the derivation here is "what the suite
+# touches", not "what survives today".
+-keep class dev.eclipse.ssh.linux.ProotCommandResult { *; }
+-keep class dev.eclipse.ssh.linux.HealthReport { *; }
 
 # ---------------------------------------------------------------------------
 # Stage 2: androidx.compose, narrowed from the whole-namespace keep in
