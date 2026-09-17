@@ -1,8 +1,5 @@
 package dev.eclipse.ssh.ui.remotedesktop
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import androidx.activity.compose.LocalActivity
@@ -76,6 +73,7 @@ import dev.eclipse.ssh.data.credentials.RdpCredentials
 import dev.eclipse.ssh.rdp.RdpFrame
 import dev.eclipse.ssh.rdp.RdpTunnel
 import dev.eclipse.ssh.rdp.RdpTunnelState
+import dev.eclipse.ssh.security.SecureClipboard
 import dev.eclipse.ssh.ssh.PortForwardingManager
 import dev.eclipse.ssh.vnc.VncFrame
 import dev.eclipse.ssh.vnc.VncTunnel
@@ -198,6 +196,32 @@ private class DesktopClipboard(
 )
 
 /**
+ * The phone's half of the same sync: the two operations the viewer performs on the phone's own
+ * clipboard, as opposed to the desktop's.
+ *
+ * It exists so that the shell touches no `ClipboardManager` of its own. The app keeps exactly one
+ * clipboard route - [SecureClipboard] - and that route is also what puts a deadline on a copy, so
+ * this is where the viewer's direction from desktop to phone stops being a special case: a remote
+ * clipboard can hold a password as easily as it holds a URL, and it therefore lands under the same
+ * auto-clear setting as every other copy the app makes. A user who wants it kept indefinitely sets
+ * that setting to 0, which is the same answer the setting already gives everywhere else.
+ *
+ * The delay is carried alongside the clipboard because it is a property of the copy rather than of
+ * the caller: keeping them together is what lets the three composables between the window and the
+ * shell carry one value instead of two.
+ */
+private class PhoneClipboard(
+    private val clipboard: SecureClipboard,
+    private val clearAfterSeconds: Int,
+) {
+    /** The desktop's clipboard, landed on the phone's, under the app's own deadline. */
+    fun put(text: String) = clipboard.copy(text, clearAfterSeconds)
+
+    /** The phone's clipboard as text, or null - including when the platform refuses the read. */
+    fun get(): String? = clipboard.paste()
+}
+
+/**
  * The remote desktop, fullscreen and immersive: the frames the tunnel delivers, zoomed and
  * panned, with a floating toolbar over them.
  *
@@ -231,10 +255,20 @@ private class DesktopClipboard(
  * and closing the viewer forgets them.
  */
 @Composable
-fun RemoteDesktopScreen(request: RemoteDesktopRequest, onClose: () -> Unit) {
+fun RemoteDesktopScreen(
+    request: RemoteDesktopRequest,
+    secureClipboard: SecureClipboard,
+    clearClipboardAfterSeconds: Int,
+    onClose: () -> Unit,
+) {
+    // Built here, from the two values the hosting window read once at startup, so the protocol
+    // halves below never see the clipboard itself - only the two operations they perform on it.
+    val phoneClipboard = remember(secureClipboard, clearClipboardAfterSeconds) {
+        PhoneClipboard(secureClipboard, clearClipboardAfterSeconds)
+    }
     when (request) {
-        is RemoteDesktopRequest.Vnc -> VncViewer(request, onClose)
-        is RemoteDesktopRequest.Rdp -> RdpViewer(request, onClose)
+        is RemoteDesktopRequest.Vnc -> VncViewer(request, phoneClipboard, onClose)
+        is RemoteDesktopRequest.Rdp -> RdpViewer(request, phoneClipboard, onClose)
     }
 }
 
@@ -243,7 +277,11 @@ fun RemoteDesktopScreen(request: RemoteDesktopRequest, onClose: () -> Unit) {
  * remembered password a reconnect re-answers with.
  */
 @Composable
-private fun VncViewer(request: RemoteDesktopRequest.Vnc, onClose: () -> Unit) {
+private fun VncViewer(
+    request: RemoteDesktopRequest.Vnc,
+    phoneClipboard: PhoneClipboard,
+    onClose: () -> Unit,
+) {
     var reconnects by remember { mutableStateOf(0) }
     val tunnel = remember(reconnects) { VncTunnel(PortForwardingManager()) }
     var rememberedPassword by remember { mutableStateOf<String?>(null) }
@@ -283,6 +321,7 @@ private fun VncViewer(request: RemoteDesktopRequest.Vnc, onClose: () -> Unit) {
             )
         },
         clipboard = remember(tunnel) { DesktopClipboard(tunnel::copyText, tunnel.remoteClipboard) },
+        phoneClipboard = phoneClipboard,
         onReconnect = { reconnects++ },
         onClose = onClose,
     )
@@ -311,7 +350,11 @@ private fun VncViewer(request: RemoteDesktopRequest.Vnc, onClose: () -> Unit) {
  * wants different credentials than were saved, or none that were.
  */
 @Composable
-private fun RdpViewer(request: RemoteDesktopRequest.Rdp, onClose: () -> Unit) {
+private fun RdpViewer(
+    request: RemoteDesktopRequest.Rdp,
+    phoneClipboard: PhoneClipboard,
+    onClose: () -> Unit,
+) {
     // Application context: FreeRDP's engine reads its certificate store location from it and
     // holds it for the session's lifetime, which outlives this composition's activity anyway.
     val appContext = LocalContext.current.applicationContext
@@ -357,6 +400,7 @@ private fun RdpViewer(request: RemoteDesktopRequest.Rdp, onClose: () -> Unit) {
             )
         },
         clipboard = remember(tunnel) { DesktopClipboard(tunnel::copyText, tunnel.remoteClipboard) },
+        phoneClipboard = phoneClipboard,
         onReconnect = { reconnects++ },
         onClose = onClose,
     )
@@ -398,11 +442,11 @@ private fun ViewerShell(
     frame: DesktopFrame?,
     input: DesktopInput,
     clipboard: DesktopClipboard,
+    phoneClipboard: PhoneClipboard,
     onReconnect: () -> Unit,
     onClose: () -> Unit,
 ) {
     val activity = LocalActivity.current
-    val context = LocalContext.current
 
     // The orientation the toolbar last asked for. The activity's own orientation (whatever the
     // user's system setting is) is restored on dispose, so leaving the viewer leaves the phone
@@ -482,10 +526,6 @@ private fun ViewerShell(
     // silently - passwords copied from a manager included - is exfiltration dressed as a
     // feature. The button is the consent: one tap, the clipboard that is on the phone right
     // now goes to the desktop, and nothing else ever does.
-    val clipboardManager = remember(context) {
-        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-    }
-
     /**
      * The last text this viewer pushed to the desktop. Some servers announce a client's own
      * paste back through the clipboard channel, and the phone's clipboard already holds that
@@ -494,22 +534,15 @@ private fun ViewerShell(
      */
     var lastPushed by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(clipboard) {
+    LaunchedEffect(clipboard, phoneClipboard) {
         clipboard.remote.collect { text ->
             if (!text.isNullOrBlank() && text != lastPushed) {
-                clipboardManager.setPrimaryClip(ClipData.newPlainText("Remote desktop", text))
+                // The app's one clipboard route rather than the framework's, which is what puts the
+                // configured deadline on this copy and marks it sensitive where the platform can.
+                phoneClipboard.put(text)
             }
         }
     }
-
-    /** The phone's current clipboard as plain text, or null when it holds none. */
-    fun phoneClipboardText(): String? =
-        clipboardManager.primaryClip
-            ?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)
-            ?.coerceToText(context)
-            ?.toString()
-            ?.takeIf { it.isNotBlank() }
 
     // Auto-hide, armed only once there is a desktop to use without a toolbar in the way.
     LaunchedEffect(interaction, state, toolbarVisible) {
@@ -646,7 +679,8 @@ private fun ViewerShell(
             onClipboard = if (!request.target.viewOnly) {
                 {
                     interaction++
-                    val text = phoneClipboardText()
+                    // A clipboard holding only whitespace has nothing to paste on the far side.
+                    val text = phoneClipboard.get()?.takeIf { it.isNotBlank() }
                     if (text != null) {
                         lastPushed = text
                         clipboard.push(text)
