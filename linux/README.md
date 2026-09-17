@@ -47,17 +47,38 @@ never exec'd by the kernel: proot's loader `mmap`s them, and mmap-exec of
 The userspace runtime in `:app` is the only intended consumer. It:
 
 - spawns `nativeLibraryDir/libproot.so` through `LinuxPty.spawn`,
-- passes `PROOT_LOADER=<nativeLibraryDir>/libproot-loader.so` and
-  `PROOT_TMP_DIR=<filesDir>/linux/tmp` in the environment,
+- passes `PROOT_LOADER=<nativeLibraryDir>/libproot-loader.so`,
+  `PROOT_TMP_DIR=<filesDir>/linux/tmp` and
+  `PROOT_SIGSYS_LOG=<filesDir>/linux/sigsys-log.txt` in the environment,
 - never relies on the embedded fallback loader (it would extract into
   `filesDir` and die with EACCES).
+
+## proot-patches/
+
+Fixes the fork needs but has not merged live in `proot-patches/` as
+numbered unified diffs; `fetchLinuxSource` applies them (in name order)
+to the extracted fork tree and records a fingerprint of the whole patch
+set — every name and every byte — in a `.patches-applied` marker. The
+tree on disk is only kept when that fingerprint matches, so a patch
+rewritten after a build makes the next one re-extract and re-apply all
+of them rather than stacking the rest onto a tree the rewrite no longer
+describes.
+See `proot-patches/README.md` and each patch's preamble for the failure
+it fixes and the evidence. 0001 is load-bearing for amd64/x86_64
+devices and emulators: without it, every plain `rename()` inside the
+rootfs (apt, dpkg, coreutils `mv`) returns `ENOSYS` — the SIGSYS
+handler decodes the trapped syscall as 0 on x86 because both `rax` and
+`orig_rax` have already been consumed, and its `PR_rename →
+PR_renameat` downgrade never matches.
 
 ## Toolchain requirements (CI installs all of these)
 
 - NDK `29.0.13113456` via the SDK package list,
 - `cmake` and `ninja` on PATH (same as `:freerdp`),
 - `make`, `tar`, `readelf` and `awk` on PATH (standard on ubuntu runners;
-  `readelf`+`awk` generate `loader-info.c` on aarch64).
+  `readelf`+`awk` generate `loader-info.c` on aarch64),
+- `patch` on PATH for `proot-patches/` (the stock ubuntu-24.04 runner image
+  does not ship it; every CI workflow installs it explicitly).
 
 ## Supported ABIs
 
@@ -72,5 +93,6 @@ proot is GPL-2.0, talloc LGPL-3.0 (statically linked into proot). Both are
 built as standalone executables that the app runs as separate processes and
 talks to over a PTY — arm's-length aggregation, not linking. The source
 offer is the pinned, SHA256-verified tarball URLs recorded in
-`build.gradle.kts`; see `docs/THIRD-PARTY.md` in the repository root for
+`build.gradle.kts` together with the patches in `proot-patches/` that the build
+applies to the extracted fork before compiling it; see `docs/THIRD-PARTY.md` for
 the full notice.

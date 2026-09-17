@@ -21,12 +21,14 @@ import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxUserspaceManager
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LinuxUserspaceState.NotInstalled
+import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -229,6 +231,35 @@ class LinuxUserspaceController @Inject constructor(
                 },
             )
         }
+    }
+
+    /**
+     * The install and repair trace of the current graph, newest last, for a screen that shows it.
+     *
+     * Derived from [graphFlow] rather than read off the graph: while nothing is installed the
+     * version chooser can swap the graph, and a collector that had captured the first graph's ring
+     * would keep showing the events of a userspace that no longer exists.
+     *
+     * This ring is the userspace counterpart of the session trace, and unlike the session trace it
+     * had no way out of the app at all — every event of a failed install was written to a ring no
+     * UI read and to logcat, which a user without `adb` does not have. [exportInstallLog] and
+     * [clearInstallLog] are that way out.
+     */
+    val installLog: Flow<List<UserspaceDiagnosticEvent>> =
+        graphProvider.graphFlow.flatMapLatest { graph ->
+            graph?.distribution?.diagnostics?.events ?: flowOf(emptyList())
+        }
+
+    /** The whole trace as text, for the clipboard or a saved file. */
+    fun exportInstallLog(): String = graph?.distribution?.diagnostics?.export().orEmpty()
+
+    /**
+     * Empties the trace. The useful way to use a five-hundred-entry ring is to clear it, reproduce
+     * the failure, and export what is left — a trace that begins at the moment of the bug is far
+     * easier to read than one that begins at app launch.
+     */
+    fun clearInstallLog() {
+        graph?.distribution?.diagnostics?.clear()
     }
 
     /** The snapshot [stateIn] starts from, computed over whatever graph is current right now. */

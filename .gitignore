@@ -29,3 +29,7 @@ keystore/
 # Local agent settings (per-machine permission grants)
 .claude/settings.local.json
 .commandcode/
+
+# Python bytecode from the E2E and audit harnesses
+__pycache__/
+*.pyc

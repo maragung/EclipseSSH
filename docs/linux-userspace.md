@@ -5,8 +5,9 @@ byte comes from, and why each layer is shaped the way it is. The native half has
 [`../linux/README.md`](../linux/README.md); third-party licensing is in
 [`THIRD-PARTY.md`](THIRD-PARTY.md).
 
-The feature in one sentence: a real Ubuntu 22.04 userland — bash, apt, Node.js, Python, git —
-running on the phone itself, inside the app's sandbox, with no VM, no root and no ISO.
+The feature in one sentence: a real Ubuntu userland — whichever LTS series you pick, 20.04 through
+26.04 — bash, apt, Node.js, Python, git — running on the phone itself, inside the app's sandbox, with
+no VM, no root and no ISO.
 
 ## Table of contents
 
@@ -60,9 +61,11 @@ the exact path a remote one does.
 
 ## The rootfs source
 
-The only root filesystem offered is **Ubuntu Base 22.04.5**, pinned per architecture to an exact
+Every root filesystem on offer is an **Ubuntu Base** release, pinned per architecture to an exact
 tarball plus SHA256 from the release's own `SHA256SUMS`
-(`cdimage.ubuntu.com/ubuntu-base/releases/22.04/release`). Ubuntu Base is the only officially
+(`cdimage.ubuntu.com/ubuntu-base/releases/<series>/release`). The catalogue carries all four current
+LTS series — 20.04, 22.04, 24.04 and 26.04, each with its own per-architecture tarball and hash — so
+22.04.5 is the default starting point rather than the only choice. Ubuntu Base is the only officially
 published Ubuntu rootfs that fits the constraints:
 
 - ~30 MB compressed (the desktop image is ~4 GB),
@@ -79,8 +82,9 @@ A hash mismatch aborts the install with nothing extracted.
 `LinuxUserspaceManager.install()` runs the whole pipeline and only reports success after the final
 health check passes — "installed" and "works" are the same fact:
 
-1. **Download** — HTTPS, streamed to a `.part` file, resumable: a previously verified tarball is
-   reused rather than re-downloaded.
+1. **Download** — HTTPS, streamed to a `.part` file. The `.part` file is never a resume point: an
+   interrupted download starts again from the first byte. What is reused is a tarball that already
+   arrived *and* verified — reinstalling over a complete download does not fetch it again.
 2. **Verify** — SHA256 against the pinned hash; a mismatch extracts nothing.
 3. **Extract** — into `rootfs.staging/`, then renamed into place. A rootfs that exists is always a
    complete one; an interrupted install leaves no half-extracted tree under the real name. Every
@@ -98,8 +102,9 @@ health check passes — "installed" and "works" are the same fact:
      `ports.ubuntu.com/ubuntu-ports`,
    - `apt-get update` + the toolchain through apt itself (git, Python 3 + pip, curl, wget,
      sudo, procps, …),
-   - Node.js 22 from the pinned NodeSource repository (jammy's own `nodejs` package is 12.x,
-     end-of-life since 2022 and too old for the toolchain the feature promises), then `pnpm` and
+   - Node.js 24 from the pinned NodeSource repository — the archive's own `nodejs` is far too old
+     for the toolchain the feature promises (jammy's is 12.x, end-of-life since 2022), which is why
+     the NodeSource line is pinned instead — then `pnpm` and
      the OpenCode CLI via npm — best-effort, reported as warnings, because they come from
      registries outside the pinned Ubuntu archive.
 5. **Health check** — a shell runs and prints a marker, `whoami` answers `ubuntu`, DNS resolves,
@@ -149,9 +154,12 @@ Everything the userspace owns lives under `filesDir/linux`:
 
 ```
 filesDir/linux/
-├── rootfs/            the extracted Ubuntu 22.04 (deleted on uninstall)
+├── rootfs/            the extracted Ubuntu (deleted on uninstall)
 │   └── home/ubuntu/workspace/   ← the persisted workspace
+├── rootfs.staging/    where a tarball is unpacked before it is validated and moved into place
+├── downloads/         the tarballs, before verification
 ├── tmp/               PROOT_TMP_DIR (proot's own scratch)
+├── install.lock       the cross-process install lock
 └── state.properties   the persisted lifecycle facts
 
 filesDir/linux-workspace-backup.tar.gz   (outside the root!)
@@ -193,8 +201,9 @@ starts it when the state machine enters Running and stops it when the machine le
 service itself watches the same state and stops itself if it is ever alive without a Running
 userspace. Its notification offers the two gestures that matter away from the app — Open (back to
 the terminal) and Stop Ubuntu (the same lifecycle verb as Settings → Stop) — and its Android 15
-six-hour dataSync budget is shared with the SSH session service, which is why both services say
-"background paused" with the same alert when the budget runs out.
+six-hour dataSync budget is shared with the SSH session service: when the budget runs out both post
+the same "background paused" text, under two notification ids of their own, so the second alert
+replaces nothing.
 
 Crash recovery is the constructor: the persisted `state.properties` is re-checked against the
 files actually on disk, and a disagreement yields NeedsRepair rather than a state the UI would
@@ -223,7 +232,7 @@ render as healthy. A stale "installed" flag can never present as a working insta
 | Symptom | Likely cause | Way out |
 |---|---|---|
 | Card never appears | Health probe failing — check Settings → Linux Userspace for the probe's field-by-field report | Repair |
-| "proot: cannot execute" at shell start | `nativeLibraryDir` mismatch after an app update changed the ABI | Stop, then Start (re-reads the directory); reinstall if it persists |
+| "proot: cannot execute" at shell start | `nativeLibraryDir` mismatch after an app update changed the ABI | Restart the app: the directory is read once, when the userspace graph is built, so a Stop and Start inside the same process reads the same stale path. Reinstall if it persists |
 | `apt-get` fails with hash/404 errors | Stale archive pin or interrupted update | Repair (re-runs `apt-get update`); check DNS in the probe report |
 | `whoami` says a number | `/etc/passwd` entry lost (rootfs edited by hand) | Repair |
 | DNS does not resolve | Network changed since setup wrote `resolv.conf` | Repair rewrites it; the wiring layer passes the live resolvers |

@@ -128,6 +128,9 @@ jobs:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
+      - name: Install patch (proot-patches are applied by fetchLinuxSource)
+        run: sudo apt-get install -y -qq patch
+
       - name: Cache the Linux userspace native build tree
         # Same entry ci.yml restores, also placed after `clean`: the release
         # build compiles :linux (the userspace ships with :app), and a cold
@@ -135,7 +138,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: linux/build
-          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
 
       - name: Bundle the AAB, then assemble the release APKs
         # Two separate invocations, in this order, on purpose. AGP (as of 9.4.0)
@@ -165,6 +168,31 @@ jobs:
               grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
             fi
           done
+
+      - name: Verify the per-ABI release splits
+        # These five APKs are the files published to the release a few steps
+        # below, so this is the gate on the artifact users download. Signature
+        # verification above says they are intact and ours; it says nothing
+        # about what is inside them, and it would pass just as happily on a
+        # split whose userspace libraries were dropped in packaging - a defect
+        # that installs fine and only shows up on a real phone. This asserts the
+        # ABI each split carries and no other, that its libraries are present
+        # and are ELFs of that architecture, and that extractNativeLibs is set
+        # so proot is extracted somewhere it can be execve'd.
+        #
+        # Identical to the check ci.yml runs on every pull request - the same
+        # script, so a release cannot be cut from a tree whose splits a PR would
+        # have failed. What it proves is the artifact; it does not prove the
+        # userspace runs, which needs a device this workflow does not have.
+        run: |
+          set -euo pipefail
+          testing/verify-release-splits.sh app/build/outputs/apk/release out/split-validation
+          EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
+          EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
+          testing/verify-release-apk.sh \
+            app/build/outputs/apk/release/app-arm64-v8a-release.apk \
+            "$EXPECTED_NAME" "$EXPECTED_CODE" \
+            out/split-validation/arm64-v8a-release.json arm64-v8a
 
       - name: Verify the AAB signature
         # AABs use the JAR signature scheme (META-INF/{ALIAS}.SF/.RSA) rather
@@ -217,10 +245,12 @@ jobs:
             PRERELEASE="false"
           fi
           AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
-          # Pick the first APK in the release directory. The per-ABI
-          # splits were removed in favour of the AAB's per-ABI
-          # splitting at Play install time, so the directory now
-          # contains a single app-release.apk.
+          # Any of the APKs in the release directory answers the same question:
+          # the build step above leaves five (the four ABI splits plus the
+          # universal APK), and a split carries the same package name,
+          # versionCode and versionName as the universal one - splits differ in
+          # which native libraries they carry, not in their identity. So
+          # "first one" is enough and the choice needs no tie-break.
           APK="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -1)"
           test -n "$APK" || { echo "no APK found in app/build/outputs/apk/release"; exit 1; }
           BADGING="$("$AAPT2" dump badging "$APK")"
@@ -248,17 +278,22 @@ jobs:
             if [ -f AUDIT-REPORT.md ]; then
               echo "### Audit summary"
               echo
-              LAST="$(grep -E '^## [0-9]+\.' AUDIT-REPORT.md | tail -1 || true)"
+              # Only claim a section as this release's summary when it actually
+              # names this release. The last numbered section is whatever the
+              # report's narrative last reached, which is not necessarily this
+              # tag - printing it unconditionally published another version's
+              # heading as this one's summary.
+              LAST="$(grep -E '^## [0-9]+\.' AUDIT-REPORT.md | grep -F "Releasing $VERSION" | tail -1 || true)"
               if [ -n "$LAST" ]; then
                 echo "$LAST"
                 echo
-                echo "The full audit report is committed at the repository root as \`AUDIT-REPORT.md\`."
               fi
+              echo "The full audit report is committed at the repository root as \`AUDIT-REPORT.md\`."
             fi
             echo
             echo "### Verification"
             echo
-            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 37, build-tools 36.0.0, NDK 29.0.13113456)"
+            echo "- \`./gradlew clean\`, then \`./gradlew bundleRelease\`, then \`./gradlew assembleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 37, build-tools 36.0.0, NDK 29.0.13113456)"
             echo "- All release APKs verified with \`apksigner verify\` (v2 + v3)"
             echo "- The AAB is verified and uploaded alongside the per-ABI APKs"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then

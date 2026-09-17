@@ -17,6 +17,7 @@ import dev.eclipse.ssh.linux.ProotRuntime
 import dev.eclipse.ssh.linux.RootfsInstaller
 import dev.eclipse.ssh.linux.RuntimeStorageManager
 import dev.eclipse.ssh.linux.UbuntuDistributionManager
+import dev.eclipse.ssh.linux.UserspaceDiagnostics
 import java.io.File
 import java.util.Properties
 import javax.inject.Inject
@@ -153,7 +154,12 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             spawner = LinuxPtySpawner,
             storage = storage,
         )
-        val installer = RootfsInstaller(rootDir, distro, storage = storage)
+        // One ring for the whole install, shared by the two halves that write to it: the rootfs
+        // download and extraction happen before the distribution manager runs at all, and a user
+        // who exports an "Install log" after a failed install needs the half that failed —
+        // whichever half it was — not only the apt phase's.
+        val diagnostics = UserspaceDiagnostics()
+        val installer = RootfsInstaller(rootDir, distro, storage = storage, diagnostics = diagnostics)
         val distribution = UbuntuDistributionManager(
             distro = distro,
             runtime = runtime,
@@ -166,6 +172,7 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // /etc/resolv.conf, so a network change between install and repair lands in the file
             // instead of pinning the DNS of the moment the graph was built.
             dnsServers = { liveDnsServers(context) },
+            diagnostics = diagnostics,
         )
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime, storage)

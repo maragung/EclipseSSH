@@ -36,7 +36,16 @@ class RootfsInstaller(
     private val distro: LinuxDistro,
     private val downloader: HttpDownloader = UrlConnectionDownloader(),
     private val storage: RuntimeStorageManager = RuntimeStorageManager(rootDir),
-    private val validator: RootfsValidator = RootfsValidator(),
+    private val validator: RootfsValidator = RootfsValidator(expectedArch = distro.ubuntuArch),
+    /**
+     * Where this phase's events are filed. The same ring the apt phase writes to — the DI graph
+     * hands one instance to both — so the "Install log" holds the whole install rather than its
+     * second half. Nothing here recorded anything before this parameter existed: a download that
+     * failed at 90%, a tarball that failed its checksum, or an extraction that skipped hard links
+     * left no trace in logcat or in the ring, and those are exactly the events the storage and
+     * rootfs failure taxonomy is built to name.
+     */
+    private val diagnostics: UserspaceDiagnostics = UserspaceDiagnostics(),
 ) {
     /** Where the tarball is downloaded to before verification. */
     val tarballFile: File get() = File(storage.downloadsDir, "rootfs-${distro.ubuntuArch}.tar.gz")
@@ -58,8 +67,12 @@ class RootfsInstaller(
         /** Verifying the tarball's SHA256. */
         data object Verifying : Progress
 
-        /** Extracting; [entries] unpacked so far. */
-        data class Extracting(val entries: Int) : Progress
+        /**
+         * Extracting; [entries] unpacked so far. [warnings] carries extraction events the rootfs
+         * can live without but the setup report should name (a forward hardlink is the classic
+         * one: a link whose target entry arrives later in the same tarball, skipped by design).
+         */
+        data class Extracting(val entries: Int, val warnings: List<String> = emptyList()) : Progress
     }
 
     /**
@@ -92,9 +105,16 @@ class RootfsInstaller(
      * The full rootfs install: download → verify → extract → move into place.
      *
      * @param onProgress invoked on [Dispatchers.IO] with each progress update; must be cheap
+     * @param onExtractionWarnings invoked once, after extraction, with events the rootfs can live
+     *   without but the setup report should name (forward hardlinks skipped, and whatever else
+     *   [extract] records from here on)
      * @throws IOException on any network, verification or extraction failure
      */
-    suspend fun install(onProgress: (Progress) -> Unit = {}): File = withContext(Dispatchers.IO) {
+    suspend fun install(
+        onProgress: (Progress) -> Unit = {},
+        onExtractionWarnings: (List<String>) -> Unit = {},
+    ): File = withContext(Dispatchers.IO) {
+        val startedAt = System.currentTimeMillis()
         // Storage first: the download lands under downloads/ and the probe inside ensureReady()
         // fails here — with a name — rather than as a mid-download EACCES. The sweep then clears
         // fragments a crashed attempt left pinning the space this one needs.
@@ -104,9 +124,18 @@ class RootfsInstaller(
         download(onProgress)
         onProgress(Progress.Verifying)
         verify()
-        extract(onProgress)
+        onExtractionWarnings(extract(onProgress))
         validateStaging()
         moveIntoPlace()
+        // One event for the phase, at its end: the four below it that matter (the gate, the
+        // download, the extraction, the validation) each recorded their own outcome, so this is
+        // the line that says the whole thing finished and how long it took.
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "rootfs ready",
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = "${distro.displayName} ${distro.ubuntuArch}",
+        )
         rootfsDir
     }
 
@@ -120,6 +149,11 @@ class RootfsInstaller(
     private fun validateStaging() {
         val findings = validator.validate(stagingDir)
         if (findings.isEmpty()) return
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "rootfs validation failed",
+            detail = findings.joinToString("; ") { "${it.path} ${it.problem}" },
+        )
         deleteTreeNoFollow(stagingDir)
         throw IOException(
             "the extracted rootfs failed validation: " +
@@ -140,6 +174,13 @@ class RootfsInstaller(
         val free = storage.freeBytes()
         if (free <= 0L) return
         val needed = distro.rootfsSizeBytes * NEEDED_TARBALL_MULTIPLE + FREE_SPACE_HEADROOM_BYTES
+        // Recorded either way, like the apt phase's gate: the number that proves an ENOSPC twenty
+        // minutes later is the one taken before the write started.
+        diagnostics.record(
+            UserspaceDiagnosticCategory.STORAGE,
+            "rootfs disk gate",
+            detail = "free=${free / MIB}MB, needed=${needed / MIB}MB",
+        )
         if (free < needed) {
             // The prefix is a contract: the error taxonomy reads "Ubuntu needs" as DiskFull.
             throw IOException(
@@ -155,8 +196,14 @@ class RootfsInstaller(
         if (tarballFile.isFile && verifyFileSha256(tarballFile, distro.rootfsSha256)) {
             // A previously verified tarball is reused, not re-downloaded: an interrupted install
             // resumes rather than starting its 30 MB download again.
+            diagnostics.record(
+                UserspaceDiagnosticCategory.DOWNLOAD,
+                "reused verified tarball",
+                detail = "${tarballFile.length()} bytes already on disk",
+            )
             return
         }
+        val startedAt = System.currentTimeMillis()
         // Captured so the downloader's non-suspending chunk callback can still honour
         // cancellation — a cancelled install must stop mid-download, not after 30 MB more.
         val job = coroutineContext[Job]
@@ -195,8 +242,21 @@ class RootfsInstaller(
             // Fail closed: an unverifiable temp file is deleted by the finally below, never
             // renamed into place as if it were the pinned tarball.
             if (!verifyFileSha256(temp, distro.rootfsSha256)) {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.DOWNLOAD,
+                    "tarball checksum mismatch",
+                    detail = "expected ${distro.rootfsSha256.take(16)}…, ${receivedFinal} bytes arrived",
+                )
                 throw IOException("Rootfs checksum mismatch for ${distro.displayName}")
             }
+            // Bytes and seconds, not a progress transcript: the rate is what says whether a slow
+            // install was the network or the unpack, which is the first question a report raises.
+            diagnostics.record(
+                UserspaceDiagnosticCategory.DOWNLOAD,
+                "tarball downloaded and verified",
+                durationMs = System.currentTimeMillis() - startedAt,
+                detail = "${receivedFinal} bytes from ${distro.rootfsTarballUrl}",
+            )
             if (!temp.renameTo(tarballFile)) {
                 temp.copyTo(tarballFile, overwrite = true)
                 temp.delete()
@@ -235,13 +295,15 @@ class RootfsInstaller(
      * Extracts the tarball into staging, then swaps staging into place. A rootfs that exists is
      * therefore always complete — see the class doc.
      */
-    private suspend fun extract(onProgress: (Progress) -> Unit) {
+    private suspend fun extract(onProgress: (Progress) -> Unit): List<String> {
         onProgress(Progress.Extracting(0))
         deleteTreeNoFollow(stagingDir)
         stagingDir.mkdirs()
         var entries = 0
         var written = 0L
+        val extractionWarnings = mutableListOf<String>()
         val budget = extractionBudgetBytes()
+        val extractionStartedAt = System.currentTimeMillis()
         openTarStream(tarballFile, DOWNLOAD_BUFFER).use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
@@ -268,10 +330,15 @@ class RootfsInstaller(
                         target.parentFile?.mkdirs()
                         val source = resolveInside(stagingDir, entry.linkName)
                         // Hardlinks inside one tarball are duplicates of an earlier entry; copying
-                        // is the portable equivalent and costs one file.
+                        // is the portable equivalent and costs one file. A link whose target has
+                        // not arrived yet (a forward link) is skipped — the tree works, but the
+                        // gap is recorded so the setup report can name it instead of a later
+                        // "file not found" standing in for it.
                         if (source.isFile) {
                             source.copyTo(target, overwrite = true)
                             written += target.length()
+                        } else {
+                            extractionWarnings += "hardlink ${entry.name} skipped: its target ${entry.linkName} was not extracted"
                         }
                     }
                     TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
@@ -298,11 +365,23 @@ class RootfsInstaller(
                 entries++
                 if (entries % PROGRESS_EVERY_ENTRIES == 0) {
                     coroutineContext.ensureActive()
-                    onProgress(Progress.Extracting(entries))
+                    onProgress(Progress.Extracting(entries, extractionWarnings.toList()))
                 }
             }
         }
-        onProgress(Progress.Extracting(entries))
+        onProgress(Progress.Extracting(entries, extractionWarnings.toList()))
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "rootfs extracted",
+            durationMs = System.currentTimeMillis() - extractionStartedAt,
+            detail = "$entries entries, ${written / (1024 * 1024)}MB unpacked, " +
+                "${extractionWarnings.size} warning(s)" +
+                // The warnings themselves, because a skipped forward hardlink is a file that is
+                // genuinely absent from the rootfs: it is the warning most likely to explain a
+                // later apt or dpkg failure, and 200 chars of it is worth more than the count.
+                (extractionWarnings.takeIf { it.isNotEmpty() }?.let { ": " + it.first() } ?: ""),
+        )
+        return extractionWarnings
     }
 
     /**

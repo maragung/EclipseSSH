@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
+import org.apache.commons.compress.archivers.tar.TarConstants
 
 /**
  * The workspace's own lifecycle: how big it is, what clearing it means, and how it survives an
@@ -30,13 +31,32 @@ class LinuxWorkspaceManager(
 
     fun exists(): Boolean = workspaceDir.isDirectory
 
-    /** Total size on disk, for the settings screen's storage line. Walks the tree; call off the UI thread. */
-    fun sizeBytes(): Long = files().sumOf { it.length() }
+    /** Total size of the workspace's own content, for the settings screen's storage line. Walks the tree; call off the UI thread. */
+    fun sizeBytes(): Long = content().sumOf { it.length() }
 
-    fun fileCount(): Long = files().count().toLong()
+    /**
+     * How many entries the workspace holds — the settings screen's file count, and the test the
+     * keep-workspace uninstall uses to decide whether there is anything worth keeping.
+     *
+     * Links count here even though they add no bytes to [sizeBytes]: a workspace can hold nothing
+     * but links (a project of symlinked directories), and a count that skipped them would read that
+     * as an empty workspace and let a keep-workspace uninstall discard the user's data. Directories
+     * do not count — they are structure, not content, and whatever writes into them recreates them.
+     */
+    fun fileCount(): Long = entries().count { !it.isDirectoryNoFollow() }.toLong()
 
-    private fun files(): Sequence<File> =
-        if (workspaceDir.isDirectory) workspaceDir.walkTopDown().filter { it.isFile } else emptySequence()
+    // walkTreeNoFollow rather than walkTopDown: `isFile` follows links, so a link pointing back
+    // into the tree — or at a directory full of files — was counted as this workspace's own bytes,
+    // and a self-referential link (`ln -s . loop`, which project tooling does leave behind) made
+    // the walk never terminate.
+    private fun entries(): Sequence<File> =
+        if (workspaceDir.isDirectory) walkTreeNoFollow(workspaceDir) else emptySequence()
+
+    // A symlink is not content: it holds a target path, and its target's bytes are this workspace's
+    // only when the target is a real entry the walk also yields. Counting through the link is how
+    // another tree's bytes — or one set of bytes twice, for a link pointing back inside — ended up
+    // in the storage line.
+    private fun content(): Sequence<File> = entries().filter { it.isRegularFileNoFollow() }
 
     /** Empties the workspace but keeps the directory itself, so the mounted home never loses it. */
     fun clear() {
@@ -59,13 +79,37 @@ class LinuxWorkspaceManager(
                 tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
                 tar.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX)
                 if (workspaceDir.isDirectory) {
-                    workspaceDir.walkTopDown()
+                    // A link is written as a link, never as what it points at. Following one here
+                    // would copy another tree's bytes into the user's snapshot, count them twice
+                    // when the link points back inside, or — for `ln -s . loop` — never finish,
+                    // writing an unbounded tar until the device fills up. restoreFrom already
+                    // reads LF_SYMLINK back, so the round trip is unchanged for real trees.
+                    walkTreeNoFollow(workspaceDir)
                         .filter { it != workspaceDir }
                         .forEach { file ->
-                            val entry = TarArchiveEntry(file, file.relativeTo(workspaceDir).path)
-                            if (file.canExecute()) entry.mode = entry.mode or 0b001_001_001
+                            val name = file.relativeTo(workspaceDir).path
+                            val linkTarget = if (java.nio.file.Files.isSymbolicLink(file.toPath())) {
+                                // toString, not a resolved path: the entry must carry the target as
+                                // the link stores it (relative links stay relative, so a restore
+                                // lands in the same shape it was archived in).
+                                java.nio.file.Files.readSymbolicLink(file.toPath()).toString()
+                            } else {
+                                null
+                            }
+                            val entry = if (linkTarget != null) {
+                                TarArchiveEntry(name, TarConstants.LF_SYMLINK).apply {
+                                    linkName = linkTarget
+                                }
+                            } else {
+                                TarArchiveEntry(file, name).apply {
+                                    if (file.canExecute()) mode = mode or 0b001_001_001
+                                }
+                            }
                             tar.putArchiveEntry(entry)
-                            if (file.isFile) {
+                            // Regular files only: opening anything else is a hazard rather than an
+                            // omission — a fifo the workspace holds would block this read until a
+                            // writer appeared, hanging the snapshot (and the uninstall behind it).
+                            if (linkTarget == null && file.isRegularFileNoFollow()) {
                                 file.inputStream().use { input -> input.copyTo(tar) }
                             }
                             tar.closeArchiveEntry()

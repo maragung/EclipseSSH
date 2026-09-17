@@ -115,6 +115,15 @@ jobs:
           java-version: '17.0.13'
           check-latest: false
 
+      - name: Check the driver's own matchers
+        # Seconds, and before the emulator: the driver's element matchers are its
+        # eyes, and when one is loose the run reports a *driver* mistake as an app
+        # failure twenty minutes later (E2E run 35061538315: a substring match for
+        # "Install" was satisfied by the new "Install log" row, so the run tapped
+        # the trace row and blamed a missing confirmation dialog). The test is
+        # device-free by design, which is why it can run here at all.
+        run: python3 testing/ubuntu-e2e/test_driver_matchers.py
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
         with:
@@ -142,11 +151,14 @@ jobs:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
+      - name: Install patch (proot-patches are applied by fetchLinuxSource)
+        run: sudo apt-get install -y -qq patch
+
       - name: Cache the Linux userspace native build tree
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: linux/build
-          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
@@ -205,7 +217,13 @@ jobs:
           EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
           EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
           mkdir -p out
-          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
+          # x86_64 because this is the emulator leg: every candidate the step
+          # above picks - the x86_64 split, or the universal APK it falls back
+          # to - carries it. The ABI is now named rather than assumed by the
+          # verifier, which is what lets the same script check the arm64-v8a
+          # split that users actually download (ci.yml's "Verify the per-ABI
+          # release splits" step).
+          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json x86_64
 
       - name: Enable KVM device permissions
         run: |
@@ -237,13 +255,6 @@ jobs:
             echo "avdmanager reported success but the emulator cannot see ci-ubuntu-e2e"
             exit 1
           fi
-          # FULL mode's storage-failure phase fills /data and reads it back as
-          # root; the default (AOSP) system image allows adb root, and a refusal
-          # here is exactly the misconfiguration that phase would trip over
-          # later - fail it now, with a name.
-          if [ "$MODE" = "FULL" ]; then
-            "$ADB" root || { echo "FULL mode needs adb root on the emulator image"; exit 1; }
-          fi
           nohup "$ANDROID_HOME/emulator/emulator" -avd ci-ubuntu-e2e \
             -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
             -gpu swiftshader_indirect -accel on > /tmp/emulator.log 2>&1 &
@@ -267,6 +278,25 @@ jobs:
             echo "emulator did not finish booting"
             tail -200 /tmp/emulator.log
             exit 1
+          fi
+          # FULL mode's storage-failure phase fills /data and reads it back as
+          # root; the default (AOSP) system image allows adb root, and a refusal
+          # here is exactly the misconfiguration that phase would trip over
+          # later - fail it now, with a name.
+          #
+          # After boot, not before the launch: adb cannot talk to an emulator
+          # that does not exist yet, so the same check up there failed on every
+          # FULL run with "get-state error: no devices/emulators found" and the
+          # run never reached the device at all. It stayed hidden while only
+          # FAST/SMOKE ran, since nothing else enters this branch.
+          if [ "$MODE" = "FULL" ]; then
+            "$ADB" root || { echo "FULL mode needs adb root on the emulator image"; exit 1; }
+            # root restarts adbd and the connection drops with it; wait for the
+            # root shell to come back, or the next step's first adb call races it
+            if ! timeout 120 "$ADB" wait-for-device; then
+              echo "adb lost the emulator after adb root"
+              exit 1
+            fi
           fi
 
       - name: Install the app and test APKs

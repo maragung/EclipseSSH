@@ -49,9 +49,11 @@ data class LinuxDistro(
  * verifies should track the series Ubuntu maintains for five years, not the one that stops
  * receiving updates nine months after it ships.
  *
- * The default ([DEFAULT_DISTRO_ID]) stays 22.04 until the wiring layer grows a version chooser;
- * a user's existing install keeps its installed distro regardless, because the userspace state
- * file records the distro id it was installed from.
+ * The default ([DEFAULT_DISTRO_ID]) is a starting point, not an override: the install screen's
+ * version chooser offers every series above (for the device's architecture), newest first, and a
+ * pick there — like an already-installed distro — wins over it. A user's existing install keeps
+ * its installed distro regardless, because the userspace state file records the distro id it was
+ * installed from. `LinuxUserspaceGraphProvider.resolveDistro` holds that resolution order.
  */
 object LinuxDistroCatalog {
 
@@ -171,8 +173,12 @@ object LinuxDistroCatalog {
     }
 
     /**
-     * The distro the "Local Ubuntu" entry point installs before a version chooser exists. One
-     * distribution per device, resolved the same way [versionsFor] resolves the list.
+     * The default the catalogue would pick for a device's primary ABI: [DEFAULT_DISTRO_ID] on the
+     * architecture that ABI maps to, or null where Ubuntu publishes no Base image for it.
+     *
+     * This is not the install path. `LinuxUserspaceGraphProvider.resolveDistro` prefers an
+     * already-installed distro, then the user's pick in the version chooser, and only then this
+     * default — so a caller that wants what the app installs wants that, not this.
      */
     fun forDevice(supportedAbis: List<String>): LinuxDistro? {
         val primary = supportedAbis.firstOrNull() ?: return null
@@ -196,6 +202,11 @@ object LinuxDistroCatalog {
             else -> null
         }
 
-    /** The distro the "Local Ubuntu" entry point installs. One distribution until there are two. */
+    /**
+     * The default `LinuxUserspaceGraphProvider.resolveDistro` falls back to when nothing is
+     * installed and the user has not picked a version. It is not the newest series this catalogue
+     * offers, and no reason for 22.04 specifically is recorded — the chooser is what makes the
+     * newer series reachable, and this is only the starting point.
+     */
     const val DEFAULT_DISTRO_ID = "ubuntu-22.04"
 }

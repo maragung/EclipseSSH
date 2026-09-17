@@ -34,7 +34,7 @@ import dev.eclipse.ssh.data.model.isForwardHostName
 import dev.eclipse.ssh.data.model.toPortOrNull
 
 /**
- * The VNC endpoint dialog behind the host card's "Remote desktop" item - what opens when the host
+ * The VNC endpoint dialog behind the host card's "VNC Viewer" item - what opens when the host
  * has no saved VNC target, and what "Configure" reopens from the viewer's failure path.
  *
  * The endpoint is *where the SSH server dials*, not where the phone does - the target rides an
@@ -76,7 +76,7 @@ fun RemoteDesktopConfigDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Default.DesktopWindows, null) },
-        title = { Text("Remote desktop on ${host.name}") },
+        title = { Text("VNC on ${host.name}") },
         text = {
             Column {
                 OutlinedTextField(

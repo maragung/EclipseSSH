@@ -15,8 +15,10 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.printToString
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.settings.HostFormActivity
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -144,40 +146,6 @@ class NavigationRobolectricTest {
     private fun drainMainLooper() = shadowOf(Looper.getMainLooper()).idle()
 
     /**
-     * Opens a dialog and returns its window.
-     *
-     * The click only flips a `remember`ed flag; the `Dialog` composable enters composition on the
-     * next frame, and the `WindowManager.addView` it performs is then posted to the paused main
-     * looper. Both have to be pumped by hand, and neither may go through `waitForIdle` — see
-     * [theAddHostDialogOpensAsAWindowAndBackDismissesIt] for why that never returns here.
-     *
-     * Pumping until the window appears rather than a fixed number of times on purpose: Robolectric
-     * runs every test class in one JVM, and how many frames the window needs depends on what has
-     * already run in it. A fixed count passes this class in isolation and fails it in a full suite.
-     */
-    private fun openDialogVia(contentDescription: String): android.app.Dialog {
-        compose.onNodeWithContentDescription(contentDescription).performClick()
-        val dialog = pumpUntil { ShadowDialog.getLatestDialog()?.takeIf { it.isShowing } }
-        return requireNotNull(dialog) {
-            "clicking \"$contentDescription\" opened no dialog window " +
-                "(shown dialogs: ${ShadowDialog.getShownDialogs().size})"
-        }
-    }
-
-    /**
-     * Dismisses an open dialog with the back gesture.
-     *
-     * Deliberately through the *dialog's* own back dispatcher: back is delivered to the focused
-     * window, and while a dialog is up that is the dialog's window, not the activity's. Going via
-     * `activity.onBackPressedDispatcher` leaves the dialog on screen — as it would on a device.
-     */
-    @Suppress("DEPRECATION")
-    private fun dismissWithBack(dialog: android.app.Dialog) {
-        dialog.onBackPressed()
-        pumpUntil { if (dialog.isShowing) null else Unit }
-    }
-
-    /**
      * Drives frames and main-looper work until [condition] produces a value, giving up after
      * [PUMP_TIMEOUT_MS] of real time. Returns null if it never does, so the caller can fail with its
      * own message.
@@ -237,8 +205,9 @@ class NavigationRobolectricTest {
     fun everyDestinationIsReachableAndRendersItsFirstRunContent() {
         compose.waitForIdle()
 
-        // Hosts is the start destination. Its top bar is now actions-only (no title, no search
-        // icon), so the screen is identified by its filter field and its actions.
+        // Hosts is the start destination. Its top bar carries the filter field in the title slot
+        // and the two actions, so those are what identify the screen - there is no title text and
+        // no separate search icon to look for.
         assertDisplayed("Search hosts, tags, or usernames")
         compose.onNodeWithContentDescription("Add host").assertIsDisplayed()
         compose.onNodeWithContentDescription("Import account").assertIsDisplayed()
@@ -323,8 +292,8 @@ class NavigationRobolectricTest {
         compose.onNode(hasText(label, substring = true)).performScrollTo().assertIsDisplayed()
 
         // And a control that opens the picker. Window-level for the reason
-        // [theAddHostDialogOpensAsAWindowAndBackDismissesIt] documents: once a dialog is up,
-        // waitForIdle never returns under Robolectric, so the chips themselves are out of reach here.
+        // `HostAndThemeUiRobolectricTest` documents: once a Compose dialog is up, waitForIdle never
+        // returns under Robolectric, so the chips themselves are out of reach here.
         val changeButton = compose.onAllNodes(hasText("Change") and hasClickAction())
             .fetchSemanticsNodes()
         assertThat(changeButton).isNotEmpty()
@@ -340,37 +309,49 @@ class NavigationRobolectricTest {
     }
 
     /**
-     * The Add Host dialog opens as a real window, and back dismisses it.
+     * Add host opens the host form's own window.
      *
-     * Deliberately asserted at the *window* level rather than by reading the dialog's contents.
-     * A Compose `AlertDialog` renders into a window of its own, and once one is open `waitForIdle`
-     * never returns under Robolectric — it throws `AppNotIdleException` after 60s with the clock in
-     * either mode (autoAdvance on: 14k attempts; off, with the looper drained by hand: 108k). Every
-     * semantics query calls `waitForIdle` first, so no assertion about the dialog's contents can
-     * complete here. It is not an infinite composition loop in the app: the only progress indicator
-     * it draws is determinate, and every non-dialog flow in this class idles in about a second.
+     * This used to be an `AlertDialog` over the Hosts list, and this test used to prove the dialog
+     * window went up and that back took it down. Both halves of that are gone. The form is an
+     * Activity now, and under Robolectric a `startActivity` is *recorded, not performed* — the target
+     * never composes, so nothing about the form is reachable from this class at all. What is reachable
+     * is the wiring, and that is what this asserts: the click names [HostFormActivity], nothing was
+     * shown as a dialog to get there, and the workspace behind it is untouched.
      *
-     * So this covers what the JVM can prove — the click really opens a dialog window, back really
-     * takes it down, and the workspace underneath is untouched — while the field labels and the
-     * Cancel button inside it stay asserted by the instrumentation copy in [AppNavigationTest],
-     * which runs on a device where idling works.
+     * The two halves are asserted separately because they fail differently. The intent names the
+     * activity; and `ShadowDialog.getShownDialogs()` must not have grown, because a regression that
+     * went back to `AlertDialog` would keep the first assertion true-looking enough to be missed while
+     * restoring the letterboxed, unscrollable body the promotion removed.
+     *
+     * The form's own contents — its field labels, the prefill on Edit, the Save button — are asserted
+     * by `HostFormActivityRobolectricTest`, which launches the window directly so that it really does
+     * compose. The instrumentation copy in [AppNavigationTest] covers the same ground on a device.
      */
     @Test
-    fun theAddHostDialogOpensAsAWindowAndBackDismissesIt() {
+    fun theAddHostActionOpensTheHostFormWindow() {
         compose.waitForIdle()
-        assertThat(ShadowDialog.getShownDialogs()).isEmpty()
 
-        val dialog = openDialogVia("Add host")
-        assertThat(dialog.isShowing).isTrue()
+        // Drain whatever startup queued, so the peek below only ever reports this click's doing.
+        // Peeking does not consume, so a stale intent would mask the one under test.
+        while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
+        val dialogsBefore = ShadowDialog.getShownDialogs().size
 
-        // Back is the dismissal a user reaches for first, and AlertDialog routes it to
-        // onDismissRequest — so this also proves the composable's own `show` state was reset,
-        // because a stale `true` would immediately put the window back up.
-        dismissWithBack(dialog)
-        assertThat(dialog.isShowing).isFalse()
+        compose.onNodeWithContentDescription("Add host").performClick()
 
-        // Dismissed, and the workspace underneath is intact.
+        pumpUntil {
+            runCatching { shadowOf(compose.activity.application).peekNextStartedActivity() }.getOrNull()
+        }
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        assertWithMessage("the Add host button did not open ${HostFormActivity::class.simpleName}")
+            .that(intent?.component?.className).isEqualTo(HostFormActivity::class.java.name)
+        // Add carries no host to edit. A form opened for an id that was never passed and an Add form
+        // are the same screen once the window is up, so the extra is the only place that difference
+        // is visible from here.
+        assertThat(intent?.getStringExtra(HostFormActivity.EXTRA_HOST_ID)).isNull()
+        assertWithMessage("Add host still opened as a dialog over the workspace")
+            .that(ShadowDialog.getShownDialogs().size).isEqualTo(dialogsBefore)
+
+        // And the workspace underneath is intact.
         assertDisplayed("Search hosts, tags, or usernames")
-        assertThat(ShadowDialog.getLatestDialog().isShowing).isFalse()
     }
 }

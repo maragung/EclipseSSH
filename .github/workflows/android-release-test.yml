@@ -165,11 +165,14 @@ jobs:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
 
+      - name: Install patch (proot-patches are applied by fetchLinuxSource)
+        run: sudo apt-get install -y -qq patch
+
       - name: Cache the Linux userspace native build tree
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: linux/build
-          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts') }}
+          key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
@@ -263,11 +266,19 @@ jobs:
       - name: Verify the release APK
         # Package, version against the checked-out source, ABI, debug flag,
         # v2+v3 signature - before anything is installed.
+        #
+        # The path is testing/, not pipeline/testing/: this job checks out this
+        # repository, which has no pipeline/ directory, so the old path could
+        # only ever have failed with "No such file or directory".
         run: |
           set -euo pipefail
           EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
           EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
-          bash pipeline/testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
+          # x86_64: the emulator leg. The ABI is named rather than assumed by
+          # the verifier, which is what lets the same script check the
+          # arm64-v8a split users download - ci.yml's "Verify the per-ABI
+          # release splits" step.
+          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json x86_64
 
       - name: Enable KVM device permissions
         run: |

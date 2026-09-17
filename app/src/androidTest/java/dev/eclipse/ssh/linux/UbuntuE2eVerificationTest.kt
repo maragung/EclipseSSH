@@ -1,5 +1,6 @@
 package dev.eclipse.ssh.linux
 
+import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.eclipse.ssh.di.LinuxUserspaceGraphProvider
@@ -47,10 +48,22 @@ class UbuntuE2eVerificationTest {
         LinuxUserspaceGraphProvider(context).graph
     }
 
-    /** A null graph means the device's ABI maps to no Ubuntu rootfs - a pipeline misconfiguration. */
+    /**
+     * A null graph means no ABI this device reports maps to an Ubuntu rootfs - a pipeline
+     * misconfiguration, not a device defect.
+     *
+     * The message names the device's own ABIs rather than presuming the emulator's. It used to
+     * assert the E2E emulator "must run an x86_64 APK", which was true of the only leg that
+     * existed and would have been actively misleading on the arm64 leg the same catalog serves:
+     * what is wrong is the pairing of APK and device, and only the device can say which ABIs it
+     * offered. `versionsFor` is handed the whole list, so the whole list is what belongs here.
+     */
     private val graph get() = checkNotNull(graphOrNull) {
-        "GRAPH stage: no userspace graph for this device's ABI - the E2E emulator must run an " +
-            "x86_64 APK (whose catalog maps to the amd64 rootfs), not a universal one that resolved otherwise"
+        val deviceAbis = Build.SUPPORTED_ABIS.joinToString(", ")
+        "GRAPH stage: no userspace graph for this device - it reports the ABIs [$deviceAbis] and " +
+            "LinuxDistroCatalog maps none of them to a rootfs. The pipeline must install an APK " +
+            "whose ABI the catalog carries (the per-ABI split for this device), not a build that " +
+            "resolved to some other ABI"
     }
 
     @Before
@@ -241,6 +254,74 @@ class UbuntuE2eVerificationTest {
         // install really happened rather than the setup merely claiming it did.
         assumeWritePhase()
         sessionSucceeds("curl -I https://example.com", HTTP_TIMEOUT_MS)
+    }
+
+    @Test
+    fun hardLinksShareOneInode() {
+        assumeWritePhase()
+        // Patch 0004's contract, probed the way shadow(1) probes it: hard-link two names together
+        // and ask each how many links it has. Android's app seccomp filter refuses link(2), so the
+        // fork emulates it by copying the bytes — two inodes of one link each — and every tool that
+        // takes a lock with a hard link (adduser, groupadd, passwd: they link <db> to <db>.lock and
+        // verify by counting links) reads that copy as a lock already held. Two names, one inode,
+        // two links is what a real link looks like, and it is what let openssh-client's postinst
+        // lock /etc/group at all.
+        //
+        // ONE session, not four. The patch's record of the pair lives in the proot process that made
+        // the link, so a stat(2) served by the *next* proot invocation finds an empty table and
+        // answers with the kernel's copy — one link each. Splitting these commands into separate
+        // sessions is how this test first failed (run 35100526297: "test a -ef b exited 1"), and the
+        // failure was the test's, not the patch's: shadow takes its lock and verifies it inside one
+        // process, which is the case the patch is built for and the only one it claims.
+        //
+        // `test -ef` and `stat -c '%h %i'` are deliberately both asked: -ef goes through the shell's
+        // own stat (glibc's newfstatat) and coreutils' stat goes through statx, so the two syscall
+        // paths the patch corrects are both exercised.
+        val probe = sessionSucceeds(
+            "rm -rf /tmp/link-probe && mkdir -p /tmp/link-probe && printf x > /tmp/link-probe/a && " +
+                "ln /tmp/link-probe/a /tmp/link-probe/b && " +
+                // Not chained with &&: a 'no' answer must still reach the stat below, so the failure
+                // message can carry what the filesystem actually said instead of an empty output.
+                "{ test /tmp/link-probe/a -ef /tmp/link-probe/b && echo same-file=yes || echo same-file=no; } && " +
+                "stat -c 'links=%h inode=%i' /tmp/link-probe/a /tmp/link-probe/b",
+        )
+        check(probe.contains("same-file=yes")) {
+            "LINK stage: the shell does not see the two names as one file, so shadow(1) would read " +
+                "its own lock as held: ${probe.take(500)}"
+        }
+        // Printed as well as asserted: the assertion is the verdict, but the device's own numbers
+        // belong in the artifact, where a reader can check them without trusting this test. The
+        // instrumentation transcript (instrument-write.txt) is the only surviving output of a run.
+        println("LINK PROBE: ${probe.trim()}")
+
+        // Plain String operations, not Regex(...).find(...) + MatchResult.groupValues: the test APK
+        // resolves its Kotlin stdlib against the MINIFIED app APK, which carries only the members
+        // the app itself reaches (proguard-instrumentation.pro lists exactly which), and
+        // MatchResult.getGroupValues was not among them - every app call site had been devirtualized,
+        // so R8 removed it from the interface. The call threw NoSuchMethodError on run 35106576845,
+        // at the line below, AFTER the probe above had already succeeded; the same class of strip
+        // the readBytes() note further up this file records.
+        val rows = probe.lines()
+            .map { it.trim() }
+            .filter { it.startsWith("links=") }
+        check(rows.size == 2) {
+            "LINK stage: expected 'stat' to report two 'links=<n> inode=<n>' rows, got: ${probe.take(500)}"
+        }
+        // The numbers stay strings - only equality is asserted (same inode, two links each), and an
+        // inode is not obliged to fit in an Int on every filesystem. toLongOrNull is just the
+        // shape check: a row that is not a number must fail here, not compare unequal later.
+        val links = rows.map { it.removePrefix("links=").substringBefore(' ') }
+        val inodes = rows.map { it.substringAfter("inode=") }
+        check(links.all { it.toLongOrNull() != null } && inodes.all { it.toLongOrNull() != null }) {
+            "LINK stage: 'stat' printed rows this probe cannot read: ${probe.take(500)}"
+        }
+        check(links[0] == "2" && links[1] == "2") {
+            "LINK stage: the two names report ${links[0]} and ${links[1]} links, expected 2 each — " +
+                "the link was emulated as a byte copy, so shadow(1) would read its own lock as held: ${probe.take(500)}"
+        }
+        check(inodes[0] == inodes[1]) {
+            "LINK stage: the two names report inodes ${inodes[0]} and ${inodes[1]}, expected one inode: ${probe.take(500)}"
+        }
     }
 
     @Test

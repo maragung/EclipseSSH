@@ -36,7 +36,7 @@ class RootfsInstallerTest {
         val installer = installInto(root, fixture)
 
         val progress = mutableListOf<RootfsInstaller.Progress>()
-        installer.install { progress += it }
+        installer.install(onProgress = { progress += it })
 
         assertThat(installer.isExtracted()).isTrue()
         val bash = installer.rootfsDir.resolve("bin/bash")
@@ -63,6 +63,29 @@ class RootfsInstallerTest {
     }
 
     @Test
+    fun `a forward hardlink is skipped and named, not silently dropped`() = runBlocking {
+        val root = newRoot()
+        val fixture = TestTarballs.writeRootfsFixtureWithForwardHardlink(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        val installer = installInto(root, fixture)
+
+        val warnings = mutableListOf<String>()
+        installer.install(onProgress = {}, onExtractionWarnings = { warnings += it })
+
+        // The rootfs is complete and valid — a forward link is a gap the tree works around —
+        // but the skip is surfaced so the setup report names it instead of a later
+        // "file not found" standing in for the explanation.
+        assertThat(installer.isExtracted()).isTrue()
+        assertThat(warnings).hasSize(1)
+        assertThat(warnings.single()).contains("bin/hardlinked-later")
+        assertThat(warnings.single()).contains("bin/later-entry")
+        // The link itself did not become a file, and its target did extract.
+        assertThat(root.resolve("rootfs/bin/hardlinked-later").exists()).isFalse()
+        assertThat(root.resolve("rootfs/bin/later-entry").readText()).isEqualTo("later\n")
+    }
+
+    @Test
     fun `a checksum mismatch extracts nothing`() = runBlocking {
         val root = newRoot()
         val fixture = TestTarballs.writeRootfsFixture(
@@ -72,7 +95,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -93,7 +116,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -122,7 +145,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -148,7 +171,7 @@ class RootfsInstallerTest {
 
             var thrown: IOException? = null
             try {
-                installer.install { }
+                installer.install(onProgress = { })
             } catch (e: IOException) {
                 thrown = e
             }
@@ -181,7 +204,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -209,7 +232,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -234,7 +257,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -255,7 +278,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -291,7 +314,7 @@ class RootfsInstallerTest {
 
         var thrown: IOException? = null
         try {
-            installer.install { }
+            installer.install(onProgress = { })
         } catch (e: IOException) {
             thrown = e
         }
@@ -300,6 +323,34 @@ class RootfsInstallerTest {
         // Nothing moved into place; the half-extracted staging tree stays for the retry to
         // reclaim, but the disk is not filled to the end of the bomb.
         assertThat(installer.rootfsDir.exists()).isFalse()
+        assertThat(installer.isExtracted()).isFalse()
+    }
+
+    @Test
+    fun `a tarball for the wrong architecture is refused before it is moved into place`() = runBlocking {
+        val root = newRoot()
+        // A structurally complete x86-64 rootfs, hash-pinned correctly, downloaded and extracted
+        // cleanly — onto an arm64 distro. The installer's default validator derives the expected
+        // architecture from the distro, so the mismatch is caught at the staging directory rather
+        // than at the first exec inside proot.
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+            linkerName = "ld-linux-x86-64.so.2",
+        )
+        val installer = installInto(root, fixture)
+
+        var thrown: IOException? = null
+        try {
+            installer.install(onProgress = { })
+        } catch (e: IOException) {
+            thrown = e
+        }
+        assertThat(thrown).isNotNull()
+        assertThat(thrown!!.message).contains("failed validation")
+        assertThat(thrown!!.message).contains("different architecture")
+        // The mismatched tree was reclaimed, and nothing looks installed.
+        assertThat(root.resolve("rootfs").exists()).isFalse()
+        assertThat(root.resolve("rootfs.staging").exists()).isFalse()
         assertThat(installer.isExtracted()).isFalse()
     }
 
@@ -316,13 +367,13 @@ class RootfsInstallerTest {
         val installer = installInto(root, fixture, downloader = countingDownloader)
 
         // First attempt: downloads, verifies, then fails at extraction (the escaping entry).
-        runCatching { installer.install { } }
+        runCatching { installer.install(onProgress = { }) }
         assertThat(downloads).isEqualTo(1)
         assertThat(installer.tarballFile.isFile).isTrue()
 
         // Second attempt: the verified tarball is reused - the retry does not restart the download,
         // which on a metered phone connection is the difference between "retry" and "pay again".
-        runCatching { installer.install { } }
+        runCatching { installer.install(onProgress = { }) }
         assertThat(downloads).isEqualTo(1)
     }
 }

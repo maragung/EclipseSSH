@@ -12,7 +12,9 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
-import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
+import dev.eclipse.ssh.ui.about.AboutActivity
+import java.time.Duration
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -20,18 +22,17 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowDialog
-import java.time.Duration
 
 /**
- * The About entry on Settings, exercised on the JVM.
+ * The About entry on Settings, and where it leads.
  *
- * What can be asserted where follows the rules the other dialog suites learned the hard way. A
- * Compose `AlertDialog` never settles `waitForIdle` under Robolectric, so the dialog is *opened*
- * and *closed* at window level through [ShadowDialog], never by an idle-driving assertion. Its
- * contents are still reachable by text the way `HostAndThemeUiRobolectricTest`'s edit-form test
- * reads prefilled values: `fetchSemanticsNodes` after hand-pumped frames, which completes because
- * this dialog holds static text only — no focused text field blinking the clock busy, and no
- * `assertIsDisplayed` inside it, which would idle and hang.
+ * About used to be an `AlertDialog` over Settings and this class used to drive it through
+ * [ShadowDialog]. It is now a window of its own, which changes what this class can honestly claim:
+ * under Robolectric a `startActivity` is *recorded*, not performed, so the activity that opens
+ * never composes here. The split that follows is the same one the rest of the suite makes - this
+ * class asserts the wiring (the About row starts [AboutActivity], and no dialog is shown over
+ * Settings to do it), and [AboutActivityRobolectricTest] asserts the screen's own contents, in its
+ * own window, where a real composition exists.
  *
  * `qualifiers` pins the same phone width as [NavigationRobolectricTest]: the workspace shell
  * branches at `maxWidth >= 700.dp`, and the settings list this reads is the narrow layout's.
@@ -64,8 +65,8 @@ class SettingsAboutRobolectricTest {
     /**
      * Drives frames and main-looper work until [condition] holds, then fails with [describe].
      *
-     * Not `compose.waitUntil`, which reports only "Condition still not satisfied"; `idleFor`
-     * rather than `idle` so real `delay`s in the Room and DataStore flows come due.
+     * Not `compose.waitUntil`, which reports only "Condition still not satisfied"; `idleFor` rather than
+     * `idle` so real `delay`s in the Room and DataStore flows come due.
      */
     private fun pumpUntil(timeoutMs: Long = 20_000, describe: () -> String, condition: () -> Boolean) {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
@@ -78,52 +79,20 @@ class SettingsAboutRobolectricTest {
     }
 
     /**
-     * Scrolls the About row into view, taps its button, and returns the dialog window the tap
-     * opened.
+     * Scrolls the About row into view and taps its button.
      *
      * The button is found by content description, not by its visible "View" label, because the
      * diagnostics row's button reads identically — the description is the one the row itself
-     * carries for exactly this disambiguation. The click only flips a `remember`ed flag; the
-     * dialog window arrives over the next hand-pumped frames.
+     * carries for exactly this disambiguation.
      */
-    private fun openAboutDialog(): android.app.Dialog {
+    private fun tapAboutRow() {
         // The row first, then the scroll: on a loaded runner the screen can still be a frame away
         // when the tab click returns, and `performScrollTo` needs the node to exist already.
         pumpUntil(describe = { "the About row never composed" }) {
             compose.onAllNodesWithContentDescription("About EclipseSSH").fetchSemanticsNodes().isNotEmpty()
         }
-        val before = ShadowDialog.getShownDialogs().size
         compose.onNodeWithContentDescription("About EclipseSSH").performScrollTo().performClick()
-        pumpUntil(describe = { "the About dialog never opened" }) {
-            ShadowDialog.getShownDialogs().size > before && ShadowDialog.getLatestDialog()?.isShowing == true
-        }
-        return requireNotNull(ShadowDialog.getLatestDialog()) { "the About dialog opened no window" }
-    }
-
-    /**
-     * Dismisses the open dialog with the back gesture, through the *dialog's* own dispatcher.
-     *
-     * Back is delivered to the focused window, and while a dialog is up that is the dialog's, not
-     * the activity's — the same distinction [NavigationRobolectricTest]'s dismissal makes.
-     */
-    @Suppress("DEPRECATION")
-    private fun dismissWithBack(dialog: android.app.Dialog) {
-        dialog.onBackPressed()
-        pumpUntil(describe = { "the About dialog never closed" }) { !dialog.isShowing }
-    }
-
-    /**
-     * Asserts the text exists somewhere in the composed trees — the main window's or a dialog's.
-     *
-     * Waited for rather than read once: the dialog *window* being up (what [openAboutDialog]
-     * returns on) is a frame or two ahead of its contents composing. `fetchSemanticsNodes`, not
-     * `assertIsDisplayed`: inside a dialog window the display assertion would idle and never
-     * return, while a plain fetch reads the tree as pumped.
-     */
-    private fun assertComposed(text: String) {
-        pumpUntil(describe = { "the About dialog did not show \"$text\"" }) {
-            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
-        }
+        pump()
     }
 
     /**
@@ -152,47 +121,34 @@ class SettingsAboutRobolectricTest {
     }
 
     /**
-     * View opens the dialog, and the dialog answers the three questions an About screen exists
-     * for: what version is this, who made it, and what is inside it.
+     * View opens About — in its own window, not as a dialog over Settings.
      *
-     * The version line is read from the PackageManager in the test, the same source the dialog
-     * reads — so the assertion is that the dialog reports what Android reports, not that it spells
-     * a version the test also hardcoded.
+     * Both halves matter and they are asserted separately. The intent names the activity, which is
+     * the wiring this class exists to pin; and `ShadowDialog.getShownDialogs()` must not have
+     * grown, because a regression that went back to `AlertDialog` would keep the first assertion
+     * true-looking enough to be missed while restoring the letterboxed, unscrollable body this
+     * change removed.
      */
     @Test
-    fun tappingViewOpensTheAboutDialogWithVersionAuthorAndLibraries() {
+    fun tappingViewOpensAboutInItsOwnWindow() {
         compose.waitForIdle()
         tab("Settings").performClick()
         pump()
-        val dialog = openAboutDialog()
 
-        val info = compose.activity.packageManager.getPackageInfo(compose.activity.packageName, 0)
-        assertComposed("Version ${info.versionName} (${info.longVersionCode})")
-        assertComposed("Created by Maragung")
-        assertComposed("Libraries")
-        assertComposed("Source code · github.com/maragung/EclipseSSH")
+        // Drain whatever startup queued, so the peek below only ever reports this click's doing —
+        // peeking does not consume, so a stale intent would mask About's.
+        while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
+        val dialogsBefore = ShadowDialog.getShownDialogs().size
 
-        dismissWithBack(dialog)
-        assertThat(dialog.isShowing).isFalse()
-    }
+        tapAboutRow()
 
-    /**
-     * The library list names the two engines the app could not exist without — the SSH stack and
-     * the RDP client that lands with it — read as composed text, not as a display assertion.
-     *
-     * Only the first rows are asserted: the list is a `LazyColumn` inside a height-capped dialog,
-     * so rows below the fold are simply not composed yet, and "scroll the dialog's list" is not
-     * something the JVM harness can do without idling the dialog it would scroll inside.
-     */
-    @Test
-    fun theAboutDialogListsTheBundledLibraries() {
-        compose.waitForIdle()
-        tab("Settings").performClick()
-        pump()
-        openAboutDialog()
-
-        assertComposed("Apache MINA SSHD 2.14.0")
-        assertComposed("vernacular-vnc f39cbe2 (JitPack)")
-        assertComposed("FreeRDP 3.31.1")
+        pumpUntil(describe = { "AboutActivity was never started" }) {
+            runCatching { shadowOf(compose.activity.application).peekNextStartedActivity() }.getOrNull() != null
+        }
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        assertWithMessage("the About row did not open AboutActivity")
+            .that(intent?.component?.className).isEqualTo(AboutActivity::class.java.name)
+        assertWithMessage("About still opened as a dialog over Settings")
+            .that(ShadowDialog.getShownDialogs().size).isEqualTo(dialogsBefore)
     }
 }

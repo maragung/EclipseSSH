@@ -112,6 +112,64 @@ internal fun resolveLinkInsideRoot(root: File, name: String, linkName: String) {
 }
 
 /**
+ * Walks [root] depth-first without following symlinks — the counterpart to [deleteTreeNoFollow]
+ * for the paths that *measure* or *archive* a tree instead of deleting it.
+ *
+ * `File.walkTopDown()` cannot serve either job here, because it asks `File.isDirectory`, which
+ * follows links and therefore descends through them. Three consequences, all of them real data in
+ * this app rather than hypothetical:
+ *
+ *  - The workspace (`/home/ubuntu/workspace`) is the user's own tree. `ln -s . loop` inside it —
+ *    or any of the self-referential links project tooling leaves behind — makes the walk never
+ *    terminate, which on the snapshot path means an unbounded tar written until the device fills.
+ *  - A link out of the tree is counted as the tree's own bytes: the settings screen's storage line
+ *    reports another directory's size, and a link back inside counts the same bytes twice.
+ *  - The rootfs is merged-/usr, so its own `bin -> usr/bin`, `lib -> usr/lib` and `sbin -> usr/sbin`
+ *    links make every file under them count twice — inflating the extracted-size floor
+ *    [RootfsValidator] uses to notice a truncated extraction.
+ *
+ * Entries are yielded parent-first, and a symlink is yielded as itself, never as its target: the
+ * caller decides what a link means, and for archiving that decision is "write a link".
+ */
+internal fun walkTreeNoFollow(root: File): Sequence<File> = sequence {
+    val pending = ArrayDeque<File>()
+    pending.addLast(root)
+    while (pending.isNotEmpty()) {
+        // Losing a directory to a permissions error must not end the walk: the entries already
+        // yielded are still true, and the callers here measure rather than account.
+        val children = pending.removeLast().listFiles() ?: continue
+        for (child in children) {
+            yield(child)
+            // NOFOLLOW asks about the entry itself, which is the whole point: a symlink to a
+            // directory is yielded as a link and never descended into, so no walk can cycle
+            // and no walk can leave the tree.
+            if (Files.isDirectory(child.toPath(), LinkOption.NOFOLLOW_LINKS)) pending.addLast(child)
+        }
+    }
+}
+
+/**
+ * Whether [this] is a regular file *itself* — a symlink to a file is a link here, not the file it
+ * points at. The distinction [walkTreeNoFollow] exists to make possible: a link is not content, so
+ * it adds nothing to a total, and its target's bytes count only when the target is itself a real
+ * entry of the tree.
+ *
+ * Note what it deliberately does *not* say: a link's own length is not content either, even though
+ * `File.length()` answers for a link (the size of its target path). A total built that way answers
+ * a question — "how many bytes do the links' targets' names take up" — that no caller asked.
+ */
+internal fun File.isRegularFileNoFollow(): Boolean =
+    Files.isRegularFile(toPath(), LinkOption.NOFOLLOW_LINKS)
+
+/**
+ * Whether [this] is a directory *itself*, on the same terms as [isRegularFileNoFollow]: a symlink
+ * to a directory is a link, not a directory, so callers that mean "the entries a user sees" count
+ * it rather than treating it as structure.
+ */
+internal fun File.isDirectoryNoFollow(): Boolean =
+    Files.isDirectory(toPath(), LinkOption.NOFOLLOW_LINKS)
+
+/**
  * Deletes a tree of extracted archive content without following symlinks, replacing
  * [File.deleteRecursively] wherever the tree came out of an archive. With `NOFOLLOW_LINKS`, a
  * symlink — to a file or a directory — is visited as a file and deleted as a link; its target is

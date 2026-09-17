@@ -110,6 +110,166 @@
             android:parentActivityName=".MainActivity" />
 
         <!--
+          About, promoted from a dialog over Settings to a window of its own.
+          It carries the app's longest piece of reading - the licence list -
+          which a height-capped dialog body could only letterbox, and whose
+          rows below the fold it could not reach. No configChanges list, unlike
+          the two above: this screen holds no live state to protect, so a
+          rotation recreating it costs one static composition and nothing else.
+          Not exported - it is only ever started from Settings.
+        -->
+        <activity
+            android:name=".ui.about.AboutActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The six Settings rows that used to open an AlertDialog of choices, promoted
+          to windows of their own. Unlike About they are all started from Settings
+          and all edit one number in the settings DataStore, so they share one base
+          class and differ only in their title, icon, choices and setter. No
+          configChanges list for the same reason About has none: each holds a single
+          number in local state, and a rotation that recreates it costs one read of
+          the store. Not exported - Settings is the only caller.
+        -->
+        <activity
+            android:name=".ui.settings.KeepAliveActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.ClipboardClearActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.ReconnectDelayActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.VaultAutoLockActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.TerminalWidthActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          Terminal font size, the one Settings row whose value is a range rather than a
+          menu of choices - hence its own Activity rather than the shared choice base,
+          and its own entry rather than a comment on the block above.
+        -->
+        <activity
+            android:name=".ui.settings.TerminalFontSizeActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The three security rows: which host keys are trusted, which hosts have a secret in
+          the vault, and the PIN that locks it. Unlike the seven above they share no base beyond
+          the window itself - each reaches a different store (the known-hosts file, the
+          credential store plus the session registry, the settings DataStore) and each owns the
+          report of its own failed write, so there is nothing left for a common shape to hold.
+          Same reasoning on configChanges as the rest: local state, one read of a store, and a
+          rotation is cheaper than the configChanges list. Not exported - Settings is the only
+          caller.
+        -->
+        <activity
+            android:name=".ui.settings.KnownHostsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.SavedCredentialsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.PinLockActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The five heavy rows, which needed more than a body: each of these opened a dialog
+          that either could not fit what it had to show, or had to own work the Settings list
+          had no room to hold.
+
+          They are one block rather than five comments because what separates them from the
+          ten above is a single fact: every one of them drives something that outlives the
+          window. A generated key pair and an exported backup each pick a destination and
+          write it; the shortcut bar edits a stored blob and can be left unsaved; diagnostics
+          reads a ring buffer the session keeps; the Ubuntu section starts and stops a real
+          userspace. The ten above read one value from a store and write it back.
+
+          That is also why each of these holds [VaultUnlockGate] across its SAF picker. A
+          picker is another app's activity, so the process reports itself backgrounded while
+          one is up, and the auto-lock observer would otherwise start the re-lock countdown
+          over a window the user is still working in.
+
+          No configChanges list, same reasoning as the rest: each of them re-reads its store
+          on creation, so a rotation costs one read. Not exported - Settings is the only
+          caller.
+        -->
+        <activity
+            android:name=".ui.settings.ShortcutBarActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.DiagnosticsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.KeyGenActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.ExportBackupActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.UbuntuActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The Add / Edit host form, and the one entry in this file that Settings does not
+          open. It is reached from the Hosts list - the Add button, a card's Edit item, and
+          the "Edit host" action on the failed-login prompt - so the comment above about
+          Settings being the only caller does not cover it.
+
+          It is here rather than beside the Hosts list's own declarations because everything
+          about the window is shared with the sixteen above it: same shell, same chrome, same
+          back arrow. What differs is the subject - a host, not a preference - and that it
+          reads the host it was opened for out of the intent.
+
+          adjustResize is the one attribute none of the sixteen carry, and it is here because
+          of what this screen is: a full page of text fields down to a Save button at the
+          bottom. Without it the IME covers the fields it is being typed into and the last
+          section of the form. The others either have no text input at all or take it in a
+          single field near the top.
+
+          The configChanges list is the other attribute none of the sixteen carry, and it is
+          here for a stronger reason than adjustResize. Their reasoning does not reach this
+          screen: they hold a value that lives in a store, so a rotation costs one read and
+          loses nothing. This one holds *unsaved user input* - a name, a hostname, a
+          passphrase, a picked key file, fourteen engine settings - and a rotation that
+          recreated it would silently discard all of it, which is data loss rather than a
+          cheap re-read. The alternatives were worse: `rememberSaveable` on the fields would
+          write the form into a Bundle, and a Bundle is persisted to disk by the system and
+          is not a place for a passphrase or a private key's bytes to end up. Not recreating
+          the window is the same choice MainActivity makes for the workspace, and for the
+          same reason.
+
+          It holds [VaultUnlockGate] across its key picker for the same reason the block
+          above does, and it is the one screen where that matters most: the passphrase for the
+          key being attached is typed after the picker returns, and a re-lock over that field
+          would discard it.
+        -->
+        <activity
+            android:name=".ui.settings.HostFormActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:parentActivityName=".MainActivity"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!--
           Long-lived work host: terminal shells, SFTP transfers and port
           forwards all run inside this service so that the process survives
           minimise / screen-off. dataSync is the correct FGS type for

@@ -1,0 +1,538 @@
+Report an emulated hard link as the hard link it stands in for
+
+Patch 0003 makes link(2)/linkat(2) work under the app seccomp filter by
+copying the bytes in PRoot's own process when the platform refuses a real
+hard link.  A copy leaves two inodes where the guest asked for one, and
+shadow(1) is what asks.  Every tool that uses a hard link as a *lock* --
+adduser(8) and groupadd(8) link their database to <db>.lock and then verify
+the lock by counting links -- reads the copy's st_nlink of 1 as "already
+held":
+
+    groupadd: /etc/group.2500379: lock file already used
+    groupadd: cannot lock /etc/group; try again later.
+    groupadd-exit=10
+
+That is the failure the Ubuntu E2E workflow died on (run 35086244789, the
+install stage), and it is reachable on a host by answering EACCES to
+linkat(2)/link(2) -- the device's refusal of hard links in app data -- with a
+seccomp filter around PRoot, which is how the trace above was taken.  It
+fails openssh-client's postinst, so apt-get install exits 100 and the Ubuntu
+install the app performs never completes.
+
+shadow's do_lock_file() is the reader: it links /etc/group.<pid> to
+/etc/group.lock, then check_link_count() requires stat().st_nlink == 2 -- the
+count only a real hard link produces, and the one thing a byte copy cannot
+fake.  The lock is taken by shadow, not by the kernel, so nothing about
+translating paths can help; and fixing the guest instead (pre-seeding the
+_ssh group) would repair this one package while leaving every other postinst
+that locks a database the same way.  The emulation is what told the lie, so
+the emulation answers for it.
+
+What is recorded is only what is needed to answer: the two names, and the
+identity each had when the copy was made.  A stat(2) of either name is then
+answered with the group's shared inode, its device, and the number of names
+in the group -- for as long as both names are still the very inodes the
+emulation left behind, so a name replaced by rename(2) (dpkg rewrites its
+status file that way) stops being reported the moment the pair stops being
+one file.  The group is closed transitively, so link(a,b) then link(b,c) is
+three names of one inode, and the inode reported is the one belonging to the
+name that existed before the first emulation -- the inode a real hard link
+would have kept.  Symbolic sources are not recorded at all: a symlink
+recreated as a symlink is already what link(2) would have made, and no tool
+asks a symlink how many links it has.
+
+The correction runs in the exit stage rather than the enter stage, because
+that is where a structure exists to correct, and on every syscall because the
+guest's stat(2) of the name is a separate, later call.  It is gated on the
+syscall number first and on string comparisons second, so a stat(2) of a file
+with no emulated link costs nothing beyond the comparisons.  statx(2) is a
+second caller rather than a second implementation: this fork's statx
+emulation fills that structure itself (tracee/statx.c), so it is corrected
+there, before it is written back to the guest.
+
+The record lives in the PRoot process that made the link, and that is the
+whole of its scope.  A later PRoot invocation finds an empty table and
+answers with the kernel's copy -- one link each -- because the app runs one
+PRoot process per command.  This is enough for what the patch is for, and
+nothing here pretends to be more: shadow takes its lock and verifies it
+inside a single process, and every tool with that protocol does the same, so
+the question is always asked in the run that made the link.  A guest that
+links in one command and stats in the next gets the truth about the copy,
+which is the right answer to a question this patch never claimed to answer.
+It is why the E2E probe links, stats and asks `test -ef` inside ONE session
+(UbuntuE2eVerificationTest.hardLinksShareOneInode): the first version of that
+probe split the three commands into three sessions and failed on run
+35100526297, and the failure was the test's, not this patch's.
+
+The correction is skipped for a 32-bit tracee.  Its struct stat64 is not the
+64-bit structure this reads and writes whole, and poking it anyway would
+write past the guest's buffer and corrupt its memory; abi.h carries offsets
+for the two fields fake_id0 needs (uid, gid) and none for inode, device and
+link count.  A 32-bit tracee therefore keeps the kernel's answer -- which is
+exactly the behaviour without this patch, so nothing is lost that was ever
+there.
+
+Not upstream: it is a fidelity fix for one consequence of 0003's emulation,
+and 0003 is itself not upstream.  The two should travel together if the fork
+ever takes them.
+
+Evidence, from a host build of this tree with EACCES answered to
+linkat(2)/link(2) for PRoot and every tracee:
+
+  - apt-get update (39.2 MB of package lists) followed by
+    apt-get install --no-install-recommends openssh-client: exit 0.  The
+    postinst runs, _ssh:x:101 appears in /etc/group and /etc/gshadow,
+    /usr/bin/ssh -V prints its version, dpkg --configure -a exits 0, and no
+    lock file is left behind.
+  - The same groupadd -g 101 _ssh before this patch: exit 10, "cannot lock
+    /etc/group; try again later." -- the A/B is a single command on one
+    rootfs, and it is the exact command the postinst runs.
+  - stat and ls of an emulated pair both report 2 links and the same inode,
+    and test a -ef b succeeds.  link(a,b); link(b,c) reports 3 links on all
+    three names.  After either name is replaced by rename(2), the survivor
+    reports 1 link again.  (Every one of these ran inside a single PRoot
+    process, which is the only scope the record has -- see above.)
+  - On the device (E2E run 35100526297, API 35): the install phase passed for
+    the first time, 304s, apt-get install exit 0 with no lock failure, where
+    run 35086244789 had died in the same phase on groupadd's exit 10.  The
+    install log the app records shows the dpkg repair pass exiting 0 with
+    nothing to do, which is what a clean lock leaves behind.  This is what
+    the patch was written for, but it is correlation, not proof: the same
+    run carried the app-side dpkg repair and storage-gate changes, and
+    attributing the pass to any one of them would need an A/B the E2E does
+    not run.
+  - A genuinely stale /etc/group.lock is still refused, with shadow's own
+    "existing lock file ... with an invalid PID" and exit 10: the EEXIST is
+    passed through rather than overwritten, so a byte copy can never clobber
+    a lock it did not create.
+diff --git a/src/proot/src/syscall/exit.c b/src/proot/src/syscall/exit.c
+index ce1831d..4fc9087 100644
+--- a/src/proot/src/syscall/exit.c
++++ b/src/proot/src/syscall/exit.c
+@@ -574,6 +574,12 @@ void translate_syscall_exit(Tracee *tracee)
+ 	poke_reg(tracee, SYSARG_RESULT, (word_t) status);
+ 
+ end:
++	/* An emulated hard link must answer for the link it stands in for,
++	 * whichever stat(2) flavour the guest asked with.  Only the stat
++	 * family gets past the syscall-number switch inside, and only a name
++	 * the emulation recorded gets past the lookup after it.  */
++	fix_emulated_link_stat(tracee, syscall_number);
++
+ 	status = notify_extensions(tracee, SYSCALL_EXIT_END, 0, 0);
+ 	if (status < 0)
+ 		poke_reg(tracee, SYSARG_RESULT, (word_t) status);
+diff --git a/src/proot/src/tracee/seccomp.c b/src/proot/src/tracee/seccomp.c
+index 6867e7b..0c32da3 100644
+--- a/src/proot/src/tracee/seccomp.c
++++ b/src/proot/src/tracee/seccomp.c
+@@ -5,6 +5,7 @@
+ #include <utime.h>     /* utimbuf, */
+ #include <sys/vfs.h>   /* statfs64 */
+ #include <sys/stat.h>  /* lstat, */
++#include <sys/sysmacros.h> /* major, minor, */
+ #include <string.h>    /* memset, strcpy */
+ #include <linux/net.h> /* SYS_SENDMMSG */
+ #include <assert.h>    /* assert(3), */
+@@ -23,6 +24,7 @@
+ #include "tracee/seccomp.h"
+ #include "tracee/mem.h"
+ #include "tracee/statx.h"
++#include "tracee/abi.h"
+ #include "path/path.h"
+ 
+ static int handle_seccomp_event_common(Tracee *tracee);
+@@ -62,6 +64,308 @@ static void link_diag(const char *fmt, ...)
+ 	fclose(f);
+ }
+ 
++/**
++ * Emulated hard links, as emulate_link() leaves them behind: @old_path and
++ * @new_path are host paths, and the identities are what the platform left
++ * there -- two inodes holding the same bytes -- instead of the one inode that
++ * two names would have shared.
++ *
++ * The table exists because the copy is a lie the guest can catch.  link(2) is
++ * how shadow(1) locks /etc/group and /etc/shadow and how it *verifies* the
++ * lock: it hard-links /etc/group.<pid> to /etc/group.lock and then requires
++ * stat(/etc/group.<pid>).st_nlink == 2, the count only a real hard link has.
++ * A byte copy is left with one link, so groupadd(8) reads the lock it just
++ * took as already held and exits 10 -- "cannot lock /etc/group; try again
++ * later." -- which fails openssh-client's postinst and with it the whole
++ * apt-get install (a device run was lost to exactly that).  PRoot made the
++ * link, so PRoot answers for it: fix_emulated_link_stat() and
++ * fix_emulated_link_statx() report the group's own inode and its number of
++ * names for as long as the pair is still the pair PRoot created.
++ *
++ * A record is dropped as soon as either name is gone or is no longer the very
++ * inode the emulation left behind, so a name later replaced by rename(2) --
++ * dpkg(1) rewrites its status file that way -- stops being reported the
++ * moment the pair stops being one file.  Only the byte copies are recorded: a
++ * symbolic source recreated as a symbolic destination is a pair of links to
++ * one target, which is what link(2) would have made of them anyway, and no
++ * tool asks a symlink how many links it has.
++ *
++ * Names are compared as the translation produced them, so two spellings of
++ * one host path (through a symlinked directory, say) are two keys and only the
++ * spelling the emulation saw is answered.  Names of PATH_MAX bytes or more are
++ * not recorded at all, and the table is a ring: the pair being asked about is
++ * the pair just made, so recency is the right thing to keep.
++ */
++#define EMLINK_MAX 16
++struct emulated_link {
++	char old_path[PATH_MAX];
++	char new_path[PATH_MAX];
++	ino_t old_ino;
++	dev_t old_dev;
++	ino_t new_ino;
++	dev_t new_dev;
++	bool used;
++};
++static struct emulated_link emulated_links[EMLINK_MAX];
++static unsigned int emulated_link_next;
++
++/**
++ * Record the byte copy @old_translated -> @new_translated that emulate_link()
++ * just made, with the identities of both names, so that a later stat(2) on
++ * either can be answered as a hard link's would be.
++ */
++static void record_emulated_link(const char *old_translated,
++		const char *new_translated, const struct stat *old_stat,
++		const struct stat *new_stat)
++{
++	struct emulated_link *link;
++
++	if (strlen(old_translated) >= PATH_MAX || strlen(new_translated) >= PATH_MAX)
++		return;
++
++	link = &emulated_links[emulated_link_next];
++	emulated_link_next = (emulated_link_next + 1) % EMLINK_MAX;
++
++	strcpy(link->old_path, old_translated);
++	strcpy(link->new_path, new_translated);
++	link->old_ino = old_stat->st_ino;
++	link->old_dev = old_stat->st_dev;
++	link->new_ino = new_stat->st_ino;
++	link->new_dev = new_stat->st_dev;
++	link->used = true;
++}
++
++/**
++ * Whether this record is still the pair the emulation made: both names there,
++ * each still the very inode it left behind.  A name that was unlinked, or
++ * replaced by rename(2), ends the pair -- and the record with it, so the table
++ * cannot answer for a file that is no longer the one it copied.
++ */
++static bool emulated_link_alive(struct emulated_link *link)
++{
++	struct stat sb;
++
++	if (lstat(link->old_path, &sb) != 0
++	    || sb.st_ino != link->old_ino || sb.st_dev != link->old_dev) {
++		link->used = false;
++		return false;
++	}
++	if (lstat(link->new_path, &sb) != 0
++	    || sb.st_ino != link->new_ino || sb.st_dev != link->new_dev) {
++		link->used = false;
++		return false;
++	}
++	return true;
++}
++
++/** Whether @path is one of the @nr names in @members.  */
++static bool is_member(const char *members[EMLINK_MAX + 1], unsigned int nr,
++		const char *path)
++{
++	unsigned int i;
++
++	for (i = 0; i < nr; i++)
++		if (strcmp(members[i], path) == 0)
++			return true;
++	return false;
++}
++
++/**
++ * What a hard link would have left for @host_path, when @host_path is one of
++ * the names of an emulated group: the inode all the names share, its device,
++ * and how many names refer to it.  Returns false when @host_path is none of
++ * them, which is the answer for every file the emulation never touched.
++ *
++ * The group is closed over transitively -- link(a, b) followed by link(b, c)
++ * is three names of one file, the third reached through the second -- and its
++ * inode is the one belonging to the name that existed before the first
++ * emulation, which is the inode a real hard link would have kept for all of
++ * them.
++ */
++static bool emulated_link_group(const char *host_path, ino_t *ino, dev_t *dev,
++		nlink_t *nlink)
++{
++	const char *members[EMLINK_MAX + 1];
++	bool seen[EMLINK_MAX] = {};
++	unsigned int nr_members = 1;
++	unsigned int nr_names = 1;
++	bool grew = true;
++	unsigned int i, j;
++
++	members[0] = host_path;
++
++	while (grew) {
++		grew = false;
++		for (i = 0; i < EMLINK_MAX; i++) {
++			struct emulated_link *link = &emulated_links[i];
++
++			/* The cheap screens come first: most records name
++			 * neither of the paths this walk has reached, and a
++			 * stat(2) of a file with no emulated link must not
++			 * pay for a lookup of every record.  */
++			if (!link->used || seen[i])
++				continue;
++			if (!is_member(members, nr_members, link->old_path)
++			    && !is_member(members, nr_members, link->new_path))
++				continue;
++			if (!emulated_link_alive(link))
++				continue;
++
++			seen[i] = true;
++			nr_names++;
++			if (!is_member(members, nr_members, link->old_path)
++			    && nr_members < EMLINK_MAX + 1)
++				members[nr_members++] = link->old_path;
++			if (!is_member(members, nr_members, link->new_path)
++			    && nr_members < EMLINK_MAX + 1)
++				members[nr_members++] = link->new_path;
++			grew = true;
++		}
++	}
++
++	if (nr_names == 1)
++		return false;
++
++	/* The name that is nobody's target came first: its inode is the one
++	 * every name of the group shares.  */
++	for (i = 0; i < EMLINK_MAX; i++) {
++		bool is_target = false;
++
++		if (!seen[i])
++			continue;
++		for (j = 0; j < EMLINK_MAX; j++)
++			if (seen[j]
++			    && strcmp(emulated_links[j].new_path,
++				      emulated_links[i].old_path) == 0)
++				is_target = true;
++		if (is_target)
++			continue;
++
++		*ino = emulated_links[i].old_ino;
++		*dev = emulated_links[i].old_dev;
++		*nlink = nr_names;
++		return true;
++	}
++
++	/* Every name is some record's target, which only a cycle could do and
++	 * the emulation cannot make one; the group is one file regardless.  */
++	for (i = 0; i < EMLINK_MAX; i++) {
++		if (!seen[i])
++			continue;
++		*ino = emulated_links[i].old_ino;
++		*dev = emulated_links[i].old_dev;
++		*nlink = nr_names;
++		return true;
++	}
++	return false;
++}
++
++/**
++ * Answer the guest's stat(2) on @host_path as the hard link it emulates would
++ * have been answered.  Called from the exit stage of every syscall; the switch
++ * on the syscall number is what keeps that from costing anything, and the
++ * group lookup that follows is a pair of string comparisons for a file with no
++ * emulated link.
++ *
++ * Only for a tracee whose ABI is PRoot's own.  The stat structure is read and
++ * written back whole rather than poked field by field at computed offsets, and
++ * a 32-bit tracee's structure -- PR_stat64 and PR_fstatat64 are its calls --
++ * is not the 64-bit one this reads and writes: doing it anyway would write
++ * past the guest's buffer and corrupt its memory.  fake_id0 pokes a field at a
++ * time for exactly this reason, and it can, because abi.h carries the offsets
++ * for the two fields it cares about; there are none for inode, device and link
++ * count, so a 32-bit tracee keeps the kernel's answer -- a byte copy with one
++ * link, which is what it would have got without this patch.  The statx(2)
++ * structure is ABI-independent, so fix_emulated_link_statx() needs no such
++ * guard.
++ *
++ * Best-effort by design.  This adds fidelity to a result the kernel already
++ * produced, so a failure here leaves the guest the kernel's answer -- a byte
++ * copy with one link -- rather than turning a successful stat(2) into a failed
++ * one.
++ */
++void fix_emulated_link_stat(Tracee *tracee, word_t syscall_number)
++{
++	Reg path_sysarg, stat_sysarg;
++	char host_path[PATH_MAX];
++	struct stat guest_stat;
++	ino_t ino;
++	dev_t dev;
++	nlink_t nlink;
++	word_t address;
++
++	/* Only a successful stat(2) has written a structure to patch.  */
++	if ((int) peek_reg(tracee, CURRENT, SYSARG_RESULT) != 0)
++		return;
++
++	/* A 32-bit tracee's structure is not the one read and written below.  */
++	if (is_32on64_mode(tracee))
++		return;
++
++	switch (syscall_number) {
++	case PR_stat:
++	case PR_stat64:
++	case PR_lstat:
++	case PR_lstat64:
++		path_sysarg = SYSARG_1;
++		stat_sysarg = SYSARG_2;
++		break;
++
++	case PR_fstatat64:
++	case PR_newfstatat:
++		path_sysarg = SYSARG_2;
++		stat_sysarg = SYSARG_3;
++		break;
++
++	default:
++		/* fstat(2) and fstat64(2) name no path, and there is
++		 * nothing to look an emulated link up by.  */
++		return;
++	}
++
++	/* The enter stage translated the path in place, so this is the host
++	 * path -- the key the emulation was recorded under.  */
++	if (get_sysarg_path(tracee, host_path, path_sysarg) <= 0)
++		return;
++
++	if (!emulated_link_group(host_path, &ino, &dev, &nlink))
++		return;
++
++	address = peek_reg(tracee, ORIGINAL, stat_sysarg);
++	if (read_data(tracee, &guest_stat, address, sizeof(guest_stat)) < 0)
++		return;
++
++	guest_stat.st_ino = ino;
++	guest_stat.st_dev = dev;
++	guest_stat.st_nlink = nlink;
++
++	write_data(tracee, address, &guest_stat, sizeof(guest_stat));
++}
++
++/**
++ * The statx(2) counterpart of fix_emulated_link_stat(), for the structure
++ * PRoot fills itself (see tracee/statx.c).  @state is corrected in place, and
++ * marked updated so that it is written back to the guest.
++ */
++void fix_emulated_link_statx(const char *host_path,
++		struct statx_syscall_state *state)
++{
++	ino_t ino;
++	dev_t dev;
++	nlink_t nlink;
++
++	if (!emulated_link_group(host_path, &ino, &dev, &nlink))
++		return;
++
++	if ((state->statx_buf.stx_mask & STATX_NLINK) != 0)
++		state->statx_buf.stx_nlink = nlink;
++	if ((state->statx_buf.stx_mask & STATX_INO) != 0)
++		state->statx_buf.stx_ino = ino;
++	state->statx_buf.stx_dev_major = major(dev);
++	state->statx_buf.stx_dev_minor = minor(dev);
++	state->updated_stats = true;
++}
++
+ /**
+  * Make @new_translated a hard link to @old_translated on behalf of the
+  * tracee, and return 0 or a negative errno for the guest.  @flags is the
+@@ -100,6 +404,7 @@ int emulate_link(Tracee *tracee, const char *old_translated,
+ 	char target[PATH_MAX];
+ 	int src_fd, dst_fd;
+ 	struct stat st;
++	struct stat dst_st;
+ 	char cpbuf[8192];
+ 	ssize_t n;
+ 	int saved;
+@@ -174,8 +479,26 @@ int emulate_link(Tracee *tracee, const char *old_translated,
+ 		return -saved;
+ 	}
+ 
++	/* The copy has to answer for the link it stands in for, and that
++	 * needs the identity of the new name before the descriptor goes.  A
++	 * copy whose identity cannot be read is not the link the guest asked
++	 * for: undo it and report the failure, the way the copy itself is
++	 * undone above.  */
++	if (fstat(dst_fd, &dst_st) < 0) {
++		saved = errno;
++		close(dst_fd);
++		close(src_fd);
++		unlinkat(AT_FDCWD, new_translated, 0);
++		return -saved;
++	}
++
+ 	close(dst_fd);
+ 	close(src_fd);
++	record_emulated_link(old_translated, new_translated, &st, &dst_st);
++	link_diag("emulated link recorded: %s (ino %llu) <-> %s (ino %llu); "
++		"stat(2) on either now reports two links",
++		old_translated, (unsigned long long) st.st_ino,
++		new_translated, (unsigned long long) dst_st.st_ino);
+ 	VERBOSE(tracee, 3, "link: copied %s -> %s", old_translated, new_translated);
+ 	return 0;
+ }
+diff --git a/src/proot/src/tracee/seccomp.h b/src/proot/src/tracee/seccomp.h
+index 7867c07..46c13b3 100644
+--- a/src/proot/src/tracee/seccomp.h
++++ b/src/proot/src/tracee/seccomp.h
+@@ -1,4 +1,5 @@
+ #include "tracee/tracee.h"
++#include "tracee/statx.h"
+ #include "sys/vfs.h"
+ 
+ struct compat_statfs {
+@@ -21,6 +22,14 @@ struct compat_statfs {
+ int emulate_link(Tracee *tracee, const char *old_translated,
+ 		const char *new_translated, int flags);
+ 
++/* Answer a stat of an emulated hard link the way the link it stands in for
++ * would have been answered.  Called from the exit stage of every syscall (the
++ * first) and from the statx(2) emulation (the second); both are no-ops for a
++ * path the emulation never linked.  See tracee/seccomp.c.  */
++void fix_emulated_link_stat(Tracee *tracee, word_t syscall_number);
++void fix_emulated_link_statx(const char *host_path,
++		struct statx_syscall_state *state);
++
+ void restart_syscall_after_seccomp(Tracee* tracee);
+ void set_result_after_seccomp(Tracee *tracee, word_t result);
+ int handle_seccomp_event(Tracee* tracee, int trapped_syscall);
+diff --git a/src/proot/src/tracee/statx.c b/src/proot/src/tracee/statx.c
+index ca972f8..6431cda 100644
+--- a/src/proot/src/tracee/statx.c
++++ b/src/proot/src/tracee/statx.c
+@@ -3,6 +3,7 @@
+ 
+ #include "tracee/statx.h"
+ #include "tracee/mem.h"
++#include "tracee/seccomp.h"
+ 
+ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
+ 	RegVersion regVersion = from_sigsys ? CURRENT : ORIGINAL;
+@@ -123,6 +124,12 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
+ 		}
+ 	}
+ 
++	/* An emulated hard link must answer for the link it stands in for,
++	 * whichever stat flavour the guest asked with.  Before the extensions
++	 * so that they see the corrected structure, and before the write-back
++	 * below, which this marks updated if it changed anything.  */
++	fix_emulated_link_statx(state.host_path, &state);
++
+ 	/* Notify extensions */
+ 	status = notify_extensions(tracee, STATX_SYSCALL, (intptr_t) &state, 0);
+ 	if (status < 0) {

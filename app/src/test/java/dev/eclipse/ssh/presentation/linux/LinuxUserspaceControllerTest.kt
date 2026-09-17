@@ -17,6 +17,7 @@ import dev.eclipse.ssh.linux.RootfsInstaller
 import dev.eclipse.ssh.linux.ScriptedPtySpawner
 import dev.eclipse.ssh.linux.TestTarballs
 import dev.eclipse.ssh.linux.UbuntuDistributionManager
+import dev.eclipse.ssh.linux.UserspaceDiagnostics
 import java.io.File
 import java.nio.file.Files
 import kotlinx.coroutines.Dispatchers
@@ -56,11 +57,26 @@ class LinuxUserspaceControllerTest {
         val rootDir: File = Files.createTempDirectory("linux-controller").toFile().apply { deleteOnExit() }
         val spawner = ScriptedPtySpawner()
         val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
+        // One ring for both halves of the install, exactly as the DI graph wires it: a log that
+        // held only the apt phase would answer half the questions a failed install raises.
+        private val diagnostics = UserspaceDiagnostics()
         val installer =
-            RootfsInstaller(rootDir, distro, downloader = { _, target, onChunk ->
-                TestTarballs.serving(FIXTURE).download("https://fixtures.invalid/rootfs.tar.gz", target, onChunk)
-            })
-        val distribution = UbuntuDistributionManager(distro, runtime, appUid = 10150, appGid = 10150)
+            RootfsInstaller(
+                rootDir,
+                distro,
+                downloader = { _, target, onChunk ->
+                    TestTarballs.serving(FIXTURE).download("https://fixtures.invalid/rootfs.tar.gz", target, onChunk)
+                },
+                diagnostics = diagnostics,
+            )
+        val distribution =
+            UbuntuDistributionManager(
+                distro,
+                runtime,
+                appUid = 10150,
+                appGid = 10150,
+                diagnostics = diagnostics,
+            )
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime)
         val backupFile = File(rootDir.parentFile, "${rootDir.name}-workspace-backup.tar.gz")
@@ -321,5 +337,56 @@ class LinuxUserspaceControllerTest {
         assertThat(reinstalled.workspaceFileCount).isEqualTo(1)
         // The snapshot is consumed by the restore, not left to shadow the live workspace.
         assertThat(reinstalled.hasPendingWorkspaceBackup).isFalse()
+    }
+
+    @Test
+    fun `the install log carries the install's own events out of the app`() = runTest {
+        mainOnTheTestScheduler()
+        val harness = newHarness()
+        val controller = newController(harness.graph)
+
+        // Nothing has happened yet, so the ring is empty and the settings row says so rather than
+        // showing a count of zero events it would have to invent.
+        assertThat(controller.installLog.first()).isEmpty()
+        assertThat(controller.exportInstallLog()).isEmpty()
+
+        controller.install()
+        controller.uiState.first { it.state is LinuxUserspaceState.Stopped && it.storageUsedBytes > 0 }
+
+        // The ring the UI reads is the one the install wrote into. Before this surface existed the
+        // only reader was logcat, which is the one channel a user without `adb` does not have — so
+        // a failed install's evidence was unreachable by the person who hit it.
+        val events = controller.installLog.first { it.isNotEmpty() }
+        val categories = events.map { it.category.tag }
+        // Both halves of the install are in the one log: the rootfs download and extraction run
+        // before the distribution manager exists, so a ring owned by the manager alone would have
+        // been blank for exactly the failures that happen first (a truncated download, a checksum
+        // mismatch, an extraction that skipped hard links).
+        assertThat(categories).contains("download")
+        assertThat(categories).contains("rootfs")
+        assertThat(categories).contains("apt")
+
+        // The exported text is the ring's own `line()` form, which is what makes a pasted report
+        // readable: one event per line, with the subsystem tag the diagnostics were filed under.
+        val export = controller.exportInstallLog()
+        assertThat(export.lines()).hasSize(events.size)
+        assertThat(export).contains("[download]")
+
+        // Clear is half the point of a ring this size: clear, reproduce, export only the failure.
+        controller.clearInstallLog()
+        assertThat(controller.installLog.first()).isEmpty()
+        assertThat(controller.exportInstallLog()).isEmpty()
+    }
+
+    @Test
+    fun `an unsupported device has an empty install log rather than an error`() = runTest {
+        // There is no graph, so there is no ring. Every reader must answer "nothing recorded"
+        // instead of throwing, because the settings section renders this row on devices whose
+        // feature is absent — a null dereference here would take the screen down.
+        val controller = newController(null)
+
+        assertThat(controller.installLog.first()).isEmpty()
+        assertThat(controller.exportInstallLog()).isEmpty()
+        controller.clearInstallLog()
     }
 }

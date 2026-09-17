@@ -16,14 +16,18 @@ import kotlinx.coroutines.flow.StateFlow
  *  - [Log] with the single stable tag, so `adb logcat -s EclipseSSH` is a complete trace;
  *  - an in-memory ring the app can export, because a user whose install failed has no `adb`.
  *
- * Wiring the export into the settings screen's copy/save path is a later pass; the ring exists
- * and is filled from the day the install code can record into it.
+ * The export runs through [LinuxUserspaceController.installLog] and the Settings → Linux Userspace
+ * "Install log" row, which offers the ring to Copy, Save and Clear — the same three actions the
+ * session trace's own dialog offers, for the same reason: the person who needs the evidence is the
+ * one whose install just failed, and that person has no `adb`.
  *
  * ## What must never appear here
  * The same rules the session trace holds: passwords, keys, tokens, terminal contents. Every
  * `detail` passes through the SSH trace's [scrub] before it enters the ring, because the one
  * rich source of detail here — a failed command's captured output — is exactly the shape of text
- * that can carry something it should not.
+ * that can carry something it should not. It is then stripped of the terminal escapes that output
+ * carries by construction ([stripEscapes]): the commands run on a pty, so their colour and
+ * progress sequences would otherwise surround every error line quoted here.
  */
 class UserspaceDiagnostics {
 
@@ -55,7 +59,7 @@ class UserspaceDiagnostics {
                 atMs = System.currentTimeMillis(),
                 category = category,
                 event = event,
-                detail = detail?.let { scrub(it).take(MAX_DETAIL) },
+                detail = detail?.let { stripEscapes(scrub(it)).take(MAX_DETAIL) },
                 exitCode = exitCode,
                 durationMs = durationMs,
             )
@@ -86,8 +90,26 @@ class UserspaceDiagnostics {
 }
 
 /**
- * The category prefix every line carries: the four subsystems of an install, so a trace can be
- * `grep`ed by subsystem rather than read whole.
+ * The terminal control sequences a command's output carries when it ran on a pty, removed.
+ *
+ * dpkg and apt colour and re-draw their progress lines whenever their output is a terminal, and
+ * under proot it always is — so the one line of a failure worth reading, taken verbatim from the
+ * command's output, arrives as `ESC[1mdpkg:ESC[0m ESC[1;31merror:ESC[0m error creating new backup
+ * file …`. The escapes are also what [UserspaceDiagnosticEvent.line] would quote into the export
+ * and into logcat, where they read as noise around the sentence that names the cause.
+ *
+ * Only SGR ("colour") sequences and the cursor/erase families a progress line uses are removed:
+ * this is presentation, and anything else in the text is evidence.
+ */
+internal fun stripEscapes(text: String): String = ANSI_ESCAPES.replace(text, "")
+
+private val ANSI_ESCAPES = Regex("\\u001B\\[[0-9;?]*[ -/]*[@-~]")
+
+/**
+ * The category prefix every line carries: the subsystems of an install — storage, the rootfs
+ * download and extraction, proot itself, DNS, and apt — so a trace can be `grep`ed by subsystem
+ * rather than read whole. Every one of the six is recorded by something: [RootfsInstaller] owns
+ * storage, download and rootfs, [UbuntuDistributionManager] the rest.
  */
 enum class UserspaceDiagnosticCategory(val tag: String) {
     STORAGE("storage"),

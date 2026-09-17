@@ -23,6 +23,7 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.settings.HostFormActivity
 import java.time.Duration
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -242,26 +243,40 @@ class HostAndThemeUiRobolectricTest {
     }
 
     /**
-     * Editing opens the form on the host that was tapped, prefilled from it.
+     * Edit opens the form on the host that was tapped.
      *
-     * The prefill is the assertion. An Edit that opened a blank Add form would look right — a form
-     * appears — and then save a second host instead of changing the one the user meant.
+     * The *which host* half is what this level can see, and it is the half that matters most: an Edit
+     * that opened the form for the wrong host, or for no host at all, would look right — a form
+     * appears — and then save a second host instead of changing the one the user meant. The id
+     * carried in the intent is the whole of that claim, and nothing below this level could catch it,
+     * because the form reads the id and not the profile.
+     *
+     * The *prefill* half used to be asserted here, by reading the values out of the dialog's own
+     * window. It cannot be any more: the form is an Activity now, and under Robolectric a
+     * `startActivity` is recorded, not performed, so the target never composes and none of its text
+     * exists to query. That assertion moved to `HostFormActivityRobolectricTest`, which launches the
+     * window directly with this same extra and reads the fields out of it.
      */
     @Test
-    fun editingAHostOpensItsOwnFormPrefilled() {
+    fun editingAHostOpensTheFormOnThatHost() {
         val host = addHost("Editable", hostname = "edit.example.test", username = "editor", port = 2244)
+
+        // Drain whatever startup queued, so the peek below only ever reports this click's doing.
+        // Peeking does not consume, so a stale intent would mask the one under test.
+        while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
+        val dialogsBefore = ShadowDialog.getShownDialogs().size
 
         openKebabMenu(host.name, "Edit")
         compose.onNodeWithText("Edit").performClick()
         pump()
 
-        // The Add/Edit form is an AlertDialog, so its window is what can be seen from here.
-        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
-        // Prefilled with this host: the values are in the dialog's own window, reachable by text.
-        listOf(host.name, "edit.example.test", "editor", "2244").forEach { value ->
-            assertWithMessage("the form did not carry $value over")
-                .that(compose.onAllNodesWithText(value, substring = true).fetchSemanticsNodes()).isNotEmpty()
-        }
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        assertWithMessage("Edit did not open ${HostFormActivity::class.simpleName}")
+            .that(intent?.component?.className).isEqualTo(HostFormActivity::class.java.name)
+        assertWithMessage("Edit did not carry the host it was opened from")
+            .that(intent?.getStringExtra(HostFormActivity.EXTRA_HOST_ID)).isEqualTo(host.id)
+        assertWithMessage("Edit still opened as a dialog over the list")
+            .that(ShadowDialog.getShownDialogs().size).isEqualTo(dialogsBefore)
     }
 
     /**
@@ -345,27 +360,33 @@ class HostAndThemeUiRobolectricTest {
     }
 
     /**
-     * The Hosts column reaches the edges of a narrow screen, measured on the search field.
+     * The Hosts column reaches the edges of a narrow screen, measured on the header row's two ends.
      *
      * The screen margins were deliberately thinned to 8dp - a phone screen is the scarce resource,
      * and 20dp each side gave back 6% of a 320dp window for nothing. This pins the new margin from
-     * below: the search field is the first full-width thing in the column, so where its text starts
-     * is the margin plus the field's own inner padding (16dp in Material3), and where it ends is
-     * the same on the other side. The bounds are taken on whatever node the placeholder text
-     * resolves to - the merged field, or the placeholder inside it - which is why both bounds are
-     * loose enough to hold for either reading and still fail the 20dp margin they replaced.
+     * below: the first label in the header row starts at the column's left edge and the last chip in
+     * it ends at the right one, so between them they are the margin on each side. The bounds are
+     * taken on whatever node each text resolves to - the chip, or the label inside it - which is why
+     * both bounds are loose enough to hold for either reading and still fail the 20dp margin they
+     * replaced.
+     *
+     * It used to be measured on the search field, which was the column's first full-width row. That
+     * field now lives in the top bar - a different container, with its own 16dp content padding and
+     * the two action buttons eating the right of it - so it is no longer a witness to this column's
+     * width, and the header row is what the column actually starts with.
      */
     @Test
     @Config(qualifiers = "w320dp-h480dp-mdpi")
     fun theHostsColumnUsesAlmostTheWholeWidthOfANarrowScreen() {
-        val search = compose.onNodeWithText("Search hosts, tags, or usernames")
-        search.performScrollTo().assertIsDisplayed()
-        val bounds = search.getUnclippedBoundsInRoot()
+        val firstLabel = compose.onNodeWithText("All hosts")
+        val lastChip = compose.onNodeWithText("Favorites")
+        firstLabel.performScrollTo().assertIsDisplayed()
+        lastChip.performScrollTo().assertIsDisplayed()
 
         assertWithMessage("the content column is inset like the 20dp margin never left")
-            .that(bounds.left.value).isAtMost(28f)
+            .that(firstLabel.getUnclippedBoundsInRoot().left.value).isAtMost(28f)
         assertWithMessage("the content column does not reach the right edge of the screen")
-            .that(bounds.right.value).isAtLeast(290f)
+            .that(lastChip.getUnclippedBoundsInRoot().right.value).isAtLeast(290f)
     }
 
     // ---------------------------------------------------------------- pasting a credential

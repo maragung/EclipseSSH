@@ -146,6 +146,18 @@
 -keep class kotlin.RuntimeException { *; }
 -keep class kotlin.sequences.Sequence { *; }
 -keep class kotlin.sequences.SequencesKt { *; }
+# MatchResult as well as Regex, and for a reason Regex alone does not cover: the
+# suite reads a match's captures through this INTERFACE (MatchResult.getGroupValues),
+# and R8 removed that member from it because every reference in the app itself had
+# been devirtualized onto the concrete impl - so the app kept working while the
+# instrumentation APK died with "NoSuchMethodError: No interface method
+# getGroupValues()" (run 35106576845, a single line in the LINK probe). Keeping the
+# class with all members is this file's rule for a surviving class; the probe no
+# longer needs it, and this is what stops the next Regex user in androidTest from
+# finding out the same way. If the list is ever regenerated, MatchResult must stay:
+# a derivation that walks referenced classes sees Regex, not the interface a match
+# is read through.
+-keep class kotlin.text.MatchResult { *; }
 -keep class kotlin.text.Regex { *; }
 -keep class kotlin.text.StringBuilder { *; }
 -keep class kotlin.text.StringsKt { *; }
@@ -234,6 +246,22 @@
 -keep class dev.eclipse.ssh.di.LinuxUserspaceGraph { *; }
 -keep class dev.eclipse.ssh.linux.ProotRuntime { *; }
 -keep class dev.eclipse.ssh.linux.LinuxUserspaceManager { *; }
+#
+# E2E run 35035691404 peeled the layer under those: the value types the
+# suite's own helpers consume. ProotRuntime.runCommand returns
+# ProotCommandResult, whose exitCode getter and outputText() the app never
+# calls (the app's setup pipeline checks the result of the whole session
+# helper, not the result object) - R8 kept the class renamed (t33) but
+# stripped the members, so sessionSucceeds() died with NoSuchMethodError:
+# No virtual method getExitCode()I in class Lt33 - 11 failures across every
+# test that runs a session command. HealthReport is kept defensively: its
+# healthy/describe() members are app-referenced today (so R8 would keep
+# them anyway), but the suite reads the object through the kept manager
+# facade and a future app refactor dropping those members would otherwise
+# break the pair silently - the derivation here is "what the suite
+# touches", not "what survives today".
+-keep class dev.eclipse.ssh.linux.ProotCommandResult { *; }
+-keep class dev.eclipse.ssh.linux.HealthReport { *; }
 
 # ---------------------------------------------------------------------------
 # Stage 2: androidx.compose, narrowed from the whole-namespace keep in

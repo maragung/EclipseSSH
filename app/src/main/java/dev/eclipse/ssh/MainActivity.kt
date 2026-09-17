@@ -25,7 +25,6 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
@@ -56,8 +55,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
-import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
@@ -91,11 +88,9 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Upload
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -123,7 +118,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -137,7 +131,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -216,7 +209,6 @@ import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.model.SyncDirection
 import dev.eclipse.ssh.background.EclipseSessionService
-import dev.eclipse.ssh.feature.about.OPEN_SOURCE_LICENSES
 import dev.eclipse.ssh.feature.quickconnect.QuickConnectContract
 import dev.eclipse.ssh.feature.vault.shouldRelockVault
 import dev.eclipse.ssh.presentation.AdvancedHostOptions
@@ -243,6 +235,7 @@ import dev.eclipse.ssh.archive.ArchiveExtractor
 import dev.eclipse.ssh.archive.ArchiveTarget
 import dev.eclipse.ssh.archive.ArchiveReader
 import dev.eclipse.ssh.archive.ArchiveUiState
+import dev.eclipse.ssh.ui.about.AboutActivity
 import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsSheet
 import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewSheet
 import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
@@ -264,15 +257,33 @@ import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopConfigDialog
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequest
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequests
 import dev.eclipse.ssh.ui.remotedesktop.RdpConfigDialog
+import dev.eclipse.ssh.ui.settings.ClipboardClearActivity
+import dev.eclipse.ssh.ui.settings.DiagnosticsActivity
+import dev.eclipse.ssh.ui.settings.ExportBackupActivity
+import dev.eclipse.ssh.ui.settings.HostFormActivity
+import dev.eclipse.ssh.ui.settings.KeepAliveActivity
+import dev.eclipse.ssh.ui.settings.KeyGenActivity
+import dev.eclipse.ssh.ui.settings.KnownHostsActivity
+import dev.eclipse.ssh.ui.settings.PinLockActivity
+import dev.eclipse.ssh.ui.settings.ReconnectDelayActivity
+import dev.eclipse.ssh.ui.settings.SavedCredentialsActivity
+import dev.eclipse.ssh.ui.settings.SettingDropdown
+import dev.eclipse.ssh.ui.settings.SettingRow
+import dev.eclipse.ssh.ui.settings.SettingsSection
+import dev.eclipse.ssh.ui.settings.ShortcutBarActivity
+import dev.eclipse.ssh.ui.settings.TerminalFontSizeActivity
+import dev.eclipse.ssh.ui.settings.TerminalWidthActivity
+import dev.eclipse.ssh.ui.settings.UbuntuActivity
+import dev.eclipse.ssh.ui.settings.VaultAutoLockActivity
 import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
 import dev.eclipse.ssh.ui.PortForwardManagerSheet
+import dev.eclipse.ssh.ui.SecretFieldKeyboard
+import dev.eclipse.ssh.ui.SecretPasteButton
 import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
-import dev.eclipse.ssh.ssh.GeneratedKeyPair
 import dev.eclipse.ssh.ssh.PERMISSION_PRESETS
-import dev.eclipse.ssh.ssh.SshKeyAlgorithm
 import dev.eclipse.ssh.ssh.SshKeyProbe
 import dev.eclipse.ssh.ssh.probeSshKey
 import dev.eclipse.ssh.ssh.symbolicPermissions
@@ -281,7 +292,6 @@ import dev.eclipse.ssh.data.credentials.KeyEdit
 import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.credentials.StoredCredentials
 import dev.eclipse.ssh.data.credentials.describe
-import dev.eclipse.ssh.data.saf.PickedKeyFile
 import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
 import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
@@ -292,7 +302,6 @@ import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalSelection
 import dev.eclipse.ssh.ui.terminal.KeyBarPrefsCodec
-import dev.eclipse.ssh.ui.terminal.ShortcutBarDialog
 import dev.eclipse.ssh.ui.terminal.TerminalInputBridge
 import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
@@ -459,47 +468,6 @@ internal fun parseSshDeepLink(uri: Uri?): HostProfile? {
     )
 }
 
-/**
- * Keyboard options for any field that holds a secret.
- *
- * [androidx.compose.ui.text.input.PasswordVisualTransformation] only changes what is *drawn*. With
- * no password keyboard type the field's underlying input type stays ordinary text, so the IME treats
- * a typed passphrase as prose: autocorrect and word suggestions run over it, and it can be committed
- * to the keyboard's personal dictionary and suggestion history. That is a copy of the user's SSH
- * password in storage this app does not own, cannot read and cannot clear — and the next app with a
- * text field may be offered it as a suggestion. `KeyboardType.Password` maps to
- * `TYPE_TEXT_VARIATION_PASSWORD`, which turns all of it off.
- *
- * Shared rather than repeated at each call site so a fifth secret field cannot quietly appear
- * without it. The PIN fields use `NumberPassword` for the same reason over a numeric keypad.
- */
-private val SecretFieldKeyboard = androidx.compose.foundation.text.KeyboardOptions(
-    keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
-)
-
-/**
- * The clipboard-paste affordance for any field created by [SecretFieldKeyboard] above.
- *
- * Long-press paste in a password field is unreliable in exactly the situation it is needed most:
- * the IME's toolbar over a `TYPE_TEXT_VARIATION_PASSWORD` field varies by keyboard, and a clip
- * copied by a password manager often carries a trailing newline a `singleLine` field cannot
- * accept. A button the user can see sidesteps both - and [onPaste] goes through the ViewModel, so
- * the read is subject to the same audited clipboard boundary and newline normalization as every
- * other clipboard access in the app.
- *
- * [what] only exists for the screen reader: the Add-host dialog can show a password, a passphrase
- * and a proxy password at once, and three buttons all announcing "Paste" would be a list nobody
- * can tell apart. The paste *replaces* the field's contents rather than appending to them - these
- * fields are never pre-filled from storage, so whatever is in one is either empty or a typo being
- * corrected.
- */
-@Composable
-private fun SecretPasteButton(what: String, onPaste: () -> String?, into: (String) -> Unit) {
-    IconButton(onClick = { onPaste()?.let(into) }) {
-        Icon(Icons.Default.ContentPaste, contentDescription = "Paste $what from clipboard")
-    }
-}
-
 private enum class Destination(val label: String, val icon: ImageVector) {
     HOSTS("Hosts", Icons.Default.Computer),
     TERMINAL("Terminal", Icons.Default.Terminal),
@@ -661,21 +629,6 @@ private fun EclipseWorkspace(
                 }
         }
     }
-    /**
-     * The key being attached in the Add / Edit Host form, held here rather than inside the dialog so a
-     * recomposition triggered by the picker returning cannot discard it.
-     */
-    var formKey by remember { mutableStateOf<PickedKeyFile?>(null) }
-    val formKeyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        pickerActive = false
-        if (uri != null) scope.launch {
-            readPickedKeyFile(context, uri)
-                .onSuccess { picked -> formKey = picked }
-                .onFailure { error ->
-                    viewModel.reportUiMessage(error.message ?: "That key file could not be read")
-                }
-        }
-    }
     var pendingDownload by remember { mutableStateOf<RemoteFile?>(null) }
     val downloadPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri: Uri? ->
         pickerActive = false
@@ -793,9 +746,7 @@ private fun EclipseWorkspace(
     // reason the preview target is: its file actions resolve against this workspace's context,
     // clipboard and overlays, none of which the screen should know about.
     var transferActionsFor by remember { mutableStateOf<TransferItem?>(null) }
-    var pendingExportPassphrase by remember { mutableStateOf<String?>(null) }
     var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
-    var showExportDialog by remember { mutableStateOf(false) }
     var showImportDialog by remember { mutableStateOf(false) }
     var pendingTextExport by remember { mutableStateOf<ByteArray?>(null) }
     var pendingScreenExport by remember { mutableStateOf<ByteArray?>(null) }
@@ -803,46 +754,9 @@ private fun EclipseWorkspace(
     var pendingAccountImportUri by remember { mutableStateOf<Uri?>(null) }
     var showAccountExportDialog by remember { mutableStateOf(false) }
     var showAccountImportDialog by remember { mutableStateOf(false) }
-    var showKeyGenDialog by remember { mutableStateOf(false) }
-    var pendingKeyPair by remember { mutableStateOf<GeneratedKeyPair?>(null) }
-    val pubKeyPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri: Uri? ->
-        pickerActive = false
-        val pair = pendingKeyPair
-        pendingKeyPair = null
-        if (uri != null && pair != null) scope.launch {
-            writeDocument(context, uri, pair.publicLine.toByteArray(Charsets.UTF_8))
-                .onFailure { viewModel.reportUiFailure("Could not save public key", it) }
-        }
-    }
-    val privateKeyPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/x-pem-file")) { uri: Uri? ->
-        pickerActive = false
-        val pair = pendingKeyPair
-        if (uri != null && pair != null) {
-            // Hold pickerActive across the write so the PIN lock cannot re-arm in the gap before
-            // the public-key picker opens, and only chain it once the private key has landed.
-            pickerActive = true
-            scope.launch {
-                writeDocument(context, uri, pair.privatePem.toByteArray(Charsets.UTF_8))
-                    .onSuccess { pubKeyPicker.launch("${pair.defaultPrivateName}.pub") }
-                    .onFailure {
-                        pickerActive = false
-                        pendingKeyPair = null
-                        viewModel.reportUiFailure("Could not save private key", it)
-                    }
-            }
-        } else {
-            pendingKeyPair = null
-        }
-    }
     val configImportPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         pickerActive = false
         if (uri != null) viewModel.importOpenSshConfig(uri)
-    }
-    val exportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri: Uri? ->
-        pickerActive = false
-        val pass = pendingExportPassphrase
-        pendingExportPassphrase = null
-        if (uri != null && pass != null) viewModel.exportVault(pass, uri)
     }
     val importPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         pickerActive = false
@@ -1002,6 +916,20 @@ private fun EclipseWorkspace(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
+    // Re-read on every resume, for the same reason the biometric capability above is: the known-hosts
+    // window writes through `SshConnectionManager`, which this view model is not subscribed to - the
+    // store is an in-memory map plus a file and announces nothing - so the copy in `knownHostsState`
+    // is a snapshot that only a fresh read can move. Without this, forgetting a fingerprint in that
+    // window would leave the Settings row counting one that is gone, and the row is where a user
+    // checks whether the thing they just did took effect. Cheap enough to do unconditionally: one
+    // copy of a map that holds a host key per trusted host.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshKnownHosts()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     // Turning the switch on requires a successful prompt, so the setting can never claim a
     // protection the device will not actually give. Failure has to be *reported*, though: with the
     // error callback dropped, a device with nothing enrolled showed a switch that flicked back with
@@ -1030,8 +958,6 @@ private fun EclipseWorkspace(
             { reason -> viewModel.reportUiMessage("Biometric unlock not enabled: $reason") },
         )
     }
-    var showAddHost by remember { mutableStateOf(false) }
-    var showEditHost by remember { mutableStateOf<HostProfile?>(null) }
     var showHostDetails by remember { mutableStateOf<HostProfile?>(null) }
     // The host whose port-forwarding manager sheet is open, by id rather than by profile: the sheet
     // edits the host's saved rules, so it must read the *current* profile from the hosts flow every
@@ -1115,7 +1041,7 @@ private fun EclipseWorkspace(
             )
         }
     }
-    // The menu's Remote desktop item: a saved, enabled target opens the viewer straight away;
+    // The menu's VNC Viewer item: a saved, enabled target opens the viewer straight away;
     // anything else - never configured, or parked with "Offer in the menu" off - opens the
     // endpoint dialog, because the entry point exists precisely so a first use does not have to
     // hunt for a settings screen before it can type a port.
@@ -1127,7 +1053,7 @@ private fun EclipseWorkspace(
             remoteDesktopHostId = host.id
         }
     }
-    // The menu's RDP desktop item: the VNC item's rule, now that the viewer it routes to exists.
+    // The menu's RDP Viewer item: the VNC item's rule, now that the viewer it routes to exists.
     // A saved, enabled target goes straight to the viewer window through the token handoff;
     // never configured or parked opens the endpoint dialog, which is also where a parked target
     // gets re-enabled.
@@ -1178,7 +1104,16 @@ private fun EclipseWorkspace(
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP ->
-                    if (!pickerActive) backgroundedAtMs = System.currentTimeMillis()
+                    // Two populations of picker hold the countdown off, and both have to be asked.
+                    // `pickerActive` is this composition's own flag, set by the launchers in this
+                    // file. The gate is the process-wide one, held by the windows that own their
+                    // pickers now - a generated key pair, an exported backup, a saved install log -
+                    // and a window cannot reach a `remember` owned here, which is exactly why the
+                    // gate exists. A picker either of them opened reports the process as
+                    // backgrounded just the same, so either one alone is a reason not to start.
+                    if (!pickerActive && !viewModel.vaultUnlockGate.pickerActive) {
+                        backgroundedAtMs = System.currentTimeMillis()
+                    }
                 Lifecycle.Event.ON_START -> {
                     val wentAwayAtMs = backgroundedAtMs
                     backgroundedAtMs = null
@@ -1311,7 +1246,7 @@ private fun EclipseWorkspace(
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
-                    onAddHost = { showAddHost = true },
+                    onAddHost = { openHostForm(context) },
                     onConnect = { host ->
                         // The local Ubuntu card never opens the login: there is nothing to
                         // authenticate (the session is the app's own uid), so the tap goes straight
@@ -1320,7 +1255,7 @@ private fun EclipseWorkspace(
                     },
                     onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
-                    onEditHost = { showEditHost = it },
+                    onEditHost = { openHostForm(context, it) },
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
@@ -1427,39 +1362,18 @@ private fun EclipseWorkspace(
                         }
                     },
                     onStopForward = viewModel::stopForwarding,
-                    onExportVault = { showExportDialog = true },
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
-                    onGenerateKey = { showKeyGenDialog = true },
                     onImportSshConfig = { pickerActive = true; configImportPicker.launch(arrayOf("text/plain", "*/*")) },
                     onBiometric = ::setBiometric,
                     onDarkTheme = viewModel::setDarkTheme,
-                    onKeepAlive = viewModel::setKeepAliveSeconds,
-                    onReconnectBase = viewModel::setReconnectBaseSeconds,
-                    onClipboard = viewModel::setClipboardSeconds,
-                    onTerminalFontSize = viewModel::setTerminalFontSize,
                     onTerminalKeyRow = viewModel::setTerminalKeyRowVisible,
-                    onTerminalMinColumns = viewModel::setTerminalMinColumns,
+                    onTerminalFontSize = viewModel::setTerminalFontSize,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
-                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
-                    onTerminalKeyBarJson = viewModel::setTerminalKeyBarJson,
-                    onSetPin = viewModel::setPin,
-                    onClearPin = viewModel::clearPin,
-                    verifyPin = viewModel::verifyPin,
-                    onForgetKnownHost = viewModel::forgetKnownHost,
-                    onClearKnownHosts = viewModel::clearKnownHosts,
-                    onForgetAllCredentials = viewModel::forgetAllCredentials,
-                    onCopyDiagnostics = { viewModel.copyToClipboard(viewModel.exportDiagnostics()) },
-                    onSaveDiagnostics = {
-                        pendingTextExport = viewModel.exportDiagnostics().toByteArray()
-                        pickerActive = true
-                        textExportPicker.launch("eclipse-diagnostics.log")
-                    },
-                    onClearDiagnostics = viewModel::clearDiagnostics,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1501,7 +1415,7 @@ private fun EclipseWorkspace(
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
-                    onAddHost = { showAddHost = true },
+                    onAddHost = { openHostForm(context) },
                     onConnect = { host ->
                         // The local Ubuntu card never opens the login: there is nothing to
                         // authenticate (the session is the app's own uid), so the tap goes straight
@@ -1510,7 +1424,7 @@ private fun EclipseWorkspace(
                     },
                     onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
-                    onEditHost = { showEditHost = it },
+                    onEditHost = { openHostForm(context, it) },
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
@@ -1617,39 +1531,18 @@ private fun EclipseWorkspace(
                         }
                     },
                     onStopForward = viewModel::stopForwarding,
-                    onExportVault = { showExportDialog = true },
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
-                    onGenerateKey = { showKeyGenDialog = true },
                     onImportSshConfig = { pickerActive = true; configImportPicker.launch(arrayOf("text/plain", "*/*")) },
                     onBiometric = ::setBiometric,
                     onDarkTheme = viewModel::setDarkTheme,
-                    onKeepAlive = viewModel::setKeepAliveSeconds,
-                    onReconnectBase = viewModel::setReconnectBaseSeconds,
-                    onClipboard = viewModel::setClipboardSeconds,
-                    onTerminalFontSize = viewModel::setTerminalFontSize,
                     onTerminalKeyRow = viewModel::setTerminalKeyRowVisible,
-                    onTerminalMinColumns = viewModel::setTerminalMinColumns,
+                    onTerminalFontSize = viewModel::setTerminalFontSize,
                     onLegacyAlgorithms = viewModel::setLegacyAlgorithms,
                     onBlockScreenshots = viewModel::setBlockScreenshots,
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
-                    onVaultAutoLock = viewModel::setVaultAutoLockMinutes,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
-                    onTerminalKeyBarJson = viewModel::setTerminalKeyBarJson,
-                    onSetPin = viewModel::setPin,
-                    onClearPin = viewModel::clearPin,
-                    verifyPin = viewModel::verifyPin,
-                    onForgetKnownHost = viewModel::forgetKnownHost,
-                    onClearKnownHosts = viewModel::clearKnownHosts,
-                    onForgetAllCredentials = viewModel::forgetAllCredentials,
-                    onCopyDiagnostics = { viewModel.copyToClipboard(viewModel.exportDiagnostics()) },
-                    onSaveDiagnostics = {
-                        pendingTextExport = viewModel.exportDiagnostics().toByteArray()
-                        pickerActive = true
-                        textExportPicker.launch("eclipse-diagnostics.log")
-                    },
-                    onClearDiagnostics = viewModel::clearDiagnostics,
                     // The shell is the one screen that must not be inset by this Scaffold. Its own
                     // padding comes from `safeDrawingPadding` inside the terminal, and applying both
                     // would inset the grid twice - once for a navigation bar that is not there and
@@ -1666,20 +1559,6 @@ private fun EclipseWorkspace(
         }
     }
 
-    if (showAddHost) {
-        AddHostDialog(
-            pickedKey = formKey,
-            onPickKey = { pickerActive = true; formKeyPicker.launch(KEY_FILE_MIME_TYPES) },
-            onForgetPickedKey = { formKey = null },
-            onDismiss = { formKey = null; showAddHost = false },
-            onSave = { profile, credentials ->
-                viewModel.saveHost(profile, credentials)
-                formKey = null
-                showAddHost = false
-            },
-            onPasteSecret = viewModel::pasteSecret,
-        )
-    }
     showHostDetails?.let { host ->
         HostDetailsSheet(
             host = host,
@@ -1737,22 +1616,6 @@ private fun EclipseWorkspace(
                 onDismiss = { rdpDesktopHostId = null },
             )
         }
-    }
-    showEditHost?.let { host ->
-        AddHostDialog(
-            initialHost = host,
-            storedCredentials = state.savedCredentials[host.id] ?: StoredCredentials(),
-            pickedKey = formKey,
-            onPickKey = { pickerActive = true; formKeyPicker.launch(KEY_FILE_MIME_TYPES) },
-            onForgetPickedKey = { formKey = null },
-            onDismiss = { formKey = null; showEditHost = null },
-            onSave = { profile, credentials ->
-                viewModel.saveHost(profile, credentials)
-                formKey = null
-                showEditHost = null
-            },
-            onPasteSecret = viewModel::pasteSecret,
-        )
     }
     pendingDeleteHost?.let { host ->
         AlertDialog(
@@ -1841,7 +1704,7 @@ private fun EclipseWorkspace(
                 selectedKeyName = selectedKeyName,
                 onEditHost = {
                     viewModel.consumeAuthFailure()
-                    showEditHost = failedHost
+                    openHostForm(context, failedHost)
                 },
                 onRetry = { password, passphrase, save ->
                     viewModel.consumeAuthFailure()
@@ -1857,15 +1720,6 @@ private fun EclipseWorkspace(
     // was open simply takes its question with it.
     state.reconnectPrompt?.let { prompt ->
         ReconnectDialog(prompt = prompt, onReconnect = viewModel::answerReconnectPrompt)
-    }
-    if (showExportDialog) {
-        PassphraseDialog(
-            title = "Export encrypted backup",
-            confirmLabel = "Export",
-            onDismiss = { showExportDialog = false },
-            onConfirm = { pass -> showExportDialog = false; pendingExportPassphrase = pass; pickerActive = true; exportPicker.launch("eclipse-backup.enc") },
-            onPasteSecret = viewModel::pasteSecret,
-        )
     }
     if (showImportDialog) {
         PassphraseDialog(
@@ -1903,40 +1757,15 @@ private fun EclipseWorkspace(
             onPasteSecret = viewModel::pasteSecret,
         )
     }
-    if (showKeyGenDialog) {
-        KeyGenDialog(
-            onDismiss = { showKeyGenDialog = false },
-            onConfirm = { algorithm ->
-                showKeyGenDialog = false
-                // Generated off the main thread. RSA key generation searches for primes, so its cost
-                // is unbounded rather than merely large: 4096-bit generation is seconds on a fast
-                // phone and tens of seconds on a slow one, and this ran inside the dialog's click
-                // handler. That is a main-thread block well past the 5 s ANR threshold — the tap
-                // froze the whole UI and Android offered to kill the app, with the key that was
-                // being generated lost when the user accepted.
-                //
-                // pickerActive is set before the coroutine starts, exactly as the screen export
-                // does, so the PIN lock cannot re-arm during the wait and then swallow the file
-                // picker that opens at the end of it.
-                pickerActive = true
-                scope.launch {
-                    val generated = withContext(Dispatchers.Default) { runCatching { algorithm.generate() } }
-                    generated
-                        .onSuccess { pair ->
-                            pendingKeyPair = pair
-                            privateKeyPicker.launch(pair.defaultPrivateName)
-                        }
-                        .onFailure { error ->
-                            // Reachable: the generator rejects a coordinate it cannot encode, and a
-                            // provider can refuse an algorithm outright. Thrown from the click
-                            // handler this crashed the activity; here it is a message.
-                            pickerActive = false
-                            viewModel.reportUiFailure("Could not generate the key pair", error)
-                        }
-                }
-            },
-        )
-    }
+    // The key-generation dialog stood here, and with it the two chained pickers that wrote the pair
+    // out. All of it is [KeyGenActivity]'s now: the algorithm chooser, the off-main-thread generation
+    // the comment used to justify, and the hold across the private-key write that kept the PIN lock
+    // from re-arming in the gap before the public-key picker opened. The two pickers went with the
+    // dialog rather than staying behind, because nothing else ever launched them - the private-key
+    // picker was the dialog's only caller and the public-key one only ran from inside its callback.
+    //
+    // The editor request below is a different flow and stays: it travels through the process-wide
+    // handoff for reasons of its own.
     // The editor opens in its own window (see [TextEditorActivity]) so it sits fully on top of the
     // workspace instead of floating over it; the request itself travels through the process-wide
     // [EditorRequests] handoff because it carries a live provider an intent cannot parcel. Cleared
@@ -2259,7 +2088,7 @@ private fun WorkspaceScaffold(
      */
     onManageForwards: (HostProfile) -> Unit = {},
     /**
-     * Opens one host's remote desktop - the card menu's Remote desktop item. A host with a saved,
+     * Opens one host's VNC desktop - the card menu's VNC Viewer item. A host with a saved,
      * enabled VNC target goes straight to the viewer window; the rest get the endpoint dialog
      * first. Named `onRemoteDesktop` rather than `onOpenRemoteDesktop` because both of those are
      * "open": which one depends on the host's saved target, and the caller does not care.
@@ -2272,7 +2101,7 @@ private fun WorkspaceScaffold(
      */
     onWakeOnLan: (HostProfile) -> Unit = {},
     /**
-     * Opens one host's RDP desktop - the card menu's RDP desktop item, with the same routing the
+     * Opens one host's RDP desktop - the card menu's RDP Viewer item, with the same routing the
      * VNC one has: a saved, enabled target goes straight to the viewer window, the rest get the
      * endpoint dialog first. Named `onRdpDesktop` rather than `onOpenRdpDesktop` for the same
      * reason [onRemoteDesktop] is.
@@ -2330,38 +2159,42 @@ private fun WorkspaceScaffold(
     onOpenTransferActions: (TransferItem) -> Unit = {},
     onAddForward: (ForwardType, Int, String?, Int?) -> Unit = { _, _, _, _ -> },
     onStopForward: (String) -> Unit = {},
-    onExportVault: () -> Unit = {},
     onImportVault: () -> Unit = {},
     onImportAccount: () -> Unit = {},
-    onGenerateKey: () -> Unit = {},
     onImportSshConfig: () -> Unit = {},
     onBiometric: (Boolean) -> Unit,
     onDarkTheme: (Boolean) -> Unit,
-    onKeepAlive: (Int) -> Unit = {},
-    onReconnectBase: (Int) -> Unit = {},
-    onClipboard: (Int) -> Unit = {},
-    onTerminalFontSize: (Int) -> Unit = {},
     onTerminalKeyRow: (Boolean) -> Unit = {},
-    onTerminalMinColumns: (Int) -> Unit = {},
     onLegacyAlgorithms: (Boolean) -> Unit = {},
     onBlockScreenshots: (Boolean) -> Unit = {},
     onReconnectAskFirst: (Boolean) -> Unit = {},
-    onVaultAutoLock: (Int) -> Unit = {},
+    /**
+     * Pinch-to-zoom on the immersive terminal, which is *not* the Settings row of the same name.
+     *
+     * Six sibling callbacks - keep-alive, clipboard, font size's own row, terminal width, reconnect
+     * delay and vault auto-lock - were deleted from this list when those rows became Activities, and
+     * this one is the exception that shows why the deletion was per-callback rather than per-setting:
+     * the terminal persists a pinch-to-zoom result through [TerminalScreen], from a window that has
+     * no Activity of its own and no way to start one mid-gesture. The Settings row and the gesture
+     * write the same field, so the Activity and this callback are two doors into one setting.
+     */
+    onTerminalFontSize: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit = {},
     // The keep-system-bars switch was wired into SettingsScreen and both scaffold call sites, but
     // never into the scaffold's own parameter list, so all three references failed to resolve.
     onTerminalKeepSystemBars: (Boolean) -> Unit = {},
-    // The shortcut bar's whole configuration, encoded - one write per Save in the bar's dialog.
-    onTerminalKeyBarJson: (String) -> Unit = {},
-    onSetPin: (String) -> Unit = {},
-    onClearPin: () -> Unit = {},
-    verifyPin: suspend (String) -> Boolean = { false },
-    onForgetKnownHost: (String) -> Unit = {},
-    onClearKnownHosts: () -> Unit = {},
-    onForgetAllCredentials: () -> Unit = {},
-    onCopyDiagnostics: () -> Unit = {},
-    onSaveDiagnostics: () -> Unit = {},
-    onClearDiagnostics: () -> Unit = {},
+    // The shortcut bar's configuration blob and the diagnostics copy/save/clear trio stood here for
+    // the same reason as the six above - to carry a dialog's answer back out to the clipboard and the
+    // SAF picker this scaffold owns. All four rows have a window of their own now, and each of those
+    // windows holds its own clipboard handle and launches its own picker, so this list has nothing
+    // left to forward.
+    // Six more callbacks stood here - onSetPin, onClearPin, verifyPin, onForgetKnownHost,
+    // onClearKnownHosts and onForgetAllCredentials - and they existed for the same reason the six
+    // above did: to carry a dialog's answer back to the view model. PIN, known hosts and saved
+    // credentials are windows of their own now, and each writes to its store directly, so there is
+    // nothing left here to forward. `verifyPin` still exists on the view model and is still passed to
+    // the lock screen that gates app startup - that one is a different caller with a live need for it,
+    // and this list was only ever one of its two.
 ) {
     // A shell owns the whole window, so it composes outside the Scaffold entirely: no top bar, no
     // Scaffold insets, nothing above the grid but the session strip. This is the branch the app enters
@@ -2417,7 +2250,39 @@ private fun WorkspaceScaffold(
         topBar = {
             if (destination == Destination.HOSTS) {
                 TopAppBar(
-                    title = {},
+                    // The filter sits in the bar rather than as the first row of the column below,
+                    // so it stays reachable while the host list scrolls - it filters that list, it
+                    // is not an entry in it. It takes the title slot, which is the space the bar
+                    // has going spare, and leaves the two actions where they were.
+                    //
+                    // Single-line by contract: the bar is one row tall, so a field that grew would
+                    // either clip or push the actions out of it. The placeholder carries the
+                    // ellipsis rather than the field, because on a narrow screen the placeholder is
+                    // what gets truncated - the text the user types is theirs to scroll.
+                    title = {
+                        OutlinedTextField(
+                            value = state.query,
+                            onValueChange = onSearch,
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = {
+                                Text(
+                                    "Search hosts, tags, or usernames",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                            leadingIcon = { Icon(Icons.Default.Search, null) },
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyMedium,
+                            shape = RoundedCornerShape(16.dp),
+                            // Transparent so the field reads as part of the bar instead of as a
+                            // second surface stacked on it; the outline still marks the hit area.
+                            colors = OutlinedTextFieldDefaults.colors(
+                                unfocusedContainerColor = Color.Transparent,
+                                focusedContainerColor = Color.Transparent,
+                            ),
+                        )
+                    },
                     actions = {
                         IconButton(onClick = onImportAccount) { Icon(Icons.Default.CloudDownload, "Import account") }
                         IconButton(onClick = onAddHost) { Icon(Icons.Default.Add, "Add host") }
@@ -2497,7 +2362,7 @@ private fun WorkspaceScaffold(
         Column(Modifier.padding(padding).fillMaxSize().widthIn(max = 1280.dp).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
             when (destination) {
                 Destination.HOSTS -> HostsScreen(
-                    state, localLinuxCard, onSearch, onAddHost, onConnect, onShowDetails, onEditHost,
+                    state, localLinuxCard, onAddHost, onConnect, onShowDetails, onEditHost,
                     onRemoveHost, onToggleFavoriteHost, onExportAccount, onDuplicateHost,
                     onManageForwards, onRemoteDesktop, onWakeOnLan, onRdpDesktop,
                 )
@@ -2510,27 +2375,13 @@ private fun WorkspaceScaffold(
                 )
                 Destination.SETTINGS -> SettingsScreen(
                     state, linuxUserspace, onBiometric, onDarkTheme, onAddForward, onStopForward,
-                    onExportVault, onImportVault, onKeepAlive, onClipboard, onTerminalFontSize,
-                    onTerminalMinColumns = onTerminalMinColumns,
-                    onReconnectBase = onReconnectBase,
+                    onImportVault,
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
                     onReconnectAskFirst = onReconnectAskFirst,
-                    onVaultAutoLock = onVaultAutoLock,
                     onTerminalTheme = onTerminalTheme,
                     onTerminalKeepSystemBars = onTerminalKeepSystemBars,
-                    onTerminalKeyBarJson = onTerminalKeyBarJson,
-                    onSetPin = onSetPin,
-                    onClearPin = onClearPin,
-                    verifyPin = verifyPin,
-                    onForgetKnownHost = onForgetKnownHost,
-                    onClearKnownHosts = onClearKnownHosts,
-                    onGenerateKey = onGenerateKey,
                     onImportSshConfig = onImportSshConfig,
-                    onForgetAllCredentials = onForgetAllCredentials,
-                    onCopyDiagnostics = onCopyDiagnostics,
-                    onSaveDiagnostics = onSaveDiagnostics,
-                    onClearDiagnostics = onClearDiagnostics,
                 )
             }
         }
@@ -2541,7 +2392,6 @@ private fun WorkspaceScaffold(
 private fun HostsScreen(
     state: MainUiState,
     localLinuxCard: StateFlow<HostProfile?>,
-    onSearch: (String) -> Unit,
     onAddHost: () -> Unit,
     onConnect: (HostProfile) -> Unit,
     onShowDetails: (HostProfile) -> Unit,
@@ -2557,16 +2407,6 @@ private fun HostsScreen(
 ) {
     var favoritesOnly by rememberSaveable { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
-    OutlinedTextField(
-        value = state.query,
-        onValueChange = onSearch,
-        modifier = Modifier.fillMaxWidth(),
-        placeholder = { Text("Search hosts, tags, or usernames") },
-        leadingIcon = { Icon(Icons.Default.Search, null) },
-        singleLine = true,
-        shape = RoundedCornerShape(16.dp),
-    )
-    Spacer(Modifier.height(18.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
         Text("All hosts", style = MaterialTheme.typography.titleMedium)
         Surface(shape = RoundedCornerShape(50), color = MaterialTheme.colorScheme.secondaryContainer) {
@@ -2713,8 +2553,12 @@ private fun HostCard(
                         // host is opened for. A host with no saved endpoint gets the config
                         // dialog rather than nothing: the menu item is the entry point, not the
                         // reminder that a settings screen exists.
+                        // Named for the protocol it dials, not for the umbrella: "Remote desktop"
+                        // was unambiguous while VNC was the only protocol, and became the parent
+                        // of the item below the day RDP landed beside it - two entries whose
+                        // labels read as one thing offered twice.
                         DropdownMenuItem(
-                            text = { Text("Remote desktop") },
+                            text = { Text("VNC Viewer") },
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRemoteDesktop(host) },
                         )
@@ -2734,7 +2578,7 @@ private fun HostCard(
                         // point too - a saved, enabled target goes straight to the viewer, and
                         // the routing for both lives with [requestRdpDesktop].
                         DropdownMenuItem(
-                            text = { Text("RDP desktop") },
+                            text = { Text("RDP Viewer") },
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRdpDesktop(host) },
                         )
@@ -4089,15 +3933,6 @@ private fun TerminalCommandBar(
 }
 
 /**
- * How long the form waits after the last passphrase keystroke before trying to read the picked key.
- *
- * Reading is not free — an encrypted OpenSSH key runs bcrypt-pbkdf on purpose — so probing on every
- * keystroke would queue one derivation per character and report verdicts for passphrase prefixes the
- * user was still in the middle of typing.
- */
-private const val KEY_PROBE_DEBOUNCE_MS = 300L
-
-/**
  * What the key picker will accept. The wildcard is last and is what actually matters: private keys
  * have no registered MIME type, so providers report them as anything from `text/plain` to
  * `application/octet-stream` to nothing at all, and a narrower filter greys out the very file the
@@ -4726,20 +4561,6 @@ private fun ChmodDialog(name: String, permissions: String?, onDismiss: () -> Uni
     )
 }
 
-/**
- * Accent choices, each paired with a name. The name is the swatch's accessibility label: the
- * swatches carry no text, so without it TalkBack announces six identical unlabelled buttons and
- * the colour — the only thing distinguishing them — is unavailable to anyone who cannot see it.
- */
-private val ACCENT_COLORS = listOf(
-    "Red" to 0xFFE53935L,
-    "Blue" to 0xFF1E88E5L,
-    "Green" to 0xFF43A047L,
-    "Orange" to 0xFFFB8C00L,
-    "Purple" to 0xFF8E24AAL,
-    "Cyan" to 0xFF00ACC1L,
-)
-
 private fun safeFileName(value: String): String = value.trim().replace(Regex("[^A-Za-z0-9._-]+"), "_").ifBlank { "account" }
 
 @Composable
@@ -5049,47 +4870,32 @@ private fun SettingsScreen(
     onDarkTheme: (Boolean) -> Unit,
     onAddForward: (ForwardType, Int, String?, Int?) -> Unit,
     onStopForward: (String) -> Unit,
-    onExportVault: () -> Unit,
     onImportVault: () -> Unit,
-    onKeepAlive: (Int) -> Unit,
-    onClipboard: (Int) -> Unit,
-    onTerminalFontSize: (Int) -> Unit,
-    onTerminalMinColumns: (Int) -> Unit = {},
-    // After the last parameter its only caller passes positionally, so adding it did not shift
-    // onTerminalFontSize onto a different slot.
-    onReconnectBase: (Int) -> Unit = {},
+    // Six `onXxx: (Int) -> Unit` callbacks used to sit here - keep-alive, clipboard, font size,
+    // terminal width, reconnect delay and vault auto-lock. They existed only to carry a dialog's
+    // answer back up to the ViewModel; those six answers are now written directly to the settings
+    // DataStore by the window that collects them, so there is nothing left for this screen to
+    // forward and no parameter to forward it through.
     onLegacyAlgorithms: (Boolean) -> Unit,
     onBlockScreenshots: (Boolean) -> Unit,
     onReconnectAskFirst: (Boolean) -> Unit = {},
-    onVaultAutoLock: (Int) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onTerminalKeepSystemBars: (Boolean) -> Unit = {},
-    onTerminalKeyBarJson: (String) -> Unit = {},
-    onSetPin: (String) -> Unit,
-    onClearPin: () -> Unit,
-    verifyPin: suspend (String) -> Boolean,
-    onForgetKnownHost: (String) -> Unit,
-    onClearKnownHosts: () -> Unit,
-    onGenerateKey: () -> Unit,
+    // Six more `onXxx` callbacks stood here for the same reason and went the same way, with one worth
+    // naming: `verifyPin` was never only this screen's. The lock screen that gates app startup takes
+    // its own, and it still does - PIN lock's Settings window calls `SettingsRepository.verifyPin`
+    // itself now, so this screen has no remaining use for any of the six.
     onImportSshConfig: () -> Unit,
-    onForgetAllCredentials: () -> Unit = {},
-    onCopyDiagnostics: () -> Unit = {},
-    onSaveDiagnostics: () -> Unit = {},
-    onClearDiagnostics: () -> Unit = {},
+    // Eight more went the other way: not into a store, but into a window. `onExportVault`,
+    // `onGenerateKey`, `onTerminalKeyBarJson`, the diagnostics copy/save/clear trio and the install
+    // log's own copy/save pair each carried a dialog's answer up to the scaffold, which owned the
+    // clipboard and the SAF picker. Those rows open an Activity now, and an Activity reaches both of
+    // those itself, so there is nothing left for this screen to hand down.
 ) {
+    // The six rows below that open a window of their own start an Activity from here, which is the
+    // one thing this screen now needs from the platform that a callback could not give it.
+    val context = LocalContext.current
     var showForwardDialog by remember { mutableStateOf(false) }
-    var showKeepAliveDialog by remember { mutableStateOf(false) }
-    var showClipboardDialog by remember { mutableStateOf(false) }
-    var showReconnectDialog by remember { mutableStateOf(false) }
-    var showFontDialog by remember { mutableStateOf(false) }
-    var showWidthDialog by remember { mutableStateOf(false) }
-    var showPinDialog by remember { mutableStateOf(false) }
-    var showVaultAutoLockDialog by remember { mutableStateOf(false) }
-    var showKnownHosts by remember { mutableStateOf(false) }
-    var showKeyBarDialog by remember { mutableStateOf(false) }
-    var confirmForgetCredentials by remember { mutableStateOf(false) }
-    var showDiagnostics by remember { mutableStateOf(false) }
-    var showAbout by remember { mutableStateOf(false) }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -5097,8 +4903,10 @@ private fun SettingsScreen(
     Spacer(Modifier.height(8.dp))
     SettingsSection("Security") {
         SettingRow(Icons.Default.Lock, "Biometric vault lock", "Protect passwords and private keys") { Switch(checked = state.settings.biometricUnlock, onCheckedChange = onBiometric) }
-        SettingRow(Icons.Default.Key, "Generate SSH key pair", "RSA 2048/4096 or ECDSA P-256, exported as PEM") { TextButton(onClick = onGenerateKey) { Text("Generate") } }
-        SettingRow(Icons.Default.Lock, "PIN lock", if (state.settings.pinEnabled) "Enabled · PIN fallback at launch" else "Set a PIN for quick unlock") { TextButton(onClick = { showPinDialog = true }) { Text(if (state.settings.pinEnabled) "Change" else "Set") } }
+        // Building the pair is the window's own work now, not this list's: generating one is seconds
+        // to tens of seconds of prime searching, and the dialog that used to hold the tap froze for it.
+        SettingRow(Icons.Default.Key, "Generate SSH key pair", "RSA 2048/4096 or ECDSA P-256, exported as PEM") { TextButton(onClick = { context.startActivity(Intent(context, KeyGenActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Generate SSH key pair" }) { Text("Generate") } }
+        SettingRow(Icons.Default.Lock, "PIN lock", if (state.settings.pinEnabled) "Enabled · PIN fallback at launch" else "Set a PIN for quick unlock") { TextButton(onClick = { context.startActivity(Intent(context, PinLockActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "PIN lock" }) { Text(if (state.settings.pinEnabled) "Change" else "Set") } }
         // The subtitle says so when there is no lock to re-arm: with no PIN set the vault has no
         // lock screen at all, so the delay would be a setting over nothing.
         SettingRow(
@@ -5109,9 +4917,9 @@ private fun SettingsScreen(
                 state.settings.vaultAutoLockMinutes == 0 -> "Never re-locks while the app is in the background"
                 else -> "Re-locks after ${state.settings.vaultAutoLockMinutes} minutes in the background"
             },
-        ) { TextButton(onClick = { showVaultAutoLockDialog = true }) { Text("Change") } }
+        ) { TextButton(onClick = { context.startActivity(Intent(context, VaultAutoLockActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Auto-lock vault" }) { Text("Change") } }
         SettingRow(Icons.Default.Security, "Encrypted vault", "AES-256-GCM · Android Keystore") { Text("Protected", color = EclipseSuccess, style = MaterialTheme.typography.labelMedium) }
-        SettingRow(Icons.Default.Key, "Known hosts", "${state.knownHosts.size} trusted fingerprint(s)") { TextButton(onClick = { showKnownHosts = true }) { Text("Manage") } }
+        SettingRow(Icons.Default.Key, "Known hosts", "${state.knownHosts.size} trusted fingerprint(s)") { TextButton(onClick = { context.startActivity(Intent(context, KnownHostsActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Known hosts" }) { Text("Manage") } }
         SettingRow(
             Icons.Default.Security,
             "Saved credentials",
@@ -5123,44 +4931,28 @@ private fun SettingsScreen(
                 "$savedCredentialCount host(s) · passwords and keys in the vault"
             },
         ) {
-            TextButton(
-                onClick = { confirmForgetCredentials = true },
-                enabled = savedCredentialCount > 0,
-            ) { Text("Forget all") }
+            // "Manage" rather than "Forget all". The row's one action used to be its most destructive
+            // one because there was nowhere to look before deciding; the screen behind it is the list
+            // this count always implied, so the thing to offer here is the going-and-looking. It also
+            // means forgetting one host no longer costs forgetting every other host to reach it.
+            TextButton(onClick = { context.startActivity(Intent(context, SavedCredentialsActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Saved credentials" }) { Text("Manage") }
         }
-    }
-    if (confirmForgetCredentials) {
-        AlertDialog(
-            onDismissRequest = { confirmForgetCredentials = false },
-            title = { Text("Forget every saved credential?") },
-            text = {
-                Text(
-                    "Passwords, private keys and passphrases saved for all $savedCredentialCount host(s) " +
-                        "are deleted from the vault. The hosts themselves are kept, and each will ask for " +
-                        "credentials again at the next connect. Sessions already open are unaffected.",
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = { onForgetAllCredentials(); confirmForgetCredentials = false },
-                ) { Text("Forget all", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = { TextButton(onClick = { confirmForgetCredentials = false }) { Text("Cancel") } },
-        )
     }
     Spacer(Modifier.height(14.dp))
     SettingsSection("Workspace") {
         SettingRow(Icons.Default.Settings, "Dark appearance", "Optimized for terminal work") { Switch(checked = state.settings.darkTheme, onCheckedChange = onDarkTheme) }
-        SettingRow(Icons.Default.Wifi, "Keep-alive interval", "Every ${state.settings.keepAliveSeconds} seconds") { TextButton(onClick = { showKeepAliveDialog = true }) { Text("Change") } }
-        SettingRow(Icons.Default.Security, "Clipboard auto-clear", if (state.settings.clearClipboardAfterSeconds == 0) "Never clear copied secrets automatically" else "Clear secrets after ${state.settings.clearClipboardAfterSeconds} seconds") { TextButton(onClick = { showClipboardDialog = true }) { Text("Change") } }
-        SettingRow(Icons.Default.Terminal, "Terminal font size", "${state.settings.terminalFontSize} sp JetBrains Mono") { TextButton(onClick = { showFontDialog = true }) { Text("Change") } }
+        SettingRow(Icons.Default.Wifi, "Keep-alive interval", "Every ${state.settings.keepAliveSeconds} seconds") { TextButton(onClick = { context.startActivity(Intent(context, KeepAliveActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Keep-alive interval" }) { Text("Change") } }
+        SettingRow(Icons.Default.Security, "Clipboard auto-clear", if (state.settings.clearClipboardAfterSeconds == 0) "Never clear copied secrets automatically" else "Clear secrets after ${state.settings.clearClipboardAfterSeconds} seconds") { TextButton(onClick = { context.startActivity(Intent(context, ClipboardClearActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Clipboard auto-clear" }) { Text("Change") } }
+        SettingRow(Icons.Default.Terminal, "Terminal font size", "${state.settings.terminalFontSize} sp JetBrains Mono") { TextButton(onClick = { context.startActivity(Intent(context, TerminalFontSizeActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Terminal font size" }) { Text("Change") } }
         // Next to the font size because both shape the terminal screen. The subtitle names what the
-        // dialog edits rather than listing the caps - the count changes with the user's own setup.
+        // window edits rather than listing the caps - the count changes with the user's own setup.
+        // The window rather than a dialog because the editor can now be left unsaved: it is a screen
+        // the user can back out of by accident, so it asks before dropping an arrangement.
         SettingRow(
             Icons.Default.Keyboard,
             "Shortcut bar",
             "Choose the keys on the bar, add custom buttons, set the rows",
-        ) { TextButton(onClick = { showKeyBarDialog = true }) { Text("Customize") } }
+        ) { TextButton(onClick = { context.startActivity(Intent(context, ShortcutBarActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Shortcut bar" }) { Text("Customize") } }
         SettingRow(
             Icons.Default.Terminal,
             "Terminal width",
@@ -5169,7 +4961,7 @@ private fun SettingsScreen(
             } else {
                 "At least ${state.settings.terminalMinColumns} columns; drag sideways for the rest"
             },
-        ) { TextButton(onClick = { showWidthDialog = true }) { Text("Change") } }
+        ) { TextButton(onClick = { context.startActivity(Intent(context, TerminalWidthActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Terminal width" }) { Text("Change") } }
         SettingRow(Icons.Default.Terminal, "Terminal theme", "Colours the grid and its background") {
             SettingDropdown(
                 label = "Terminal theme",
@@ -5211,7 +5003,10 @@ private fun SettingsScreen(
     }
     Spacer(Modifier.height(14.dp))
     SettingsSection("Backup & restore") {
-        SettingRow(Icons.Default.CloudUpload, "Export encrypted backup", "Hosts and settings, passphrase-protected") { TextButton(onClick = onExportVault) { Text("Export") } }
+        // The window owns the passphrase field and the SAF picker that follows it, because the two
+        // have to be one motion: the picker leaves the app, and the passphrase must not be left
+        // behind in a list that has already scrolled on.
+        SettingRow(Icons.Default.CloudUpload, "Export encrypted backup", "Hosts and settings, passphrase-protected") { TextButton(onClick = { context.startActivity(Intent(context, ExportBackupActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Export encrypted backup" }) { Text("Export") } }
         SettingRow(Icons.Default.CloudDownload, "Import backup", "Restore hosts and settings") { TextButton(onClick = onImportVault) { Text("Import") } }
         SettingRow(Icons.Default.Computer, "Import OpenSSH config", "Parse Host blocks from ssh_config") { TextButton(onClick = onImportSshConfig) { Text("Import") } }
     }
@@ -5231,7 +5026,7 @@ private fun SettingsScreen(
             Icons.Default.Refresh,
             "Reconnect delay",
             "First retry after ${state.settings.reconnectBaseSeconds} s, then doubling · auto reconnect on network recovery",
-        ) { TextButton(onClick = { showReconnectDialog = true }) { Text("Change") } }
+        ) { TextButton(onClick = { context.startActivity(Intent(context, ReconnectDelayActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Reconnect delay" }) { Text("Change") } }
         SettingRow(
             Icons.Default.Terminal,
             "Connection diagnostics",
@@ -5240,48 +5035,50 @@ private fun SettingsScreen(
             } else {
                 "${state.diagnostics.size} event(s) recorded · no secrets"
             },
-        ) { TextButton(onClick = { showDiagnostics = true }) { Text("View") } }
+        // "View" alone is ambiguous on this list - the Ubuntu row below carries a control too, and
+        // the About row at the end of this block records that a screen reader once heard two rows
+        // as the same word.
+        ) { TextButton(onClick = { context.startActivity(Intent(context, DiagnosticsActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Connection diagnostics" }) { Text("View") } }
     }
     Spacer(Modifier.height(14.dp))
-    LinuxUserspaceSection(linuxUserspace)
+    // The userspace control panel is a window of its own now. Everything that acts on the
+    // environment - install, uninstall, start, stop, repair, the version chooser, and the install
+    // log with its two exports - needed more room than a Settings row has, and the log in
+    // particular was a capped dialog body. What stays on this list is the one fact the list is
+    // for: whether there is an environment, and what it is doing.
+    val linuxUi by linuxUserspace.uiState.collectAsStateWithLifecycle()
+    SettingsSection("Linux userspace") {
+        SettingRow(
+            Icons.Default.Computer,
+            "Ubuntu on this device",
+            linuxUserspaceSummary(linuxUi),
+        ) {
+            // Absent, not disabled, on a device that cannot run it - the rule the section kept: an
+            // unsupported device cannot be offered an install that cannot finish, but it also
+            // should not look like a feature that went missing.
+            if (linuxUi.supported) {
+                TextButton(
+                    onClick = { context.startActivity(Intent(context, UbuntuActivity::class.java)) },
+                    modifier = Modifier.semantics { contentDescription = "Ubuntu on this device" },
+                ) { Text("Open") }
+            }
+        }
+    }
     Spacer(Modifier.height(14.dp))
     SettingsSection("About") {
         SettingRow(Icons.Default.Info, "About EclipseSSH", "Version, libraries and credits") {
+            val context = LocalContext.current
             // Two "View" buttons sit on this screen once diagnostics is counted, and a screen reader
             // hears both of them as just "View" — so the button carries the row it belongs to, the
             // same "setting, action" shape the theme picker's content description uses.
+            //
+            // It opens a window rather than a dialog: the licence list is longer than a capped
+            // dialog body can show, and the rows past the fold were unreachable inside one.
             TextButton(
-                onClick = { showAbout = true },
+                onClick = { context.startActivity(Intent(context, AboutActivity::class.java)) },
                 modifier = Modifier.semantics { contentDescription = "About EclipseSSH" },
             ) { Text("View") }
         }
-    }
-
-    if (showAbout) {
-        AboutDialog(onDismiss = { showAbout = false })
-    }
-
-    if (showKeyBarDialog) {
-        ShortcutBarDialog(
-            initial = remember(state.settings.terminalKeyBarJson) {
-                KeyBarPrefsCodec.decode(state.settings.terminalKeyBarJson)
-            },
-            onDismiss = { showKeyBarDialog = false },
-            onApply = { json ->
-                showKeyBarDialog = false
-                onTerminalKeyBarJson(json)
-            },
-        )
-    }
-
-    if (showDiagnostics) {
-        DiagnosticsDialog(
-            events = state.diagnostics,
-            onDismiss = { showDiagnostics = false },
-            onCopy = onCopyDiagnostics,
-            onSave = { showDiagnostics = false; onSaveDiagnostics() },
-            onClear = onClearDiagnostics,
-        )
     }
 
     if (showForwardDialog) {
@@ -5290,74 +5087,17 @@ private fun SettingsScreen(
             onConfirm = { type, localPort, remoteHost, remotePort -> showForwardDialog = false; onAddForward(type, localPort, remoteHost, remotePort) },
         )
     }
-    if (showKeepAliveDialog) {
-        IntervalDialog(
-            title = "Keep-alive interval",
-            subtitle = "Seconds between SSH keep-alive signals",
-            current = state.settings.keepAliveSeconds,
-            options = listOf(15, 30, 60, 120, 300),
-            onDismiss = { showKeepAliveDialog = false },
-            onConfirm = { onKeepAlive(it); showKeepAliveDialog = false },
-        )
-    }
-    if (showReconnectDialog) {
-        IntervalDialog(
-            title = "Reconnect delay",
-            subtitle = "Wait before the first reconnect attempt; each further attempt doubles it",
-            current = state.settings.reconnectBaseSeconds,
-            options = SettingsRepository.RECONNECT_BASE_CHOICES,
-            onDismiss = { showReconnectDialog = false },
-            onConfirm = { onReconnectBase(it); showReconnectDialog = false },
-        )
-    }
-    if (showClipboardDialog) {
-        IntervalDialog(
-            title = "Clipboard auto-clear",
-            subtitle = "Clear copied secrets after (0 = never)",
-            current = state.settings.clearClipboardAfterSeconds,
-            options = listOf(0, 15, 30, 60, 120),
-            onDismiss = { showClipboardDialog = false },
-            onConfirm = { onClipboard(it); showClipboardDialog = false },
-        )
-    }
-    if (showVaultAutoLockDialog) {
-        VaultAutoLockDialog(
-            current = state.settings.vaultAutoLockMinutes,
-            onDismiss = { showVaultAutoLockDialog = false },
-            onConfirm = { onVaultAutoLock(it); showVaultAutoLockDialog = false },
-        )
-    }
-    if (showFontDialog) {
-        FontSizeDialog(
-            current = state.settings.terminalFontSize,
-            onDismiss = { showFontDialog = false },
-            onConfirm = { onTerminalFontSize(it); showFontDialog = false },
-        )
-    }
-    if (showWidthDialog) {
-        TerminalWidthDialog(
-            current = state.settings.terminalMinColumns,
-            onDismiss = { showWidthDialog = false },
-            onConfirm = { onTerminalMinColumns(it); showWidthDialog = false },
-        )
-    }
-    if (showPinDialog) {
-        PinDialog(
-            enabled = state.settings.pinEnabled,
-            onDismiss = { showPinDialog = false },
-            verifyPin = verifyPin,
-            onSetPin = onSetPin,
-            onClearPin = onClearPin,
-        )
-    }
-    if (showKnownHosts) {
-        KnownHostsDialog(
-            hosts = state.knownHosts,
-            onDismiss = { showKnownHosts = false },
-            onForget = onForgetKnownHost,
-            onClearAll = { onClearKnownHosts(); showKnownHosts = false },
-        )
-    }
+    // The six choice dialogs that used to sit here - keep-alive, reconnect delay, clipboard
+    // auto-clear, auto-lock vault, font size, terminal width - are now windows of their own, opened
+    // from the rows above. Their values are written straight to the settings DataStore, which this
+    // screen reads through its own flow, so the row's subtitle is already correct by the time the
+    // user is back here. Nothing is returned through the intent because nothing needs to be.
+    //
+    // The three security dialogs that sat beside them - PIN, known hosts, saved credentials - went the
+    // same way with one difference worth naming: each of those wrote to a store this screen does not
+    // collect, so coming back here is not enough on its own. The known-hosts count in particular is a
+    // snapshot the view model holds, and a fingerprint forgotten in that window would leave the row
+    // above counting one that is gone; see the ON_RESUME refresh in the workspace.
 }
 
 /**
@@ -5466,400 +5206,6 @@ private fun SessionWhySheet(
 }
 
 @Composable
-private fun DiagnosticsDialog(
-    events: List<SessionDiagnosticEvent>,
-    onDismiss: () -> Unit,
-    onCopy: () -> Unit,
-    onSave: () -> Unit,
-    onClear: () -> Unit,
-) {
-    // Newest first. A trace is read to answer "what just happened", and the answer is at the end of a
-    // ring that holds up to five hundred entries.
-    val ordered = remember(events) { events.asReversed() }
-    // Fixed 24-hour with seconds, not the locale's time format: the interval between two events is the
-    // whole point of reading this, and half the locales drop seconds entirely.
-    val clock = remember {
-        DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Connection diagnostics") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f))) {
-                if (events.isEmpty()) {
-                    Text(
-                        "Nothing recorded yet. Connect a host and this becomes a timestamped trace of every connect, disconnect, reconnect and network change.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    Text(
-                        "${events.size} event(s) · hosts are labelled s1, s2… and the number after the dot counts that host's connections, so s2.3 is its third. No password, key or host name is recorded, so this is safe to attach to a bug report.",
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        // The line() form starts with the epoch millis, which the exported text needs and
-                        // a reader does not; the row shows a clock and drops the raw number.
-                        items(ordered, key = { it.sequence }) { entry ->
-                            Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                                Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
-                                    Text(
-                                        clock.format(Instant.ofEpochMilli(entry.atMs)),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                    Text(
-                                        entry.line().substringAfter(' '),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontFamily = FontFamily.Monospace,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TextButton(onClick = onCopy) { Text("Copy") }
-                        TextButton(onClick = onSave) { Text("Save") }
-                        TextButton(onClick = onClear) { Text("Clear", color = MaterialTheme.colorScheme.error) }
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
-}
-
-/**
- * Version, credits and the library list — the screen a licence question or a "what is this app"
- * question is answered from.
- *
- * The version is read from the PackageManager rather than from a generated `BuildConfig` field: the
- * app builds with no buildConfig fields at all, and this answer is the one Android itself shows in
- * system settings, so the dialog cannot disagree with it.
- */
-@Composable
-private fun AboutDialog(onDismiss: () -> Unit) {
-    val context = LocalContext.current
-    val packageInfo = remember { context.packageManager.getPackageInfo(context.packageName, 0) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("About EclipseSSH") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.70f))) {
-                Text("EclipseSSH", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "Version ${packageInfo.versionName} (${packageInfo.longVersionCode})",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    "An SSH and SFTP client for Android: a full-screen VT/ANSI terminal, concurrent " +
-                        "sessions in tabs, a two-pane SFTP browser with resumable transfers, port " +
-                        "forwarding and remote desktop, with credentials kept in an Android " +
-                        "Keystore-backed vault.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text("Created by Maragung", style = MaterialTheme.typography.titleSmall)
-                // The repo is private, so this link serves the owner and contributors rather than the
-                // public — anyone else lands on GitHub's sign-in, which is still the honest
-                // destination for "where is the source".
-                TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ABOUT_REPO_URL))) }) {
-                    Text("Source code · github.com/maragung/EclipseSSH")
-                }
-                Text("Libraries", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                // The one list the repo keeps: the dialog renders OPEN_SOURCE_LICENSES as-is, so
-                // what an About screen says and what the repo claims cannot drift apart.
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(OPEN_SOURCE_LICENSES) { library ->
-                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
-                                Text("${library.name} ${library.version}", style = MaterialTheme.typography.titleSmall)
-                                Text(
-                                    // Bouncy Castle is the one entry with no purpose line - a
-                                    // transitive dependency nothing calls directly - so its row
-                                    // is the licence alone, not a sentence ending in a dangling dot.
-                                    library.purpose?.let { "${library.license} · $it" } ?: library.license,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-    )
-}
-
-/** Where the source lives. Private repository — see the comment on the dialog's link. */
-private const val ABOUT_REPO_URL = "https://github.com/maragung/EclipseSSH"
-
-@Composable
-private fun KnownHostsDialog(
-    hosts: Map<String, String>,
-    onDismiss: () -> Unit,
-    onForget: (String) -> Unit,
-    onClearAll: () -> Unit,
-) {
-    val entries = hosts.toList().sortedBy { it.first }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Known hosts") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.60f))) {
-                if (entries.isEmpty()) {
-                    Text("No trusted hosts yet. You'll be asked to verify a host's fingerprint the first time you connect.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    Text("Fingerprints you've trusted. Removing one will prompt you to verify again on next connect.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        itemsIndexed(entries) { index, (key, fingerprint) ->
-                            Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    Column(Modifier.weight(1f)) {
-                                        Text(key, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                        Text(fingerprint, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    }
-                                    TextButton(onClick = { onForget(key) }) { Text("Forget") }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        dismissButton = if (entries.isNotEmpty()) {
-            { TextButton(onClick = onClearAll) { Text("Forget all", color = MaterialTheme.colorScheme.error) } }
-        } else null,
-    )
-}
-
-@Composable
-private fun IntervalDialog(title: String, subtitle: String, current: Int, options: List<Int>, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
-    var selected by remember { mutableIntStateOf(current) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                    options.forEach { option ->
-                        FilterChip(
-                            selected = selected == option,
-                            onClick = { selected = option },
-                            label = { Text(if (option == 0) "Off" else "$option s") },
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-/**
- * Picks how long the app may sit in the background before the vault re-locks. See
- * [dev.eclipse.ssh.data.model.AppSettings.vaultAutoLockMinutes].
- *
- * Its own dialog rather than an [IntervalDialog], only because that one labels every chip in
- * seconds and this setting is in minutes, with a "Never" choice rather than an "Off" one. The
- * choices come from the repository that clamps them, so a chip cannot offer a delay that would be
- * stored as a different number.
- */
-@Composable
-private fun VaultAutoLockDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
-    var selected by remember { mutableIntStateOf(current) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Auto-lock vault") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(
-                    "How long the app may sit in the background before the PIN is asked for again. " +
-                        "The countdown starts the moment you leave the app.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                    SettingsRepository.VAULT_AUTO_LOCK_CHOICES.forEach { option ->
-                        FilterChip(
-                            selected = selected == option,
-                            onClick = { selected = option },
-                            label = { Text(if (option == 0) "Never" else "$option min") },
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-/**
- * Picks the narrowest grid the pty may be given. See [dev.eclipse.ssh.data.model.AppSettings.terminalMinColumns].
- *
- * Its own dialog rather than an [IntervalDialog], only because that one labels every chip in seconds.
- * The choices come from the repository that clamps them, so a chip cannot offer a width that would be
- * stored as a different number.
- */
-@Composable
-private fun TerminalWidthDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
-    var selected by remember { mutableIntStateOf(current) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Terminal width") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(
-                    "80 columns is what command-line output is formatted for. Ask for fewer than the " +
-                        "server needs and it breaks paths, URLs and tables itself, which nothing here " +
-                        "can undo; ask for more than the screen fits and the grid pans sideways.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                    SettingsRepository.TERMINAL_MIN_COLUMN_CHOICES.forEach { option ->
-                        FilterChip(
-                            selected = selected == option,
-                            onClick = { selected = option },
-                            label = { Text(if (option == 0) "Fit screen" else "$option cols") },
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Apply") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
-private fun FontSizeDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
-    // One range, named once. The repository clamps to it on read and on write, this dialog offers it,
-    // and the terminal's pinch-to-zoom gesture rounds into it - three places that have to agree about
-    // what a legal font size is, and did not while each carried its own literal.
-    val range = SettingsRepository.TERMINAL_FONT_SIZE_RANGE
-    var size by remember { mutableFloatStateOf(SettingsRepository.normalizeFontSize(current).toFloat()) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Terminal font size") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("${size.toInt()} sp", style = MaterialTheme.typography.titleMedium)
-                Text(
-                    "Pinch the terminal with two fingers to zoom without opening this dialog.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Slider(
-                    value = size,
-                    onValueChange = { size = it },
-                    valueRange = range.first.toFloat()..range.last.toFloat(),
-                    steps = range.last - range.first - 1,
-                )
-            }
-        },
-        confirmButton = { Button(onClick = { onConfirm(size.toInt()) }) { Text("Apply") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
-private fun PinDialog(
-    enabled: Boolean,
-    onDismiss: () -> Unit,
-    verifyPin: suspend (String) -> Boolean,
-    onSetPin: (String) -> Unit,
-    onClearPin: () -> Unit,
-) {
-    val scope = rememberCoroutineScope()
-    var stage by remember { mutableIntStateOf(if (enabled) 0 else 1) }
-    var current by remember { mutableStateOf("") }
-    var newPin by remember { mutableStateOf("") }
-    var confirm by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
-    var verifying by remember { mutableStateOf(false) }
-
-    fun verifyCurrent(onOk: () -> Unit) {
-        // Guarded the same way the lock screen is: verification is PBKDF2 at 60k iterations, so
-        // it now suspends for a noticeable moment, and without this a double-tap — or a tap on
-        // "Disable" followed by "Change" — runs two verifications whose callbacks both fire.
-        if (verifying) return
-        verifying = true
-        error = null
-        scope.launch {
-            if (verifyPin(current)) onOk() else error = "Incorrect PIN"
-            verifying = false
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (enabled) "Change PIN" else "Set PIN") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
-                if (stage == 0) {
-                    OutlinedTextField(
-                        current,
-                        { current = it.filter(Char::isDigit).take(6) },
-                        label = { Text("Current PIN") },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword),
-                    )
-                    error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium) }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = { verifyCurrent { onClearPin(); onDismiss() } },
-                            enabled = current.isNotBlank() && !verifying,
-                        ) { Text("Disable") }
-                        Button(
-                            onClick = { verifyCurrent { stage = 1; error = null } },
-                            enabled = current.isNotBlank() && !verifying,
-                        ) { Text(if (verifying) "Verifying…" else "Change") }
-                    }
-                } else {
-                    OutlinedTextField(
-                        newPin,
-                        { newPin = it.filter(Char::isDigit).take(6) },
-                        label = { Text("New PIN (4+ digits)") },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword),
-                    )
-                    OutlinedTextField(
-                        confirm,
-                        { confirm = it.filter(Char::isDigit).take(6) },
-                        label = { Text("Confirm PIN") },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword),
-                    )
-                    error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelMedium) }
-                }
-            }
-        },
-        confirmButton = {
-            if (stage == 1) {
-                Button(
-                    onClick = {
-                        when {
-                            newPin.length < 4 -> error = "PIN must be at least 4 digits"
-                            newPin != confirm -> error = "PINs do not match"
-                            else -> { onSetPin(newPin); onDismiss() }
-                        }
-                    },
-                    enabled = newPin.isNotBlank(),
-                ) { Text("Save") }
-            }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
 private fun ForwardDialog(onDismiss: () -> Unit, onConfirm: (ForwardType, Int, String?, Int?) -> Unit) {
     var type by remember { mutableStateOf(ForwardType.LOCAL) }
     var localPort by remember { mutableStateOf("8080") }
@@ -5895,249 +5241,41 @@ private fun ForwardDialog(onDismiss: () -> Unit, onConfirm: (ForwardType, Int, S
 }
 
 /**
- * Settings → Linux Userspace: the whole feature's control panel and, for most users, its front
- * door. The section is derived from [LinuxUserspaceController]'s one state object — every row
- * below reads from it, so the settings screen can never disagree with the host-list card about
- * whether the environment is installed, and no row is shown for a state that cannot answer it.
+ * The one line the Settings list keeps about the userspace, for every state it can be in.
  *
- * One rule shapes the layout: an operation in flight hides every button. A mid-install screen
- * with a working Install button would restart the pipeline underneath itself, and a mid-stop
- * screen with Stop still armed would be a lie about what is already happening.
+ * This replaced a section of up to six rows and a progress bar, and that is now the window's own
+ * business: [UbuntuActivity] shows the same facts with the room to act on them, which the section
+ * never had - the install log alone was a capped dialog body. What the list still needs is the
+ * question that decides whether the row is worth tapping: is there an environment, and what is it
+ * doing.
+ *
+ * Exhaustive over [LinuxUserspaceState] deliberately. A `when` with a fallback line would quietly
+ * stop reporting a state added later, which is the silence the section's one-state-object rule
+ * existed to prevent.
  */
-@Composable
-private fun LinuxUserspaceSection(linuxUserspace: LinuxUserspaceController) {
-    val ui by linuxUserspace.uiState.collectAsStateWithLifecycle()
-    var confirmInstall by remember { mutableStateOf(false) }
-    var confirmUninstall by remember { mutableStateOf(false) }
-
-    SettingsSection("Linux userspace") {
-        if (!ui.supported) {
-            // One row, no button: an unsupported device cannot be offered an install that cannot
-            // finish, but it also should not look like a feature that went missing.
-            SettingRow(
-                Icons.Default.Computer,
-                "Ubuntu on this device",
-                "Not supported on this device's processor",
-            ) { }
-            return@SettingsSection
-        }
-        val distro = ui.distro ?: return@SettingsSection
-        val state = ui.state
-
-        when (state) {
-            // supported implies a graph, and a graph always has a state; this branch is the
-            // compiler's proof of that invariant rather than a state any device can reach.
-            null -> Unit
-            is LinuxUserspaceState.Installing -> {
-                val (label, fraction) = describeInstallStep(state.step)
-                SettingRow(Icons.Default.CloudDownload, "Installing ${distro.displayName}", label) { }
-                if (fraction != null) {
-                    LinearProgressIndicator(
-                        progress = { fraction },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
-                    )
-                }
+private fun linuxUserspaceSummary(ui: LinuxUserspaceUiState): String {
+    if (!ui.supported) return "Not supported on this device's processor"
+    return when (val state = ui.state) {
+        // `supported` implies a graph and a graph always has a state, so this branch is the
+        // compiler's proof of that invariant rather than a state any device can reach.
+        null -> "Not installed"
+        is LinuxUserspaceState.Installing ->
+            "Installing ${ui.distro?.displayName ?: "…"} · ${describeInstallStep(state.step).first}"
+        is LinuxUserspaceState.NotInstalled ->
+            if (ui.hasPendingWorkspaceBackup) {
+                "Not installed · a saved workspace will be restored"
+            } else {
+                "Not installed · real bash, apt, Node.js and Python, on the device"
             }
-            is LinuxUserspaceState.NotInstalled -> SettingRow(
-                Icons.Default.Computer,
-                "Ubuntu on this device",
-                if (ui.hasPendingWorkspaceBackup) {
-                    "Not installed · a saved workspace will be restored"
-                } else {
-                    "Not installed · real bash, apt, Node.js and Python, on the device"
-                },
-            ) {
-                // The version chooser lives here and only here: once anything is on disk the
-                // installed version is the only relevant one (Repair and Start operate on it), so
-                // the dropdown disappears with the Not Installed state that gave it a choice to
-                // make. Selecting swaps the graph, and the Install dialog below names whatever
-                // the dropdown left selected.
-                SettingDropdown(
-                    label = "Ubuntu version",
-                    options = ui.availableVersions,
-                    selected = distro,
-                    optionLabel = { it.displayName },
-                    onSelect = { linuxUserspace.selectDistro(it.id) },
-                )
-            }
-            is LinuxUserspaceState.Stopped -> SettingRow(
-                Icons.Default.Terminal,
-                "Ubuntu on this device",
-                "Installed and verified · stopped",
-            ) { }
-            is LinuxUserspaceState.Starting -> SettingRow(Icons.Default.Terminal, "Ubuntu on this device", "Starting…") { }
-            is LinuxUserspaceState.Running -> SettingRow(
-                Icons.Default.Terminal,
-                "Ubuntu on this device",
-                // Held open, not merely alive: closing the last terminal does not end this, and
-                // the count is what tells the user there are shells to come back to.
-                "Running · ${ui.sessionCount} terminal session(s) held open",
-            ) { }
-            is LinuxUserspaceState.Stopping -> SettingRow(Icons.Default.Terminal, "Ubuntu on this device", "Stopping…") { }
-            is LinuxUserspaceState.NeedsRepair -> SettingRow(
-                Icons.Default.Warning,
-                "Ubuntu on this device",
-                "Needs repair · ${state.detail}",
-            ) { }
-        }
-
-        // The facts that only an installed userspace can answer, absent while it is not — a
-        // "0 B used" line on a fresh install screen would be a status pretending to exist.
-        if (state is LinuxUserspaceState.Stopped ||
-            state is LinuxUserspaceState.Starting ||
-            state is LinuxUserspaceState.Running ||
-            state is LinuxUserspaceState.Stopping ||
-            state is LinuxUserspaceState.NeedsRepair
-        ) {
-            SettingRow(
-                Icons.Default.Storage,
-                "Storage used",
-                formatTransferBytes(ui.storageUsedBytes),
-            ) { }
-            SettingRow(
-                Icons.Default.Folder,
-                "Workspace",
-                "/home/ubuntu/workspace · ${ui.workspaceFileCount} file(s) · kept by Stop and Restart",
-            ) { }
-            SettingRow(
-                Icons.Default.CheckCircle,
-                "Health check",
-                ui.health?.describe() ?: "Not checked yet",
-            ) {
-                TextButton(onClick = { linuxUserspace.refreshHealth() }) { Text("Verify") }
-            }
-        }
-
-        // The action row. Kept out of SettingRow's width-capped trailing slot on purpose: Start,
-        // Restart and Uninstall are three coequal controls and capping the third to fit a label
-        // column would demote whichever action the layout happened to squeeze.
-        if (state != null &&
-            state !is LinuxUserspaceState.Installing &&
-            state !is LinuxUserspaceState.Starting &&
-            state !is LinuxUserspaceState.Stopping
-        ) {
-            Row(
-                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                when (state) {
-                    is LinuxUserspaceState.NotInstalled ->
-                        TextButton(onClick = { confirmInstall = true }) {
-                            Icon(Icons.Default.CloudDownload, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Install")
-                        }
-                    is LinuxUserspaceState.Stopped -> {
-                        TextButton(onClick = { linuxUserspace.start() }) {
-                            Icon(Icons.Default.PlayArrow, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Start")
-                        }
-                        TextButton(onClick = { linuxUserspace.restart() }) { Text("Restart") }
-                    }
-                    is LinuxUserspaceState.Running -> {
-                        TextButton(onClick = { linuxUserspace.stop() }) {
-                            Icon(Icons.Default.Stop, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Stop")
-                        }
-                        TextButton(onClick = { linuxUserspace.restart() }) { Text("Restart") }
-                    }
-                    is LinuxUserspaceState.NeedsRepair ->
-                        TextButton(onClick = { linuxUserspace.repair() }) {
-                            Icon(Icons.Default.Refresh, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Repair")
-                        }
-                    else -> Unit
-                }
-                Spacer(Modifier.weight(1f))
-                if (state !is LinuxUserspaceState.NotInstalled) {
-                    TextButton(onClick = { confirmUninstall = true }) {
-                        Text("Uninstall", color = MaterialTheme.colorScheme.error)
-                    }
-                }
-            }
-        }
-
-        // The last operation's failure, verbatim, with a way to clear it — an error line that
-        // could not be dismissed would outlive the fix it described.
-        if (ui.error != null) {
-            SettingRow(
-                Icons.Default.Warning,
-                "Last operation",
-                ui.error ?: "",
-            ) { TextButton(onClick = { linuxUserspace.clearError() }) { Text("OK") } }
-        }
-        if (ui.installWarnings.isNotEmpty()) {
-            SettingRow(
-                Icons.Default.Warning,
-                "Installed with warnings",
-                ui.installWarnings.joinToString("; "),
-            ) { TextButton(onClick = { linuxUserspace.clearInstallWarnings() }) { Text("OK") } }
-        }
-    }
-
-    if (confirmInstall) {
-        AlertDialog(
-            onDismissRequest = { confirmInstall = false },
-            title = { Text("Install ${distroTitle(ui)}?") },
-            text = {
-                Text(
-                    "A verified ${distroTitle(ui)} root filesystem (~30 MB) is downloaded and the " +
-                        "toolchain — bash, git, Python, Node.js — is installed through apt itself, " +
-                        "which needs a few hundred MB over your network. Nothing runs as root, and the " +
-                        "workspace at /home/ubuntu/workspace survives Stop and Restart." +
-                        if (ui.hasPendingWorkspaceBackup) {
-                            " Your saved workspace is restored after the install."
-                        } else {
-                            ""
-                        },
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { confirmInstall = false; linuxUserspace.install() }) { Text("Install") }
-            },
-            dismissButton = { TextButton(onClick = { confirmInstall = false }) { Text("Cancel") } },
-        )
-    }
-    if (confirmUninstall) {
-        AlertDialog(
-            onDismissRequest = { confirmUninstall = false },
-            title = { Text("Uninstall ${distroTitle(ui)}?") },
-            text = {
-                Text(
-                    "The root filesystem and every installed package are deleted" +
-                        if (ui.workspaceFileCount > 0) {
-                            ". The workspace holds ${ui.workspaceFileCount} file(s): keep them (restored " +
-                                "by the next install) or delete them with the rest."
-                        } else {
-                            ", together with the empty workspace."
-                        },
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = { confirmUninstall = false; linuxUserspace.uninstall(keepWorkspace = false) },
-                ) { Text("Delete everything", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
-                Row {
-                    if (ui.workspaceFileCount > 0) {
-                        TextButton(onClick = { confirmUninstall = false; linuxUserspace.uninstall(keepWorkspace = true) }) {
-                            Text("Keep workspace")
-                        }
-                    }
-                    TextButton(onClick = { confirmUninstall = false }) { Text("Cancel") }
-                }
-            },
-        )
+        is LinuxUserspaceState.Stopped -> "Installed and verified · stopped"
+        is LinuxUserspaceState.Starting -> "Starting…"
+        // Held open, not merely alive: closing the last terminal does not end this, and the count
+        // is what tells the user there are shells to come back to.
+        is LinuxUserspaceState.Running -> "Running · ${ui.sessionCount} terminal session(s) held open"
+        is LinuxUserspaceState.Stopping -> "Stopping…"
+        is LinuxUserspaceState.NeedsRepair -> "Needs repair · ${state.detail}"
     }
 }
-
-/** The distro's display name, or a neutral title on a device where none is supported. */
-private fun distroTitle(ui: LinuxUserspaceUiState): String =
-    ui.distro?.displayName ?: "Ubuntu"
 
 /**
  * One install phase as the progress line renders it: the label, and the download's fraction when
@@ -6173,100 +5311,10 @@ private fun describeSetupStep(step: SetupStep, detail: String?): String {
     return if (detail.isNullOrBlank()) label else "$label · ${detail.trim().take(80)}"
 }
 
-@Composable
-private fun SettingsSection(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Text(title.uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 4.dp, bottom = 8.dp))
-    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), content = content)
-}
-
-/**
- * One settings line: an icon, a title, a subtitle, and a control on the right.
- *
- * The [trailing] slot is width-capped, and that cap is the fix for a layout that broke on narrow
- * screens. A `Row` measures its unweighted children first and gives the weighted one whatever is
- * left, so a trailing control that wanted more than the row had — the terminal-theme picker used to be
- * a horizontally scrolling strip of one chip per theme, which asks for the width of all of them —
- * consumed nearly the whole line and left the title column a few dozen dp. The title then wrapped one
- * word per line, or clipped, and the taller the theme list grew the worse it got. Capped, the labels
- * always keep the rest of the row, and every control the app actually puts here (a `Switch`, a
- * `TextButton`, a compact dropdown) fits inside the cap on any screen this app supports.
- *
- * The title is one line with an ellipsis for the same reason. The subtitle is allowed to wrap: it is
- * prose describing the setting, not a value, and some of them genuinely need two lines.
- */
-@Composable
-private fun SettingRow(icon: ImageVector, title: String, subtitle: String, trailing: @Composable () -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-        Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(21.dp))
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(subtitle, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Spacer(Modifier.width(10.dp))
-        Box(Modifier.widthIn(max = SETTING_TRAILING_MAX_WIDTH), contentAlignment = Alignment.CenterEnd) { trailing() }
-    }
-}
-
-/** How much of a settings row its control may take. The rest belongs to the title and subtitle. */
-private val SETTING_TRAILING_MAX_WIDTH = 156.dp
-
-/**
- * A compact single-choice control for a settings row: the current value, a caret, and a menu.
- *
- * Replaces a row of chips, one per option, and it is not only a matter of taste — a chip strip grows
- * with the option list, so adding a theme silently made the Settings screen worse, and a scrolling
- * strip hides the options that do not fit behind a gesture nobody knows is there. A dropdown is a
- * fixed width whatever the list length, shows the current value where a value belongs, and puts every
- * option one tap away with the selected one ticked.
- *
- * The trigger's label is one line with an ellipsis and the button is bounded by
- * [SETTING_TRAILING_MAX_WIDTH] from the row around it, so no option name can push the row out of shape
- * however long it is. Menu items are single-line for the same reason.
- *
- * The content description carries both the setting and its value ("Terminal theme, Amber"), because
- * the visible label alone says only "Amber" — which names the value and not what it sets, and is the
- * one thing a screen reader user cannot recover from the surrounding row.
- */
-@Composable
-private fun <T> SettingDropdown(
-    label: String,
-    options: List<T>,
-    selected: T?,
-    optionLabel: (T) -> String,
-    onSelect: (T) -> Unit,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val selectedLabel = selected?.let(optionLabel) ?: ""
-    Box {
-        OutlinedButton(
-            onClick = { expanded = true },
-            shape = RoundedCornerShape(12.dp),
-            contentPadding = PaddingValues(start = 14.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
-            modifier = Modifier.semantics { contentDescription = "$label, $selectedLabel" },
-        ) {
-            Text(
-                selectedLabel,
-                style = MaterialTheme.typography.labelLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
-            )
-            Icon(Icons.Default.ArrowDropDown, null, modifier = Modifier.size(20.dp))
-        }
-        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            options.forEach { option ->
-                DropdownMenuItem(
-                    text = { Text(optionLabel(option), maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    onClick = { expanded = false; onSelect(option) },
-                    trailingIcon = {
-                        if (option == selected) Icon(Icons.Default.Check, "Selected", modifier = Modifier.size(18.dp))
-                    },
-                )
-            }
-        }
-    }
-}
+// The three settings building blocks - SettingsSection, SettingRow, SettingDropdown - moved to
+// dev.eclipse.ssh.ui.settings when each Settings row became a window of its own. They are imported
+// at the top of this file rather than duplicated here, so the promoted screens and the list they
+// came from cannot drift apart.
 
 @Composable
 private fun EmptyState(
@@ -6452,27 +5500,6 @@ private fun HostKeyDialog(challenge: HostKeyChallenge, onAccept: () -> Unit, onR
 }
 
 @Composable
-private fun KeyGenDialog(onDismiss: () -> Unit, onConfirm: (SshKeyAlgorithm) -> Unit) {
-    var selected by remember { mutableStateOf(SshKeyAlgorithm.RSA_2048) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Generate SSH key pair") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("A private key (PEM) and a public key (OpenSSH format) will be saved as separate files. Keep the private key secret and add the public key to your server's authorized_keys.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SshKeyAlgorithm.entries.forEach { algorithm ->
-                        FilterChip(selected = selected == algorithm, onClick = { selected = algorithm }, label = { Text(algorithm.label) })
-                    }
-                }
-            }
-        },
-        confirmButton = { Button(onClick = { onConfirm(selected) }) { Text("Generate & save") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-@Composable
 private fun PassphraseDialog(
     title: String,
     confirmLabel: String,
@@ -6500,444 +5527,24 @@ private fun PassphraseDialog(
     )
 }
 
-@Composable
-private fun AddHostDialog(
-    initialHost: HostProfile? = null,
-    /** What is already saved for this profile. Metadata only — no secret ever reaches this dialog. */
-    storedCredentials: StoredCredentials = StoredCredentials(),
-    /** A key file picked during this editing session, held by the caller that owns the launcher. */
-    pickedKey: PickedKeyFile? = null,
-    onPickKey: () -> Unit = {},
-    onForgetPickedKey: () -> Unit = {},
-    onDismiss: () -> Unit,
-    onSave: (HostProfile, HostCredentialUpdate) -> Unit,
-    onPasteSecret: () -> String?,
-) {
-    val editing = initialHost != null
-    var name by remember(initialHost?.id) { mutableStateOf(initialHost?.name.orEmpty()) }
-    var host by remember(initialHost?.id) { mutableStateOf(initialHost?.host.orEmpty()) }
-    var username by remember(initialHost?.id) { mutableStateOf(initialHost?.username.orEmpty()) }
-    var port by remember(initialHost?.id) { mutableStateOf((initialHost?.port ?: 22).toString()) }
-    var authMethod by remember(initialHost?.id) { mutableStateOf(initialHost?.authMethod ?: AuthMethod.PASSWORD) }
-    var group by remember(initialHost?.id) { mutableStateOf(initialHost?.group ?: "Personal") }
-    var tags by remember(initialHost?.id) { mutableStateOf(initialHost?.tags?.joinToString(", ").orEmpty()) }
-    var favorite by remember(initialHost?.id) { mutableStateOf(initialHost?.isFavorite ?: false) }
-    var proxyType by remember(initialHost?.id) { mutableStateOf(initialHost?.proxyType ?: ProxyType.NONE) }
-    var proxyJump by remember(initialHost?.id) { mutableStateOf(initialHost?.proxyJump.orEmpty()) }
-    var socksHost by remember(initialHost?.id) { mutableStateOf(initialHost?.socksHost.orEmpty()) }
-    var socksPort by remember(initialHost?.id) { mutableStateOf((initialHost?.socksPort ?: 1080).toString()) }
-    var socksUsername by remember(initialHost?.id) { mutableStateOf(initialHost?.socksUsername.orEmpty()) }
-    var socksPassword by remember(initialHost?.id) { mutableStateOf(initialHost?.socksPassword.orEmpty()) }
-    var accentColor by remember(initialHost?.id) { mutableStateOf(initialHost?.accentColor) }
-    var timeout by remember(initialHost?.id) { mutableStateOf((initialHost?.connectTimeoutSeconds ?: DEFAULT_CONNECT_TIMEOUT_SECONDS).toString()) }
-    // Empty means "follow the global keep-alive", which is what a null column means. Kept as a string
-    // so clearing the field is expressible at all — a numeric field cannot represent "unset".
-    var keepAlive by remember(initialHost?.id) { mutableStateOf(initialHost?.keepAliveSeconds?.toString().orEmpty()) }
-    var fingerprint by remember(initialHost?.id) { mutableStateOf(initialHost?.fingerprint.orEmpty()) }
-    // The MAC as typed, blank for none - the same convention the profile column uses.
-    var wakeOnLanMac by remember(initialHost?.id) { mutableStateOf(initialHost?.wakeOnLanMac.orEmpty()) }
-    // Seeded from the profile, and from the shipped default for a new one, so the box reflects what
-    // this host will actually do rather than a hardcoded position.
-    var autoLoginSftp by remember(initialHost?.id) {
-        mutableStateOf(initialHost?.autoLoginSftp ?: HostProfile.DEFAULT_AUTO_LOGIN_SFTP)
-    }
-    // The fourteen per-host engine settings, as one value. See [AdvancedHostOptions] for why none of
-    // their rules live in this file.
-    var advanced by remember(initialHost?.id) { mutableStateOf(AdvancedHostOptions.from(initialHost)) }
-    // The credential fields. All four start empty on every open, including when editing: a saved
-    // secret is never rendered back into the field it came from, not even masked, because a field
-    // that holds it can be read out by an accessibility service, offered to an autofill provider, or
-    // simply revealed by the next person holding an unlocked phone. What is stored is reported as
-    // "saved" and can be replaced or forgotten, which is all a user needs and nothing an onlooker
-    // can use.
-    var password by remember(initialHost?.id) { mutableStateOf("") }
-    var passphrase by remember(initialHost?.id) { mutableStateOf("") }
-    var forgetPassword by remember(initialHost?.id) { mutableStateOf(false) }
-    var forgetKey by remember(initialHost?.id) { mutableStateOf(false) }
-    // Reading a private key costs a deliberate key derivation — bcrypt-pbkdf, for the OpenSSH
-    // format — so it runs off the main thread, and not until the user has stopped typing. `value` is
-    // cleared first so the form cannot report a stale verdict for the passphrase now in the field;
-    // HostFormDraft.keyReadable treats "picked but not read yet" as not-yet-saveable.
-    val probe by produceState<SshKeyProbe?>(null, pickedKey, passphrase) {
-        val picked = pickedKey
-        value = null
-        if (picked == null) return@produceState
-        delay(KEY_PROBE_DEBOUNCE_MS)
-        value = withContext(Dispatchers.Default) { probeSshKey(picked.bytes, picked.name, passphrase) }
-    }
-    // Read into a local because smart casts do not see through a delegated property, and the three
-    // branches below all need the narrowed type.
-    val keyProbe = probe
-    // Every validity rule lives in HostFormDraft, which is a plain data class with plain tests.
-    // Robolectric cannot idle a Compose dialog window, so rules left inline here would be
-    // permanently unverifiable on the JVM.
-    val draft = HostFormDraft(
-        host = host,
-        username = username,
-        port = port,
-        timeout = timeout,
-        keepAlive = keepAlive,
-        fingerprint = fingerprint,
-        storedFingerprint = initialHost?.fingerprint,
-        wakeOnLanMac = wakeOnLanMac,
-        proxyType = proxyType,
-        proxyJump = proxyJump,
-        socksHost = socksHost,
-        socksPort = socksPort,
-        passphrase = passphrase,
-        keyPicked = pickedKey != null,
-        pickedKey = keyProbe,
-        storedCredentials = storedCredentials,
-        forgetKey = forgetKey,
-    )
-    /**
-     * One line describing the key situation, and whether it is a problem. Null when there is nothing
-     * to say — no key picked, none saved.
-     */
-    val keyStatus: Pair<String, Boolean>? = when {
-        pickedKey != null && keyProbe == null -> "Reading ${pickedKey.name}…" to false
-        keyProbe is SshKeyProbe.Ready -> "${pickedKey?.name.orEmpty()} · ${keyProbe.type}" to false
-        keyProbe is SshKeyProbe.PassphraseRequired -> "That key is encrypted — enter its passphrase below" to false
-        keyProbe is SshKeyProbe.Unreadable -> keyProbe.reason to true
-        forgetKey && storedCredentials.hasKey -> "The saved key will be removed when you save" to false
-        storedCredentials.hasKey ->
-            listOfNotNull(storedCredentials.keyLabel, storedCredentials.keyType).joinToString(" · ") to false
-        else -> null
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (editing) "Edit host" else "Add host") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Text("Connection details are stored in the encrypted vault. Credentials are optional — save them for one-tap connects, or leave them blank to be asked each time.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                OutlinedTextField(name, { name = it }, label = { Text("Profile name") }, singleLine = true)
-                OutlinedTextField(host, { host = it }, label = { Text("Hostname or IP") }, singleLine = true)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("SSH port") }, singleLine = true, isError = draft.showPortError, supportingText = { if (draft.showPortError) Text("${PORT_RANGE.first}–${PORT_RANGE.last}") }, modifier = Modifier.weight(1f))
-                    OutlinedTextField(username, { username = it }, label = { Text("Username") }, singleLine = true, modifier = Modifier.weight(2f))
-                }
-                Text("Authentication", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    AuthMethod.entries.forEach { method ->
-                        FilterChip(selected = authMethod == method, onClick = { authMethod = method }, label = { Text(method.label) })
-                    }
-                }
-                // Both a password and a key are offered whatever the method above says, and on purpose:
-                // a server can want a key *and* a password, `KEYBOARD_INTERACTIVE` is usually answered
-                // with the account password, and hiding a field would take away a combination that
-                // works. The method chips say what to try first; these say what the app has to try with.
-                Text(
-                    "Saved credentials (optional)",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                Text(
-                    "Encrypted with the device keystore and used automatically when you connect. Leave blank to be asked each time.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedTextField(
-                    password,
-                    {
-                        password = it
-                        // Typing a replacement is a clearer statement of intent than the pending
-                        // "forget", so it wins rather than fighting it.
-                        if (it.isNotEmpty()) forgetPassword = false
-                    },
-                    label = { Text(if (storedCredentials.hasPassword) "Replace saved password" else "Password") },
-                    singleLine = true,
-                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    keyboardOptions = SecretFieldKeyboard,
-                    modifier = Modifier.fillMaxWidth(),
-                    // The paste button sets the state directly, which bypasses the onValueChange
-                    // above — so the same "a replacement beats a pending forget" rule is restated
-                    // here. Without it, a pasted replacement would lose to a "Forget" the user
-                    // ticked before pasting, and the save would drop the password they just fixed.
-                    trailingIcon = {
-                        SecretPasteButton("password", onPasteSecret) {
-                            password = it
-                            if (it.isNotEmpty()) forgetPassword = false
-                        }
-                    },
-                )
-                if (storedCredentials.hasPassword && password.isEmpty()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            if (forgetPassword) "The saved password will be removed when you save" else "A password is saved for this host",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(onClick = { forgetPassword = !forgetPassword }) {
-                            Text(if (forgetPassword) "Keep" else "Forget")
-                        }
-                    }
-                }
-                OutlinedButton(onClick = onPickKey, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Default.Key, null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        when {
-                            pickedKey != null -> "Choose a different key"
-                            storedCredentials.hasKey && !forgetKey -> "Replace private key"
-                            else -> "Attach private key"
-                        },
-                    )
-                }
-                keyStatus?.let { (message, isProblem) ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            message,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (isProblem) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f),
-                        )
-                        if (pickedKey != null) {
-                            // Drops the pick and falls back to whatever was already saved, so
-                            // picking the wrong file is not a one-way door.
-                            TextButton(onClick = onForgetPickedKey) { Text("Remove") }
-                        } else if (storedCredentials.hasKey) {
-                            TextButton(onClick = { forgetKey = !forgetKey }) { Text(if (forgetKey) "Keep" else "Forget") }
-                        }
-                    }
-                }
-                if (draft.keyAttached || pickedKey != null) {
-                    OutlinedTextField(
-                        passphrase,
-                        { passphrase = it },
-                        label = {
-                            Text(if (storedCredentials.hasPassphrase) "Replace key passphrase" else "Key passphrase")
-                        },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        keyboardOptions = SecretFieldKeyboard,
-                        isError = !draft.keyReadable && keyProbe is SshKeyProbe.Unreadable,
-                        trailingIcon = { SecretPasteButton("passphrase", onPasteSecret) { passphrase = it } },
-                        supportingText = {
-                            Text(
-                                when {
-                                    keyProbe is SshKeyProbe.PassphraseRequired -> "Required to unlock this key"
-                                    storedCredentials.hasPassphrase -> "A passphrase is already saved for this key"
-                                    else -> "Only if the key is encrypted"
-                                },
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                } else if (passphrase.isNotBlank()) {
-                    // Unreachable through the fields above (the passphrase field is only shown when a
-                    // key is attached), but reachable by attaching a key, typing a passphrase and then
-                    // forgetting the key — which would otherwise leave Save disabled with nothing on
-                    // screen explaining why.
-                    Text(
-                        "Attach a private key, or clear the passphrase.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(group, { group = it }, label = { Text("Group") }, singleLine = true, modifier = Modifier.weight(1f))
-                    OutlinedTextField(tags, { tags = it }, label = { Text("Tags (comma separated)") }, singleLine = true, modifier = Modifier.weight(2f))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = favorite, onCheckedChange = { favorite = it })
-                    Text("Favorite host")
-                }
-                Text("Accent color", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    FilterChip(selected = accentColor == null, onClick = { accentColor = null }, label = { Text("Default") })
-                    ACCENT_COLORS.forEach { (name, color) ->
-                        Surface(
-                            // selectable (not clickable) so the swatch reports its checked state:
-                            // TalkBack reads "Red, selected" instead of just "Red".
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(RoundedCornerShape(50))
-                                .selectable(
-                                    selected = accentColor == color,
-                                    onClick = { accentColor = color },
-                                )
-                                .semantics { contentDescription = name },
-                            color = Color(color),
-                        ) {
-                            // Decorative: `selectable` above already announces the selected state,
-                            // so labelling the tick too would make TalkBack say it twice.
-                            if (accentColor == color) Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.CheckCircle, null, tint = Color.White, modifier = Modifier.size(18.dp)) }
-                        }
-                    }
-                }
-                Text("Connection options", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        timeout,
-                        { timeout = it.filter(Char::isDigit).take(3) },
-                        label = { Text("Timeout (s)") },
-                        singleLine = true,
-                        isError = !draft.timeoutValid,
-                        supportingText = { Text(if (draft.timeoutValid) "Connect and auth" else "${CONNECT_TIMEOUT_RANGE.first}–${CONNECT_TIMEOUT_RANGE.last}") },
-                        modifier = Modifier.weight(1f),
-                    )
-                    OutlinedTextField(
-                        keepAlive,
-                        { keepAlive = it.filter(Char::isDigit).take(3) },
-                        label = { Text("Keep-alive (s)") },
-                        singleLine = true,
-                        isError = !draft.keepAliveValid,
-                        supportingText = { Text(if (draft.keepAliveValid) "Blank = use global" else "${KEEP_ALIVE_RANGE.first}–${KEEP_ALIVE_RANGE.last}") },
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                OutlinedTextField(
-                    fingerprint,
-                    { fingerprint = it.trim() },
-                    label = { Text("Pin host key fingerprint (optional)") },
-                    placeholder = { Text("SHA256:…") },
-                    singleLine = true,
-                    isError = !draft.fingerprintValid,
-                    supportingText = {
-                        Text(
-                            if (!draft.fingerprintValid) "Expected SHA256:<base64>"
-                            // Pinning is strictly stronger than the trust-on-first-use prompt: paste the
-                            // fingerprint from a channel you already trust and the very first connection
-                            // is verified instead of asking the user to accept an unseen key.
-                            else "Verifies the first connection instead of prompting",
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    wakeOnLanMac,
-                    { wakeOnLanMac = it },
-                    label = { Text("Wake-on-LAN MAC (optional)") },
-                    placeholder = { Text("AA:BB:CC:DD:EE:FF") },
-                    singleLine = true,
-                    isError = !draft.wakeOnLanMacValid,
-                    supportingText = {
-                        Text(
-                            if (!draft.wakeOnLanMacValid) "Six pairs of hex digits — AA:BB:CC:DD:EE:FF"
-                            // The same-LAN limit is stated here, in the field's own helper line, rather
-                            // than left to a failure to explain: a wake sent from another network stops
-                            // at the first router and nothing on screen would say why.
-                            else "Wakes the machine from the host menu — phone and machine must be on the same network",
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                // A switch rather than a chip row: it is one binary choice whose off state has to be
-                // as visible as its on state. The whole row is the target — `toggleable` puts the
-                // label, the explanation and the switch in a single accessible node, so TalkBack
-                // reads "Auto Login SFTP, on" once instead of announcing an unlabelled switch, and a
-                // thumb lands on it anywhere along the line.
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .toggleable(
-                            value = autoLoginSftp,
-                            role = Role.Switch,
-                            onValueChange = { autoLoginSftp = it },
-                        ),
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Auto Login SFTP")
-                        // Worded as what happens on connect, not as a protocol name, and switched on
-                        // the current value so the consequence is readable without toggling it first.
-                        Text(
-                            if (autoLoginSftp) "Signs in to the file browser as soon as the shell connects"
-                            else "Connects the shell only — the Files tab opens on demand",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    // Null handler: the row above owns the input, and a second clickable node here
-                    // would swallow taps on the switch itself and be announced twice.
-                    Switch(checked = autoLoginSftp, onCheckedChange = null)
-                }
-                Text("Connection route", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ProxyType.entries.forEach { type ->
-                        FilterChip(selected = proxyType == type, onClick = { proxyType = type }, label = { Text(type.label) })
-                    }
-                }
-                when (proxyType) {
-                    ProxyType.PROXY_JUMP -> OutlinedTextField(proxyJump, { proxyJump = it }, label = { Text("Jump host (user@host:port)") }, placeholder = { Text("gateway@bastion.example.com:22") }, singleLine = true)
-                    ProxyType.SOCKS5, ProxyType.HTTP_CONNECT -> {
-                        OutlinedTextField(socksHost, { socksHost = it }, label = { Text(if (proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy host" else "SOCKS5 host") }, singleLine = true)
-                        OutlinedTextField(socksPort, { socksPort = it.filter(Char::isDigit).take(5) }, label = { Text(if (proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy port" else "SOCKS5 port") }, singleLine = true)
-                        OutlinedTextField(socksUsername, { socksUsername = it }, label = { Text("Proxy username (optional)") }, singleLine = true)
-                        OutlinedTextField(socksPassword, { socksPassword = it }, label = { Text("Proxy password (optional)") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), keyboardOptions = SecretFieldKeyboard, trailingIcon = { SecretPasteButton("proxy password", onPasteSecret) { socksPassword = it } })
-                    }
-                    ProxyType.NONE -> Unit
-                }
-                AdvancedHostSection(advanced, onChange = { advanced = it })
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    onSave(
-                        HostProfile(
-                            id = initialHost?.id ?: java.util.UUID.randomUUID().toString(),
-                            name = name.trim().ifBlank { host.trim() },
-                            host = host.trim(),
-                            username = username.trim(),
-                            port = draft.portNumber ?: DEFAULT_SSH_PORT,
-                            authMethod = authMethod,
-                            group = group.trim().ifBlank { "Personal" },
-                            tags = tags.split(',').map(String::trim).filter(String::isNotBlank).distinct(),
-                            isFavorite = favorite,
-                            lastConnectedAt = initialHost?.lastConnectedAt,
-                            fingerprint = fingerprint.trim().takeIf(String::isNotBlank) ?: initialHost?.fingerprint,
-                            proxyType = proxyType,
-                            proxyJump = proxyJump.trim().takeIf(String::isNotBlank),
-                            socksHost = socksHost.trim().takeIf(String::isNotBlank),
-                            socksPort = draft.socksPortNumber ?: DEFAULT_SOCKS_PORT,
-                            socksUsername = socksUsername.trim().takeIf(String::isNotBlank),
-                            socksPassword = socksPassword.takeIf(String::isNotBlank),
-                            accentColor = accentColor,
-                            connectTimeoutSeconds = draft.timeoutNumber ?: DEFAULT_CONNECT_TIMEOUT_SECONDS,
-                            keepAliveSeconds = draft.keepAliveNumber,
-                            autoLoginSftp = autoLoginSftp,
-                            // Trimmed rather than normalised to one spelling: the text as typed is
-                            // what the profile shows the next time the form opens, and parseMac takes
-                            // every spelling at the moment the address is used.
-                            wakeOnLanMac = wakeOnLanMac.trim(),
-                        ).let(advanced::applyTo),
-                        HostCredentialUpdate(
-                            // A typed replacement beats a pending forget; a pending forget beats
-                            // leaving it alone. Anything else leaves what is stored untouched, which
-                            // is what an untouched empty field has to mean — see the fields above.
-                            password = when {
-                                password.isNotEmpty() -> SecretEdit.Replace(password)
-                                forgetPassword -> SecretEdit.Forget
-                                else -> SecretEdit.Keep
-                            },
-                            // `draft.canSave` is false unless a picked key reached
-                            // SshKeyProbe.Ready, so this never stores a key the app could not read.
-                            key = when {
-                                pickedKey != null && keyProbe is SshKeyProbe.Ready ->
-                                    KeyEdit.Replace(pickedKey.bytes, pickedKey.name, keyProbe.type)
-                                forgetKey -> KeyEdit.Forget
-                                else -> KeyEdit.Keep
-                            },
-                            // Forgetting the key drops its passphrase in the same write, so this only
-                            // has to handle a passphrase changing on a key that stays.
-                            passphrase = when {
-                                passphrase.isNotEmpty() -> SecretEdit.Replace(passphrase)
-                                forgetKey -> SecretEdit.Forget
-                                else -> SecretEdit.Keep
-                            },
-                        ),
-                    )
-                },
-                // Both halves of the form gate the button: the identity fields through
-                // [HostFormDraft], the engine settings through [AdvancedHostOptions]. A collapsed
-                // section can still hold an out-of-range number typed before it was closed.
-                enabled = draft.canSave && advanced.isValid,
-            ) { Text(if (editing) "Save changes" else "Save securely") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+/**
+ * Opens the Add / Edit host form in a window of its own.
+ *
+ * [host] absent is Add, present is Edit. The form is told *which* host by id and loads the profile
+ * itself rather than being handed one: the id is a parcelable string, and a profile passed through
+ * an intent would be a snapshot that stops matching the store the moment anything else edits it.
+ * That is also why nothing comes back — [HostRepository] and [HostCredentialStore] are both Flows,
+ * so a save made in that window is in this one's state by the time it resumes.
+ *
+ * The three callers are the Hosts list's Add button, a card's Edit item, and the Edit host button on
+ * the failed-login prompt. The last of those is why the form owns its own key picker: the prompt's
+ * picker returns a key for a *retry*, not for the form, and the two used to share one launcher.
+ */
+private fun openHostForm(context: Context, host: HostProfile? = null) {
+    context.startActivity(
+        Intent(context, HostFormActivity::class.java).apply {
+            if (host != null) putExtra(HostFormActivity.EXTRA_HOST_ID, host.id)
+        }
     )
 }
 

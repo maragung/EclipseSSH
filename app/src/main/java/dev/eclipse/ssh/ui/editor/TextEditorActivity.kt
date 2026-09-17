@@ -11,6 +11,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.rememberCoroutineScope
 import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.security.SecureClipboard
 import dev.eclipse.ssh.ui.EclipseTheme
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -38,6 +39,10 @@ import kotlinx.coroutines.launch
 class TextEditorActivity : ComponentActivity() {
 
     @Inject lateinit var settingsRepository: SettingsRepository
+
+    // The app's one audited clipboard boundary (a Hilt @Singleton, shared with the rest of the
+    // app), so the editor's copy/paste never reaches for Compose's deprecated LocalClipboardManager.
+    @Inject lateinit var secureClipboard: SecureClipboard
 
     // A snapshot list rather than a plain one: later opens arrive while the composition is already
     // showing earlier files, and an append nobody observes is an append the UI never sees.
@@ -101,6 +106,12 @@ class TextEditorActivity : ComponentActivity() {
                         }
                     },
                     onClose = { finish() },
+                    // clearAfterSeconds = 0: editor content is the user's document, not a
+                    // short-lived secret to wipe on a timer — it stays on the clipboard until
+                    // something replaces it, the way copy behaves everywhere else. paste() keeps
+                    // newlines (it is not the secret-normalising path), so multi-line paste works.
+                    onClipboardCopy = { text -> secureClipboard.copy(text, clearAfterSeconds = 0) },
+                    onClipboardPaste = { secureClipboard.paste() },
                 )
             }
         }

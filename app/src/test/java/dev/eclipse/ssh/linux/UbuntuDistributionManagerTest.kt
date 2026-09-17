@@ -367,6 +367,82 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a feed whose body is not a plausible mirror list is named as too large`() = runTest {
+        // Past the 256 KiB ceiling: not a mirror list but a misredirect or hostile body, refused
+        // before it can be buffered — and named as "too large", which is a different fact from
+        // "unreachable" when someone reads the exhaustion message.
+        val feed =
+            File.createTempFile("mirrors", ".txt").apply {
+                deleteOnExit()
+                writeText(buildString {
+                    repeat(64 * 1024) { append("http://mirror.example/ubuntu-ports\n") } // 2 MiB
+                })
+            }
+        val harness = Harness(distro(arch = "arm64"), mirrorListUrl = "file://${feed.absolutePath}")
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update")) {
+                100 to "Err:1 … Could not connect"
+            } else {
+                baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(thrown).isInstanceOf(UserspaceFailure.MirrorUnreachable::class.java)
+        assertThat(thrown!!.message).contains("mirror feed: too large (over 256 KiB)")
+    }
+
+    @Test
+    fun `a failing rung surfaces the blocked-syscall log the proot fork kept`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        // The shape the rename ENOSYS left behind: apt output that says nothing about why, and a
+        // SIGSYS log naming the syscall the fork could not downgrade (patch 0001's evidence).
+        // Written while the run is in flight, which is where the log comes from: setup empties it
+        // at the start, so anything written before it is another run's evidence and is dropped.
+        val log = File(harness.runtime.rootDir, "sigsys-log.txt")
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update") && isScopedRung(command)) {
+                log.appendText(
+                    listOf(
+                        "SIGSYS: time=15:57:49 pid=1234 comm=apt-get kernel_num=82 pr=82",
+                        "SIGSYS: time=15:57:50 pid=1234 comm=dpkg kernel_num=82 pr=82",
+                    ).joinToString("\n") + "\n",
+                )
+                100 to "E: Failed to fetch … rename failed, Function not implemented\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+
+        // The diagnostic ring names the trapped syscall, which is the difference between
+        // "apt failed" and "rename (82) was blocked and unmapped".
+        val export = harness.distribution.diagnostics.export()
+        assertThat(export).contains("blocked-syscall log")
+        assertThat(export).contains("kernel_num=82")
+    }
+
+    @Test
+    fun `a failing rung with no blocked syscalls records no syscall-log event`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command.startsWith("apt-get update") && isScopedRung(command)) {
+                100 to "Err:1 … Could not connect\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+
+        // No SIGSYS happened, so the event must not appear either — silence is not evidence.
+        assertThat(harness.distribution.diagnostics.export())
+            .doesNotContain("blocked-syscall log")
+    }
+
+    @Test
     fun `a rung dying with the launcher's exit code aborts the ladder as a proot failure`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
         harness.scripted.respond = { command ->
@@ -509,6 +585,42 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a full disk fails the apt phase before the first archive is asked`() = runTest {
+        // The installer's gate passed (the rootfs got this far), but the disk filled since —
+        // or the budget was spent on the extraction itself. The re-check must refuse before
+        // apt burns minutes downloading into a disk that cannot hold the packages.
+        val harness = Harness(
+            distro(arch = "arm64"),
+            // 0 means "unknown" everywhere else in this cluster; a small positive number is
+            // "known, and below every budget".
+            freeBytes = { 100L * 1024 * 1024 },
+        )
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        // The DiskFull contract: the gate's own message, mapped by the "Ubuntu needs" prefix.
+        assertThat(thrown).isInstanceOf(UserspaceFailure.DiskFull::class.java)
+        assertThat(thrown!!.message).contains("only about 100 MB is free")
+        // No rung ran: the refusal happened before the ladder, not inside it.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it.startsWith("apt-get update") },
+        ).isTrue()
+    }
+
+    @Test
+    fun `an unknown free-space answer never blocks the apt phase`() = runTest {
+        // 0 is "the probe could not answer", never "full" — the same contract as the
+        // installer's gate. Setup must run to completion on an unmeasurable disk.
+        val harness = Harness(distro(arch = "arm64"), freeBytes = { 0L })
+
+        val report = harness.distribution.setup()
+
+        assertThat(report.warnings).isEmpty()
+    }
+
+    @Test
     fun `one unavailable base package is a warning, not a failed install`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
         var fullListAttempts = 0
@@ -529,9 +641,137 @@ class UbuntuDistributionManagerTest {
 
         val report = harness.distribution.setup()
 
-        // The list ran whole, then once more with --fix-missing, before the per-package fallback.
-        assertThat(fullListAttempts).isEqualTo(2)
+        // The list ran whole, once more with --fix-missing, and once more after the recovery
+        // repair pass cleared the interruption that the failed install itself left behind —
+        // before the per-package fallback got its turn.
+        assertThat(fullListAttempts).isEqualTo(3)
         assertThat(report.warnings.any { it.contains("package 'git' was not installed") }).isTrue()
+    }
+
+    @Test
+    fun `a failed maintainer script is recorded with the line that names its cause`() = runTest {
+        // E2E run 35058820878, in the shape the app saw it: the bulk install got seventy seconds
+        // in and died configuring openssh-client — whose postinst runs addgroup, a setgid chmod and
+        // update-alternatives, the steps Android is likeliest to refuse — and then every later apt
+        // command failed in a second or two, because dpkg retries a half-configured package before
+        // it does anything else and dies on it again. All of them print the same sentence, and what
+        // the report carried was dpkg's summary block, which names no step at all: "Errors were
+        // encountered while processing: openssh-client". The line that diagnoses it is the one
+        // dpkg prints *above* that block, and the ring is where it has to land.
+        val harness = Harness(distro(arch = "arm64"))
+        val refused =
+            "Setting up openssh-client (1:8.9p1-3ubuntu0.17) ...\n" +
+                "update-alternatives: error: cannot create /etc/alternatives/rsh: Permission denied\n" +
+                "dpkg: error processing package openssh-client (--configure):\n" +
+                " installed openssh-client package post-installation script subprocess returned error exit status 2\n" +
+                "Errors were encountered while processing:\n" +
+                " openssh-client\n" +
+                "E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> 100 to refused
+                command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to refused
+                else -> baseline(command)
+            }
+        }
+
+        val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
+        val export = harness.distribution.diagnostics.export()
+
+        assertThat(thrown).isNotNull()
+        assertThat(export).contains("update-alternatives: error: cannot create /etc/alternatives/rsh")
+        assertThat(export).contains("dpkg: error processing package openssh-client")
+        // The fourteen per-package refusals are one fact, not fourteen entries: they all said the
+        // same sentence, because it is the same half-configured package every apt command trips on.
+        assertThat(export.lines().count { it.contains("base packages refused one by one") }).isEqualTo(1)
+        assertThat(export).contains("14/14 refused")
+    }
+
+    @Test
+    fun `the cause is recorded, not the dependents that report it`() = runTest {
+        // The shape the real failure has and the single-package fixture above does not: a failed
+        // maintainer script is followed by *every* package that depends on it, each with its own
+        // dpkg verdict, so the last verdict in the output describes a consequence. Run 35058820878
+        // died configuring openssh-client; ssh and openssh-sftp-server then reported that they
+        // cannot be configured because of it. The verdict that diagnoses is the first one whose
+        // script failed, and dpkg says so on the line under it.
+        val harness = Harness(distro(arch = "arm64"))
+        val cascade =
+            "Setting up openssh-client (1:8.9p1-3ubuntu0.17) ...\n" +
+                "chgrp: invalid group: '_ssh'\n" +
+                "dpkg: error processing package openssh-client (--configure):\n" +
+                " installed openssh-client package post-installation script subprocess returned error exit status 1\n" +
+                "dpkg: dependency problems prevent configuration of openssh-sftp-server:\n" +
+                " openssh-sftp-server depends on openssh-client (>= 1:8.9p1-3); however:\n" +
+                "  Package openssh-client is not configured yet.\n" +
+                "dpkg: error processing package openssh-sftp-server (--configure):\n" +
+                " dependency problems - leaving unconfigured\n" +
+                "Errors were encountered while processing:\n" +
+                " openssh-client\n" +
+                " openssh-sftp-server\n" +
+                "E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> 100 to cascade
+                command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to cascade
+                else -> baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+        val export = harness.distribution.diagnostics.export()
+        val reason = export.lines()
+            .first { it.contains("bulk base-package install failed") }
+
+        // The step Android refused, and the verdict naming the package it belonged to.
+        assertThat(reason).contains("chgrp: invalid group: '_ssh'")
+        assertThat(reason).contains("dpkg: error processing package openssh-client")
+        // Not the cascade: a dependent's complaint is not the reason the install died, and a
+        // report that leads with it sends the reader to the wrong package.
+        assertThat(reason).doesNotContain("dependency problems")
+    }
+
+    @Test
+    fun `a failed bulk install is repaired before the per-package fallback`() = runTest {
+        // A bulk install that dies part-way is what interrupts dpkg, and apt then refuses every
+        // command for about a second without touching a mirror. The per-package fallback is such
+        // a command, so without a repair pass between them it measures the database rather than
+        // the packages and loses all of them — E2E run 35056615874: 33 packages, every one
+        // refused in 1-2s, while `apt-get check` exited 0 before and after.
+        val harness = Harness(distro(arch = "arm64"))
+        var bulkAttempts = 0
+        var repairPasses = 0
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> {
+                    bulkAttempts++
+                    // The attempt after the recovery pass is the one that works, and it is the
+                    // only reason three attempts are spent: the retry is one command where the
+                    // fallback is one per package.
+                    if (bulkAttempts == 3) 0 to "" else 100 to "E: dpkg was interrupted, you must manually run 'dpkg --configure -a'"
+                }
+                command.startsWith("dpkg --configure -a") -> {
+                    repairPasses++
+                    0 to ""
+                }
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup()
+
+        // The prologue's pass and the recovery pass. The third bulk attempt exists only because
+        // the second of those ran and exited 0, which is also what makes the order a fact rather
+        // than a coincidence of the fake.
+        assertThat(repairPasses).isEqualTo(2)
+        assertThat(bulkAttempts).isEqualTo(3)
+        assertThat(report.warnings).contains("the base packages needed a dpkg repair pass to install")
+        // And the fallback never ran: the recovery rung answered first.
+        assertThat(
+            harness.scripted.commandsWith
+                .map { it.second }
+                .none { it == "apt-get install -y --no-install-recommends git" },
+        ).isTrue()
     }
 
     @Test
@@ -618,6 +858,125 @@ class UbuntuDistributionManagerTest {
         assertThat(report.warnings.any { "armhf" in it }).isTrue()
     }
 
+    @Test
+    fun `the failed install names the package dpkg is stuck on`() = runTest {
+        // The other half of the diagnosis, and the half apt's own output does not carry: which
+        // package every later command is dying on. Run 35058820878 recorded the database's *shape*
+        // (status=169537B, updates=0) and nothing else, so the one thing a reader needs — the name,
+        // and through it the maintainer script that refused — had to be inferred.
+        val harness = Harness(distro(arch = "arm64"))
+        val dpkgDir = File(harness.runtime.rootfsDir, "var/lib/dpkg")
+        dpkgDir.mkdirs()
+        File(dpkgDir, "status").writeText(
+            "Package: bash\n" +
+                "Status: install ok installed\n" +
+                "\n" +
+                "Package: openssh-client\n" +
+                "Status: install ok half-configured\n" +
+                "\n" +
+                "Package: openssh-sftp-server\n" +
+                "Status: install ok half-installed\n",
+        )
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("python3-pip sudo") -> 100 to "dpkg: error processing package openssh-client (--configure):\n"
+                command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to "E: dpkg was interrupted\n"
+                else -> baseline(command)
+            }
+        }
+
+        runCatching { harness.distribution.setup() }
+        val export = harness.distribution.diagnostics.export()
+
+        assertThat(export).contains("half-configured=openssh-client,openssh-sftp-server (half-installed)")
+        // The installed package is not named: this line is about what is stuck, not what is fine.
+        assertThat(export.lines().first { it.contains("half-configured=") }).doesNotContain("bash")
+    }
+
+    @Test
+    fun `a failing repair pass records dpkg's database and its own error line`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        // The state the device was actually left in: a status the pass could not back up, a
+        // stale status-old and one unconsumed update record — what makes every later apt run
+        // print "dpkg was interrupted" and exit 100 without touching a mirror.
+        val dpkgDir = File(harness.runtime.rootfsDir, "var/lib/dpkg")
+        File(dpkgDir, "updates").mkdirs()
+        File(dpkgDir, "status").writeText("Package: bash\n")
+        File(dpkgDir, "status-old").writeText("Package: bash\n")
+        File(File(dpkgDir, "updates"), "0001").writeText("record")
+        harness.scripted.respond = { command ->
+            if (command.startsWith("dpkg --configure -a")) {
+                // dpkg colours its errors whenever stderr is a terminal, and under proot it is.
+                2 to "\u001B[1mdpkg:\u001B[0m \u001B[1;31merror:\u001B[0m error creating new" +
+                    " backup file '/var/lib/dpkg/status-old': Permission denied\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup()
+        val export = harness.distribution.diagnostics.export()
+
+        assertThat(export).contains("dpkg repair pass")
+        assertThat(export).contains("exit=2")
+        // The evidence that the pass left the database interrupted, read from the host side.
+        assertThat(export).contains("dpkg database")
+        assertThat(export).contains("status-old=14B")
+        assertThat(export).contains("updates=1 pending record(s)")
+        // Terminal escapes are presentation, and a diagnostic that quotes dpkg's own line must
+        // not push `ESC[1;31m` into the export the user reads.
+        assertThat(export).doesNotContain("\u001B")
+        assertThat(export).contains("error creating new backup file")
+        // The user-facing warning carries the same sentence, without the escapes.
+        val warning = report.warnings.first { it.contains("did not fully succeed") }
+        assertThat(warning).contains("Permission denied")
+        assertThat(warning).doesNotContain("\u001B")
+    }
+
+    @Test
+    fun `the repair pass surfaces what the fork logged about hard links`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        // A stale line from an earlier run, which the run's own reset must drop: evidence for a
+        // failure at minute twelve is not evidence if it is buried under last week's install.
+        File(harness.runtime.rootDir, "sigsys-log.txt").writeText(
+            "SIGSYS: time=09:00:00 pid=1 comm=apt-get kernel_num=82 pr=82\n",
+        )
+        harness.scripted.respond = { command ->
+            if (command.startsWith("dpkg --configure -a")) {
+                // What the fork writes while the pass runs: patch 0003's decision line, then the
+                // failure dpkg reported when the emulation was refused anyway.
+                File(harness.runtime.rootDir, "sigsys-log.txt").appendText(
+                    "LINK: linkat(/var/lib/dpkg/status, /var/lib/dpkg/status-old, flags=0)\n" +
+                        "LINK: native linkat refused (13), emulating: /var/lib/dpkg/status ->" +
+                        " /var/lib/dpkg/status-old\n",
+                )
+                2 to "dpkg: error: error creating new backup file: Permission denied\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        harness.distribution.setup()
+
+        val export = harness.distribution.diagnostics.export()
+        assertThat(export).contains("blocked-syscall log")
+        assertThat(export).contains("native linkat refused (13)")
+        // And the stale line is gone: the log describes this run.
+        assertThat(export).doesNotContain("kernel_num=82")
+    }
+
+    @Test
+    fun `a clean run leaves no blocked-syscall event behind`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        File(harness.runtime.rootDir, "sigsys-log.txt").writeText("SIGSYS: stale\n")
+
+        harness.distribution.setup()
+
+        // Nothing was trapped, so nothing is reported — silence is not evidence.
+        assertThat(harness.distribution.diagnostics.export()).doesNotContain("blocked-syscall log")
+        assertThat(File(harness.runtime.rootDir, "sigsys-log.txt").exists()).isFalse()
+    }
+
     // ------------------------------------------------------------------ fixtures
 
     /**
@@ -635,6 +994,7 @@ class UbuntuDistributionManagerTest {
         networkOnline: () -> Boolean = { true },
         mirrorListUrl: String = "http://127.0.0.1:1/mirrors.txt",
         aptUpdateAttemptTimeoutMs: Long = 10 * 60_000L,
+        freeBytes: () -> Long = { 0L },
     ) {
         /** The scripted fake every non-wedged spawn lands in, even when [wedgeOn] wraps it. */
         val scripted: ScriptedPtySpawner = scripted.apply { respond = { baseline(it) } }
@@ -644,6 +1004,7 @@ class UbuntuDistributionManagerTest {
                 rootDir,
                 "/fake/native/lib",
                 if (wedgeOn != null) WedgingPtySpawner(scripted, wedgeOn) else scripted,
+                storage = RuntimeStorageManager(rootDir, freeBytesProbe = { freeBytes() }),
             )
         val distribution =
             UbuntuDistributionManager(
@@ -735,6 +1096,79 @@ class UbuntuDistributionManagerTest {
         override fun awaitExit(): Int = 1
 
         override fun close() = wake.countDown()
+    }
+
+    @Test
+    fun `the reason for a failed postinst keeps both lines shadow needed to name the lock`() {
+        // The transcript E2E run 35086244789 died on, verbatim: shadow reports a lock it could not
+        // take in two lines, and the two are a pair — the second says what failed, the first says
+        // which file and whose PID. Keeping two lines kept the second and the verdict, so the
+        // evidence named neither the lock file nor the process that held it.
+        val reason = dpkgFailureReason(
+            """
+            Setting up openssh-client (1:8.9p1-3ubuntu0.10) ...
+            groupadd: /etc/group.2500379: lock file already used
+            groupadd: cannot lock /etc/group; try again later.
+            dpkg: error processing package openssh-client (--configure):
+             installed openssh-client package post-installation script subprocess returned error exit status 10
+            dpkg: dependency problems prevent configuration of openssh-sftp-server:
+            Errors were encountered while processing:
+             openssh-client
+            E: Sub-process /usr/bin/dpkg returned an error code (1)
+            """.trimIndent(),
+        )
+
+        assertThat(reason).isNotNull()
+        assertThat(reason!!).contains("/etc/group.2500379")
+        assertThat(reason).contains("cannot lock /etc/group")
+        assertThat(reason).contains("dpkg: error processing package openssh-client")
+    }
+
+    @Test
+    fun `the reason prefers the script that failed over the packages that report the damage`() {
+        // The whole cascade, in dpkg's order: the maintainer script's verdict first, then one
+        // verdict per package that depended on it. The last verdict describes a consequence; the
+        // first names the cause.
+        val reason = dpkgFailureReason(
+            """
+            dpkg: error processing package openssh-client (--configure):
+             installed openssh-client package post-installation script subprocess returned error exit status 10
+            dpkg: dependency problems prevent configuration of openssh-sftp-server:
+             openssh-sftp-server depends on openssh-client (>= 1:8.9p1-3); however:
+              Package openssh-client is not configured yet.
+            Errors were encountered while processing:
+             openssh-client
+             openssh-sftp-server
+            """.trimIndent(),
+        )
+
+        assertThat(reason!!).contains("openssh-client")
+        assertThat(reason).doesNotContain("sftp-server")
+    }
+
+    @Test
+    fun `a failure with no maintainer script falls back to the last verdict`() {
+        // An unpack failure, which dpkg reports the same way but with nothing of the package's own
+        // to say. There is no script verdict to prefer, so the last one stands — and the noise
+        // filter still leaves the report reading as a cause rather than as a progress log.
+        val reason = dpkgFailureReason(
+            """
+            Unpacking libssl3:amd64 (3.0.2-0ubuntu1.10) ...
+            dpkg-deb: error: archive './libssl3.deb' is not a debian format archive
+            dpkg: error processing archive ./libssl3.deb (--unpack):
+             dpkg-deb --control subprocess returned error exit status 2
+            """.trimIndent(),
+        )
+
+        assertThat(reason!!).contains("dpkg: error processing archive")
+        assertThat(reason).doesNotContain("Unpacking libssl3")
+    }
+
+    @Test
+    fun `a failed command with no output has no reason to report`() {
+        assertThat(dpkgFailureReason(null)).isNull()
+        assertThat(dpkgFailureReason("")).isNull()
+        assertThat(dpkgFailureReason("\n \n")).isNull()
     }
 
     private fun distro(arch: String, release: String = "jammy") =
