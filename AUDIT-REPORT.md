@@ -4252,7 +4252,8 @@ java.lang.IllegalStateException: No compose hierarchies found in the app.
 
 It is not the diff's doing, and again that is proven rather than argued. The head that failed,
 `e39ab08`, is `main` plus §38.2's one file: `git diff origin/main origin/fix/retry-linux-source-fetch
--- app/src` is **empty**, so `app/src/androidTest/AppNavigationTest.kt` is byte-for-byte the file that
+-- app/src` is **empty**, so `app/src/androidTest/java/dev/eclipse/ssh/AppNavigationTest.kt` is
+byte-for-byte the file that
 `main` ran. `main`'s own instrumentation run on `874a493` was green at 17:38, and the same file had
 been green on `5bbdf60` at 16:50 and on `bc0d8be`. Three green runs of one file, then a red one of the
 identical file, is the same proof §38.5 used.
