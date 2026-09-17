@@ -30,11 +30,12 @@ import org.robolectric.annotation.Config
  * section header - the same words uppercased, a third string - is asserted on its own.
  *
  * The editor body itself is the one part not asserted, and the reason is scope rather than difficulty:
- * it is `ShortcutBarEditorBody`, the same composable the dialog draws, so the controls it renders are
- * the editor's subject and not this window's. What this class pins is that the window composed it at
- * all - the count on the row above is read from the editor's live working copy, so a count on screen is
- * a statement that the editor state exists and is rendering - plus the two actions the window owns and
- * the discard guard's *absence* until there is something to discard.
+ * it is `ShortcutBarEditorBody`, which is the editor's own composable rather than this window's - the
+ * deleted dialog drew the same one - so what it renders is the editor's subject. What this class pins
+ * is that the window composed it at all - the count on the row above is read from the editor's live
+ * working copy, so a count on screen is a statement that the editor state exists and is rendering -
+ * plus the two actions the window owns and the discard guard's *absence* until there is something to
+ * discard.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = EclipseApp::class, sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
@@ -166,9 +167,10 @@ class ShortcutBarActivityRobolectricTest {
      * The body is laid out in a window that carries the destination's own chrome.
      *
      * Worth more here than on the sibling screens: the editor's body is what the dialog capped at 75%
-     * of the screen height, and the cap is what a regression would restore. The header and the row are
-     * asserted displayed without any scrolling first, which is the closest this level can come to
-     * saying the page is the page.
+     * of the screen height, and a frame like that coming back - the body letterboxed inside a window
+     * that already scrolls - is what a regression here looks like. The header and the row are asserted
+     * displayed without any scrolling first, which is the closest this level can come to saying the
+     * page is the page.
      */
     @Test
     fun theBodyIsLaidOutInAWindowWithItsOwnChrome() {

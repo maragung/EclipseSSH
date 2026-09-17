@@ -53,11 +53,12 @@ private const val KEY_BAR_WRITE = "the shortcut bar layout"
  * capped at a fraction of the screen height and the cap list inside it carried a second cap of its
  * own, so a bar with more caps than fit was edited through a window inside a window. What the
  * promotion must *not* do is rewrite the editor: the body is not reimplemented here.
- * `ShortcutBarEditorBody` in `ui/terminal` draws it, and the dialog and this screen are two skins over
- * that one body - the only things this file decides are the frame, what a saved write does, and what
- * leaving asks. A screen with its own copy of the sections is exactly the pair that drifts, and the
- * rules in there (where a new cap lands, that a preset is a whole arrangement, that a reset is
- * confirmed like any other replacement) are not obvious enough to be got right twice.
+ * `ShortcutBarEditorBody` in `ui/terminal` draws it, and it is the only skin over that body now that
+ * the modal dialog it was extracted from is gone - the only things this file decides are the frame,
+ * what a saved write does, and what leaving asks. A screen with its own copy of the sections is
+ * exactly the pair that drifts, and the rules in there (where a new cap lands, that a preset is a
+ * whole arrangement, that a reset is confirmed like any other replacement) are not obvious enough to
+ * be got right twice.
  *
  * Like every destination, this screen writes through the repository the shell injects rather than
  * through the Settings view model: one call, [SettingsRepository.setTerminalKeyBarJson], with the
@@ -141,23 +142,19 @@ class ShortcutBarActivity : SettingsDestinationActivity() {
                     color = MaterialTheme.colorScheme.primary,
                 )
             }
-            // The dialog's own frame supplied this padding, and its height cap; the cap is gone with
-            // the dialog (the page scrolls instead) and the gutter is the app's usual 16dp, which is
-            // what the sections in here are drawn against on either skin.
+            // The dialog's frame supplied this padding and its height cap; the cap is gone with the
+            // dialog (the page scrolls instead) and the gutter is the app's usual 16dp, which is what
+            // the sections in here are drawn against.
             ShortcutBarEditorBody(
                 state = editor,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 14.dp),
-                // The page around this body scrolls, so the cap list must not: a second vertical
-                // scroller nested in this one would take the drag and leave the page unable to reach
-                // its own bottom. See [ShortcutBarEditorBody].
-                capListScrolls = false,
             )
         }
 
-        // The dialog's Reset and Save, kept as buttons under the card rather than in the bar: the
-        // shell's bar has no actions slot, and these are not a setting row - they are what this screen
-        // does with the whole arrangement. Cancel is gone on purpose, because leaving *is* Cancel
-        // here.
+        // The editor's two actions, as buttons under the card rather than in the bar: the shell's bar
+        // has no actions slot, and these are not a setting row - they are what this screen does with
+        // the whole arrangement. The dialog kept them in its button row, which is the frame the
+        // promotion removed. Cancel is gone on purpose, because leaving *is* Cancel here.
         Spacer(Modifier.height(14.dp))
         Row(
             Modifier.fillMaxWidth(),
@@ -173,9 +170,10 @@ class ShortcutBarActivity : SettingsDestinationActivity() {
         }
 
         // The editor's own dialogs - the custom-cap editor, and the confirmation a preset or a reset
-        // takes - drawn over this screen, which is what a window's own dialog looks like. In the
-        // dialog skin the same call is made *instead of* the frame; here the frame is the page, and it
-        // has no business disappearing because a preset is being confirmed.
+        // takes - drawn over this screen, which is what a window's own dialog looks like. The dialog
+        // skin made the same call *instead of* its frame, because two stacked dialogs was a look it
+        // never had; here the frame is the page, and it has no business disappearing because a preset
+        // is being confirmed.
         ShortcutBarEditorDialogs(editor)
 
         // The screen's back-out guard, and the judgement it encodes.
@@ -188,10 +186,10 @@ class ShortcutBarActivity : SettingsDestinationActivity() {
         // reasons, and a screen that dropped the arrangement on it would be dropping work nobody chose
         // to abandon. So back asks *when there is something to lose*, and only then.
         //
-        // This is the one place the two skins are not symmetric, and the asymmetry is held to the
-        // smallest thing that makes the screen honest. The protection the dialog did have - the
-        // confirmation before a preset or a reset discards a hand-built bar - is not weakened or
-        // reworded: it is the shared dialog above, firing in both skins.
+        // This guard is the one thing the screen does that the dialog it replaces did not, and the
+        // asymmetry is deliberately held to the smallest thing that makes the screen honest: the
+        // protection the dialog *did* have - the confirmation before a preset or a reset discards a
+        // hand-built bar - is neither weakened nor reworded, and is the shared dialog above.
         //
         // The shell's back arrow calls `finish()` directly from outside this body, so this guard
         // covers the system back and not the arrow. That is a real gap and it is not hidden here: a
