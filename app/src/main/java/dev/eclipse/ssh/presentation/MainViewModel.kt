@@ -13,6 +13,7 @@ import dev.eclipse.ssh.data.TransferRepository
 import dev.eclipse.ssh.data.backup.AccountCredentials
 import dev.eclipse.ssh.data.backup.BackupFormatException
 import dev.eclipse.ssh.data.backup.VaultBackup
+import dev.eclipse.ssh.data.backup.VaultExporter
 import dev.eclipse.ssh.data.credentials.HostCredentialStore
 import dev.eclipse.ssh.data.credentials.KeyEdit
 import dev.eclipse.ssh.data.credentials.RdpCredentialUpdate
@@ -56,6 +57,7 @@ import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.data.settings.SnippetRepository
+import dev.eclipse.ssh.feature.vault.VaultUnlockGate
 import dev.eclipse.ssh.feature.wakeonlan.WakeOnLan
 import dev.eclipse.ssh.feature.wakeonlan.parseMac
 import dev.eclipse.ssh.linux.LocalLinuxHost
@@ -166,8 +168,16 @@ class MainViewModel @Inject constructor(
     private val livenessProbe: SessionLivenessProbe,
     private val wakeOnLan: WakeOnLan,
     private val transferNotifier: TransferNotifier,
+    private val vaultExporter: VaultExporter,
     val filesExplorer: FilesExplorerController,
     val linuxUserspace: LinuxUserspaceController,
+    /**
+     * Exposed rather than private for the same reason [linuxUserspace] is: the auto-lock observer
+     * lives in a composable, and a composable reaches a singleton through the view model it already
+     * has rather than through an entry point of its own. See [VaultUnlockGate] for why the flag it
+     * carries has to be process-wide.
+     */
+    val vaultUnlockGate: VaultUnlockGate,
     @ApplicationContext private val context: Context,
 ) : ViewModel() {
     private val query = MutableStateFlow("")
@@ -4429,11 +4439,7 @@ class MainViewModel @Inject constructor(
      */
     fun exportVault(passphrase: String, uri: Uri) = viewModelScope.launch(Dispatchers.IO) {
         guardBackup("Export failed") {
-            val hosts = hostRepository.hosts.first()
-            val settings = settingsRepository.settings.first()
-            val payload = VaultBackup.encrypt(VaultBackup.toJson(hosts, settings, sshConnectionManager.knownHosts()), passphrase)
-            writeDocument(uri, payload)
-            report("Exported ${hosts.size} host(s)")
+            report("Exported ${vaultExporter.export(passphrase, uri)} host(s)")
         }
     }
 
