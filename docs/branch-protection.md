@@ -1,14 +1,13 @@
 # Branch protection
 
-**Not currently in force.** The rule below is the one this repository intends
-`main` to carry, and it stays copy-pasteable — but as of 2026-09-17 it is not
-applied: `GET /repos/<owner>/EclipseSSH/branches/main/protection` answers
-`Branch not protected`. Nothing therefore stops a merge to `main` without a
-green run, and the six most recent pull requests — every one authored and
-merged by the same account — are what that looks like in practice. Until the
-rule is applied the discipline is the author's, not GitHub's, which is the
-weaker of the two. Settings are at
-`github.com/<owner>/EclipseSSH/settings/branches`.
+**In force since 2026-09-17.** `GET
+/repos/maragung/EclipseSSH/branches/main/protection` answers with the rule below
+as stored, and that read-back is the evidence — a `PUT` returning `200` is a
+claim, not a state. Until that date the same endpoint answered `Branch not
+protected`, and the six pull requests before it — every one authored and merged
+by the same account — are what that looked like in practice: the discipline was
+the author's, not GitHub's. Settings are at
+`github.com/maragung/EclipseSSH/settings/branches`.
 
 ## Rule for `main`
 
@@ -16,15 +15,29 @@ weaker of the two. Settings are at
 | --- | --- |
 | Branch name pattern | `main` |
 | Require a pull request before merging | yes |
-| Required approvals | 1 |
+| Required approvals | 0 — see below |
 | Dismiss stale pull request approvals when new commits are pushed | yes |
-| Require review from Code Owners | yes |
+| Require review from Code Owners | no — see below |
 | Require status checks to pass before merging | yes |
 | Require branches to be up to date before merging | yes |
-| Require linear history | yes |
+| Require linear history | no — see below |
 | Do not allow force pushes | yes |
 | Do not allow deletions | yes |
 | Include administrators | yes |
+
+### The three rows that are not what a template would say
+
+Each of these was `yes` (or `1`) when this document was a recipe, and each is
+now written as it is actually stored, because a recipe mistaken for a safeguard
+is worse than no recipe — which is the defect this file carried until
+2026-09-17. All three were found by reading the repository rather than the
+template, and none of them was left unset by accident.
+
+| Row as a template has it | Stored as | Why |
+| --- | --- | --- |
+| Required approvals `1` | `0` | `maragung` is the only collaborator, and it authors every pull request. GitHub does not let an author approve their own pull request, so one required approval on a one-account repository makes `main` permanently unmergeable — it would have blocked the very pull request that applied this rule. The requirement that does the work here is the status checks, and `enforce_admins: true` is what makes them bind the administrator too. Raise this to `1` in the same breath as adding a second collaborator who can review. |
+| Require review from Code Owners `yes` | `no` | `.github/CODEOWNERS` exists and names `@maragung` on every pattern. Requiring code-owner review is the row above with a stricter resolver, so on one account it is the same deadlock and not a second safeguard. |
+| Require linear history `yes` | `no` | `main` carries 85 merge commits and its convention is `Merge pull request #NN from …`. Linear history forbids merge commits outright, so the setting does not distinguish a good merge from a bad one — it forbids the repository's own history, and any release merged the way every release has been merged. If the convention ever changes to squash, this row follows it; the convention does not follow this row. |
 
 ### Required status checks
 
