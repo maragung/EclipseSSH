@@ -1,53 +1,67 @@
 # Continuous integration
 
-Three workflows, by purpose:
+Ten workflows, by purpose:
 
-| Workflow | Trigger | Job |
+| Workflow | Trigger | What it does |
 | --- | --- | --- |
-| `ci.yml` | Every push to `main`, every pull request, `workflow_dispatch` | Lint, both unit-test variants, instrumentation compile, both APKs, signature check, artifacts |
-| `release.yml` | Push to `main`, `workflow_dispatch` | `assembleRelease` + signature check, uploads the APKs as a downloadable artifact |
-| `tagged-release.yml` | A `vX.Y.Z` (or `vX.Y.Z-…`) tag | The same as `release.yml`, then creates a GitHub release, attaches every APK and the checksums file, and writes release notes drawn from `AUDIT-REPORT.md` |
+| `ci.yml` | Push to `main`, every pull request, `workflow_dispatch` | The gate. Six jobs: both native modules, release lint, the unit and integration suite, the instrumentation and AAB builds with their signature checks, an emulator crash-on-open smoke, and an idle stress matrix. |
+| `fast-test.yml` | Push to `fast-test/**`, `workflow_dispatch` | Lint and the unit/integration suite as a two-entry matrix, each under a hard timeout. The gate a work-in-progress branch uses so it does not have to push to `main` first. |
+| `focused-test.yml` | `workflow_dispatch` (`ref`, `filter`, `task`) | One Gradle task against one `--tests` filter, on any ref. How a single class is run without paying for the whole suite. |
+| `instrumentation.yml` | Push to `main`, every pull request, `workflow_dispatch` | `connectedDebugAndroidTest` on a booted AVD, against the debug build. |
+| `release.yml` | Push to `main`, `workflow_dispatch` | Signed `assembleRelease` and `bundleRelease`, both signatures verified, checksums computed. |
+| `tagged-release.yml` | A `vX.Y.Z` (or `vX.Y.Z-…`) tag | The same build from the exact tag, then creates the GitHub release with every APK, the AAB and the checksums. |
+| `android-release-test.yml` | `release: published`, `workflow_dispatch` | Takes a *published* release and exercises its APK on an emulator matrix, one job per API level. |
+| `universal-apk-test.yml` | `workflow_dispatch` (`apk_source`) | The universal APK on an emulator matrix. Resolve → test → gate → `auto-fix`, which is the autonomous repair loop. |
+| `android-ubuntu-e2e.yml` | `workflow_dispatch` (`mode`) | The Linux userspace end-to-end drive: `SMOKE`, `STANDARD`, or `FULL` (which adds failure injection and needs `adb root`). |
+| `schema-dump.yml` | `workflow_dispatch` | `:app:kspDebugKotlin` and uploads `app/schemas`, for a pull request that changes the database layer. |
 
-The CI gate (`ci.yml`) is the one that has to stay fast. The other two exist so a release can be
-rebuilt at any time without rerunning lint and the full test suite, and so a `git tag` is the only
-path that creates a published release.
+Only `tagged-release.yml` creates a public release. The three matrix workflows do write outside the
+Actions tab: each has a `gate` job that collects every API level's report before deciding, and opens
+a GitHub issue when the run failed (`issues: write`), and each has an `auto-fix` job — *Autonomous
+repair* — that then runs the repository's own repair loop in `testing/` over the failure evidence,
+with `contents: write` and an `ANTHROPIC_AUTH_TOKEN`. That loop is bounded (a `max_repair_attempts`
+input, default 5) and can be turned off (`run_repair: false`); it is the one part of this pipeline
+that reacts to a red run by trying to change something rather than only reporting it.
 
 ## ci.yml
 
-`.github/workflows/ci.yml` runs on every push to `main`, on every pull request, and on demand
-(`workflow_dispatch`). One job, `verify`, does the whole chain in order, so a failure stops at the
-first thing that is actually broken:
+Six jobs, so a failure lands on the thing that is actually broken instead of stopping a chain:
 
-| Step | Command | What it protects |
+| Job | Command | What it protects |
 | --- | --- | --- |
-| Lint | `./gradlew lintRelease` | Release-variant Android lint, including the manifest and resource checks that only run for `release`. |
-| Unit tests | `./gradlew testDebugUnitTest testReleaseUnitTest` | Both variants. `release` is not a duplicate: it compiles against the minified/shrunk resource set and different `BuildConfig`, and has caught variant-only breakage before. |
-| Instrumentation compile | `./gradlew assembleDebugAndroidTest` | The `androidTest` sources cannot run here (see below) but they must still compile, or they rot silently. |
-| Build | `./gradlew assembleDebug assembleRelease` | Both APKs, R8/resource shrinking included. |
-| Signature | `apksigner verify --verbose` | That the release APK is signed. See the note below on reading its output. |
-| Artifacts | `actions/upload-artifact` | `eclipse-ssh-debug-apk`, `eclipse-ssh-release-apk`, and `reports` (lint + test HTML, kept 14 days, uploaded even on failure). |
+| `native` | `:freerdp:assembleDebug`, `:linux:assembleDebug` | That both native modules still build from their pinned sources and patches, on all four ABIs. |
+| `lint` | `lintRelease` | Release-variant Android lint, including the manifest and resource checks that only run for `release`. |
+| `test` | `testDebugUnitTest` | The whole JVM suite, Robolectric included, with an isolated OpenSSH sandbox started for the tests that dial a real server. |
+| `assemble` | `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `:app:dependencies --write-locks` | That the `androidTest` sources still compile, that both APKs and the Play AAB build, that the dependency lockfiles are still satisfied, and that the release APK is signed. |
+| `smoke` | Boots a headless AVD and launches both APKs | That the app starts and stays up. This is the crash-on-open gate — a window that dies in `onCreate` passes every JVM test there is. |
+| `stress` | A filtered `testDebugUnitTest` under `timeout --signal=QUIT` | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. |
 
-## release.yml
+The `assemble` job's first step asserts that the `androidTest` sources contain at least one test,
+because a suite that compiles to nothing is indistinguishable from a suite that passes.
 
-`.github/workflows/release.yml` runs on every push to `main` and on demand. It does
-`assembleRelease`, verifies the APKs, computes a `SHA256SUMS.txt`, and uploads everything as the
-`eclipse-ssh-release-apk` artifact. There is no test run and no OpenSSH sandbox - the CI gate
-already covers that, and a release rebuild should not pay for it twice.
+`testReleaseUnitTest` is a real task and worth running locally, but no workflow runs it: the
+release variant's resource shrinking is exercised by `assemble` and the smoke job instead.
 
-## tagged-release.yml
+## fast-test.yml
 
-`.github/workflows/tagged-release.yml` is what the brief calls the "tagged release" path. It runs
-on any `v*` tag pushed to the repository (matching `v[0-9]+.[0-9]+.[0-9]+`, optionally with a
-`-…` pre-release suffix). It does `clean assembleRelease` from the tag exactly
-(`git describe --exact-match` is asserted), verifies the signature, computes checksums, and uses
-`softprops/action-gh-release` to create a GitHub release. The release title and the
-`versionName`/`versionCode` it reports are read out of the built APK with `aapt2 dump badging` so
-the published metadata cannot drift from the artifact.
+One matrix job, `verify`, with two entries — `lintRelease` and `testDebugUnitTest` — each run
+through `timeout --signal=QUIT --kill-after=60s` so a hung test is killed and reported rather than
+sitting until the six-hour job limit. It fires on `fast-test/**` branches, which is what makes it
+the gate for work that is not ready for `main`.
 
-The release is created as a **draft** when the tag carries a pre-release suffix (e.g. `v1.2.0-rc.1`),
-and as a normal release otherwise. Release notes are composed from the latest section heading of
-`AUDIT-REPORT.md`; if that file is missing or the section cannot be found the step fails rather
-than producing a blank release.
+## release.yml and tagged-release.yml
+
+Both do `assembleRelease` **and** `bundleRelease`, verify the APK signature and the AAB signature
+separately (the AAB is not an APK and `apksigner` cannot read it as one), and compute checksums.
+
+The difference is the source of the build. `release.yml` builds whatever the branch holds and
+uploads the artifacts. `tagged-release.yml` asserts `git describe --exact-match` first — the build
+must be the tag, not a branch that resembles it — and then creates the GitHub release. Release
+notes are composed from the latest section heading of `AUDIT-REPORT.md`, and the step fails if that
+file is missing or the section cannot be found, rather than publishing a blank release.
+
+The release is created as a **draft** when the tag carries a pre-release suffix (e.g. `v1.2.0-rc.1`)
+and as a normal release otherwise.
 
 Cutting a release:
 
@@ -55,6 +69,23 @@ Cutting a release:
 git tag v1.2.3
 git push origin v1.2.3
 ```
+
+## The emulator jobs
+
+Five workflows boot an AVD: `instrumentation.yml` (to run `connectedDebugAndroidTest`), `ci.yml`'s
+`smoke` job (to launch both APKs and assert they stay up), and the three matrix workflows
+(`android-release-test.yml`, `universal-apk-test.yml`, `android-ubuntu-e2e.yml`), which each
+resolve a matrix, run one job per API level, and gate on the collected reports.
+
+Every one of them enables KVM device permissions on the runner before starting the emulator, and
+every one creates a **headless** AVD — there is no window to attach to, and no screenshot to take.
+The failure evidence is the device log, uploaded as an artifact.
+
+The three matrix workflows share a shape worth knowing when one of them goes red: a `resolve` job
+turns the dispatch inputs into a matrix, `test` runs per API level, and `gate` collects every
+report before deciding — so a single failing API level fails the run with the others' results still
+available. `universal-apk-test.yml` and the other two then run `auto-fix`, which is a repair loop
+that reads the failure report and the run evidence from the artifacts.
 
 ## Reading the signature check
 
@@ -75,19 +106,9 @@ A CI run without the signing secrets prints the mirror image — `v2: true, v3: 
 reason. That APK is signed with the debug key, and the explicit `enableV3Signing = true` lives on the
 release `signingConfig`, so the fallback carries AGP's defaults instead. It installs on everything the
 app supports (v2 covers API 24 up, `minSdk` is 28) and the debug key is never rotated, so v3 buys it
-nothing. Both readings are why the workflow only asserts the v2 *and* v3 blocks when
+nothing. Both readings are why the workflows only assert the v2 *and* v3 blocks when
 `steps.signing.outputs.signed` is `true`: with a real key their absence is a defect worth failing on,
 and without one it is expected.
-
-## Why there is no emulator step
-
-`connectedAndroidTest` needs a device. GitHub's `ubuntu-latest` runners are nested VMs without KVM,
-so an x86 system image runs under full software emulation; it boots, then the guest's watchdog kills
-`system_server` before the test run starts. Reactor-style AVD actions work around this on runners
-that do expose KVM, which these do not. The instrumentation suite is therefore compiled in CI and run
-on a real device, and everything that *can* be expressed as a JVM test is: `NavigationRobolectricTest`
-drives the real `MainActivity` through Robolectric at SDK 35, and `SessionStabilityTest` runs a real
-Apache MINA SSHD server in-process and asserts on kernel socket options.
 
 ## Caching
 
@@ -116,8 +137,10 @@ publishable and cannot upgrade an existing install.
 ## Reproducing a CI failure locally
 
 ```sh
-./gradlew lintRelease testDebugUnitTest testReleaseUnitTest assembleDebugAndroidTest \
-          assembleDebug assembleRelease
+./gradlew lintRelease testDebugUnitTest assembleDebugAndroidTest \
+          assembleDebug assembleRelease bundleRelease
 ```
 
 Reports land in `app/build/reports/`; that whole directory is what the `reports` artifact contains.
+The emulator jobs cannot be reproduced this way — they need a booted device, which is what
+`focused-test.yml` and the matrix workflows exist to provide.
