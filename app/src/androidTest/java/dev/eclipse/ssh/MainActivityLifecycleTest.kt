@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
@@ -42,6 +43,31 @@ class MainActivityLifecycleTest {
             .setAction(Intent.ACTION_VIEW)
             .setData(Uri.parse(link))
 
+    /**
+     * Waits for [text] to appear, then asserts it is displayed.
+     *
+     * Same shape as `ReleaseChaosJourneyTest.awaitSeededRow` and `AppNavigationTest.awaitSeededRow`,
+     * which is where this idiom already lives in this suite. A bare `waitForIdle()` followed by an
+     * assertion is a race for anything the app derives from its intent: the link is handed to the
+     * activity by the system's activity manager and reaches the main thread afterwards, so Compose
+     * can report idle before the state that opens the prompt has been posted, let alone composed.
+     * A healthy emulator hides this — a recomposition is ~30ms, so the dialog usually wins — and
+     * that is why this file read as green rather than as flaky. Under load it does not hide it: the
+     * run on 2026-09-17 measured the guest at `app_time_stats: avg=4235.73ms` per frame, the link
+     * was delivered at 15:26:01.774 (`result code=3`, START_DELIVERED_TO_TOP), the activity went
+     * PAUSED/RESUMED at .823/.824, and the assertion had already failed by .84 — while the dialog
+     * needed a frame the starved guest never got around to.
+     *
+     * The wait is bounded and the assertion still runs afterwards, so a prompt that never appears
+     * still fails. This waits for the state under test; it does not excuse its absence.
+     */
+    private fun awaitTextDisplayed(text: String) {
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText(text).assertIsDisplayed()
+    }
+
     @Test
     fun aColdLaunchReachesResumedWithoutFinishing() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
@@ -59,7 +85,7 @@ class MainActivityLifecycleTest {
             compose.waitForIdle()
 
             // The link is offered as a one-off quick connect, named user@host.
-            compose.onNodeWithText("Authenticate to deploy@edge.example.com").assertIsDisplayed()
+            awaitTextDisplayed("Authenticate to deploy@edge.example.com")
         }
     }
 
@@ -68,7 +94,7 @@ class MainActivityLifecycleTest {
         ActivityScenario.launch<MainActivity>(viewIntent("sftp://files.example.com")).use {
             compose.waitForIdle()
 
-            compose.onNodeWithText("Authenticate to root@files.example.com").assertIsDisplayed()
+            awaitTextDisplayed("Authenticate to root@files.example.com")
         }
     }
 
@@ -79,7 +105,7 @@ class MainActivityLifecycleTest {
         ActivityScenario.launch<MainActivity>(viewIntent("ssh://ops@edge.example.com:0")).use {
             compose.waitForIdle()
 
-            compose.onNodeWithText("Authenticate to ops@edge.example.com").assertIsDisplayed()
+            awaitTextDisplayed("Authenticate to ops@edge.example.com")
         }
     }
 
@@ -101,19 +127,27 @@ class MainActivityLifecycleTest {
             )
             compose.waitForIdle()
 
-            compose.onNodeWithText("Authenticate to ci@build.example.com").assertIsDisplayed()
-            scenario.onActivity { assertThat(it.isFinishing).isFalse() }
-
-            // MainActivity keeps a delivered link as its intent, and ActivityScenario only accepts
-            // lifecycle callbacks for an activity whose intent still matches the one it launched
-            // with — so from the link's arrival onwards it silently ignored this instance, and
-            // close() waited 45s for a DESTROYED callback it had itself been discarding
-            // ("last lifecycle transition = PAUSED"; on device the activity had long been
-            // destroyed). Putting the launch intent back re-opens the bookkeeping before the
-            // teardown close() performs. The other tests here never deliver a second intent, and
-            // launching with a VIEW intent directly (the no-usable-host cases) tracks that same
-            // intent, so only this test needs the restore.
-            launchIntent?.let { saved -> scenario.onActivity { it.setIntent(saved) } }
+            try {
+                awaitTextDisplayed("Authenticate to ci@build.example.com")
+                scenario.onActivity { assertThat(it.isFinishing).isFalse() }
+            } finally {
+                // MainActivity keeps a delivered link as its intent, and ActivityScenario only
+                // accepts lifecycle callbacks for an activity whose intent still matches the one
+                // it launched with — so from the link's arrival onwards it silently ignored this
+                // instance, and close() waited 45s for a DESTROYED callback it had itself been
+                // discarding ("last lifecycle transition = PAUSED"; on device the activity had
+                // long been destroyed). Putting the launch intent back re-opens the bookkeeping
+                // before the teardown close() performs. The other tests here never deliver a
+                // second intent, and launching with a VIEW intent directly (the no-usable-host
+                // cases) tracks that same intent, so only this test needs the restore.
+                //
+                // In a finally rather than after the assertions because the restore is what makes
+                // the teardown cheap, and a failing assertion is exactly when it matters: the
+                // 2026-09-17 failure threw before reaching it and paid the whole 45s (link
+                // delivered 15:26:01.84, failure reported 15:26:46.87) on top of the failure
+                // itself.
+                launchIntent?.let { saved -> scenario.onActivity { it.setIntent(saved) } }
+            }
         }
     }
 
