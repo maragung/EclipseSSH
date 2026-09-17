@@ -110,6 +110,20 @@
             android:parentActivityName=".MainActivity" />
 
         <!--
+          About, promoted from a dialog over Settings to a window of its own.
+          It carries the app's longest piece of reading - the licence list -
+          which a height-capped dialog body could only letterbox, and whose
+          rows below the fold it could not reach. No configChanges list, unlike
+          the two above: this screen holds no live state to protect, so a
+          rotation recreating it costs one static composition and nothing else.
+          Not exported - it is only ever started from Settings.
+        -->
+        <activity
+            android:name=".ui.about.AboutActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
           Long-lived work host: terminal shells, SFTP transfers and port
           forwards all run inside this service so that the process survives
           minimise / screen-off. dataSync is the correct FGS type for

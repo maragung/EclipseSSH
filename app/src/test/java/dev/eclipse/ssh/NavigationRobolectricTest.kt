@@ -237,8 +237,9 @@ class NavigationRobolectricTest {
     fun everyDestinationIsReachableAndRendersItsFirstRunContent() {
         compose.waitForIdle()
 
-        // Hosts is the start destination. Its top bar is now actions-only (no title, no search
-        // icon), so the screen is identified by its filter field and its actions.
+        // Hosts is the start destination. Its top bar carries the filter field in the title slot
+        // and the two actions, so those are what identify the screen - there is no title text and
+        // no separate search icon to look for.
         assertDisplayed("Search hosts, tags, or usernames")
         compose.onNodeWithContentDescription("Add host").assertIsDisplayed()
         compose.onNodeWithContentDescription("Import account").assertIsDisplayed()

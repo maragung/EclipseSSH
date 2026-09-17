@@ -345,27 +345,33 @@ class HostAndThemeUiRobolectricTest {
     }
 
     /**
-     * The Hosts column reaches the edges of a narrow screen, measured on the search field.
+     * The Hosts column reaches the edges of a narrow screen, measured on the header row's two ends.
      *
      * The screen margins were deliberately thinned to 8dp - a phone screen is the scarce resource,
      * and 20dp each side gave back 6% of a 320dp window for nothing. This pins the new margin from
-     * below: the search field is the first full-width thing in the column, so where its text starts
-     * is the margin plus the field's own inner padding (16dp in Material3), and where it ends is
-     * the same on the other side. The bounds are taken on whatever node the placeholder text
-     * resolves to - the merged field, or the placeholder inside it - which is why both bounds are
-     * loose enough to hold for either reading and still fail the 20dp margin they replaced.
+     * below: the first label in the header row starts at the column's left edge and the last chip in
+     * it ends at the right one, so between them they are the margin on each side. The bounds are
+     * taken on whatever node each text resolves to - the chip, or the label inside it - which is why
+     * both bounds are loose enough to hold for either reading and still fail the 20dp margin they
+     * replaced.
+     *
+     * It used to be measured on the search field, which was the column's first full-width row. That
+     * field now lives in the top bar - a different container, with its own 16dp content padding and
+     * the two action buttons eating the right of it - so it is no longer a witness to this column's
+     * width, and the header row is what the column actually starts with.
      */
     @Test
     @Config(qualifiers = "w320dp-h480dp-mdpi")
     fun theHostsColumnUsesAlmostTheWholeWidthOfANarrowScreen() {
-        val search = compose.onNodeWithText("Search hosts, tags, or usernames")
-        search.performScrollTo().assertIsDisplayed()
-        val bounds = search.getUnclippedBoundsInRoot()
+        val firstLabel = compose.onNodeWithText("All hosts")
+        val lastChip = compose.onNodeWithText("Favorites")
+        firstLabel.performScrollTo().assertIsDisplayed()
+        lastChip.performScrollTo().assertIsDisplayed()
 
         assertWithMessage("the content column is inset like the 20dp margin never left")
-            .that(bounds.left.value).isAtMost(28f)
+            .that(firstLabel.getUnclippedBoundsInRoot().left.value).isAtMost(28f)
         assertWithMessage("the content column does not reach the right edge of the screen")
-            .that(bounds.right.value).isAtLeast(290f)
+            .that(lastChip.getUnclippedBoundsInRoot().right.value).isAtLeast(290f)
     }
 
     // ---------------------------------------------------------------- pasting a credential
