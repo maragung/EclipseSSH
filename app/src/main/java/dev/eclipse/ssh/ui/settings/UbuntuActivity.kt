@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -30,6 +31,7 @@ import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -41,6 +43,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
@@ -444,10 +447,14 @@ class UbuntuActivity : SettingsDestinationActivity() {
                     // store when this window opened; this screen edits no setting, so there is nothing
                     // fresher for it to consult.
                     val trace = linuxUserspace.exportInstallLog()
-                    // `copy` reports nothing back - it swallows a refused write itself, because a
-                    // clipboard set for an app without window focus is refused by the platform on
-                    // Android 10+ - so this catch is for the throw, not for a status.
+                    // Both outcomes are reported, and the success one is not a guess. `copy` swallows a
+                    // refused write itself, and the only refusal it can meet is the platform's "no
+                    // window focus" on Android 10+ — which cannot be the case here, because this ran
+                    // from a tap on a control in the window that holds focus. A copy that returns
+                    // without throwing is a copy. Confirming it matters more now that the action is an
+                    // icon: with no label, there is nothing else on screen to show the tap registered.
                     runCatching { secureClipboard.copy(trace, settings.clearClipboardAfterSeconds) }
+                        .onSuccess { report("Install log copied to the clipboard") }
                         .onFailure { report("Could not copy to the clipboard") }
                 },
                 onSave = {
@@ -535,8 +542,18 @@ private fun InstallLogDialog(
                             }
                         }
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TextButton(onClick = onCopy) { Text("Copy") }
+                    // Centred rather than the Row default of Top: an icon button's box is taller than a
+                    // text button's, so top alignment would leave the icon riding above Save and Clear.
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // The label is gone, so the content description carries what it said — and it
+                        // names the thing being copied rather than only the verb, because the body it
+                        // sits under is a wall of monospace lines that "Copy" alone would not identify.
+                        IconButton(onClick = onCopy) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = "Copy install log")
+                        }
                         TextButton(onClick = onSave) { Text("Save") }
                         TextButton(onClick = onClear) { Text("Clear", color = MaterialTheme.colorScheme.error) }
                     }
