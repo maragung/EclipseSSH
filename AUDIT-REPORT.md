@@ -1,9 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 9 / versionName 1.1.1 · minSdk 28, target/compileSdk 35
+`dev.eclipse.ssh` · versionCode 25 / versionName 1.1.17 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
-Where those snapshots call `lintRelease` clean, read §16.2: the current count is 0 errors and 51 warnings, and §16.2 says which are new and which are not.
-Kotlin 2.1.20 · AGP 8.9.1 · Gradle 8.11.1 · JDK 17 · Compose BOM 2025.04.01 · Hilt 2.56.1 · Room 2.7.1 · Apache MINA SSHD 2.14.0
+Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
+Kotlin 2.4.20 · AGP 9.4.0 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2025.04.01 · Hilt 2.60.1 · KSP 2.3.11 · Room 2.7.1 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.79
+Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
+The numbered sections end at §36, *Releasing 1.1.4*: the narrative is a record of the passes that wrote it and was not carried forward through 1.1.5–1.1.17, the last of which is the version this file's header names. What happened after 1.1.4 is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -204,26 +206,32 @@ malformed entries; 500+ file directories; large files.
   release build.
 
 ### Known residual items (not fixed, deliberately)
-Everything that used to be on this list except the two items below has since been fixed at the root
-and covered by tests — see section 12.
+One item is left. Everything else that used to be on this list has since been fixed at the root and
+covered by tests — see section 12 — and the last of those to close was the destructive-migration
+fallback, since replaced by the downgrade-only form described below the list.
 
 - **In-app Compose text is hardcoded English.** Everything the *system* draws on the app's behalf comes
   from `strings.xml` (notification channels, the biometric sheet, the shortcuts), so nothing outside the
   app's own windows is unlocalisable, but the screens themselves hold their text in source. Extracting
   it is mechanical and large, and it is the one change in this list that cannot be verified by a test —
   it needs a translator. Recorded rather than half-done.
-- **`fallbackToDestructiveMigration(dropAllTables = true)` is still the last resort.** Every version
-  step from 2 to 11 has a real migration and `MigrationTest` walks them, so the fallback only fires for
-  a downgrade or a version this build has never heard of — where the alternative is refusing to open
-  the database at all. What made it dangerous was `exportSchema = false`: without the committed schema
-  JSON there is nothing to write the *next* migration against, and Room cannot check one. The schema is
-  now exported (see 12.9), which is the part that had to happen before a schema change ships.
+
+**Closed since this list was written: the destructive-migration fallback.** It is
+`fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)` now, not the blanket
+`fallbackToDestructiveMigration(dropAllTables = true)` — so a *missing upgrade* migration is a loud
+failure at open rather than silent data loss, which is the behaviour this entry was about. Every
+version step from 2 to 18 has a real migration and `MigrationTest` walks all sixteen of them. What made
+the blanket form dangerous was `exportSchema = false`: without the committed schema JSON there is
+nothing to write the *next* migration against, and Room cannot check one. The schema is exported now
+(see 12.9), which is the part that had to happen before a schema change ships.
 
 ## 6. Build and test results
 
-> This section records the full eight-step chain as it ran on 18 August. The terminal work landed after
-> it; **§10 has the current figures** (493 tests per variant, lint clean, both APKs), and where they
-> disagree §10 is the tree as it stands.
+> This section records the full eight-step chain as it ran on 18 August, and every figure below is
+> what that chain printed. It is not the current tree, and neither is any later section — §10, which
+> the terminal work landed on, reports 493 tests per variant and a clean lint, and §16.2 corrects that
+> lint reading. The current figures are the header block at the top of this file and the counts in
+> `README.md`, which `scripts/check-doc-figures.sh` re-derives from the sources on every run.
 
 Chain: `.tmp-emulator/final-build6.sh` → `.tmp-emulator/final-build6.log`, 20:39:26 → 20:58:18
 (18 min 52 s wall). JDK 17.0.20+8, Gradle 8.11.1, AGP 8.9.1, Kotlin 2.1.20, build-tools 35.0.0,
@@ -1369,10 +1377,11 @@ The other four are genuinely mine, and the earlier "clean" reading was simply wr
 local report for the section 15 pass does contain 4 warnings, and calling it clean was counting errors
 and not warnings. Run #4 has none of them; runs #5, #6 and #7 each have exactly 4.
 
-They sit on the two lines section 15 added: `ConfigurationScreenWidthHeight` at
-`MainActivity.kt:1809-1810`, telling us to read
-`LocalWindowInfo.current.containerSize` instead of `Configuration.screenWidthDp/screenHeightDp`. It is
-not followed, and the reason is the same reason the code reads the screen in the first place.
+They sit on the two lines section 15 added: `ConfigurationScreenWidthHeight` on the
+`configuration.screenWidthDp, configuration.screenHeightDp` pair that section 15 passes to
+`terminalTextInset`, telling us to read `LocalWindowInfo.current.containerSize` instead of
+`Configuration.screenWidthDp/screenHeightDp`. It is not followed, and the reason is the same reason
+the code reads the screen in the first place.
 
 `containerSize` measures the **window**. This activity is edge-to-edge, and on API 30+ that makes the
 keyboard an inset rather than a resize, so on a modern device the two would agree. But `minSdk` is 28,

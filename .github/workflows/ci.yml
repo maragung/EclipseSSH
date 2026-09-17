@@ -45,13 +45,34 @@ env:
   FREERDP_CMAKE_VERSION: '4.1.2'
 
 jobs:
+  # The documentation gate, listed first because it is the cheapest thing here:
+  # no JDK, no Android SDK, no Gradle, no cache to restore. It is a shell script
+  # checking the claims the documents make against the files that decide them:
+  # the version figures (app/build.gradle.kts, gradle/libs.versions.toml, the
+  # wrapper properties, linux/build.gradle.kts), the repository paths they name,
+  # the check names branch protection requires, and that no Kotlin source under
+  # app/src carries a NUL byte. So a release that bumps a pin and leaves the
+  # prose behind goes red in seconds rather than being noticed a release later.
+  # See scripts/check-doc-figures.sh for what it does and does not claim.
+  docs:
+    name: Documentation figures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the documents against the build
+        run: bash scripts/check-doc-figures.sh
+
   # One native build feeds every consumer. `native` compiles the four-ABI
   # FreeRDP tree and saves the freerdp/build cache; lint, test and assemble
   # restore that same tree, so every Gradle task wired into preBuild finds the
   # native outputs and goes UP-TO-DATE instead of rebuilding. Wall clock is
   # roughly native + the longest consumer, not the serial sum of everything
-  # the old single job did. Branch protection must require the five check
-  # names below (native, lint, test, assemble, smoke); the old combined
+  # the old single job did. Branch protection must require the six check
+  # names below (docs, native, lint, test, assemble, smoke); the old combined
   # "Lint, tests, APKs and AAB" check is gone.
   native:
     name: FreeRDP native (4 ABIs)

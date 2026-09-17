@@ -93,5 +93,6 @@ proot is GPL-2.0, talloc LGPL-3.0 (statically linked into proot). Both are
 built as standalone executables that the app runs as separate processes and
 talks to over a PTY — arm's-length aggregation, not linking. The source
 offer is the pinned, SHA256-verified tarball URLs recorded in
-`build.gradle.kts`; see `docs/THIRD-PARTY.md` in the repository root for
+`build.gradle.kts` together with the patches in `proot-patches/` that the build
+applies to the extracted fork before compiling it; see `docs/THIRD-PARTY.md` for
 the full notice.

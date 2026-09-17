@@ -245,10 +245,12 @@ jobs:
             PRERELEASE="false"
           fi
           AAPT2="$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
-          # Pick the first APK in the release directory. The per-ABI
-          # splits were removed in favour of the AAB's per-ABI
-          # splitting at Play install time, so the directory now
-          # contains a single app-release.apk.
+          # Any of the APKs in the release directory answers the same question:
+          # the build step above leaves five (the four ABI splits plus the
+          # universal APK), and a split carries the same package name,
+          # versionCode and versionName as the universal one - splits differ in
+          # which native libraries they carry, not in their identity. So
+          # "first one" is enough and the choice needs no tie-break.
           APK="$(find app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -1)"
           test -n "$APK" || { echo "no APK found in app/build/outputs/apk/release"; exit 1; }
           BADGING="$("$AAPT2" dump badging "$APK")"
@@ -276,17 +278,22 @@ jobs:
             if [ -f AUDIT-REPORT.md ]; then
               echo "### Audit summary"
               echo
-              LAST="$(grep -E '^## [0-9]+\.' AUDIT-REPORT.md | tail -1 || true)"
+              # Only claim a section as this release's summary when it actually
+              # names this release. The last numbered section is whatever the
+              # report's narrative last reached, which is not necessarily this
+              # tag - printing it unconditionally published another version's
+              # heading as this one's summary.
+              LAST="$(grep -E '^## [0-9]+\.' AUDIT-REPORT.md | grep -F "Releasing $VERSION" | tail -1 || true)"
               if [ -n "$LAST" ]; then
                 echo "$LAST"
                 echo
-                echo "The full audit report is committed at the repository root as \`AUDIT-REPORT.md\`."
               fi
+              echo "The full audit report is committed at the repository root as \`AUDIT-REPORT.md\`."
             fi
             echo
             echo "### Verification"
             echo
-            echo "- \`./gradlew clean assembleRelease bundleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 37, build-tools 36.0.0, NDK 29.0.13113456)"
+            echo "- \`./gradlew clean\`, then \`./gradlew bundleRelease\`, then \`./gradlew assembleRelease\` succeeded on a GitHub-hosted runner (Ubuntu 24.04, JDK 17.0.13, Android SDK 37, build-tools 36.0.0, NDK 29.0.13113456)"
             echo "- All release APKs verified with \`apksigner verify\` (v2 + v3)"
             echo "- The AAB is verified and uploaded alongside the per-ABI APKs"
             if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then

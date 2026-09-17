@@ -64,9 +64,14 @@ mode, same screens, same action sequence.
   data schemes become deep links).
 - **Runtime**: after the first verified launch, the first screen is dumped
   and its classified elements are merged into the model.
-- **Element addressing** (preference order): resource-id > content-desc >
-  class+index > text > bounds. Taps resolve through the element's center
-  from its bounds - coordinates are the last resort, not the plan.
+- **Element addressing**: elements are picked from the dump by *kind* first
+  (`KIND_PRIORITY`: tab, menu, button, link, image-button, picker, switch,
+  radio, clickable, scrollable, text-field, webview) and then by a stable,
+  bounds-free descriptor, so the same screen yields the same walk. A tap is
+  always the element's `center` from its bounds; the human-readable name in
+  the traces and reports is the first non-empty of text, content-desc,
+  resource-id, class. Coordinates are never invented — every tap is inside a
+  node the dump actually reported.
 - **Screen identity**: a stable sha1 over sorted element descriptors
   (class, resource-id, content-desc, truncated text) - deliberately
   bounds-free so a rotation does not fork the visited-screen set. Compose
@@ -120,13 +125,19 @@ reports/    release-test-report.md, universal-test-result.json,
 
 GitHub Actions -> "Universal APK test" -> Run workflow:
 
-- `apk_source`: `build-from-source` (build and test this ref), 
+- `apk_source`: `build-from-source` (build and test this ref),
   `artifact-from-release` (download a published release asset), `url`
   (fetch an arbitrary APK).
+- `apk_url`: the direct APK URL — required when `apk_source=url`.
+- `tag`: the release tag to download from — used when
+  `apk_source=artifact-from-release`, and empty means the latest release.
 - `mode`: SMOKE / STANDARD / DEEP / RELEASE (see table above).
 - `api_levels`: emulator matrix, default `35,30`.
 - `seed`: default `20260914`; keep it fixed to compare runs, change it to
   explore different paths.
+- `max_actions`, `max_test_minutes`: per-run overrides of the mode's action
+  and time budgets; empty means the mode's own numbers.
+- `max_repair_attempts`: the repair loop's cap, default 5.
 - `run_repair`: `true` lets the repair loop run **only** when
   `apk_source=build-from-source` and `ANTHROPIC_AUTH_TOKEN` is configured.
 

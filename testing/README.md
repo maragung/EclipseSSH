@@ -40,14 +40,16 @@ key's signing identity, and resource shrinking.
 
 | File | Role |
 |---|---|
-| `feature-manifest.json` | Machine-readable feature inventory: components, permissions, every user-facing feature with its priority and the suite that covers it. The report's feature list comes from here — keep it current when screens or flows change. |
+| `feature-manifest.json` | Machine-readable feature inventory: components, permissions, every user-facing feature with its priority and the suite that covers it. Nothing in the pipeline reads it today — the generated report has no feature list, and no script resolves its ids — so keeping it current is a manual discipline rather than something the pipeline enforces. |
 | `verify-release-apk.sh` | Distribution-artifact verification: package name, versionCode/versionName against the checked-out source, the native ABI the caller names, no debuggable flag, valid v2+v3 signature. Writes `release-validation.json` (carrying the expected ABI); any mismatch fails before install. |
 | `verify-split-apk.sh` | One per-ABI split's *content*: the ABI it carries and no other, the named libraries present under `lib/<abi>/`, each an ELF of the architecture it is filed under, and `extractNativeLibs=true` so proot is extracted somewhere it can be `execve`'d. Writes a per-split verdict JSON; names every failure rather than the first. |
-| `verify-release-splits.sh` | Runs `verify-split-apk.sh` over all four release splits. Holds the per-ABI library mapping in one place (`:freerdp` builds four ABIs, `:linux` three, so x86 carries eight libraries to the others' eleven) and is called by both `ci.yml` and `tagged-release.yml` so a PR gate and a release gate cannot disagree. |
+| `verify-release-splits.sh` | Runs `verify-split-apk.sh` over each of the four release splits in turn — stopping at the first bad one, since the script is `set -euo pipefail` and calls the verifier unguarded, so a red split reports that split rather than all four. Holds the per-ABI library mapping in one place (`:freerdp` builds four ABIs, `:linux` three, so x86 carries eight libraries to the others' eleven) and is called by both `ci.yml` and `tagged-release.yml` so a PR gate and a release gate cannot disagree. |
 | `scan-crashes.sh` | Post-suite logcat scan for JVM fatals, ANRs, native crashes, force-closes. A passing suite with a crashed background service still fails the gate. Writes `crash-report.json`. |
 | `collect-diagnostics.sh` | Deterministic evidence collection (always, pass or fail): logcat, dumpsys activity/package/meminfo/gfxinfo, ANR traces, screenshot, environment record. |
 | `generate-report.py` | Composes `release-test-report.md` (verdict, tests, crashes, APK validation, RELEASE / DO NOT RELEASE recommendation) and, on failure, `failure-report.json` with failing tests, stacks, and the app frames a fix will most likely touch. |
 | `auto-fix.sh` | The autonomous repair loop. See below. |
+| `universal/` | The `universal-apk-test.yml` pipeline's own scripts (`explore.py`, `adbutil.py`, `discover-app.py`, `generate-report.py`, `scan-issues.py`, `verify-apk.sh`, `auto-fix.sh`) and its README, which is the reference for that workflow's modes and budgets. |
+| `ubuntu-e2e/` | The `android-ubuntu-e2e.yml` driver (`driver.py`, `summary.py`) and its README. It drives a device directly and calls back into this directory's `auto-fix.sh` and `collect-diagnostics.sh`. |
 
 ## Autonomous repair loop
 
@@ -78,8 +80,8 @@ Honest limits, stated rather than hidden:
   ~600 MB download; they are covered by the JVM suites against embedded
   servers and by the maintainer's on-device loop. The manifest records this
   per feature.
-- **API 30 is the oldest leg** — one step above minSdk 28. Add levels via the
-  `api_levels` dispatch input; each leg is a full emulator suite, so the
+- **API 30 is the oldest leg** — two API levels above minSdk 28. Add levels via
+  the `api_levels` dispatch input; each leg is a full emulator suite, so the
   default matrix is deliberately two.
 - **Video recording** is not wired; screenshots and full logcat are. The
   collector's layout leaves room for `videos/` when a runner-side encoder is

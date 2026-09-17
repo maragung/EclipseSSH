@@ -6,7 +6,7 @@ import java.util.Collections
 
 /**
  * The two ways the proxy connectors reach into Apache MINA internals, and the degradation each one
- * owes when the internal it depends on is no longer shaped the way MINA 2.14 shapes it.
+ * owes when the internal it depends on is no longer shaped the way MINA 2.19 shapes it.
  *
  * Both are reflection- and cast-hardening rather than wire behaviour, so they are exercised here as
  * plain functions rather than through a live handshake: the point of each fix is precisely what
@@ -47,7 +47,7 @@ class ProxyConnectorInternalsTest {
 
     @Test
     fun `a writable session map takes the registration`() {
-        // The path MINA 2.14 always takes: the map is a real ConcurrentHashMap, so the session is stored
+        // The path MINA 2.19 always takes: the map is a real ConcurrentHashMap, so the session is stored
         // and connect() proceeds exactly as the blind cast used to let it.
         val sessions = hashMapOf(1L to "existing")
 

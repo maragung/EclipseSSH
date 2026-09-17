@@ -38,7 +38,7 @@ import dev.eclipse.ssh.ssh.reviewAlgorithmList
  * represent "the user has cleared this field", and three of these fields need exactly that state to
  * mean something specific - "inherit the app-wide delay", "match the screen".
  *
- * Only settings Apache MINA SSHD 2.14.0 can actually apply per host are here. Four of the settings that
+ * Only settings Apache MINA SSHD 2.19.0 can actually apply per host are here. Four of the settings that
  * were asked for are absent, and their absence is deliberate rather than an omission:
  *
  *  - **Socket read timeout.** `NIO2_READ_TIMEOUT` is read from the client when the socket is created,

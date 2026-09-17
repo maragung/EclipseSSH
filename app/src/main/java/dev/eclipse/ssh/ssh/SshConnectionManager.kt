@@ -167,7 +167,7 @@ class SshConnectionManager @Inject constructor(
      *
      * Apache MINA SSHD's own defaults are more permissive than OpenSSH's, and taking them verbatim
      * meant this app negotiated deprecated cryptography with *every* server whatever the setting said:
-     * `MINA 2.14`'s default cipher list still contains `aes128/192/256-cbc` (OpenSSH stopped offering
+     * `MINA 2.19`'s default cipher list still contains `aes128/192/256-cbc` (OpenSSH stopped offering
      * CBC by default in 6.7) and its default signature list still contains SHA-1 `ssh-rsa` (OpenSSH
      * disabled that in 8.8). Those are exactly the two things the legacy switch existed to add, so
      * with the switch off the app was no safer, and with it on the switch barely did anything.
