@@ -229,6 +229,47 @@
             android:parentActivityName=".MainActivity" />
 
         <!--
+          The Add / Edit host form, and the one entry in this file that Settings does not
+          open. It is reached from the Hosts list - the Add button, a card's Edit item, and
+          the "Edit host" action on the failed-login prompt - so the comment above about
+          Settings being the only caller does not cover it.
+
+          It is here rather than beside the Hosts list's own declarations because everything
+          about the window is shared with the sixteen above it: same shell, same chrome, same
+          back arrow. What differs is the subject - a host, not a preference - and that it
+          reads the host it was opened for out of the intent.
+
+          adjustResize is the one attribute none of the sixteen carry, and it is here because
+          of what this screen is: a full page of text fields down to a Save button at the
+          bottom. Without it the IME covers the fields it is being typed into and the last
+          section of the form. The others either have no text input at all or take it in a
+          single field near the top.
+
+          The configChanges list is the other attribute none of the sixteen carry, and it is
+          here for a stronger reason than adjustResize. Their reasoning does not reach this
+          screen: they hold a value that lives in a store, so a rotation costs one read and
+          loses nothing. This one holds *unsaved user input* - a name, a hostname, a
+          passphrase, a picked key file, fourteen engine settings - and a rotation that
+          recreated it would silently discard all of it, which is data loss rather than a
+          cheap re-read. The alternatives were worse: `rememberSaveable` on the fields would
+          write the form into a Bundle, and a Bundle is persisted to disk by the system and
+          is not a place for a passphrase or a private key's bytes to end up. Not recreating
+          the window is the same choice MainActivity makes for the workspace, and for the
+          same reason.
+
+          It holds [VaultUnlockGate] across its key picker for the same reason the block
+          above does, and it is the one screen where that matters most: the passphrase for the
+          key being attached is typed after the picker returns, and a re-lock over that field
+          would discard it.
+        -->
+        <activity
+            android:name=".ui.settings.HostFormActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:parentActivityName=".MainActivity"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!--
           Long-lived work host: terminal shells, SFTP transfers and port
           forwards all run inside this service so that the process survives
           minimise / screen-off. dataSync is the correct FGS type for

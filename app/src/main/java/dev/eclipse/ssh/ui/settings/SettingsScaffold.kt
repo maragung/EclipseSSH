@@ -70,12 +70,25 @@ val LocalSettingsReport = staticCompositionLocalOf<(String) -> Unit> { {} }
  * that moved out of `MainViewModel` still reads to the user exactly as it did before the move.
  */
 internal fun reportWriteFailure(report: (String) -> Unit, what: String, error: Throwable) {
+    reportFailure(report, "Could not save $what", error)
+}
+
+/**
+ * Reports [error] under a prefix the caller writes in full.
+ *
+ * [reportWriteFailure] is this with the "Could not save …" prefix, which is what every settings write
+ * wants. The host form is the one caller that needs a different sentence: its save has already
+ * succeeded by the time its credential write can fail, and the view model it replaces said so in as
+ * many words - "Saved X, but its credentials could not be stored". A message that opened with
+ * "Could not save" would tell the user the opposite of what happened.
+ */
+internal fun reportFailure(report: (String) -> Unit, prefix: String, error: Throwable) {
     // Cancellation is the window going away mid-write, not a failed write, and it must keep
     // propagating - swallowing it here would leave this coroutine running in a scope already torn
     // down, and would hide a cancellation the caller may be waiting on.
     if (error is CancellationException) throw error
     val detail = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
-    report("Could not save $what: $detail")
+    report("$prefix: $detail")
 }
 
 /**
@@ -106,15 +119,69 @@ fun SettingsDestination(
     onClose: () -> Unit,
     content: @Composable (AppSettings) -> Unit,
 ) {
-    // The app's own dark-theme setting rather than the system's, so a settings screen does not flip
-    // on a user who pinned one - the same reason About reads it this way.
-    // One read of the store, not two: the theme and the snapshot the body renders come from the same
-    // emission, so a body can never be drawn in one theme against another theme's values.
+    val loaded = rememberSettings(settingsRepository)
+    SettingsWindowThemed(loaded?.darkTheme ?: isSystemInDarkTheme(), title, onClose) {
+        content(loaded ?: AppSettings())
+    }
+}
+
+/**
+ * The same window for a screen whose subject is not a setting.
+ *
+ * The host form is the one caller: it is reached from the Hosts list rather than from Settings, and
+ * what it edits is a host, so it has no snapshot to render and takes none. What it does still need
+ * is everything [SettingsDestination] wraps around that snapshot - the app's own dark-theme setting,
+ * a `SnackbarHostState` and the [LocalSettingsReport] above it - because saving a host can fail
+ * exactly as saving a setting can, and the report has to have somewhere to land.
+ *
+ * Separate from [SettingsDestination] rather than a defaulted parameter on it: a window that takes
+ * no snapshot and one that takes a snapshot are two different contracts, and the one that takes none
+ * should not have to name a type it does not use to get the theme.
+ */
+@Composable
+fun SettingsDestinationWindow(
+    settingsRepository: SettingsRepository,
+    title: String,
+    onClose: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val loaded = rememberSettings(settingsRepository)
+    SettingsWindowThemed(loaded?.darkTheme ?: isSystemInDarkTheme(), title, onClose, content)
+}
+
+/**
+ * The one read of the settings store a window makes, or null before it has answered.
+ *
+ * Extracted so the two entry points above cannot drift into reading it differently - and, more to
+ * the point, so neither of them reads it twice. The dark theme and the values a body renders come
+ * from the same emission, which is what makes it impossible for a body to be drawn in one theme
+ * against another theme's values.
+ *
+ * Null means "not answered yet" and not "failed": a store that threw is reported by the write paths
+ * that touch it, and a window whose first frame shows the shipped defaults for a few milliseconds is
+ * a cheaper failure than one that never opens.
+ */
+@Composable
+private fun rememberSettings(settingsRepository: SettingsRepository): AppSettings? {
     val loaded by produceState(initialValue = null as AppSettings?, settingsRepository) {
         value = runCatching { settingsRepository.settings.first() }.getOrNull()
     }
-    val darkTheme = loaded?.darkTheme ?: isSystemInDarkTheme()
-    val settings = loaded ?: AppSettings()
+    return loaded
+}
+
+/**
+ * Theme, snackbar host and report channel: what every one of these windows wraps its body in.
+ *
+ * Takes [darkTheme] already resolved rather than reading it, so the caller that also wants the
+ * settings snapshot pays for one read of the store instead of two.
+ */
+@Composable
+private fun SettingsWindowThemed(
+    darkTheme: Boolean,
+    title: String,
+    onClose: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     CompositionLocalProvider(
@@ -128,7 +195,7 @@ fun SettingsDestination(
         },
     ) {
         EclipseTheme(darkTheme = darkTheme) {
-            SettingsWindow(title = title, onClose = onClose, snackbarHostState = snackbarHostState) { content(settings) }
+            SettingsWindow(title = title, onClose = onClose, snackbarHostState = snackbarHostState, content = content)
         }
     }
 }

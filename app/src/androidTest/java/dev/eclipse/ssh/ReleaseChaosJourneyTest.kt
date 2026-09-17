@@ -9,6 +9,8 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextInput
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -110,21 +112,45 @@ class ReleaseChaosJourneyTest {
     }
 
     /**
-     * A dialog open during a configuration change is a classic leak-and-crash
-     * window: the dialog's window is torn down with the activity while its state
-     * survives in the composition. Cancel must still work afterwards.
+     * A form open during a configuration change keeps everything in it, and Cancel still works.
+     *
+     * This used to rotate `MainActivity` with an `AlertDialog` layered over it, where the risk was a
+     * dialog window outliving the activity that owned it. The form is an activity of its own now, so
+     * the risk moved: the window is the one holding the state, and the failure this catches is a
+     * rotation that wipes it.
+     *
+     * That is not hypothetical here, and the assertion below is what pins the fix.
+     * [HostFormActivity] declares the configChanges list for exactly this reason — the form is a
+     * page of unsaved input, and recreating the window would discard it. Every other window in the
+     * Settings block deliberately does *not* declare one, because each of them holds a value that
+     * already lives in a store. So a reader who aligns this entry with its sixteen neighbours, or who
+     * reaches for `rememberSaveable` on the fields instead, gets a form that comes back empty; the
+     * typed value asserted after the rotation is what makes that visible rather than silent.
      */
     @Test
-    fun theAddHostDialogSurvivesARotation() {
+    fun theAddHostFormSurvivesARotation() {
         compose.waitForIdle()
 
         compose.onNodeWithContentDescription("Add host").performClick()
-        compose.onNodeWithText("Hostname or IP").assertIsDisplayed()
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        // Something typed, so the rotation has state to lose rather than only a layout to redo.
+        // The profile name is the one field an empty form can hold without becoming saveable - the
+        // Save button stays switched off, so nothing here can reach the host store.
+        compose.onNodeWithText("Profile name").performScrollTo().performTextInput("Rotated")
+        compose.onNodeWithText("Rotated").assertIsDisplayed()
 
         rotate(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Hostname or IP").assertIsDisplayed()
+        // The half that fails if the window was recreated behind the user's back.
+        compose.onNodeWithText("Rotated").assertIsDisplayed()
 
-        compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
+        compose.onNode(hasText("Cancel") and hasClickAction()).performScrollTo().performClick()
         compose.waitForIdle()
         compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
     }

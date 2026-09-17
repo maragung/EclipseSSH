@@ -260,6 +260,7 @@ import dev.eclipse.ssh.ui.remotedesktop.RdpConfigDialog
 import dev.eclipse.ssh.ui.settings.ClipboardClearActivity
 import dev.eclipse.ssh.ui.settings.DiagnosticsActivity
 import dev.eclipse.ssh.ui.settings.ExportBackupActivity
+import dev.eclipse.ssh.ui.settings.HostFormActivity
 import dev.eclipse.ssh.ui.settings.KeepAliveActivity
 import dev.eclipse.ssh.ui.settings.KeyGenActivity
 import dev.eclipse.ssh.ui.settings.KnownHostsActivity
@@ -279,6 +280,8 @@ import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
 import dev.eclipse.ssh.ui.PortForwardManagerSheet
+import dev.eclipse.ssh.ui.SecretFieldKeyboard
+import dev.eclipse.ssh.ui.SecretPasteButton
 import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
 import dev.eclipse.ssh.ssh.PERMISSION_PRESETS
 import dev.eclipse.ssh.ssh.SshKeyProbe
@@ -289,7 +292,6 @@ import dev.eclipse.ssh.data.credentials.KeyEdit
 import dev.eclipse.ssh.data.credentials.SecretEdit
 import dev.eclipse.ssh.data.credentials.StoredCredentials
 import dev.eclipse.ssh.data.credentials.describe
-import dev.eclipse.ssh.data.saf.PickedKeyFile
 import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
 import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
@@ -466,47 +468,6 @@ internal fun parseSshDeepLink(uri: Uri?): HostProfile? {
     )
 }
 
-/**
- * Keyboard options for any field that holds a secret.
- *
- * [androidx.compose.ui.text.input.PasswordVisualTransformation] only changes what is *drawn*. With
- * no password keyboard type the field's underlying input type stays ordinary text, so the IME treats
- * a typed passphrase as prose: autocorrect and word suggestions run over it, and it can be committed
- * to the keyboard's personal dictionary and suggestion history. That is a copy of the user's SSH
- * password in storage this app does not own, cannot read and cannot clear — and the next app with a
- * text field may be offered it as a suggestion. `KeyboardType.Password` maps to
- * `TYPE_TEXT_VARIATION_PASSWORD`, which turns all of it off.
- *
- * Shared rather than repeated at each call site so a fifth secret field cannot quietly appear
- * without it. The PIN fields use `NumberPassword` for the same reason over a numeric keypad.
- */
-private val SecretFieldKeyboard = androidx.compose.foundation.text.KeyboardOptions(
-    keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
-)
-
-/**
- * The clipboard-paste affordance for any field created by [SecretFieldKeyboard] above.
- *
- * Long-press paste in a password field is unreliable in exactly the situation it is needed most:
- * the IME's toolbar over a `TYPE_TEXT_VARIATION_PASSWORD` field varies by keyboard, and a clip
- * copied by a password manager often carries a trailing newline a `singleLine` field cannot
- * accept. A button the user can see sidesteps both - and [onPaste] goes through the ViewModel, so
- * the read is subject to the same audited clipboard boundary and newline normalization as every
- * other clipboard access in the app.
- *
- * [what] only exists for the screen reader: the Add-host dialog can show a password, a passphrase
- * and a proxy password at once, and three buttons all announcing "Paste" would be a list nobody
- * can tell apart. The paste *replaces* the field's contents rather than appending to them - these
- * fields are never pre-filled from storage, so whatever is in one is either empty or a typo being
- * corrected.
- */
-@Composable
-private fun SecretPasteButton(what: String, onPaste: () -> String?, into: (String) -> Unit) {
-    IconButton(onClick = { onPaste()?.let(into) }) {
-        Icon(Icons.Default.ContentPaste, contentDescription = "Paste $what from clipboard")
-    }
-}
-
 private enum class Destination(val label: String, val icon: ImageVector) {
     HOSTS("Hosts", Icons.Default.Computer),
     TERMINAL("Terminal", Icons.Default.Terminal),
@@ -663,21 +624,6 @@ private fun EclipseWorkspace(
                     selectedKeyBytes = picked.bytes
                     selectedKeyName = picked.name
                 }
-                .onFailure { error ->
-                    viewModel.reportUiMessage(error.message ?: "That key file could not be read")
-                }
-        }
-    }
-    /**
-     * The key being attached in the Add / Edit Host form, held here rather than inside the dialog so a
-     * recomposition triggered by the picker returning cannot discard it.
-     */
-    var formKey by remember { mutableStateOf<PickedKeyFile?>(null) }
-    val formKeyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        pickerActive = false
-        if (uri != null) scope.launch {
-            readPickedKeyFile(context, uri)
-                .onSuccess { picked -> formKey = picked }
                 .onFailure { error ->
                     viewModel.reportUiMessage(error.message ?: "That key file could not be read")
                 }
@@ -1012,8 +958,6 @@ private fun EclipseWorkspace(
             { reason -> viewModel.reportUiMessage("Biometric unlock not enabled: $reason") },
         )
     }
-    var showAddHost by remember { mutableStateOf(false) }
-    var showEditHost by remember { mutableStateOf<HostProfile?>(null) }
     var showHostDetails by remember { mutableStateOf<HostProfile?>(null) }
     // The host whose port-forwarding manager sheet is open, by id rather than by profile: the sheet
     // edits the host's saved rules, so it must read the *current* profile from the hosts flow every
@@ -1302,7 +1246,7 @@ private fun EclipseWorkspace(
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
-                    onAddHost = { showAddHost = true },
+                    onAddHost = { openHostForm(context) },
                     onConnect = { host ->
                         // The local Ubuntu card never opens the login: there is nothing to
                         // authenticate (the session is the app's own uid), so the tap goes straight
@@ -1311,7 +1255,7 @@ private fun EclipseWorkspace(
                     },
                     onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
-                    onEditHost = { showEditHost = it },
+                    onEditHost = { openHostForm(context, it) },
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
@@ -1471,7 +1415,7 @@ private fun EclipseWorkspace(
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
                     onSearch = viewModel::setQuery,
-                    onAddHost = { showAddHost = true },
+                    onAddHost = { openHostForm(context) },
                     onConnect = { host ->
                         // The local Ubuntu card never opens the login: there is nothing to
                         // authenticate (the session is the app's own uid), so the tap goes straight
@@ -1480,7 +1424,7 @@ private fun EclipseWorkspace(
                     },
                     onReconnectSession = { reconnectAndOpen(it) },
                     onShowDetails = { showHostDetails = it },
-                    onEditHost = { showEditHost = it },
+                    onEditHost = { openHostForm(context, it) },
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
@@ -1615,20 +1559,6 @@ private fun EclipseWorkspace(
         }
     }
 
-    if (showAddHost) {
-        AddHostDialog(
-            pickedKey = formKey,
-            onPickKey = { pickerActive = true; formKeyPicker.launch(KEY_FILE_MIME_TYPES) },
-            onForgetPickedKey = { formKey = null },
-            onDismiss = { formKey = null; showAddHost = false },
-            onSave = { profile, credentials ->
-                viewModel.saveHost(profile, credentials)
-                formKey = null
-                showAddHost = false
-            },
-            onPasteSecret = viewModel::pasteSecret,
-        )
-    }
     showHostDetails?.let { host ->
         HostDetailsSheet(
             host = host,
@@ -1686,22 +1616,6 @@ private fun EclipseWorkspace(
                 onDismiss = { rdpDesktopHostId = null },
             )
         }
-    }
-    showEditHost?.let { host ->
-        AddHostDialog(
-            initialHost = host,
-            storedCredentials = state.savedCredentials[host.id] ?: StoredCredentials(),
-            pickedKey = formKey,
-            onPickKey = { pickerActive = true; formKeyPicker.launch(KEY_FILE_MIME_TYPES) },
-            onForgetPickedKey = { formKey = null },
-            onDismiss = { formKey = null; showEditHost = null },
-            onSave = { profile, credentials ->
-                viewModel.saveHost(profile, credentials)
-                formKey = null
-                showEditHost = null
-            },
-            onPasteSecret = viewModel::pasteSecret,
-        )
     }
     pendingDeleteHost?.let { host ->
         AlertDialog(
@@ -1790,7 +1704,7 @@ private fun EclipseWorkspace(
                 selectedKeyName = selectedKeyName,
                 onEditHost = {
                     viewModel.consumeAuthFailure()
-                    showEditHost = failedHost
+                    openHostForm(context, failedHost)
                 },
                 onRetry = { password, passphrase, save ->
                     viewModel.consumeAuthFailure()
@@ -4019,15 +3933,6 @@ private fun TerminalCommandBar(
 }
 
 /**
- * How long the form waits after the last passphrase keystroke before trying to read the picked key.
- *
- * Reading is not free — an encrypted OpenSSH key runs bcrypt-pbkdf on purpose — so probing on every
- * keystroke would queue one derivation per character and report verdicts for passphrase prefixes the
- * user was still in the middle of typing.
- */
-private const val KEY_PROBE_DEBOUNCE_MS = 300L
-
-/**
  * What the key picker will accept. The wildcard is last and is what actually matters: private keys
  * have no registered MIME type, so providers report them as anything from `text/plain` to
  * `application/octet-stream` to nothing at all, and a narrower filter greys out the very file the
@@ -4655,20 +4560,6 @@ private fun ChmodDialog(name: String, permissions: String?, onDismiss: () -> Uni
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
-
-/**
- * Accent choices, each paired with a name. The name is the swatch's accessibility label: the
- * swatches carry no text, so without it TalkBack announces six identical unlabelled buttons and
- * the colour — the only thing distinguishing them — is unavailable to anyone who cannot see it.
- */
-private val ACCENT_COLORS = listOf(
-    "Red" to 0xFFE53935L,
-    "Blue" to 0xFF1E88E5L,
-    "Green" to 0xFF43A047L,
-    "Orange" to 0xFFFB8C00L,
-    "Purple" to 0xFF8E24AAL,
-    "Cyan" to 0xFF00ACC1L,
-)
 
 private fun safeFileName(value: String): String = value.trim().replace(Regex("[^A-Za-z0-9._-]+"), "_").ifBlank { "account" }
 
@@ -5636,444 +5527,24 @@ private fun PassphraseDialog(
     )
 }
 
-@Composable
-private fun AddHostDialog(
-    initialHost: HostProfile? = null,
-    /** What is already saved for this profile. Metadata only — no secret ever reaches this dialog. */
-    storedCredentials: StoredCredentials = StoredCredentials(),
-    /** A key file picked during this editing session, held by the caller that owns the launcher. */
-    pickedKey: PickedKeyFile? = null,
-    onPickKey: () -> Unit = {},
-    onForgetPickedKey: () -> Unit = {},
-    onDismiss: () -> Unit,
-    onSave: (HostProfile, HostCredentialUpdate) -> Unit,
-    onPasteSecret: () -> String?,
-) {
-    val editing = initialHost != null
-    var name by remember(initialHost?.id) { mutableStateOf(initialHost?.name.orEmpty()) }
-    var host by remember(initialHost?.id) { mutableStateOf(initialHost?.host.orEmpty()) }
-    var username by remember(initialHost?.id) { mutableStateOf(initialHost?.username.orEmpty()) }
-    var port by remember(initialHost?.id) { mutableStateOf((initialHost?.port ?: 22).toString()) }
-    var authMethod by remember(initialHost?.id) { mutableStateOf(initialHost?.authMethod ?: AuthMethod.PASSWORD) }
-    var group by remember(initialHost?.id) { mutableStateOf(initialHost?.group ?: "Personal") }
-    var tags by remember(initialHost?.id) { mutableStateOf(initialHost?.tags?.joinToString(", ").orEmpty()) }
-    var favorite by remember(initialHost?.id) { mutableStateOf(initialHost?.isFavorite ?: false) }
-    var proxyType by remember(initialHost?.id) { mutableStateOf(initialHost?.proxyType ?: ProxyType.NONE) }
-    var proxyJump by remember(initialHost?.id) { mutableStateOf(initialHost?.proxyJump.orEmpty()) }
-    var socksHost by remember(initialHost?.id) { mutableStateOf(initialHost?.socksHost.orEmpty()) }
-    var socksPort by remember(initialHost?.id) { mutableStateOf((initialHost?.socksPort ?: 1080).toString()) }
-    var socksUsername by remember(initialHost?.id) { mutableStateOf(initialHost?.socksUsername.orEmpty()) }
-    var socksPassword by remember(initialHost?.id) { mutableStateOf(initialHost?.socksPassword.orEmpty()) }
-    var accentColor by remember(initialHost?.id) { mutableStateOf(initialHost?.accentColor) }
-    var timeout by remember(initialHost?.id) { mutableStateOf((initialHost?.connectTimeoutSeconds ?: DEFAULT_CONNECT_TIMEOUT_SECONDS).toString()) }
-    // Empty means "follow the global keep-alive", which is what a null column means. Kept as a string
-    // so clearing the field is expressible at all — a numeric field cannot represent "unset".
-    var keepAlive by remember(initialHost?.id) { mutableStateOf(initialHost?.keepAliveSeconds?.toString().orEmpty()) }
-    var fingerprint by remember(initialHost?.id) { mutableStateOf(initialHost?.fingerprint.orEmpty()) }
-    // The MAC as typed, blank for none - the same convention the profile column uses.
-    var wakeOnLanMac by remember(initialHost?.id) { mutableStateOf(initialHost?.wakeOnLanMac.orEmpty()) }
-    // Seeded from the profile, and from the shipped default for a new one, so the box reflects what
-    // this host will actually do rather than a hardcoded position.
-    var autoLoginSftp by remember(initialHost?.id) {
-        mutableStateOf(initialHost?.autoLoginSftp ?: HostProfile.DEFAULT_AUTO_LOGIN_SFTP)
-    }
-    // The fourteen per-host engine settings, as one value. See [AdvancedHostOptions] for why none of
-    // their rules live in this file.
-    var advanced by remember(initialHost?.id) { mutableStateOf(AdvancedHostOptions.from(initialHost)) }
-    // The credential fields. All four start empty on every open, including when editing: a saved
-    // secret is never rendered back into the field it came from, not even masked, because a field
-    // that holds it can be read out by an accessibility service, offered to an autofill provider, or
-    // simply revealed by the next person holding an unlocked phone. What is stored is reported as
-    // "saved" and can be replaced or forgotten, which is all a user needs and nothing an onlooker
-    // can use.
-    var password by remember(initialHost?.id) { mutableStateOf("") }
-    var passphrase by remember(initialHost?.id) { mutableStateOf("") }
-    var forgetPassword by remember(initialHost?.id) { mutableStateOf(false) }
-    var forgetKey by remember(initialHost?.id) { mutableStateOf(false) }
-    // Reading a private key costs a deliberate key derivation — bcrypt-pbkdf, for the OpenSSH
-    // format — so it runs off the main thread, and not until the user has stopped typing. `value` is
-    // cleared first so the form cannot report a stale verdict for the passphrase now in the field;
-    // HostFormDraft.keyReadable treats "picked but not read yet" as not-yet-saveable.
-    val probe by produceState<SshKeyProbe?>(null, pickedKey, passphrase) {
-        val picked = pickedKey
-        value = null
-        if (picked == null) return@produceState
-        delay(KEY_PROBE_DEBOUNCE_MS)
-        value = withContext(Dispatchers.Default) { probeSshKey(picked.bytes, picked.name, passphrase) }
-    }
-    // Read into a local because smart casts do not see through a delegated property, and the three
-    // branches below all need the narrowed type.
-    val keyProbe = probe
-    // Every validity rule lives in HostFormDraft, which is a plain data class with plain tests.
-    // Robolectric cannot idle a Compose dialog window, so rules left inline here would be
-    // permanently unverifiable on the JVM.
-    val draft = HostFormDraft(
-        host = host,
-        username = username,
-        port = port,
-        timeout = timeout,
-        keepAlive = keepAlive,
-        fingerprint = fingerprint,
-        storedFingerprint = initialHost?.fingerprint,
-        wakeOnLanMac = wakeOnLanMac,
-        proxyType = proxyType,
-        proxyJump = proxyJump,
-        socksHost = socksHost,
-        socksPort = socksPort,
-        passphrase = passphrase,
-        keyPicked = pickedKey != null,
-        pickedKey = keyProbe,
-        storedCredentials = storedCredentials,
-        forgetKey = forgetKey,
-    )
-    /**
-     * One line describing the key situation, and whether it is a problem. Null when there is nothing
-     * to say — no key picked, none saved.
-     */
-    val keyStatus: Pair<String, Boolean>? = when {
-        pickedKey != null && keyProbe == null -> "Reading ${pickedKey.name}…" to false
-        keyProbe is SshKeyProbe.Ready -> "${pickedKey?.name.orEmpty()} · ${keyProbe.type}" to false
-        keyProbe is SshKeyProbe.PassphraseRequired -> "That key is encrypted — enter its passphrase below" to false
-        keyProbe is SshKeyProbe.Unreadable -> keyProbe.reason to true
-        forgetKey && storedCredentials.hasKey -> "The saved key will be removed when you save" to false
-        storedCredentials.hasKey ->
-            listOfNotNull(storedCredentials.keyLabel, storedCredentials.keyType).joinToString(" · ") to false
-        else -> null
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(if (editing) "Edit host" else "Add host") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Text("Connection details are stored in the encrypted vault. Credentials are optional — save them for one-tap connects, or leave them blank to be asked each time.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                OutlinedTextField(name, { name = it }, label = { Text("Profile name") }, singleLine = true)
-                OutlinedTextField(host, { host = it }, label = { Text("Hostname or IP") }, singleLine = true)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(port, { port = it.filter(Char::isDigit).take(5) }, label = { Text("SSH port") }, singleLine = true, isError = draft.showPortError, supportingText = { if (draft.showPortError) Text("${PORT_RANGE.first}–${PORT_RANGE.last}") }, modifier = Modifier.weight(1f))
-                    OutlinedTextField(username, { username = it }, label = { Text("Username") }, singleLine = true, modifier = Modifier.weight(2f))
-                }
-                Text("Authentication", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    AuthMethod.entries.forEach { method ->
-                        FilterChip(selected = authMethod == method, onClick = { authMethod = method }, label = { Text(method.label) })
-                    }
-                }
-                // Both a password and a key are offered whatever the method above says, and on purpose:
-                // a server can want a key *and* a password, `KEYBOARD_INTERACTIVE` is usually answered
-                // with the account password, and hiding a field would take away a combination that
-                // works. The method chips say what to try first; these say what the app has to try with.
-                Text(
-                    "Saved credentials (optional)",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-                Text(
-                    "Encrypted with the device keystore and used automatically when you connect. Leave blank to be asked each time.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                OutlinedTextField(
-                    password,
-                    {
-                        password = it
-                        // Typing a replacement is a clearer statement of intent than the pending
-                        // "forget", so it wins rather than fighting it.
-                        if (it.isNotEmpty()) forgetPassword = false
-                    },
-                    label = { Text(if (storedCredentials.hasPassword) "Replace saved password" else "Password") },
-                    singleLine = true,
-                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    keyboardOptions = SecretFieldKeyboard,
-                    modifier = Modifier.fillMaxWidth(),
-                    // The paste button sets the state directly, which bypasses the onValueChange
-                    // above — so the same "a replacement beats a pending forget" rule is restated
-                    // here. Without it, a pasted replacement would lose to a "Forget" the user
-                    // ticked before pasting, and the save would drop the password they just fixed.
-                    trailingIcon = {
-                        SecretPasteButton("password", onPasteSecret) {
-                            password = it
-                            if (it.isNotEmpty()) forgetPassword = false
-                        }
-                    },
-                )
-                if (storedCredentials.hasPassword && password.isEmpty()) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            if (forgetPassword) "The saved password will be removed when you save" else "A password is saved for this host",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(onClick = { forgetPassword = !forgetPassword }) {
-                            Text(if (forgetPassword) "Keep" else "Forget")
-                        }
-                    }
-                }
-                OutlinedButton(onClick = onPickKey, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Default.Key, null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        when {
-                            pickedKey != null -> "Choose a different key"
-                            storedCredentials.hasKey && !forgetKey -> "Replace private key"
-                            else -> "Attach private key"
-                        },
-                    )
-                }
-                keyStatus?.let { (message, isProblem) ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            message,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (isProblem) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f),
-                        )
-                        if (pickedKey != null) {
-                            // Drops the pick and falls back to whatever was already saved, so
-                            // picking the wrong file is not a one-way door.
-                            TextButton(onClick = onForgetPickedKey) { Text("Remove") }
-                        } else if (storedCredentials.hasKey) {
-                            TextButton(onClick = { forgetKey = !forgetKey }) { Text(if (forgetKey) "Keep" else "Forget") }
-                        }
-                    }
-                }
-                if (draft.keyAttached || pickedKey != null) {
-                    OutlinedTextField(
-                        passphrase,
-                        { passphrase = it },
-                        label = {
-                            Text(if (storedCredentials.hasPassphrase) "Replace key passphrase" else "Key passphrase")
-                        },
-                        singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                        keyboardOptions = SecretFieldKeyboard,
-                        isError = !draft.keyReadable && keyProbe is SshKeyProbe.Unreadable,
-                        trailingIcon = { SecretPasteButton("passphrase", onPasteSecret) { passphrase = it } },
-                        supportingText = {
-                            Text(
-                                when {
-                                    keyProbe is SshKeyProbe.PassphraseRequired -> "Required to unlock this key"
-                                    storedCredentials.hasPassphrase -> "A passphrase is already saved for this key"
-                                    else -> "Only if the key is encrypted"
-                                },
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                } else if (passphrase.isNotBlank()) {
-                    // Unreachable through the fields above (the passphrase field is only shown when a
-                    // key is attached), but reachable by attaching a key, typing a passphrase and then
-                    // forgetting the key — which would otherwise leave Save disabled with nothing on
-                    // screen explaining why.
-                    Text(
-                        "Attach a private key, or clear the passphrase.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(group, { group = it }, label = { Text("Group") }, singleLine = true, modifier = Modifier.weight(1f))
-                    OutlinedTextField(tags, { tags = it }, label = { Text("Tags (comma separated)") }, singleLine = true, modifier = Modifier.weight(2f))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = favorite, onCheckedChange = { favorite = it })
-                    Text("Favorite host")
-                }
-                Text("Accent color", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    FilterChip(selected = accentColor == null, onClick = { accentColor = null }, label = { Text("Default") })
-                    ACCENT_COLORS.forEach { (name, color) ->
-                        Surface(
-                            // selectable (not clickable) so the swatch reports its checked state:
-                            // TalkBack reads "Red, selected" instead of just "Red".
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(RoundedCornerShape(50))
-                                .selectable(
-                                    selected = accentColor == color,
-                                    onClick = { accentColor = color },
-                                )
-                                .semantics { contentDescription = name },
-                            color = Color(color),
-                        ) {
-                            // Decorative: `selectable` above already announces the selected state,
-                            // so labelling the tick too would make TalkBack say it twice.
-                            if (accentColor == color) Box(contentAlignment = Alignment.Center) { Icon(Icons.Default.CheckCircle, null, tint = Color.White, modifier = Modifier.size(18.dp)) }
-                        }
-                    }
-                }
-                Text("Connection options", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        timeout,
-                        { timeout = it.filter(Char::isDigit).take(3) },
-                        label = { Text("Timeout (s)") },
-                        singleLine = true,
-                        isError = !draft.timeoutValid,
-                        supportingText = { Text(if (draft.timeoutValid) "Connect and auth" else "${CONNECT_TIMEOUT_RANGE.first}–${CONNECT_TIMEOUT_RANGE.last}") },
-                        modifier = Modifier.weight(1f),
-                    )
-                    OutlinedTextField(
-                        keepAlive,
-                        { keepAlive = it.filter(Char::isDigit).take(3) },
-                        label = { Text("Keep-alive (s)") },
-                        singleLine = true,
-                        isError = !draft.keepAliveValid,
-                        supportingText = { Text(if (draft.keepAliveValid) "Blank = use global" else "${KEEP_ALIVE_RANGE.first}–${KEEP_ALIVE_RANGE.last}") },
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                OutlinedTextField(
-                    fingerprint,
-                    { fingerprint = it.trim() },
-                    label = { Text("Pin host key fingerprint (optional)") },
-                    placeholder = { Text("SHA256:…") },
-                    singleLine = true,
-                    isError = !draft.fingerprintValid,
-                    supportingText = {
-                        Text(
-                            if (!draft.fingerprintValid) "Expected SHA256:<base64>"
-                            // Pinning is strictly stronger than the trust-on-first-use prompt: paste the
-                            // fingerprint from a channel you already trust and the very first connection
-                            // is verified instead of asking the user to accept an unseen key.
-                            else "Verifies the first connection instead of prompting",
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    wakeOnLanMac,
-                    { wakeOnLanMac = it },
-                    label = { Text("Wake-on-LAN MAC (optional)") },
-                    placeholder = { Text("AA:BB:CC:DD:EE:FF") },
-                    singleLine = true,
-                    isError = !draft.wakeOnLanMacValid,
-                    supportingText = {
-                        Text(
-                            if (!draft.wakeOnLanMacValid) "Six pairs of hex digits — AA:BB:CC:DD:EE:FF"
-                            // The same-LAN limit is stated here, in the field's own helper line, rather
-                            // than left to a failure to explain: a wake sent from another network stops
-                            // at the first router and nothing on screen would say why.
-                            else "Wakes the machine from the host menu — phone and machine must be on the same network",
-                        )
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                // A switch rather than a chip row: it is one binary choice whose off state has to be
-                // as visible as its on state. The whole row is the target — `toggleable` puts the
-                // label, the explanation and the switch in a single accessible node, so TalkBack
-                // reads "Auto Login SFTP, on" once instead of announcing an unlabelled switch, and a
-                // thumb lands on it anywhere along the line.
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .toggleable(
-                            value = autoLoginSftp,
-                            role = Role.Switch,
-                            onValueChange = { autoLoginSftp = it },
-                        ),
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Auto Login SFTP")
-                        // Worded as what happens on connect, not as a protocol name, and switched on
-                        // the current value so the consequence is readable without toggling it first.
-                        Text(
-                            if (autoLoginSftp) "Signs in to the file browser as soon as the shell connects"
-                            else "Connects the shell only — the Files tab opens on demand",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    // Null handler: the row above owns the input, and a second clickable node here
-                    // would swallow taps on the switch itself and be announced twice.
-                    Switch(checked = autoLoginSftp, onCheckedChange = null)
-                }
-                Text("Connection route", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ProxyType.entries.forEach { type ->
-                        FilterChip(selected = proxyType == type, onClick = { proxyType = type }, label = { Text(type.label) })
-                    }
-                }
-                when (proxyType) {
-                    ProxyType.PROXY_JUMP -> OutlinedTextField(proxyJump, { proxyJump = it }, label = { Text("Jump host (user@host:port)") }, placeholder = { Text("gateway@bastion.example.com:22") }, singleLine = true)
-                    ProxyType.SOCKS5, ProxyType.HTTP_CONNECT -> {
-                        OutlinedTextField(socksHost, { socksHost = it }, label = { Text(if (proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy host" else "SOCKS5 host") }, singleLine = true)
-                        OutlinedTextField(socksPort, { socksPort = it.filter(Char::isDigit).take(5) }, label = { Text(if (proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy port" else "SOCKS5 port") }, singleLine = true)
-                        OutlinedTextField(socksUsername, { socksUsername = it }, label = { Text("Proxy username (optional)") }, singleLine = true)
-                        OutlinedTextField(socksPassword, { socksPassword = it }, label = { Text("Proxy password (optional)") }, singleLine = true, visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), keyboardOptions = SecretFieldKeyboard, trailingIcon = { SecretPasteButton("proxy password", onPasteSecret) { socksPassword = it } })
-                    }
-                    ProxyType.NONE -> Unit
-                }
-                AdvancedHostSection(advanced, onChange = { advanced = it })
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    onSave(
-                        HostProfile(
-                            id = initialHost?.id ?: java.util.UUID.randomUUID().toString(),
-                            name = name.trim().ifBlank { host.trim() },
-                            host = host.trim(),
-                            username = username.trim(),
-                            port = draft.portNumber ?: DEFAULT_SSH_PORT,
-                            authMethod = authMethod,
-                            group = group.trim().ifBlank { "Personal" },
-                            tags = tags.split(',').map(String::trim).filter(String::isNotBlank).distinct(),
-                            isFavorite = favorite,
-                            lastConnectedAt = initialHost?.lastConnectedAt,
-                            fingerprint = fingerprint.trim().takeIf(String::isNotBlank) ?: initialHost?.fingerprint,
-                            proxyType = proxyType,
-                            proxyJump = proxyJump.trim().takeIf(String::isNotBlank),
-                            socksHost = socksHost.trim().takeIf(String::isNotBlank),
-                            socksPort = draft.socksPortNumber ?: DEFAULT_SOCKS_PORT,
-                            socksUsername = socksUsername.trim().takeIf(String::isNotBlank),
-                            socksPassword = socksPassword.takeIf(String::isNotBlank),
-                            accentColor = accentColor,
-                            connectTimeoutSeconds = draft.timeoutNumber ?: DEFAULT_CONNECT_TIMEOUT_SECONDS,
-                            keepAliveSeconds = draft.keepAliveNumber,
-                            autoLoginSftp = autoLoginSftp,
-                            // Trimmed rather than normalised to one spelling: the text as typed is
-                            // what the profile shows the next time the form opens, and parseMac takes
-                            // every spelling at the moment the address is used.
-                            wakeOnLanMac = wakeOnLanMac.trim(),
-                        ).let(advanced::applyTo),
-                        HostCredentialUpdate(
-                            // A typed replacement beats a pending forget; a pending forget beats
-                            // leaving it alone. Anything else leaves what is stored untouched, which
-                            // is what an untouched empty field has to mean — see the fields above.
-                            password = when {
-                                password.isNotEmpty() -> SecretEdit.Replace(password)
-                                forgetPassword -> SecretEdit.Forget
-                                else -> SecretEdit.Keep
-                            },
-                            // `draft.canSave` is false unless a picked key reached
-                            // SshKeyProbe.Ready, so this never stores a key the app could not read.
-                            key = when {
-                                pickedKey != null && keyProbe is SshKeyProbe.Ready ->
-                                    KeyEdit.Replace(pickedKey.bytes, pickedKey.name, keyProbe.type)
-                                forgetKey -> KeyEdit.Forget
-                                else -> KeyEdit.Keep
-                            },
-                            // Forgetting the key drops its passphrase in the same write, so this only
-                            // has to handle a passphrase changing on a key that stays.
-                            passphrase = when {
-                                passphrase.isNotEmpty() -> SecretEdit.Replace(passphrase)
-                                forgetKey -> SecretEdit.Forget
-                                else -> SecretEdit.Keep
-                            },
-                        ),
-                    )
-                },
-                // Both halves of the form gate the button: the identity fields through
-                // [HostFormDraft], the engine settings through [AdvancedHostOptions]. A collapsed
-                // section can still hold an out-of-range number typed before it was closed.
-                enabled = draft.canSave && advanced.isValid,
-            ) { Text(if (editing) "Save changes" else "Save securely") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+/**
+ * Opens the Add / Edit host form in a window of its own.
+ *
+ * [host] absent is Add, present is Edit. The form is told *which* host by id and loads the profile
+ * itself rather than being handed one: the id is a parcelable string, and a profile passed through
+ * an intent would be a snapshot that stops matching the store the moment anything else edits it.
+ * That is also why nothing comes back — [HostRepository] and [HostCredentialStore] are both Flows,
+ * so a save made in that window is in this one's state by the time it resumes.
+ *
+ * The three callers are the Hosts list's Add button, a card's Edit item, and the Edit host button on
+ * the failed-login prompt. The last of those is why the form owns its own key picker: the prompt's
+ * picker returns a key for a *retry*, not for the form, and the two used to share one launcher.
+ */
+private fun openHostForm(context: Context, host: HostProfile? = null) {
+    context.startActivity(
+        Intent(context, HostFormActivity::class.java).apply {
+            if (host != null) putExtra(HostFormActivity.EXTRA_HOST_ID, host.id)
+        }
     )
 }
 

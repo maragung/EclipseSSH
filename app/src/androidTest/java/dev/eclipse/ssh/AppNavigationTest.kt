@@ -5,6 +5,7 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -124,18 +125,34 @@ class AppNavigationTest {
         compose.onNodeWithContentDescription("Import account").assertIsDisplayed()
     }
 
+    /**
+     * Add host opens the form in a window of its own, and Cancel closes it without saving.
+     *
+     * The form is an Activity now rather than an `AlertDialog` over this screen, so what proves it
+     * opened is that the other window's content is up — there is no dialog to look for, and no
+     * `ShadowDialog` to ask. The fields themselves, and everything else the form shows, are asserted
+     * by `HostFormActivityRobolectricTest`; what this adds is the half only a device has, that the
+     * transition between two real activities happens and that backing out of it leaves the workspace
+     * exactly as it was.
+     */
     @Test
-    fun theAddHostDialogOpensAndCancelsWithoutSavingAnything() {
+    fun theAddHostFormOpensAndCancelsWithoutSavingAnything() {
         compose.waitForIdle()
 
         compose.onNodeWithContentDescription("Add host").performClick()
+        // A second activity, so the wait is for a different window to compose rather than for this
+        // one to settle. `waitUntil` rather than a bare `waitForIdle`, which cannot know that the
+        // window it is about to find has not been created yet.
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText("Hostname or IP").assertIsDisplayed()
         compose.onNodeWithText("Username").assertIsDisplayed()
 
-        compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
+        compose.onNode(hasText("Cancel") and hasClickAction()).performScrollTo().performClick()
         compose.waitForIdle()
 
-        // Dismissed, and the workspace underneath is intact.
+        // Closed, and the workspace underneath is intact.
         compose.onNodeWithText("Search hosts, tags, or usernames").assertIsDisplayed()
     }
 
@@ -144,18 +161,28 @@ class AppNavigationTest {
      *
      * Long-press paste over a `TYPE_TEXT_VARIATION_PASSWORD` field varies by keyboard, and a clip
      * copied by a password manager often ends in a newline a single-line field cannot accept - so
-     * the field's trailing icon is the paste that always works. It is asserted here rather than in
-     * the Robolectric copy because an open Compose dialog never idles on the JVM; the wiring
-     * behind the button (the ViewModel read and the newline normalization) is covered there.
+     * the field's trailing icon is the paste that always works.
+     *
+     * This used to be asserted on a device *only*, because an open Compose dialog never settles
+     * `waitForIdle` on the JVM and no semantics query could complete. The form is a window now, so
+     * that reason is gone and the same description is asserted in
+     * `HostFormActivityRobolectricTest` as well. Both are kept because they are not the same claim:
+     * the JVM copy pins that the affordance is wired to the right field, and this one pins that it
+     * renders and is reachable with a real IME on screen, which is the situation the button exists
+     * for and the one no Robolectric run has.
      */
     @Test
-    fun theAddHostDialogsPasswordFieldOffersAPasteButton() {
+    fun theAddHostFormsPasswordFieldOffersAPasteButton() {
         compose.waitForIdle()
 
         compose.onNodeWithContentDescription("Add host").performClick()
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithContentDescription("Paste password from clipboard")
+                .fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithContentDescription("Paste password from clipboard").assertIsDisplayed()
 
-        compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
+        compose.onNode(hasText("Cancel") and hasClickAction()).performScrollTo().performClick()
         compose.waitForIdle()
     }
 
@@ -282,6 +309,9 @@ class AppNavigationTest {
     fun theAddHostFormCarriesTheAutoLoginSftpSwitch() {
         compose.waitForIdle()
         compose.onNodeWithContentDescription("Add host").performClick()
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodesWithText("Auto Login SFTP").fetchSemanticsNodes().isNotEmpty()
+        }
 
         compose.onNodeWithText("Auto Login SFTP").performScrollTo().assertIsDisplayed()
         // The explanation under the label is switched on the current value, so one of the two is on
@@ -294,7 +324,7 @@ class AppNavigationTest {
             ).fetchSemanticsNodes().size
         assertWithMessage("the switch has no explanation under it").that(explained).isEqualTo(1)
 
-        compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
+        compose.onNode(hasText("Cancel") and hasClickAction()).performScrollTo().performClick()
     }
 
     /**

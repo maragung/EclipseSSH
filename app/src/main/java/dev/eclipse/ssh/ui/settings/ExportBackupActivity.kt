@@ -7,12 +7,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material3.Button
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -23,7 +18,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dagger.hilt.android.AndroidEntryPoint
@@ -33,6 +27,8 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.feature.vault.VaultUnlockGate
 import dev.eclipse.ssh.security.SecureClipboard
 import dev.eclipse.ssh.security.normalizePastedSecret
+import dev.eclipse.ssh.ui.SecretFieldKeyboard
+import dev.eclipse.ssh.ui.SecretPasteButton
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -164,7 +160,7 @@ class ExportBackupActivity : SettingsDestinationActivity() {
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = SecretFieldKeyboard,
                 trailingIcon = {
-                    SecretPasteButton(onPaste = {
+                    SecretPasteButton("passphrase", onPaste = {
                         // The view model's own read, and its own report for an empty clipboard: a
                         // Paste that appears to do nothing is indistinguishable from a broken one.
                         val pasted = secureClipboard.paste()?.let(::normalizePastedSecret)
@@ -200,41 +196,3 @@ class ExportBackupActivity : SettingsDestinationActivity() {
     }
 }
 
-/**
- * The IME treatment for a secret field, carried here because it is `private` in `MainActivity`.
- *
- * `KeyboardType.Password` maps to `TYPE_TEXT_VARIATION_PASSWORD`, and without it a field whose input
- * type stays ordinary text is treated by the keyboard as prose: autocorrect and word suggestions run
- * over the passphrase, and it can be committed to the keyboard's personal dictionary and suggestion
- * history. That is a copy of the user's passphrase in storage this app does not own, cannot read and
- * cannot clear.
- *
- * The definition in `MainActivity` is the app's shared one and says this at length; the windows that
- * own a secret field need it too, and this is one of them. It is repeated rather than hoisted because
- * the shared copy is `private` to that file: moving it would mean editing a file this change is not
- * the owner of, and two copies that agree is the smaller problem.
- */
-private val SecretFieldKeyboard = KeyboardOptions(keyboardType = KeyboardType.Password)
-
-/**
- * The clipboard-paste affordance for a field created by [SecretFieldKeyboard] above.
- *
- * Long-press paste in a password field is unreliable in exactly the situation it is needed most: the
- * IME's toolbar over a `TYPE_TEXT_VARIATION_PASSWORD` field varies by keyboard, and a clip copied by
- * a password manager often carries a trailing newline a `singleLine` field cannot accept. A button
- * the user can see sidesteps both. [onPaste] is expected to read through [SecureClipboard] and
- * [normalizePastedSecret] - the audited clipboard boundary and the newline normalization every other
- * clipboard access in the app goes through - and the caller owns what is done with the value.
- *
- * `MainActivity`'s twin takes the field's name for its content description because three secret
- * fields can be on screen at once there; this window shows one, so the description is fixed. The
- * paste *replaces* the field's contents rather than appending to them, which is the semantics every
- * other secret field in the app has: these fields are never pre-filled from storage, so whatever is
- * in one is either empty or a typo being corrected.
- */
-@Composable
-private fun SecretPasteButton(onPaste: () -> String?, into: (String) -> Unit) {
-    IconButton(onClick = { onPaste()?.let(into) }) {
-        Icon(Icons.Default.ContentPaste, contentDescription = "Paste passphrase from clipboard")
-    }
-}
