@@ -1,9 +1,14 @@
 # Branch protection
 
-The repository is protected so a merge to `main` cannot happen without
-a green CI run and a code-owner approval. Settings are at
-`github.com/<owner>/EclipseSSH/settings/branches`; the rule below is
-copy-pasteable.
+**Not currently in force.** The rule below is the one this repository intends
+`main` to carry, and it stays copy-pasteable — but as of 2026-09-17 it is not
+applied: `GET /repos/<owner>/EclipseSSH/branches/main/protection` answers
+`Branch not protected`. Nothing therefore stops a merge to `main` without a
+green run, and the six most recent pull requests — every one authored and
+merged by the same account — are what that looks like in practice. Until the
+rule is applied the discipline is the author's, not GitHub's, which is the
+weaker of the two. Settings are at
+`github.com/<owner>/EclipseSSH/settings/branches`.
 
 ## Rule for `main`
 

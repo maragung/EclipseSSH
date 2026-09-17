@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 25 / versionName 1.1.17 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 26 / versionName 1.1.18 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.0 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2025.04.01 · Hilt 2.60.1 · KSP 2.3.11 · Room 2.7.1 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.79
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §36, *Releasing 1.1.4*: the narrative is a record of the passes that wrote it and was not carried forward through 1.1.5–1.1.17, the last of which is the version this file's header names. What happened after 1.1.4 is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §37, *Releasing 1.1.18*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -4042,3 +4042,49 @@ where `README.txt` now leads with 1.1.4 as entry 1 of eleven.
 Signing passwords went to `apksigner` through mode-600 files in a mode-700 directory, shredded by an `EXIT`
 trap; `/proc/<pid>/cmdline` is world-readable on this host, so they were never arguments. No `sign.*`
 directory survived the run.
+
+## 37. Releasing 1.1.18
+
+1.1.18 is the first release to carry a section here since §36, and it claims only what this pass
+verified. §1–§36 stand as written and nothing below is a summary of 1.1.5–1.1.17.
+
+### 37.1 The suite, recounted from a CI artifact rather than from memory
+
+The `reports` artifact of CI run `35216018752` (artifact id `10496965307`, 670,086 bytes) holds 158
+`<testsuite>` elements with 158 distinct names and `tests="1749" skipped="7" failures="0" errors="0"`.
+Those 1,749 test methods live in **152 files**, and the gap between the two numbers is the point: one
+Kotlin file may declare several test classes, and `ChoiceActivitiesRobolectricTest.kt` declares six,
+so a file count is not a class count. The README said "152 classes" until this pass. It was 152 files
+wearing the wrong noun, and the check meant to catch that read the same wrong noun off both sides —
+`grep -l` lists files, and the variable holding them was called `test_classes`.
+
+### 37.2 What the documentation guard does now
+
+`scripts/check-doc-figures.sh` runs as the `docs` job of `ci.yml` and needs no JDK, no Android SDK and
+no Gradle. It runs one check per figure the documents state and per repository path they name — no
+count of its own checks is quoted here, deliberately, because adding a citation to any document
+changes that count, and a figure that moves when a document cites a new file is a figure that would go
+stale in the act of writing it. It now counts the suite's methods and its files as the different
+things they are, and it checks the one claim the README makes about classes rather than files against
+the file that makes it true. Both readers were mutation-probed before they were trusted: a wrong file
+count, a wrong class count in either direction, a source file that gains a seventh class, a deleted
+file and a deleted clause each fail it, and a correct claim written as a digit passes it.
+
+### 37.3 The idle stress matrix is now something a dispatch asks for
+
+`stress` is gated on a `workflow_dispatch` boolean input defaulting to false, so a plain dispatch
+finishes with the other six jobs. What the job proves is unchanged — §36.2 describes the seven
+`ECLIPSE_STRESS` tests, 56.5 minutes of held-open silence between them — and it is still not a
+required check.
+
+### 37.4 What this release is, and what it is not
+
+`git push --tags` builds from the tag, asserts `git describe --exact-match` so the source must be the
+tag rather than a branch that resembles it, verifies the signature, and computes checksums. The v1.1.17
+run's `apksigner` output reads `Verified using v3 scheme (APK Signature Scheme v3): true`, so the
+artifacts carry the real upload key. The release is created as a **draft** and was published
+deliberately as a second step.
+
+`ci.yml` still cannot run the instrumentation suite: no emulator on the runner, so `connectedAndroidTest`
+is compiled there and executed only by `instrumentation.yml` on its own hosted AVD. The 7
+`ECLIPSE_STRESS` tests stay skipped unless a dispatch asks for them.
