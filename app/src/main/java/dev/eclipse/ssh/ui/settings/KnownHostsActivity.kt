@@ -52,7 +52,7 @@ class KnownHostsActivity : SettingsDestinationActivity() {
      */
     @Inject lateinit var sshConnectionManager: SshConnectionManager
 
-    override val title = "Known hosts"
+    override val screenTitle = "Known hosts"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -88,7 +88,7 @@ class KnownHostsActivity : SettingsDestinationActivity() {
             hosts = sshConnectionManager.knownHosts()
         }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             if (entries.isEmpty()) {
                 Text(
                     "No trusted hosts yet. You'll be asked to verify a host's fingerprint the first time you connect.",

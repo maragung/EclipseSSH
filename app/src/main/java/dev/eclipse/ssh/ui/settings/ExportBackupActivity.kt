@@ -78,7 +78,7 @@ class ExportBackupActivity : SettingsDestinationActivity() {
      */
     @Inject lateinit var secureClipboard: SecureClipboard
 
-    override val title = "Export encrypted backup"
+    override val screenTitle = "Export encrypted backup"
 
     // Neither the settings snapshot nor the repository is read. The only setting this screen touches
     // is the vault's contents, and those are read by [VaultExporter] when the export runs.
@@ -138,7 +138,7 @@ class ExportBackupActivity : SettingsDestinationActivity() {
             }
         }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             // The row's own subtitle, which is what this screen's card is about. The dialog had no
             // text above its field at all - a dialog titled "Export encrypted backup" said this much
             // by being on top of the row that offered it, and a window that outlives that context has

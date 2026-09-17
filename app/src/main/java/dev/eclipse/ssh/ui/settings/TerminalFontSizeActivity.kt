@@ -36,7 +36,7 @@ import kotlinx.coroutines.launch
 @AndroidEntryPoint
 class TerminalFontSizeActivity : SettingsDestinationActivity() {
 
-    override val title = "Terminal font size"
+    override val screenTitle = "Terminal font size"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -46,10 +46,10 @@ class TerminalFontSizeActivity : SettingsDestinationActivity() {
         }
         val scope = rememberCoroutineScope()
         val report = LocalSettingsReport.current
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             SettingRow(
                 Icons.Default.Terminal,
-                title,
+                screenTitle,
                 "Pinch the terminal with two fingers to zoom without opening this screen",
             ) {
                 Text("${size.toInt()} sp", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)

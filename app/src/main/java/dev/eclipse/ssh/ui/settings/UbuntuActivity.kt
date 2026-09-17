@@ -129,7 +129,7 @@ class UbuntuActivity : SettingsDestinationActivity() {
      */
     @Inject lateinit var vaultUnlockGate: VaultUnlockGate
 
-    override val title = "Ubuntu on this device"
+    override val screenTitle = "Ubuntu on this device"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -182,7 +182,7 @@ class UbuntuActivity : SettingsDestinationActivity() {
         // heading labelled a section *of the Settings list*, and this window is not a section of
         // anything: it is the screen the row opened, and the bar above already says its name. It is the
         // shape every promoted screen in this package has, so the one card here reads like theirs.
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             if (!ui.supported) {
                 // One row, no button: an unsupported device cannot be offered an install that cannot
                 // finish, but it also should not look like a feature that went missing.

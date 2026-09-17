@@ -93,7 +93,7 @@ class DiagnosticsActivity : SettingsDestinationActivity() {
      */
     @Inject lateinit var vaultUnlockGate: VaultUnlockGate
 
-    override val title = "Connection diagnostics"
+    override val screenTitle = "Connection diagnostics"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -149,7 +149,7 @@ class DiagnosticsActivity : SettingsDestinationActivity() {
             }
         }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             if (events.isEmpty()) {
                 Text(
                     "Nothing recorded yet. Connect a host and this becomes a timestamped trace of every connect, disconnect, reconnect and network change.",

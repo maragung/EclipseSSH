@@ -53,8 +53,21 @@ abstract class SettingsDestinationActivity : ComponentActivity() {
 
     @Inject lateinit var settingsRepository: SettingsRepository
 
-    /** The bar's title, and the screen's subject. */
-    protected abstract val title: String
+    /**
+     * The bar's title, and the screen's subject.
+     *
+     * Deliberately not called `title`, and the name is load-bearing rather than a style choice. A
+     * Kotlin property declared on an `Activity` subclass compiles to a getter named after it, so
+     * `title` here would emit `getTitle(): String` on this hierarchy — colliding by name with
+     * `android.app.Activity.getTitle(): CharSequence`. The Hilt-generated base class sits between this
+     * one and each concrete screen, and the framework's own call to `getTitle()`, made from
+     * `Activity.onPostCreate`, arrives there as the `CharSequence` variant and lands on the abstract
+     * `String` declaration below instead of the screen's override. That is an `AbstractMethodError` at
+     * launch, thrown before the window draws anything — which is how all fourteen screens in this
+     * hierarchy failed at once. `subtitle`, `icon`, `what` and `options` were checked against
+     * `android.app.Activity` and have no counterpart there; only `title` does.
+     */
+    protected abstract val screenTitle: String
 
     /** The screen's body. Receives the settings snapshot read when the window opened. */
     @Composable
@@ -66,7 +79,7 @@ abstract class SettingsDestinationActivity : ComponentActivity() {
         setContent {
             SettingsDestination(
                 settingsRepository = settingsRepository,
-                title = title,
+                title = screenTitle,
                 onClose = { finish() },
             ) { settings -> Body(settings, settingsRepository) }
         }
@@ -117,7 +130,7 @@ abstract class ChoiceDestinationActivity : SettingsDestinationActivity() {
      * already the wording of a `writeSetting("the …")` call, and a failure that has moved out of
      * `MainViewModel` should not also change how it reads.
      */
-    protected open val what: String get() = "the ${title.lowercase()}"
+    protected open val what: String get() = "the ${screenTitle.lowercase()}"
 
     /**
      * How a value is spelled on its chip. "Off" and "Fit screen" say more than a bare 0 does, and it
@@ -145,8 +158,8 @@ abstract class ChoiceDestinationActivity : SettingsDestinationActivity() {
         var chosen by remember(storedValue) { mutableIntStateOf(initialChoice(storedValue)) }
         val scope = rememberCoroutineScope()
         val report = LocalSettingsReport.current
-        SettingsSection(title) {
-            SettingRow(icon, title, subtitle) {
+        SettingsSection(screenTitle) {
+            SettingRow(icon, screenTitle, subtitle) {
                 // The row's own control is now the value it currently holds, which is the one thing
                 // a dialog had no place to put: the chips below say it too, but a user who scrolled
                 // past them should not have to scroll back to read what is set.
@@ -193,7 +206,7 @@ abstract class ChoiceDestinationActivity : SettingsDestinationActivity() {
 /** Keep-alive interval: how often the transport is prodded so a NAT does not silently drop it. */
 @AndroidEntryPoint
 class KeepAliveActivity : ChoiceDestinationActivity() {
-    override val title = "Keep-alive interval"
+    override val screenTitle = "Keep-alive interval"
     override val what = "the keep-alive interval"
     override val subtitle = "Seconds between SSH keep-alive signals"
     override val icon = Icons.Default.Wifi
@@ -205,7 +218,7 @@ class KeepAliveActivity : ChoiceDestinationActivity() {
 /** Clipboard auto-clear: how long a copied secret is allowed to sit in the system clipboard. */
 @AndroidEntryPoint
 class ClipboardClearActivity : ChoiceDestinationActivity() {
-    override val title = "Clipboard auto-clear"
+    override val screenTitle = "Clipboard auto-clear"
     override val what = "the clipboard timeout"
     override val subtitle = "Clear copied secrets after (0 = never)"
     override val icon = Icons.Default.Security
@@ -222,7 +235,7 @@ class ClipboardClearActivity : ChoiceDestinationActivity() {
 /** Reconnect delay: the wait before the first retry, which doubles on each further attempt. */
 @AndroidEntryPoint
 class ReconnectDelayActivity : ChoiceDestinationActivity() {
-    override val title = "Reconnect delay"
+    override val screenTitle = "Reconnect delay"
     override val what = "the reconnect delay"
     override val subtitle = "Wait before the first reconnect attempt; each further attempt doubles it"
     override val icon = Icons.Default.Refresh
@@ -234,7 +247,7 @@ class ReconnectDelayActivity : ChoiceDestinationActivity() {
 /** Auto-lock vault: how long the app may sit in the background before the PIN is asked for again. */
 @AndroidEntryPoint
 class VaultAutoLockActivity : ChoiceDestinationActivity() {
-    override val title = "Auto-lock vault"
+    override val screenTitle = "Auto-lock vault"
     override val what = "the vault auto-lock delay"
     override val subtitle = "Starts counting when you leave the app; the vault re-locks when you come back"
     override val icon = Icons.Default.Lock
@@ -247,7 +260,7 @@ class VaultAutoLockActivity : ChoiceDestinationActivity() {
 /** Terminal width: the narrowest terminal the server is told it has, whatever the screen fits. */
 @AndroidEntryPoint
 class TerminalWidthActivity : ChoiceDestinationActivity() {
-    override val title = "Terminal width"
+    override val screenTitle = "Terminal width"
     override val what = "the terminal width"
     override val subtitle = "The narrowest the server is told it has; drag the grid sideways for the rest"
     override val icon = Icons.Default.Terminal

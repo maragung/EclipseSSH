@@ -66,7 +66,7 @@ class SavedCredentialsActivity : SettingsDestinationActivity() {
 
     @Inject lateinit var hostRepository: HostRepository
 
-    override val title = "Saved credentials"
+    override val screenTitle = "Saved credentials"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -90,7 +90,7 @@ class SavedCredentialsActivity : SettingsDestinationActivity() {
         val savedCount = savedHosts?.size ?: 0
         val profiles = hosts.associateBy { it.id }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             when {
                 savedHosts == null -> Unit
                 savedHosts.isEmpty() -> Text(

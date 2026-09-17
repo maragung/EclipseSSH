@@ -70,7 +70,7 @@ class KeyGenActivity : SettingsDestinationActivity() {
      */
     @Inject lateinit var vaultUnlockGate: VaultUnlockGate
 
-    override val title = "Generate SSH key pair"
+    override val screenTitle = "Generate SSH key pair"
 
     // Neither the settings snapshot nor the repository is read: nothing on this screen is a
     // preference. The algorithm is chosen per key pair and the files go where the user points the
@@ -201,7 +201,7 @@ class KeyGenActivity : SettingsDestinationActivity() {
             }
         }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             Text(
                 "A private key (PEM) and a public key (OpenSSH format) will be saved as separate files. " +
                     "Keep the private key secret and add the public key to your server's authorized_keys.",

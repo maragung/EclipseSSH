@@ -54,7 +54,7 @@ import kotlinx.coroutines.launch
 @AndroidEntryPoint
 class PinLockActivity : SettingsDestinationActivity() {
 
-    override val title = "PIN lock"
+    override val screenTitle = "PIN lock"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -139,10 +139,10 @@ class PinLockActivity : SettingsDestinationActivity() {
             }
         }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             SettingRow(
                 Icons.Default.Lock,
-                title,
+                screenTitle,
                 if (pinSet) {
                     "Asked for when the app starts, and before this screen will change it"
                 } else {

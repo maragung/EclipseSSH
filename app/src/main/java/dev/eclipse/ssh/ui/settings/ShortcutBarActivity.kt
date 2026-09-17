@@ -70,7 +70,7 @@ private const val KEY_BAR_WRITE = "the shortcut bar layout"
 @AndroidEntryPoint
 class ShortcutBarActivity : SettingsDestinationActivity() {
 
-    override val title = "Shortcut bar"
+    override val screenTitle = "Shortcut bar"
 
     @Composable
     override fun Body(settings: AppSettings, repository: SettingsRepository) {
@@ -127,13 +127,13 @@ class ShortcutBarActivity : SettingsDestinationActivity() {
             }
         }
 
-        SettingsSection(title) {
+        SettingsSection(screenTitle) {
             // The Settings row this came from, in the shape every promoted destination keeps it: the
             // same icon, the same title and the same subtitle, so the screen reads as the row that
             // opened it. Its control is a count of what the bar currently shows - the one summary a
             // configuration has - and it tracks the working copy rather than the store, so a tap on a
             // switch below is answered on the line above it instead of one round-trip later.
-            SettingRow(Icons.Default.Keyboard, title, "Choose the keys on the bar, add custom buttons, set the rows") {
+            SettingRow(Icons.Default.Keyboard, screenTitle, "Choose the keys on the bar, add custom buttons, set the rows") {
                 val buttons = editor.prefs.caps.count { it.visible }
                 Text(
                     if (buttons == 1) "1 button" else "$buttons buttons",
