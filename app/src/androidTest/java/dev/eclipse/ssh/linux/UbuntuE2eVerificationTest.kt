@@ -1,5 +1,6 @@
 package dev.eclipse.ssh.linux
 
+import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.eclipse.ssh.di.LinuxUserspaceGraphProvider
@@ -47,10 +48,22 @@ class UbuntuE2eVerificationTest {
         LinuxUserspaceGraphProvider(context).graph
     }
 
-    /** A null graph means the device's ABI maps to no Ubuntu rootfs - a pipeline misconfiguration. */
+    /**
+     * A null graph means no ABI this device reports maps to an Ubuntu rootfs - a pipeline
+     * misconfiguration, not a device defect.
+     *
+     * The message names the device's own ABIs rather than presuming the emulator's. It used to
+     * assert the E2E emulator "must run an x86_64 APK", which was true of the only leg that
+     * existed and would have been actively misleading on the arm64 leg the same catalog serves:
+     * what is wrong is the pairing of APK and device, and only the device can say which ABIs it
+     * offered. `versionsFor` is handed the whole list, so the whole list is what belongs here.
+     */
     private val graph get() = checkNotNull(graphOrNull) {
-        "GRAPH stage: no userspace graph for this device's ABI - the E2E emulator must run an " +
-            "x86_64 APK (whose catalog maps to the amd64 rootfs), not a universal one that resolved otherwise"
+        val deviceAbis = Build.SUPPORTED_ABIS.joinToString(", ")
+        "GRAPH stage: no userspace graph for this device - it reports the ABIs [$deviceAbis] and " +
+            "LinuxDistroCatalog maps none of them to a rootfs. The pipeline must install an APK " +
+            "whose ABI the catalog carries (the per-ABI split for this device), not a build that " +
+            "resolved to some other ABI"
     }
 
     @Before

@@ -564,6 +564,20 @@ jobs:
         # with the same signing config the APK uses, signed with the same key.
         run: ./gradlew --stacktrace assembleDebug assembleRelease bundleRelease
 
+      - name: Assemble the per-ABI release splits
+        # A second invocation, bundle-free, and that is the entire point of it.
+        # The step above stands splits.abi down because a bundle task shares its
+        # invocation, so on its own CI would never build a per-ABI APK at all -
+        # and the per-ABI APKs are what a GitHub release actually serves, the
+        # smaller download the splits block in app/build.gradle.kts exists for.
+        # One task name with no bundle in it makes splits engage: four ABI
+        # splits plus the universal APK. Bundle first, APKs second - the same
+        # order the release workflows use, and for the same reason: the per-ABI
+        # files a reversed order leaves behind would crash a later bundle task
+        # just the same. The signature step below globs the output directory,
+        # so it covers these five without having to know they exist.
+        run: ./gradlew --stacktrace assembleRelease
+
       - name: Verify the release APK signatures
         run: |
           set -euo pipefail
@@ -579,6 +593,51 @@ jobs:
               grep -q "Verified using v3 scheme (APK Signature Scheme v3): true" /tmp/sigs.txt
             fi
           done
+
+      - name: Verify the per-ABI release splits
+        # The gap this closes. Until now nothing checked what is *inside* a
+        # per-ABI split. A signature verifies over an APK carrying no native
+        # code at all, so a packaging regression that dropped the userspace
+        # libraries - or filed an x86_64 build under an arm64-v8a directory -
+        # would sign cleanly, verify cleanly and only ever reproduce on a real
+        # phone, which is the one place this workflow cannot look. Each split
+        # is therefore checked for the ABI it carries and no other, for the
+        # libraries its ABI actually builds, for each library being an ELF of
+        # the architecture it is filed under, and for extractNativeLibs - the
+        # property that gets proot extracted to nativeLibraryDir where it can
+        # be execve'd, without which every userspace start dies with EACCES.
+        #
+        # x86 gets eight libraries to the others' eleven because :linux builds
+        # no x86 toolchain. That per-ABI mapping lives in
+        # testing/verify-release-splits.sh rather than here, because
+        # tagged-release.yml runs the same check over the artifacts that
+        # actually ship and two copies of the mapping would drift the first
+        # time an ABI is added or dropped.
+        #
+        # What this proves, and what it does not. It proves the artifact is
+        # correct. It does NOT prove the userspace runs: no arm64 device or
+        # emulator exists in this workflow, and claiming otherwise from a
+        # static check would be a lie a future release could be cut on. The
+        # runtime half is android-ubuntu-e2e.yml's x86_64 emulator leg and the
+        # maintainer's on-device loop. Artifact correctness is the half that
+        # can be established here, and it is the half that has to hold before
+        # any of the rest is worth testing.
+        run: |
+          set -euo pipefail
+          testing/verify-release-splits.sh app/build/outputs/apk/release out/split-validation
+          # The distribution contract proper, on the split most users download.
+          # Package name, version against the checked-out source, no debuggable
+          # flag, valid v2+v3 signature - the same verifier the release
+          # workflows run. Only the one split: every answer it gives is
+          # ABI-independent, so checking four would be four copies of one
+          # answer, and the per-split differences are what the script above is
+          # for.
+          EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
+          EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
+          testing/verify-release-apk.sh \
+            app/build/outputs/apk/release/app-arm64-v8a-release.apk \
+            "$EXPECTED_NAME" "$EXPECTED_CODE" \
+            out/split-validation/arm64-v8a-release.json arm64-v8a
 
       - name: Verify the AAB signature
         # The apksigner tool's APK format check refuses AABs because they
@@ -623,12 +682,21 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
-      - name: Upload release APKs
+      - name: Upload the universal release APK
+        # The universal one only, though the output directory now also holds the
+        # four ABI splits and possibly the plain-named APK the bundle
+        # invocation left behind. This artifact's contract is one APK: the smoke
+        # job installs exactly one on an x86_64 emulator, and these uploads are
+        # declared convenience copies - storing five copies of one build is the
+        # wrong trade when the account's artifact quota is the thing that runs
+        # out. The splits are verified where they are built, and the release
+        # workflow publishes them as release assets, which is where a user gets
+        # them.
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: eclipse-ssh-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/release/app-universal-release.apk
           if-no-files-found: error
 
       - name: Upload release AAB
@@ -814,8 +882,16 @@ jobs:
         run: |
           set -euo pipefail
           ADB="$ANDROID_HOME/platform-tools/adb"
-          APK="$(find "$APK_DIR" -name '*.apk' | head -1)"
-          test -n "$APK" || { echo "no release APK under $APK_DIR"; exit 1; }
+          # Named, not "the first .apk found". A release build now emits five
+          # APKs (four ABI splits plus the universal one), and this emulator is
+          # x86_64: `find | head -1` would install whichever the filesystem
+          # happened to list first, and the arm64 or armeabi-v7a split fails
+          # here with INSTALL_FAILED_NO_MATCHING_ABIS - a red gate that says
+          # nothing about the app. The universal APK carries every ABI, which is
+          # what this gate wants: it asks whether the release build opens, not
+          # which ABI the runner has.
+          APK="$(find "$APK_DIR" -name 'app-universal-release.apk' | head -1)"
+          test -n "$APK" || { echo "no universal release APK under $APK_DIR"; exit 1; }
           echo "== smoke [$VARIANT]: installing $APK"
           "$ADB" install -r "$APK"
           "$ADB" logcat -c

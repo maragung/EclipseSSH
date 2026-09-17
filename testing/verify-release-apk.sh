@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 # Verifies that the APK under test is the real distribution artifact, not a
 # lookalike: package name, versionCode/versionName against the checked-out
-# source, native ABI for the emulator, no debuggable flag, and a valid v2+v3
-# signature. Writes a machine-readable release-validation.json and exits
+# source, the native ABI the caller expects, no debuggable flag, and a valid
+# v2+v3 signature. Writes a machine-readable release-validation.json and exits
 # non-zero on any mismatch, so the workflow fails before a bad APK is ever
 # installed on the emulator.
 #
-# Usage: verify-release-apk.sh <apk> <expected-version-name> <expected-version-code> <out-json>
+# The expected ABI is an argument rather than a constant. It was x86_64 once,
+# because the only caller tested the emulator leg - but x86_64 is the ABI *no
+# user runs*: the release splits that reach a phone are arm64-v8a first, and a
+# verifier that could only name the emulator's ABI could never check them.
+#
+# Usage: verify-release-apk.sh <apk> <expected-version-name> <expected-version-code> <out-json> <expected-abi>
 set -euo pipefail
 
 APK="$1"
 EXPECTED_VERSION_NAME="$2"
 EXPECTED_VERSION_CODE="$3"
 OUT_JSON="$4"
+EXPECTED_ABI="${5:?the expected ABI must be named (e.g. arm64-v8a, x86_64) - \
+a verifier that guesses it cannot check the split it was handed}"
 
 : "${ANDROID_HOME:?ANDROID_HOME must be set}"
 : "${BUILD_TOOLS:?BUILD_TOOLS must be set}"
@@ -35,9 +42,13 @@ if [ -n "$EXPECTED_VERSION_CODE" ] && [ "$actual_version_code" != "$EXPECTED_VER
   errors+=("versionCode is '$actual_version_code', the checked-out source says '$EXPECTED_VERSION_CODE'")
 fi
 
-# The emulator runs x86_64; an APK without that ABI cannot install or run.
-if ! printf '%s\n' "$badging" | grep -q "native-code: 'x86_64'"; then
-  errors+=("APK does not carry the x86_64 native code the emulator needs")
+# The caller names the ABI it means to be testing, and the APK must carry it.
+# Naming it is what makes a per-ABI split checkable at all: the same script
+# now verifies the arm64-v8a split a phone downloads and the x86_64 split the
+# emulator runs, without either caller inheriting the other's assumption.
+if ! printf '%s\n' "$badging" | grep -q "native-code: '$EXPECTED_ABI'"; then
+  actual_abis="$(printf '%s\n' "$badging" | sed -n "s/^native-code: \(.*\)$/\1/p" | head -1)"
+  errors+=("APK does not carry the $EXPECTED_ABI native code the caller expects (it carries: ${actual_abis:-none})")
 fi
 
 # A debuggable "release" APK is not a distribution artifact.
@@ -64,10 +75,10 @@ fi
 
 # JSON via python so escaping is never a hand-rolled bug.
 python3 - "$OUT_JSON" "$STATUS" "$actual_package" "$actual_version_code" "$actual_version_name" \
-  "$cert_digest" "$apk_sha256" "$apk_bytes" "${errors[@]+"${errors[@]}"}" <<'PY'
+  "$cert_digest" "$apk_sha256" "$apk_bytes" "$EXPECTED_ABI" "${errors[@]+"${errors[@]}"}" <<'PY'
 import json, sys
-out, status, pkg, code, name, digest, sha, size = sys.argv[1:9]
-errors = sys.argv[9:]
+out, status, pkg, code, name, digest, sha, size, abi = sys.argv[1:10]
+errors = sys.argv[10:]
 doc = {
     "status": status,
     "apk": {
@@ -78,6 +89,10 @@ doc = {
         "sha256": sha,
         "bytes": int(size),
     },
+    # Which ABI this artifact was checked to carry - the whole point of the
+    # split, and the field a reader needs to tell an arm64 run from an
+    # emulator run in the evidence.
+    "expectedAbi": abi,
 }
 if errors:
     doc["errors"] = errors

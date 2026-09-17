@@ -266,11 +266,19 @@ jobs:
       - name: Verify the release APK
         # Package, version against the checked-out source, ABI, debug flag,
         # v2+v3 signature - before anything is installed.
+        #
+        # The path is testing/, not pipeline/testing/: this job checks out this
+        # repository, which has no pipeline/ directory, so the old path could
+        # only ever have failed with "No such file or directory".
         run: |
           set -euo pipefail
           EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
           EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
-          bash pipeline/testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json
+          # x86_64: the emulator leg. The ABI is named rather than assumed by
+          # the verifier, which is what lets the same script check the
+          # arm64-v8a split users download - ci.yml's "Verify the per-ABI
+          # release splits" step.
+          bash testing/verify-release-apk.sh "$APK" "$EXPECTED_NAME" "$EXPECTED_CODE" out/release-validation.json x86_64
 
       - name: Enable KVM device permissions
         run: |

@@ -169,6 +169,31 @@ jobs:
             fi
           done
 
+      - name: Verify the per-ABI release splits
+        # These five APKs are the files published to the release a few steps
+        # below, so this is the gate on the artifact users download. Signature
+        # verification above says they are intact and ours; it says nothing
+        # about what is inside them, and it would pass just as happily on a
+        # split whose userspace libraries were dropped in packaging - a defect
+        # that installs fine and only shows up on a real phone. This asserts the
+        # ABI each split carries and no other, that its libraries are present
+        # and are ELFs of that architecture, and that extractNativeLibs is set
+        # so proot is extracted somewhere it can be execve'd.
+        #
+        # Identical to the check ci.yml runs on every pull request - the same
+        # script, so a release cannot be cut from a tree whose splits a PR would
+        # have failed. What it proves is the artifact; it does not prove the
+        # userspace runs, which needs a device this workflow does not have.
+        run: |
+          set -euo pipefail
+          testing/verify-release-splits.sh app/build/outputs/apk/release out/split-validation
+          EXPECTED_NAME="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
+          EXPECTED_CODE="$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -1)"
+          testing/verify-release-apk.sh \
+            app/build/outputs/apk/release/app-arm64-v8a-release.apk \
+            "$EXPECTED_NAME" "$EXPECTED_CODE" \
+            out/split-validation/arm64-v8a-release.json arm64-v8a
+
       - name: Verify the AAB signature
         # AABs use the JAR signature scheme (META-INF/{ALIAS}.SF/.RSA) rather
         # than the APK signature scheme, so apksigner verify cannot read

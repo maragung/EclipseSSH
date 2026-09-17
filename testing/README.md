@@ -41,7 +41,9 @@ key's signing identity, and resource shrinking.
 | File | Role |
 |---|---|
 | `feature-manifest.json` | Machine-readable feature inventory: components, permissions, every user-facing feature with its priority and the suite that covers it. The report's feature list comes from here — keep it current when screens or flows change. |
-| `verify-release-apk.sh` | Distribution-artifact verification: package name, versionCode/versionName against the checked-out source, x86_64 ABI, no debuggable flag, valid v2+v3 signature. Writes `release-validation.json`; any mismatch fails before install. |
+| `verify-release-apk.sh` | Distribution-artifact verification: package name, versionCode/versionName against the checked-out source, the native ABI the caller names, no debuggable flag, valid v2+v3 signature. Writes `release-validation.json` (carrying the expected ABI); any mismatch fails before install. |
+| `verify-split-apk.sh` | One per-ABI split's *content*: the ABI it carries and no other, the named libraries present under `lib/<abi>/`, each an ELF of the architecture it is filed under, and `extractNativeLibs=true` so proot is extracted somewhere it can be `execve`'d. Writes a per-split verdict JSON; names every failure rather than the first. |
+| `verify-release-splits.sh` | Runs `verify-split-apk.sh` over all four release splits. Holds the per-ABI library mapping in one place (`:freerdp` builds four ABIs, `:linux` three, so x86 carries eight libraries to the others' eleven) and is called by both `ci.yml` and `tagged-release.yml` so a PR gate and a release gate cannot disagree. |
 | `scan-crashes.sh` | Post-suite logcat scan for JVM fatals, ANRs, native crashes, force-closes. A passing suite with a crashed background service still fails the gate. Writes `crash-report.json`. |
 | `collect-diagnostics.sh` | Deterministic evidence collection (always, pass or fail): logcat, dumpsys activity/package/meminfo/gfxinfo, ANR traces, screenshot, environment record. |
 | `generate-report.py` | Composes `release-test-report.md` (verdict, tests, crashes, APK validation, RELEASE / DO NOT RELEASE recommendation) and, on failure, `failure-report.json` with failing tests, stacks, and the app frames a fix will most likely touch. |
@@ -82,6 +84,13 @@ Honest limits, stated rather than hidden:
 - **Video recording** is not wired; screenshots and full logcat are. The
   collector's layout leaves room for `videos/` when a runner-side encoder is
   justified.
+- **The per-ABI split gate proves the artifact, not the terminal.** `ci.yml`
+  and `tagged-release.yml` verify each split's ABI, libraries, ELF
+  architectures and `extractNativeLibs` on every pull request and every
+  release. That establishes the artifact is correct; it does not establish the
+  userspace *runs*, because no arm64 device or emulator exists in either
+  workflow. The runtime half is `android-ubuntu-e2e.yml`'s x86_64 emulator leg
+  and the maintainer's on-device loop.
 
 ## Dispatching manually
 
