@@ -4080,10 +4080,11 @@ required check.
 ### 37.4 What this release is, and what it is not
 
 `git push --tags` builds from the tag, asserts `git describe --exact-match` so the source must be the
-tag rather than a branch that resembles it, verifies the signature, and computes checksums. The v1.1.17
-run's `apksigner` output reads `Verified using v3 scheme (APK Signature Scheme v3): true`, so the
-artifacts carry the real upload key. The release is created as a **draft** and was published
-deliberately as a second step.
+tag rather than a branch that resembles it, verifies the signature, and computes checksums. This
+release's own run answers `Verified using v3 scheme (APK Signature Scheme v3): true`, so the
+artifacts carry the real upload key rather than a debug one (the debug path prints the mirror
+`v2: true, v3: false`). The release is created as a **draft** and was published deliberately as a
+second step.
 
 `ci.yml` still cannot run the instrumentation suite: no emulator on the runner, so `connectedAndroidTest`
 is compiled there and executed only by `instrumentation.yml` on its own hosted AVD. The 7
