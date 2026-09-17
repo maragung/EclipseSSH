@@ -146,12 +146,18 @@ expect README.md 1 12 SSHD      "$v_sshd"
 # ---------------------------------------------------------------------------------------------
 
 test_methods() { grep -rhaE '^[[:space:]]*@Test(\(|$)' "$1" --include='*.kt' | wc -l | tr -d ' '; }
-test_classes() { grep -rlaE '^[[:space:]]*@Test(\(|$)' "$1" --include='*.kt' | wc -l | tr -d ' '; }
+# `grep -l` lists files, so this is a FILE count and it is named one. It used to be called
+# test_classes, and that name is the whole defect: the README said "152 classes" because this counted
+# 152 files, and a check that reads the same wrong noun off both sides cannot notice that the noun is
+# wrong -- it only notices when the two numbers disagree. One Kotlin file can declare several test
+# classes (ChoiceActivitiesRobolectricTest.kt declares six), so the count this produces is a file
+# count, and the README now says so. The classes-per-file case is checked on its own below.
+test_files() { grep -rlaE '^[[:space:]]*@Test(\(|$)' "$1" --include='*.kt' | wc -l | tr -d ' '; }
 
 jvm_methods="$(test_methods app/src/test)"
-jvm_classes="$(test_classes app/src/test)"
+jvm_files="$(test_files app/src/test)"
 android_methods="$(test_methods app/src/androidTest)"
-android_classes="$(test_classes app/src/androidTest)"
+android_files="$(test_files app/src/androidTest)"
 
 # A Kotlin source file that is not text: every line-oriented tool degrades on it, and the counts
 # above are only trustworthy because none of them is. One check for the whole tree rather than one per
@@ -177,13 +183,28 @@ if [ "$scanned" -eq 0 ]; then
 fi
 
 # The two sentences, each read from its own line. The JVM figure is the first number on its line; the
-# class count is the number that precedes the word "classes"; and each line is found by a phrase
-# unique to it, so a reordering of the README cannot silently pair a figure with the wrong count.
+# file count is the number that precedes the word "files", allowing one lowercase word between them,
+# because one line says "152 test files" and the other says "6 files"; and each line is found by a
+# phrase unique to it, so a reordering of the README cannot silently pair a figure with the wrong count.
 first_number() { printf '%s\n' "$1" | grep -oE '[0-9][0-9,]*' | head -1 | tr -d ','; }
-count_before_classes() { printf '%s\n' "$1" | grep -oE '[0-9][0-9,]* classes' | head -1 | grep -oE '^[0-9,]+' | tr -d ','; }
+count_before_files() { printf '%s\n' "$1" | grep -oE '[0-9][0-9,]*([[:space:]][a-z]+)?[[:space:]]files' | head -1 | grep -oE '^[0-9,]+' | tr -d ','; }
 
-jvm_line="$(grep -F 'JVM/Robolectric test methods across' README.md | head -1)"
+jvm_line="$(grep -F 'JVM/Robolectric test methods in' README.md | head -1)"
 android_line="$(grep -F 'holds the instrumentation tests' README.md | head -1)"
+
+# The README's own answer to "a file count is not a class count": it names one file and says how many
+# test classes that file declares, with the number spelled as a word. It is read out of the clause that
+# names the file rather than as the first "<word> test classes" on the line, because the same sentence
+# says "several test classes" a few words earlier, about the general case.
+#
+# `^(...)*class` rather than `^class`, so a class declared `internal` or `open` is still counted -- the
+# point of the check is to agree with what a run executes, and a run does not care about the modifier.
+classes_file_line="$(grep -F 'declares' README.md | grep -F 'test classes' | grep -F 'RobolectricTest.kt' | head -1)"
+# `[a-z0-9]` and not `[a-z]`: `number()` reads the digit form as readily as the word, and a README that
+# writes "declares 6 test classes" states the same claim. Rejecting it would be a check failing a
+# correct document, which is the kind of noise that gets a check turned off.
+declared_classes="$(number "$(printf '%s\n' "$classes_file_line" | sed -n 's/.*declares \([a-z0-9]*\) test classes.*/\1/p')")"
+classes_src="$(find app/src/test -name 'ChoiceActivitiesRobolectricTest.kt' -print -quit 2>/dev/null)"
 
 check_count() {
   local what="$1" got="$2" want="$3"
@@ -196,9 +217,24 @@ check_count() {
 }
 
 check_count "JVM test methods"              "$jvm_methods"     "$(first_number "$jvm_line")"
-check_count "JVM test classes"              "$jvm_classes"     "$(count_before_classes "$jvm_line")"
+check_count "JVM test files"                "$jvm_files"       "$(count_before_files "$jvm_line")"
 check_count "instrumentation test methods"  "$android_methods" "$(first_number "$android_line")"
-check_count "instrumentation test classes"  "$android_classes" "$(count_before_classes "$android_line")"
+check_count "instrumentation test files"    "$android_files"   "$(count_before_files "$android_line")"
+
+# The classes-per-file claim. The file is located rather than hardcoded, so moving it is not a failure;
+# only deleting it is, and that is failed explicitly rather than left to grep, whose `-c` on an empty
+# path reads stdin and would hang the job instead of reporting anything.
+checked=$((checked + 1))
+if [ -z "$classes_src" ]; then
+  fail "app/src/test holds no ChoiceActivitiesRobolectricTest.kt, the file README.md names as the example of one file declaring several test classes"
+elif [ -z "$declared_classes" ]; then
+  fail "README.md no longer states how many test classes ChoiceActivitiesRobolectricTest.kt declares in the shape this script reads — this script is out of date"
+else
+  actual_classes="$(grep -cE '^([a-z]+ )*class [A-Za-z]' "$classes_src" | tr -d ' ')"
+  if [ "$actual_classes" != "$declared_classes" ]; then
+    fail "README.md says ChoiceActivitiesRobolectricTest.kt declares $declared_classes test classes; it declares $actual_classes"
+  fi
+fi
 
 # ---------------------------------------------------------------------------------------------
 # README's "Settings, one window per subject" paragraph. It is a map of the UI, and a map is the

@@ -56,11 +56,14 @@ one test, because a suite that compiles to nothing is indistinguishable from a s
 file that owns it — the SDK levels and version names from `app/build.gradle.kts`, the library
 versions from `gradle/libs.versions.toml`, the Gradle version from the wrapper properties, the proot
 commit from `linux/build.gradle.kts`, the FreeRDP pin from `freerdp/build.gradle.kts` — and fails
-when a document states a different one. It also recounts the test totals in the README from the
-sources, checks every library version the About screen shows, checks that every workflow a document
-names exists, checks that every repository path a document names resolves (from the root or from
-that document's own directory), and checks that each row of the branch-protection table names a check
-the job actually reports as. One of its checks is about the tree rather than a document: no Kotlin
+when a document states a different one. It also recounts the README's test totals from the sources —
+the `@Test` methods in `app/src/test` and `app/src/androidTest`, and the files that hold them, which
+are a different number and which the README therefore names as files — and checks the README's one
+claim about classes rather than files, that `ChoiceActivitiesRobolectricTest.kt` declares six of them,
+against that file. It checks every library version the About screen shows, checks that every workflow
+a document names exists, checks that every repository path a document names resolves (from the root or
+from that document's own directory), and checks that each row of the branch-protection table names a
+check the job actually reports as. One of its checks is about the tree rather than a document: no Kotlin
 source under `app/src` may contain a NUL byte, because such a file is binary to `grep` and every
 count taken from it is silently short.
 

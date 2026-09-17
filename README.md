@@ -112,20 +112,23 @@ is 28).
 
 ## Tests
 
-The suite is 1,749 JVM/Robolectric test methods across 152 classes and runs offline: the SSH and SFTP
+The suite is 1,749 JVM/Robolectric test methods in 152 test files and runs offline: the SSH and SFTP
 integration tests start a real Apache MINA SSHD server on a loopback port inside the test JVM, so
 nothing external is contacted and no public or shared SSH account is involved. That figure is the
 count of `@Test` methods in `app/src/test` — a few of them sit behind `assumeTrue` and report as
 skipped wherever their precondition cannot hold, which is why a green CI run reports a slightly
-smaller number than this. `scripts/check-doc-figures.sh` recounts it, so it cannot drift silently
-again: it read 1,731 across 151 until that check existed, because one test file carried a literal NUL
-byte inside a string and every `grep`-based count of the suite stopped counting that file's methods.
+smaller number than this. A file count is not a class count: one Kotlin file may declare several test
+classes, and `ChoiceActivitiesRobolectricTest.kt` declares six test classes, so a run executes more
+classes than there are files here. `scripts/check-doc-figures.sh` recounts both, so neither can drift
+silently again: it read 1,731 across 151 until that check existed, because one test file carried a
+literal NUL byte inside a string and every `grep`-based count of the suite stopped counting that
+file's methods.
 
 `app/src/test/resources/keys/` holds throwaway Ed25519 fixtures (`plain_ed25519`,
 `encrypted_ed25519`) used only to exercise key parsing against that in-process server. They are test
 data, they authorise nothing anywhere, and they must never be reused as real credentials.
 
-`app/src/androidTest/` holds the instrumentation tests — 46 test methods across 6 classes — which
+`app/src/androidTest/` holds the instrumentation tests — 46 test methods in 6 files — which
 need a device or emulator.
 
 ## Continuous integration
