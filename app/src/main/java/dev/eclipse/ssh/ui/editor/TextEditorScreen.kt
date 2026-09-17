@@ -27,9 +27,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.Redo
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tag
 import androidx.compose.material.icons.filled.Undo
@@ -129,6 +133,13 @@ fun TextEditorScreen(
     prefs: EditorPrefs,
     onPrefsChange: (EditorPrefs) -> Unit,
     onClose: () -> Unit,
+    // The editor's one route to the system clipboard, both directions, supplied by the activity so
+    // it goes through the app's audited SecureClipboard rather than Compose's LocalClipboardManager
+    // (deprecated here). Copy keeps the text until something replaces it — editor content is not a
+    // short-lived secret to be wiped on a timer — and paste keeps newlines, which a multi-line paste
+    // depends on.
+    onClipboardCopy: (String) -> Unit,
+    onClipboardPaste: () -> String?,
 ) {
     val scope = rememberCoroutineScope()
 
@@ -240,6 +251,8 @@ fun TextEditorScreen(
             scope = scope,
             prefs = prefs,
             onPrefsChange = onPrefsChange,
+            onClipboardCopy = onClipboardCopy,
+            onClipboardPaste = onClipboardPaste,
             findOpen = findOpen,
             findQuery = findQuery,
             findReplacement = findReplacement,
@@ -308,6 +321,8 @@ private fun SingleFileEditor(
     scope: CoroutineScope,
     prefs: EditorPrefs,
     onPrefsChange: (EditorPrefs) -> Unit,
+    onClipboardCopy: (String) -> Unit,
+    onClipboardPaste: () -> String?,
     findOpen: Boolean,
     findQuery: String,
     findReplacement: String,
@@ -364,6 +379,8 @@ private fun SingleFileEditor(
             textValue = tab.textValue,
             onTextChange = tab::applyEdit,
             onSnapshot = tab::applySnapshot,
+            onClipboardCopy = onClipboardCopy,
+            onClipboardPaste = onClipboardPaste,
             history = tab.history,
             dirty = tab.dirty,
             saving = tab.saving,
@@ -731,6 +748,8 @@ private fun EditorBody(
     textValue: TextFieldValue,
     onTextChange: (TextFieldValue) -> Unit,
     onSnapshot: (TextFieldValue) -> Unit,
+    onClipboardCopy: (String) -> Unit,
+    onClipboardPaste: () -> String?,
     history: EditorHistory,
     dirty: Boolean,
     saving: Boolean,
@@ -806,6 +825,53 @@ private fun EditorBody(
         onScrollHandled()
     }
 
+    // The editor's clipboard verbs, each routed through the audited SecureClipboard the parent
+    // handed down rather than Compose's LocalClipboardManager. They are shared by the toolbar
+    // buttons and the Ctrl-key handler below, so a copy is one copy however it was asked for.
+    // Each reports whether it actually acted: the key handler returns that verdict from the
+    // preview so a no-op (Ctrl+C with nothing selected, Ctrl+V of an empty clipboard) falls
+    // through to the field instead of being swallowed. Copy and select-all only read, so they
+    // work on a read-only file; cut and paste change the text and stand down when it cannot be
+    // written — the same guard the field's own `readOnly` enforces.
+    fun copySelection(): Boolean {
+        val selection = textValue.selection
+        if (selection.collapsed) return false
+        onClipboardCopy(textValue.text.substring(selection.min, selection.max))
+        return true
+    }
+    fun cutSelection(): Boolean {
+        if (readOnly) return false
+        val selection = textValue.selection
+        if (selection.collapsed) return false
+        onClipboardCopy(textValue.text.substring(selection.min, selection.max))
+        onTextChange(
+            textValue.copy(
+                text = textValue.text.replaceRange(selection.min, selection.max, ""),
+                selection = TextRange(selection.min),
+            ),
+        )
+        return true
+    }
+    fun pasteClipboard(): Boolean {
+        if (readOnly) return false
+        val pasted = onClipboardPaste() ?: return false
+        val selection = textValue.selection
+        onTextChange(
+            textValue.copy(
+                text = textValue.text.replaceRange(selection.min, selection.max, pasted),
+                selection = TextRange(selection.min + pasted.length),
+            ),
+        )
+        return true
+    }
+    // Select-all changes no text, only the selection, so it goes through onSnapshot: no undo entry
+    // to record (EditorHistory ignores a no-text-change edit anyway) and no dirty flag to raise.
+    fun selectAllText(): Boolean {
+        if (textValue.text.isEmpty()) return false
+        onSnapshot(textValue.copy(selection = TextRange(0, textValue.text.length)))
+        return true
+    }
+
     // navigationBarsPadding rather than leaving the root to imePadding alone: with edge-to-edge the
     // text area would otherwise run under the gesture bar on every device, and placing the two
     // inset paddings side by side takes the larger of them rather than summing, so an open IME
@@ -824,57 +890,109 @@ private fun EditorBody(
             .imePadding()
             .navigationBarsPadding(),
     ) {
+        // A two-row header. The identity row up top carries the file name, the save-state line, and
+        // only the actions that are always about the file as a whole — undo, redo, save; the action
+        // row below carries the editing verbs. They were one row once, and that row was the bug the
+        // user reported: seven 48dp touch targets beside a weight(1f) column starve it to a sliver on
+        // a phone, and the "Saved" label — with no line limit of its own — wrapped one glyph per line
+        // to fit the sliver it was left, reading as a vertical "S/a/v/e/d". Splitting the actions off
+        // gives the name and status the width they need; the hardening on the two Texts (one line, no
+        // soft wrap, an ellipsis) makes the vertical stack unrepresentable even if a later change
+        // crowds them again.
         Surface(tonalElevation = 3.dp) {
-            Row(
-                Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onClose) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close editor")
-                }
-                Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
-                    Text(
-                        if (dirty) "${request.entry.name} •" else request.entry.name,
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                    )
-                    Text(
-                        when {
-                            saving -> "Saving…"
-                            dirty -> "Unsaved changes"
-                            else -> "Saved"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (dirty) MaterialTheme.colorScheme.tertiary
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                IconButton(
-                    onClick = { history.undo(textValue)?.let(onSnapshot) },
-                    enabled = history.canUndo,
+            Column(Modifier.fillMaxWidth().statusBarsPadding()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Filled.Undo, contentDescription = "Undo")
+                    IconButton(onClick = onClose) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close editor")
+                    }
+                    Column(Modifier.weight(1f).padding(horizontal = 4.dp)) {
+                        Text(
+                            if (dirty) "${request.entry.name} •" else request.entry.name,
+                            style = MaterialTheme.typography.titleSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            when {
+                                saving -> "Saving…"
+                                dirty -> "Unsaved changes"
+                                else -> "Saved"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (dirty) MaterialTheme.colorScheme.tertiary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                            // One line, never wrapped: this is the label that stacked into a vertical
+                            // "S/a/v/e/d" when the toolbar squeezed its column, and these three
+                            // together make that impossible rather than merely unlikely.
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    IconButton(
+                        onClick = { history.undo(textValue)?.let(onSnapshot) },
+                        enabled = history.canUndo,
+                    ) {
+                        Icon(Icons.Filled.Undo, contentDescription = "Undo")
+                    }
+                    IconButton(
+                        onClick = { history.redo(textValue)?.let(onSnapshot) },
+                        enabled = history.canRedo,
+                    ) {
+                        Icon(Icons.Filled.Redo, contentDescription = "Redo")
+                    }
+                    // Greyed out, not hidden: the icon's absence would read as "nothing to save"
+                    // rather than "cannot save", and the status line's READ chip is what explains
+                    // which of the two it is.
+                    IconButton(onClick = onSave, enabled = dirty && !saving && !readOnly) {
+                        Icon(Icons.Filled.Done, contentDescription = "Save")
+                    }
                 }
-                IconButton(
-                    onClick = { history.redo(textValue)?.let(onSnapshot) },
-                    enabled = history.canRedo,
+                // The editing verbs, scrolled rather than squeezed — the same choice the tab strip
+                // makes — so a narrow screen slides them under the finger instead of dropping any.
+                // Cut and copy act on a selection, so they follow it (disabled when nothing is
+                // selected); cut and paste write, so they stand down on a read-only file, while copy
+                // and select-all only read and stay live there.
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(start = 4.dp, end = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Filled.Redo, contentDescription = "Redo")
-                }
-                IconButton(onClick = onGoToLine) {
-                    Icon(Icons.Filled.Tag, contentDescription = "Go to line")
-                }
-                IconButton(onClick = onToggleFind) {
-                    Icon(Icons.Filled.Search, contentDescription = "Find and replace")
-                }
-                IconButton(onClick = onOpenOptions) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Editor options")
-                }
-                // Greyed out, not hidden: the icon's absence would read as "nothing to save"
-                // rather than "cannot save", and the status line's READ chip is what explains
-                // which of the two it is.
-                IconButton(onClick = onSave, enabled = dirty && !saving && !readOnly) {
-                    Icon(Icons.Filled.Done, contentDescription = "Save")
+                    IconButton(
+                        onClick = { cutSelection() },
+                        enabled = !readOnly && !textValue.selection.collapsed,
+                    ) {
+                        Icon(Icons.Filled.ContentCut, contentDescription = "Cut")
+                    }
+                    IconButton(
+                        onClick = { copySelection() },
+                        enabled = !textValue.selection.collapsed,
+                    ) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
+                    }
+                    IconButton(onClick = { pasteClipboard() }, enabled = !readOnly) {
+                        Icon(Icons.Filled.ContentPaste, contentDescription = "Paste")
+                    }
+                    IconButton(
+                        onClick = { selectAllText() },
+                        enabled = textValue.text.isNotEmpty(),
+                    ) {
+                        Icon(Icons.Filled.SelectAll, contentDescription = "Select all")
+                    }
+                    IconButton(onClick = onGoToLine) {
+                        Icon(Icons.Filled.Tag, contentDescription = "Go to line")
+                    }
+                    IconButton(onClick = onToggleFind) {
+                        Icon(Icons.Filled.Search, contentDescription = "Find and replace")
+                    }
+                    IconButton(onClick = onOpenOptions) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Editor options")
+                    }
                 }
             }
         }
@@ -988,6 +1106,18 @@ private fun EditorBody(
                                 history.redo(textValue)?.let(onSnapshot)
                                 true
                             }
+                            // Clipboard shortcuts for the hardware and Bluetooth keyboards this is an
+                            // SSH client for, routed through the same SecureClipboard-backed handlers
+                            // as the toolbar buttons so a copy is one copy either way. Each branch's
+                            // value is the handler's verdict: a copy or cut with nothing selected, a
+                            // paste of an empty clipboard, a select-all of an empty file — and, for the
+                            // two that write, a read-only tab — all return false, so the key falls
+                            // through to the field's own handling instead of being swallowed to no
+                            // effect.
+                            ctrl && event.key == Key.C -> copySelection()
+                            ctrl && event.key == Key.X -> cutSelection()
+                            ctrl && event.key == Key.V -> pasteClipboard()
+                            ctrl && event.key == Key.A -> selectAllText()
                             event.key == Key.Tab -> {
                                 val insertion = tabInsertion(prefs)
                                 val start = textValue.selection.min
