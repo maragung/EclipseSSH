@@ -144,7 +144,7 @@ class AppNavigationTest {
         // one to settle. `waitUntil` rather than a bare `waitForIdle`, which cannot know that the
         // window it is about to find has not been created yet.
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
         compose.onNodeWithText("Hostname or IP").assertIsDisplayed()
         compose.onNodeWithText("Username").assertIsDisplayed()
@@ -178,7 +178,7 @@ class AppNavigationTest {
         compose.onNodeWithContentDescription("Add host").performClick()
         compose.waitUntil(timeoutMillis = 10_000) {
             compose.onAllNodesWithContentDescription("Paste password from clipboard")
-                .fetchSemanticsNodes().isNotEmpty()
+                .fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
         compose.onNodeWithContentDescription("Paste password from clipboard").assertIsDisplayed()
 
@@ -310,7 +310,7 @@ class AppNavigationTest {
         compose.waitForIdle()
         compose.onNodeWithContentDescription("Add host").performClick()
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText("Auto Login SFTP").fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText("Auto Login SFTP").fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
 
         compose.onNodeWithText("Auto Login SFTP").performScrollTo().assertIsDisplayed()
@@ -336,7 +336,7 @@ class AppNavigationTest {
      */
     private fun awaitSeededRow(text: String) {
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText(text).fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
     }
 

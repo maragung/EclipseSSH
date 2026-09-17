@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 26 / versionName 1.1.18 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 27 / versionName 1.1.19 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.0 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2025.04.01 · Hilt 2.60.1 · KSP 2.3.11 · Room 2.7.1 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.79
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §37, *Releasing 1.1.18*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §38, *Releasing 1.1.19*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -4089,3 +4089,194 @@ second step.
 `ci.yml` still cannot run the instrumentation suite: no emulator on the runner, so `connectedAndroidTest`
 is compiled there and executed only by `instrumentation.yml` on its own hosted AVD. The 7
 `ECLIPSE_STRESS` tests stay skipped unless a dispatch asks for them.
+
+## 38. Releasing 1.1.19
+
+1.1.19 carries four changes and none of them is a change to the app. `git diff v1.1.18..v1.1.19 --
+app/src/main` is empty — not small, empty — so this release behaves as 1.1.18 did and the version
+stamp is the only thing in the artifact a user can observe. It is published rather than held because
+two of the four are gates a release should not be cut without: the instrumented suite, and the fetch
+that supplies the native sources.
+
+### 38.1 The instrumented suite had a race of its own, and it was the suite's, not the app's
+
+`instrumentation.yml` turned its check red three times on 2026-09-17, and all three were the same
+test: `MainActivityLifecycleTest.aDeepLinkDeliveredWhileAlreadyRunningIsNotDropped`. The archives of
+runs `35237978568` and `35236294921` both read `tests="46" failures="15"`, and decomposing those
+fifteen by exception type leaves **one** real failure and the same fourteen assumption violations
+described in §38.4 — the one real failure being that test, in both. This was not three unrelated
+defects and it was not a defect in the app.
+
+The test delivered a second `ssh://` link to the live activity and asserted the authentication prompt
+was on screen after `waitForIdle()`. That is a race for anything the app derives from its intent: the
+link is handed to the activity by the system's activity manager and reaches the main thread
+afterwards, so Compose can report idle before the state that opens the prompt has been posted, let
+alone composed. The run that failed at 15:26 measured the guest at `EGL_emulation: app_time_stats:
+avg=4235.73ms min=3.57ms max=37501.37ms` per frame against a healthy machine's ~16ms. The link was
+delivered at 15:26:01.774 (`result code=3`, START_DELIVERED_TO_TOP), the activity went PAUSED and
+RESUMED at .823 and .824, and the assertion had already failed by .84 — the dialog needed one frame
+the starved guest never got around to.
+
+The app lost nothing there. `result code=3` is delivered-to-top, and the PAUSED/RESUMED pair is
+`onNewIntent` running on the live instance: the link was not dropped, which is the behaviour the test
+exists to pin down. The test lost a race it had no business running.
+
+The fix replaces the `waitForIdle()` that stood between the link and the assertion with the bounded
+wait this suite already used twice — `ReleaseChaosJourneyTest.awaitSeededRow` and
+`AppNavigationTest.awaitSeededRow` — as
+`compose.waitUntil(timeoutMillis = 10_000) { onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty() }`.
+That snippet is left as it was written, in the same sense as this file's header block: §38.6 later
+changed the query inside every wait in this suite, this one included, and says why.
+The assertion still runs after the wait, so a prompt that never appears still fails: this waits for
+the state under test, it does not excuse its absence. The same test's intent-restore moved into a
+`finally`, because that restore is what makes `ActivityScenario.close()` cheap and the failing run had
+thrown before reaching it and paid the full 45s teardown on top of the failure.
+
+The evidence is a before-and-after on the same artifact rather than a green check alone. Both red runs
+and the green run `35243114627` report `tests="46"`; the red ones `failures="15"`, the green one
+`failures="14"` with **no** real failure left. The repaired test passes in 2.707s where the failing
+run spent 46.5s.
+
+### 38.2 The native source fetch retries a transient gateway error
+
+`linux/build.gradle.kts` downloads the proot and talloc sources from `samba.org`, which sits behind a
+CDN that intermittently answers `504`. A single gateway error failed the whole native build and cost
+CI a run on 2026-09-15. `download` now attempts the same URL up to five times with linear backoff
+(5s, 10s, 15s, 20s), logging each retry, and still throws the original `HTTP <code>` message when the
+last attempt fails.
+
+What makes the retry safe to add is that it does not decide anything: every download is followed by
+`verifySha256` against the digest published beside the archive, so a truncated or substituted body
+still fails the build. The retry changes how many times the same bytes are asked for, not which bytes
+are accepted — and because the accepted input is bit-identical, the natives that come out are too.
+That is why a build-only change like this does not make the APK a different artifact even though it
+touches a file the APK's libraries are built from.
+
+What this release proves about the retry is narrower than "it works", and the narrower claim is the
+one written here. The `:linux` native job on this release's own head did fetch both archives —
+`Downloading the proot fork @ 754583c9…` and `Downloading talloc 2.4.2` — so the module builds with
+the new code in place. But the retry never fired: `fetchOnce` returns a status code and only a
+non-2xx one reaches `logger.warn`, so the log would carry `… failed: HTTP <code> - retry n/4` if it
+had, and the run carries no such line. Every download that run made succeeded on its first attempt.
+The retry is therefore compiled, reachable and unexercised; what would confirm it is a 504, and this
+release did not have one.
+
+### 38.3 The previous section's signature claim now names its own release
+
+§37.4 said "the v1.1.17 run's `apksigner` output reads …". A section describing 1.1.18 that cites
+1.1.17's signature check is a claim about the wrong release, and it is the kind of sentence that reads
+as verified while being one release out of date. It now names this release's own run and states the
+mirror a debug build prints (`v2: true, v3: false`) as the contrast, so the sentence cannot be
+satisfied by a debug signature. `testing/README.md`'s dispatch example moved from `tag=v1.1.17` to
+`tag=v1.1.18` for the same reason, and stays there in this release rather than moving to `v1.1.19`:
+this section is written before the tag exists, and an example naming a tag that is not there yet is a
+worse reference than one a release behind.
+
+The sentence is corrected in the report, and only there: the published v1.1.18 release body carries
+§37's heading as its audit summary and not §37.4's prose, so nothing already published states the
+wrong release. What was wrong was the repository's copy, and that is what changed.
+
+### 38.4 What this release is, and what it is not
+
+The instrumented suite's XML still reads `failures="14"` on a green run, and that number is not
+fourteen defects. `app/build/outputs/androidTest-results/connected/debug/TEST-*.xml` writes an
+`org.junit.AssumptionViolatedException` from an `assumeTrue` in a `@Before` as a `<failure>` element
+and leaves `skipped="0"`, while AGP's own verdict ignores it — the same archive prints `BUILD
+SUCCESSFUL` and the job concludes `success`. `UbuntuE2eVerificationTest` is the source: every test in
+it is gated on `-e ubuntuE2e true`, which the ordinary suite never passes, so the whole class
+assumption-violates on every run by design and the 7 `ECLIPSE_STRESS` tests stay skipped unless a
+dispatch asks for them.
+
+This is recorded rather than fixed. The honest way to read that file is as a delta against a run known
+to be green — which is what §38.1 did — and not as a total. A reader who takes `failures="14"` at face
+value will hunt fourteen defects that are not there.
+
+`ci.yml` still cannot run the instrumentation suite: no emulator on that runner, so
+`connectedAndroidTest` is compiled there and executed only by `instrumentation.yml` on its own hosted
+AVD. `git push --tags` builds from the tag, asserts `git describe --exact-match` so the source must be
+the tag rather than a branch that resembles it, verifies the signature, and computes checksums. The
+release is created as a **draft** and is published deliberately as a second step.
+
+### 38.5 A race this release does not fix, recorded rather than papered over
+
+CI run `35249025845` — the `5bbdf60` head of the pull request that became §38.2 — turned its
+`Unit and integration tests` job red on one test of 1,749:
+`PortForwardingRobolectricTest.a fault under a surviving sibling rebinds the forwards and the last
+session stops them`. It is recorded here because a release that says "the suite is green" while a
+known red run exists is the kind of claim this report is for avoiding.
+
+The failure is not that pull request's doing, and that is provable rather than argued: the sibling
+pull request `#103` carries identical application code and only document changes, ran in the same
+minute, and its `Unit and integration tests` was green; and `5bbdf60`'s own commit `572c2b4` had
+already passed a complete CI run (`35237978779`) one hour and forty-five minutes earlier. Two runs of
+the same application code disagreeing is the cheapest proof that the red one is not the diff.
+
+What it is instead is a symptom of the app's own rebind path. The test kills the primary transport
+and waits for the forwards to move to the surviving sibling; the app reported
+`ForwardStatus(state=FAILED, error=NoSuchElementException)` and the forwards never moved. The throw
+comes from `openForward` → `PortForwardingManager.startLocal` →
+`ClientSession.createLocalPortForwardingTracker`, and `LivenessClientSession` is a thin
+`ClientSessionImpl` subclass, so it originates inside Apache MINA SSHD while a session is in the
+rebind window.
+
+**It could not be root-caused from the evidence CI keeps, and this release does not claim it is
+fixed.** The reason is itself a defect worth naming: `startForwardBatch` renders a failure as
+`error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName`, so a throwable with no
+message is reported as its **class name alone** and its stack trace is discarded. The test's captured
+`system-out` and `system-err` hold only MINA's own warnings, and the failure HTML carries nothing
+more. A user who hits this sees `NoSuchElementException` where a sentence should be. Until the stack
+is kept somewhere, each occurrence is a dead end, and hardening the test to tolerate the FAILED row
+would hide a real symptom rather than fix it.
+
+The rerun of that job passed — `run 35249025845`, attempt 2, `conclusion=success`, no red job — which
+is the same statement from the other direction: the same code, run again, is green. Two occurrences of
+the red direction are on record, both on 2026-09-17: run `35231586827` at 14:08 and run `35249025845`
+at 16:50, and both times the JVM suite job was the only red job in its run. The test had been
+hardened once before, in `45efafe`, but that pass taught the test's *probe* to tolerate a refused
+connection; this failure is the application reporting FAILED, which is a different and more serious
+thing.
+
+### 38.6 The same suite, a second race, and the same conclusion: the suite's, not the app's
+
+The native fetch was not the only thing this release had to fix twice. While §38.2's pull request sat
+on the runner, `instrumentation.yml` turned red again — on a **different** test from §38.1's, and on
+the instrumented suite rather than the JVM one:
+
+```
+dev.eclipse.ssh.AppNavigationTest.theAddHostFormOpensAndCancelsWithoutSavingAnything
+java.lang.IllegalStateException: No compose hierarchies found in the app.
+  at androidx.compose.ui.test.TestOwnerKt.getAllSemanticsNodes(TestOwner.kt:106)
+  at androidx.compose.ui.test.SemanticsNodeInteractionCollection.fetchSemanticsNodes(SemanticsNodeInteraction.kt:249)
+  at dev.eclipse.ssh.AppNavigationTest.theAddHostFormOpensAndCancelsWithoutSavingAnything(AppNavigationTest.kt:147)
+```
+
+It is not the diff's doing, and again that is proven rather than argued. The head that failed,
+`e39ab08`, is `main` plus §38.2's one file: `git diff origin/main origin/fix/retry-linux-source-fetch
+-- app/src` is **empty**, so `app/src/androidTest/AppNavigationTest.kt` is byte-for-byte the file that
+`main` ran. `main`'s own instrumentation run on `874a493` was green at 17:38, and the same file had
+been green on `5bbdf60` at 16:50 and on `bc0d8be`. Three green runs of one file, then a red one of the
+identical file, is the same proof §38.5 used.
+
+What the exception says is precise, and it is the whole defect. `waitUntil` evaluates its condition
+immediately, and `fetchSemanticsNodes()` defaults to `atLeastOneRootRequired = true` — so when nothing
+has composed at all it **throws** rather than returning an empty list. The wait therefore did not
+wait: it died on its first evaluation, at 3.108s against a 10_000ms timeout. The test was written for
+exactly this situation and its own comment says so ("the wait is for a different window to compose
+rather than for this one to settle … which cannot know that the window it is about to find has not
+been created yet") — the intent was right and the API call defeated it. The guest was loaded, at
+`app_time_stats: avg=425.38ms min=6.74ms max=2555.12ms` per frame against a healthy ~16ms, which is
+what made a latent bug observable rather than what created it.
+
+Every one of this suite's eight waiting semantics queries assumed a root it may not have. Five wait
+for `HostFormActivity`, a *second* activity the compose rule does not own; two wait on a Room emission
+that can land before the first frame; and the last waits for the deep-link prompt inside an activity
+launched by `ActivityScenario` under `createEmptyComposeRule`, where the rule owns no activity at all.
+All eight now pass `atLeastOneRootRequired = false`, which is the parameter the API provides for this
+case; the alternative, wrapping the query in `try`/`catch`, would have swallowed real failures
+alongside the transient one that matters. Nothing is excused by the change: each wait is still
+followed by an assertion, so a form that never appears still fails.
+
+This is where it differs from §38.5, and the difference is why one was fixed and the other was not.
+There the `FAILED` row was the **application's** own report, so a test taught to tolerate it would
+have hidden a symptom of the app. Here the exception is thrown by the **test's own query** into a
+window that does not exist yet — nothing about the app is wrong, and the test is what was wrong.

@@ -44,7 +44,7 @@ class ReleaseChaosJourneyTest {
      */
     private fun awaitSeededRow(text: String) {
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText(text).fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
     }
 
@@ -133,7 +133,7 @@ class ReleaseChaosJourneyTest {
 
         compose.onNodeWithContentDescription("Add host").performClick()
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
 
         // Something typed, so the rotation has state to lose rather than only a layout to redo.
@@ -144,7 +144,7 @@ class ReleaseChaosJourneyTest {
 
         rotate(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText("Hostname or IP").fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
         compose.onNodeWithText("Hostname or IP").assertIsDisplayed()
         // The half that fails if the window was recreated behind the user's back.

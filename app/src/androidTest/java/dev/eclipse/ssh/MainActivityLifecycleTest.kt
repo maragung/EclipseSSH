@@ -63,7 +63,7 @@ class MainActivityLifecycleTest {
      */
     private fun awaitTextDisplayed(text: String) {
         compose.waitUntil(timeoutMillis = 10_000) {
-            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+            compose.onAllNodesWithText(text).fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
         compose.onNodeWithText(text).assertIsDisplayed()
     }
