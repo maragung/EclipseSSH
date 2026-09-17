@@ -1117,7 +1117,7 @@ private fun EclipseWorkspace(
             )
         }
     }
-    // The menu's Remote desktop item: a saved, enabled target opens the viewer straight away;
+    // The menu's VNC Viewer item: a saved, enabled target opens the viewer straight away;
     // anything else - never configured, or parked with "Offer in the menu" off - opens the
     // endpoint dialog, because the entry point exists precisely so a first use does not have to
     // hunt for a settings screen before it can type a port.
@@ -1129,7 +1129,7 @@ private fun EclipseWorkspace(
             remoteDesktopHostId = host.id
         }
     }
-    // The menu's RDP desktop item: the VNC item's rule, now that the viewer it routes to exists.
+    // The menu's RDP Viewer item: the VNC item's rule, now that the viewer it routes to exists.
     // A saved, enabled target goes straight to the viewer window through the token handoff;
     // never configured or parked opens the endpoint dialog, which is also where a parked target
     // gets re-enabled.
@@ -2273,7 +2273,7 @@ private fun WorkspaceScaffold(
      */
     onManageForwards: (HostProfile) -> Unit = {},
     /**
-     * Opens one host's remote desktop - the card menu's Remote desktop item. A host with a saved,
+     * Opens one host's VNC desktop - the card menu's VNC Viewer item. A host with a saved,
      * enabled VNC target goes straight to the viewer window; the rest get the endpoint dialog
      * first. Named `onRemoteDesktop` rather than `onOpenRemoteDesktop` because both of those are
      * "open": which one depends on the host's saved target, and the caller does not care.
@@ -2286,7 +2286,7 @@ private fun WorkspaceScaffold(
      */
     onWakeOnLan: (HostProfile) -> Unit = {},
     /**
-     * Opens one host's RDP desktop - the card menu's RDP desktop item, with the same routing the
+     * Opens one host's RDP desktop - the card menu's RDP Viewer item, with the same routing the
      * VNC one has: a saved, enabled target goes straight to the viewer window, the rest get the
      * endpoint dialog first. Named `onRdpDesktop` rather than `onOpenRdpDesktop` for the same
      * reason [onRemoteDesktop] is.
@@ -2736,8 +2736,12 @@ private fun HostCard(
                         // host is opened for. A host with no saved endpoint gets the config
                         // dialog rather than nothing: the menu item is the entry point, not the
                         // reminder that a settings screen exists.
+                        // Named for the protocol it dials, not for the umbrella: "Remote desktop"
+                        // was unambiguous while VNC was the only protocol, and became the parent
+                        // of the item below the day RDP landed beside it - two entries whose
+                        // labels read as one thing offered twice.
                         DropdownMenuItem(
-                            text = { Text("Remote desktop") },
+                            text = { Text("VNC Viewer") },
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRemoteDesktop(host) },
                         )
@@ -2757,7 +2761,7 @@ private fun HostCard(
                         // point too - a saved, enabled target goes straight to the viewer, and
                         // the routing for both lives with [requestRdpDesktop].
                         DropdownMenuItem(
-                            text = { Text("RDP desktop") },
+                            text = { Text("RDP Viewer") },
                             leadingIcon = { Icon(Icons.Default.DesktopWindows, null) },
                             onClick = { menuOpen = false; onRdpDesktop(host) },
                         )

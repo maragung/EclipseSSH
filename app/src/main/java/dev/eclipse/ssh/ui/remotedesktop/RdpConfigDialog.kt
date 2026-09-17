@@ -34,7 +34,7 @@ import dev.eclipse.ssh.data.model.isForwardHostName
 import dev.eclipse.ssh.data.model.toPortOrNull
 
 /**
- * The RDP endpoint dialog behind the host card's "RDP desktop" item - the RDP counterpart of
+ * The RDP endpoint dialog behind the host card's "RDP Viewer" item - the RDP counterpart of
  * [RemoteDesktopConfigDialog]: same fields, same "where the SSH server dials" question, different
  * default port.
  *

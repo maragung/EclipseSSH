@@ -34,7 +34,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowDialog
 
 /**
- * The host card's "Remote desktop" item and where it leads, and its RDP sibling "RDP desktop".
+ * The host card's "VNC Viewer" item and where it leads, and its RDP sibling "RDP Viewer".
  *
  * Each item is one menu tap with three outcomes, and the routing is the feature: a host with a
  * saved, enabled target goes straight to the viewer window; a host with nothing saved (or a
@@ -150,6 +150,35 @@ class RemoteDesktopEntryRobolectricTest {
         assertWithMessage("the item did not open the endpoint dialog")
             .that(ShadowDialog.getShownDialogs().size).isGreaterThan(before)
         assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
+    }
+
+    // ---------------------------------------------------------------- what the menu calls them
+
+    /**
+     * The two desktop items name their protocol, and neither is the umbrella.
+     *
+     * "Remote desktop" was the VNC item's label while VNC was the only protocol the app spoke, so
+     * it was accurate when it was alone. The day the RDP item landed beside it the label became
+     * ambiguous rather than wrong - RDP is a remote desktop too - and a menu holding "Remote
+     * desktop" and "RDP desktop" reads as one action offered twice.
+     *
+     * Asserted on both halves, the protocol names present and the umbrella gone: a rename that
+     * only added the new label would leave the old one free to return as a third item.
+     */
+    @Test
+    fun theMenuNamesEachDesktopByItsProtocol() {
+        val host = addHost("Two protocols")
+
+        openKebabMenu(host.name, "VNC Viewer")
+
+        listOf("VNC Viewer", "RDP Viewer").forEach { label ->
+            assertWithMessage("the menu does not offer $label")
+                .that(compose.onAllNodesWithText(label).fetchSemanticsNodes()).isNotEmpty()
+        }
+        listOf("Remote desktop", "RDP desktop").forEach { umbrella ->
+            assertWithMessage("$umbrella is back in the menu, beside the protocol-named item")
+                .that(compose.onAllNodesWithText(umbrella).fetchSemanticsNodes()).isEmpty()
+        }
     }
 
     // ---------------------------------------------------------------- what a save commits
@@ -403,25 +432,25 @@ class RemoteDesktopEntryRobolectricTest {
         return profile
     }
 
-    /** Opens the kebab and taps Remote desktop, waiting for the menu the way the flake taught us to. */
+    /** Opens the kebab and taps VNC Viewer, waiting for the menu the way the flake taught us to. */
     private fun openRemoteDesktopMenu(host: HostProfile) {
         // Drain whatever the setup started, so the peek below only ever reports this click's
         // doing — peeking does not consume, so a stale intent would mask the viewer's.
         while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
 
-        openKebabMenu(host.name, "Remote desktop")
-        compose.onNodeWithText("Remote desktop").performClick()
+        openKebabMenu(host.name, "VNC Viewer")
+        compose.onNodeWithText("VNC Viewer").performClick()
         pump()
     }
 
-    /** Opens the kebab and taps RDP desktop, waiting for the menu the way the flake taught us to. */
+    /** Opens the kebab and taps RDP Viewer, waiting for the menu the way the flake taught us to. */
     private fun openRdpMenu(host: HostProfile) {
         // Drain whatever the setup started, so the peek below only ever reports this click's
         // doing — peeking does not consume, so a stale intent would mask the viewer's.
         while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
 
-        openKebabMenu(host.name, "RDP desktop")
-        compose.onNodeWithText("RDP desktop").performClick()
+        openKebabMenu(host.name, "RDP Viewer")
+        compose.onNodeWithText("RDP Viewer").performClick()
         pump()
     }
 
