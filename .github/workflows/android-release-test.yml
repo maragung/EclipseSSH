@@ -476,9 +476,18 @@ jobs:
           FAILED_LEGS="$(find reports -name release-test-report.md -exec grep -l '^\*\*FAIL\*\*$' {} \; | wc -l)"
           if [ "$FAILED_LEGS" -eq 0 ]; then
             echo "all matrix legs passed"
-            if [ "${{ github.event_name }}" = "release" ]; then
-              gh release comment "$TAG" --body "Validated by the release-test pipeline (android-release-test.yml): the published APK installed, launched, and passed the full instrumented suite with no crash or ANR signatures. Report: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            fi
+            # Recorded on the run, not on the release. GitHub releases have no comment thread and
+            # `gh release` has no `comment` subcommand, so the call that stood here failed on every
+            # green run: `set -e` stopped the step before `exit 0`, and a release whose APK had
+            # passed every leg was reported as a gate failure. Writing the release body instead
+            # would replace the one `tagged-release.yml` generates, which is a contract.
+            {
+              echo "### Release test passed: $TAG"
+              echo
+              echo "The published APK installed, launched, and passed the full instrumented suite with no crash or ANR signatures, on every matrix leg."
+              echo
+              echo "Report: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           {
