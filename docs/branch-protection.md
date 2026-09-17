@@ -49,7 +49,9 @@ runner was online; that model is gone.)
 
 `CI`'s `Long idle stress test` (`stress`) is **not** in the list: it is a single
 90-minute job against a real OpenSSH server, meant to be watched rather than to
-block a merge.
+block a merge. It is also the one `ci.yml` job a plain `workflow_dispatch` does
+not start — it needs the dispatch's `stress` input set, because a job that holds
+a connection open for 30 minutes should not be the tail of every on-demand run.
 
 The `Release build` workflow is **not** a required check for `main`, because it
 is gated by the `release` environment (see below) and should not block a merge.

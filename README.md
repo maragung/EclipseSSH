@@ -138,8 +138,10 @@ are what a release passes through:
   a documentation figure check, both native modules, release lint, the unit and integration suite
   (the debug variant only, since AGP 9 removed `testReleaseUnitTest`), the instrumentation and AAB
   builds with their signature checks, and an emulator crash-on-open smoke — with the idle stress
-  matrix as a seventh job that only a `workflow_dispatch` starts, because a push-triggered idle test
-  would burn the runner's metered time for a regression the rest of the suite cannot see anyway. The
+  matrix as a seventh job that runs only when a `workflow_dispatch` sets its `stress` input. A
+  push-triggered idle test would burn the runner's metered time for a regression the rest of the
+  suite cannot see anyway, and a 30-minute idle test behind every on-demand run would put a
+  75-minute tail on checks that otherwise answer in 35. The
   debug and release APKs are uploaded as build artifacts, and the test reports are uploaded even when
   a step fails.
 - [`.github/workflows/release.yml`](.github/workflows/release.yml) — the release build, run on

@@ -4,7 +4,7 @@ Ten workflows, by purpose:
 
 | Workflow | Trigger | What it does |
 | --- | --- | --- |
-| `ci.yml` | Push to `main`, every pull request, `workflow_dispatch` | The gate. Seven jobs: the documentation figure check, both native modules, release lint, the unit and integration suite, the instrumentation and AAB builds with their signature checks, an emulator crash-on-open smoke, and an idle stress matrix. |
+| `ci.yml` | Push to `main`, every pull request, `workflow_dispatch` | The gate. Seven jobs: the documentation figure check, both native modules, release lint, the unit and integration suite, the instrumentation and AAB builds with their signature checks, an emulator crash-on-open smoke, and an idle stress matrix that only a dispatch which asks for it runs. |
 | `fast-test.yml` | Push to `fast-test/**`, `workflow_dispatch` | Lint and the unit/integration suite as a two-entry matrix, each under a hard timeout. The gate a work-in-progress branch uses so it does not have to push to `main` first. |
 | `focused-test.yml` | `workflow_dispatch` (`ref`, `filter`, `task`) | One Gradle task against one `--tests` filter, on any ref. How a single class is run without paying for the whole suite. |
 | `instrumentation.yml` | Push to `main`, every pull request, `workflow_dispatch` | `connectedDebugAndroidTest` on a booted AVD, against the debug build. |
@@ -45,7 +45,7 @@ Seven jobs, so a failure lands on the thing that is actually broken instead of s
 | `test` | `testDebugUnitTest` | The whole JVM suite, Robolectric included, with an isolated OpenSSH sandbox started for the tests that dial a real server. |
 | `assemble` | `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `:app:dependencies --configuration releaseRuntimeClasspath --write-locks` | That the `androidTest` sources still compile, that both APKs and the Play AAB build, that the dependency lockfiles are still satisfied, and that the release APK is signed. |
 | `smoke` | Boots a headless AVD and launches both APKs | That the app starts and stays up. This is the crash-on-open gate — a window that dies in `onCreate` passes every JVM test there is. |
-| `stress` | `ECLIPSE_STRESS=1 :app:testDebugUnitTest --tests '*RealOpenSshInteropRobolectricTest'`, under a 90-minute job cap | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. The step asserts the class ran with `skipped="0"`, so a leg that quietly skipped is a failure rather than a pass. |
+| `stress` | `ECLIPSE_STRESS=1 :app:testDebugUnitTest --tests '*RealOpenSshInteropRobolectricTest'`, under a 90-minute job cap | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. The step asserts the class ran with `skipped="0"`, so a leg that quietly skipped is a failure rather than a pass. Runs only when a `workflow_dispatch` sets the `stress` input, which defaults to false — a dispatch that does not ask for it finishes with the other six. |
 
 The `assemble` job asserts, before it compiles them, that the `androidTest` sources contain at least
 one test, because a suite that compiles to nothing is indistinguishable from a suite that passes.
