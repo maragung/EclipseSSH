@@ -7,9 +7,12 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
+import androidx.core.view.WindowCompat
 
 private val EclipseBlue = Color(0xFF8EAFFF)
 private val EclipseBlueBright = Color(0xFFB7C9FF)
@@ -67,6 +70,33 @@ private val EclipseTypography = Typography().run {
 
 @Composable
 fun EclipseTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
+    val view = LocalView.current
+    // Edge-to-edge draws the status and navigation bars over a transparent background, so their
+    // icons have to contrast with whatever this app painted behind them. That background follows
+    // the app's own darkTheme setting, which is deliberately independent of the system night mode -
+    // but enableEdgeToEdge()'s default styling reads the *system* uiMode, and nothing else in the
+    // app sets the icon appearance. So when the two disagree, which is the ordinary case of the
+    // default dark app on a light-mode device, the framework leaves dark icons on a dark app
+    // surface and the battery, clock and signal glyphs disappear into it. Drive the appearance
+    // from the same flag that drives the surface: dark app -> light (white) icons, and vice versa.
+    //
+    // A SideEffect rather than a DisposableEffect(darkTheme): it re-applies after each successful
+    // recomposition, so toggling "Dark appearance" in Settings flips the icons on the same frame
+    // the surface changes instead of a frame later.
+    //
+    // Guarded the way the other two window effects in this app are (MainActivity's FLAG_SECURE and
+    // terminal-immersive effects): the context is an Activity only where there is a real window, so
+    // the cast is what makes this a no-op in a preview or a bare-JVM composition, and an OEM insets
+    // implementation that refuses the call must not take the process down - these icons are
+    // decoration, and every screen behind them stays perfectly usable without them.
+    SideEffect {
+        val window = (view.context as? android.app.Activity)?.window
+        if (window != null) runCatching {
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.isAppearanceLightStatusBars = !darkTheme
+            controller.isAppearanceLightNavigationBars = !darkTheme
+        }
+    }
     MaterialTheme(
         colorScheme = if (darkTheme) DarkColors else LightColors,
         typography = EclipseTypography,
