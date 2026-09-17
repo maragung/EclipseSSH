@@ -7,6 +7,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performScrollTo
 import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.AppSettings
 import dev.eclipse.ssh.ui.settings.ShortcutBarActivity
@@ -124,13 +125,20 @@ class ShortcutBarActivityRobolectricTest {
      *
      * The dialog's "Cancel" has no twin here on purpose: leaving *is* Cancel on this screen, and the
      * back-out guard below is what asks before it drops anything.
+     *
+     * Scrolled to first, because the page does: the two buttons sit under the card, and the editor body
+     * above them is taller than the window at any size the shortcut key set reaches. That is the same
+     * shape `HostFormActivityRobolectricTest` asserts its Save through, and the alternative - asserting
+     * them without scrolling - is a claim about the screen's height that this screen never made. It is
+     * what failed when this class first ran for real: until the window could open at all, every test
+     * here died at launch, so this one had never once reported the truth.
      */
     @Test
     fun theWindowOffersResetAndSave() {
         compose.waitForIdle()
 
-        compose.onNodeWithText("Reset").assertIsDisplayed()
-        compose.onNodeWithText("Save").assertIsDisplayed()
+        compose.onNodeWithText("Reset").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Save").performScrollTo().assertIsDisplayed()
     }
 
     /**
