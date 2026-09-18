@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 28 / versionName 1.1.20 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 29 / versionName 1.2.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.0 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2025.04.01 · Hilt 2.60.1 · KSP 2.3.11 · Room 2.7.1 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.79
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §39, *Releasing 1.1.20*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §40, *Releasing 1.2.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -4408,3 +4408,124 @@ would stay there "rather than moving to `v1.1.19`", because a section written be
 cannot name it. That reason has expired: `v1.1.19` now exists and is published, so the example moves
 to it. The rule §38.3 was applying is that the example should name the newest tag that is actually
 there, and this release is the first in which a newer one is.
+
+---
+
+## 40. Releasing 1.2.0
+
+1.2.0's only change to the application is a removal, and the removal is the release.
+`git diff --numstat v1.1.20..v1.2.0 -- app/src/main` returns four files, 45 insertions and **140
+deletions**: `UbuntuDistributionManager.kt` carries `38 129` of it, and the other three drop the two
+step labels and the summary strings that named the toolchain. The userspace install stops installing a
+curated toolchain and starts installing a Ubuntu:
+14 base packages become 7, and the two steps that reached outside the pinned archive go with the
+toolchain they fetched. The minor number is for that reason and not in spite of it — what a user gets
+from "Install" is a different environment than it was, so a patch number would be claiming nothing
+changed.
+
+The rest of the range is elsewhere: `app/src/androidTest` gains `SystemBarAppearanceTest.kt` (139
+lines) as *proof* of behaviour 1.1.20 already shipped — `app/src/main` has no system-bar change in
+this range, so that commit is a test and nothing else. Four documents come back in step with the code,
+`scripts/check-doc-figures.sh` learns to scope a figure to a section rather than to line numbers, and
+the harness (`testing/`) takes the bulk of the diff: `driver.py` `651 80`, `test_driver_matchers.py`
+`793 5`, `adbutil.py` `44 6`.
+
+### 40.1 The install stops installing a toolchain and starts installing an Ubuntu
+
+`BASE_PACKAGES` goes from 14 entries to 7 — `bash-completion`, `ca-certificates`, `curl`, `git`,
+`openssh-client`, `sudo`, `wget` — and `SetupStep` from 9 to 7, losing `INSTALL_NODEJS` and
+`INSTALL_GLOBAL_TOOLS` together with `installNodeJs`, `installGlobalTools`, `GLOBAL_TOOLS` and the
+`NODESOURCE_*` constants that served them.
+
+The argument is in the class comment, and it is about what an install step is allowed to promise.
+Every step that remains comes from the pinned Ubuntu archive through `aptUpdate`'s ladder, so no step
+is left whose failure is tolerable. The two that were had to be tolerated — a NodeSource or npmjs
+outage must not leave a user with "install failed" over a toolchain Repair could add later — and a
+step whose failure cannot fail the install is a step where a third party's uptime decides whether
+"Ubuntu installed". Node.js was the sharpest case: the archive's own `nodejs` lags years behind, so a
+current one had to come from `deb.nodesource.com`, which publishes no armhf packages at all — an
+entire ABI where the step was skipped outright, and the userspace was that much smaller for a reason
+no user could see.
+
+What a user observes: the summary line reads "real bash, apt and git, on the device" instead of "real
+bash, apt, Node.js and Python"; the install screen has two fewer steps; and Python, Node.js, `less`,
+`unzip`, `zip`, `procps` and `gnupg` are no longer preinstalled — each one `apt-get install` away
+inside the terminal, which is the decision recorded for 2026-09-18: the base is what makes the rest
+possible, and guessing at the rest would put a curated toolchain and its third-party registries in
+everybody's install path.
+
+One consequence looks like an unrelated tidy-up and is not: `disableShippedAptLists` no longer makes
+an exception for the app's own NodeSource entry. The app writes its entry into `sources.list` itself —
+`writeSourcesList` — so every list in `sources.list.d` is a shipped one, and the exception and the
+list it excepted were removed in the same change.
+
+**The device evidence is green on this path.** Run `35328758621` was dispatched against the userspace
+branch at `a8bffd4c15de`, whose tree `b7c299f6ad974149` is main's tip tree, so its verdict is a verdict
+about what this release ships. Its phase table reads: `preflight` pass, `storage-gate` pass, **`install`
+pass in 202.9s**, `install-log` pass, **`verify` pass**, `terminal-ui` pass, `persistence-restart` pass.
+`verify` is the arg-gated `UbuntuE2eVerificationTest` executing commands *inside* the installed
+userspace through the app's own session argv, and `persistence-restart` re-reads its marker after the
+app has been force-stopped. So the minimal install is not "expected to work": it installed from the
+pinned archive, answered commands, and survived a force-stop, on an emulator running the R8-minified
+release APK.
+
+### 40.2 Three defects the harness had, and none of them in the app
+
+The same run's last two phases failed — `interrupt-process` and `interrupt-network`, both
+`RuntimeError: the Settings tab did not open` — and neither was an app failure. Three distinct defects
+produced them over the course of the pass, and all three are in `testing/`, which ships in no artifact:
+
+1. **The Settings promotion moved the destination and the driver kept tapping where it used to be**
+   (#111, `8cdbae2`). Repaired before this pass, and recorded here only because the run that exposed
+   the next two is also the run that proves this one.
+2. **A second BACK sent on a dump that had not caught up** (#117, `3559bbd`). On a freshly `pm
+   clear`ed install the app raises its own keyboard; the IME consumed the first BACK and reported
+   `onHidden` 0.4s later, after the driver's fixed `sleep(1)`, so the dump still read "up" and a second
+   BACK was sent with nothing left to dismiss. It reached the app and exited it. The fix waits on the
+   dump instead of sleeping, and never sends the second BACK. The same commit stopped counting the
+   system's own app evictions as crashes — 17 of them, `com.android.music` and `printspooler` among
+   them, had been flipping a passing phase to CRASH while the package-scoped scan on the same run
+   reported clean.
+3. **A dump that could not be trusted at all, which is what this pass found.** Defect 2's fix still
+   assumed the IME's dump told the truth about whether a keyboard was up, and run `35328758621`
+   contains the counter-example: `mInputShown=true` for the whole phase with no `showSoftInput` and no
+   `onRequestShow` anywhere in the run's logcat after 09:50:51. The BACK the driver sent at 09:50:56
+   was therefore the only BACK on screen, and with nothing to take it, it reached the app.
+   `ActivityTaskManager` logged `Transition ... type = CLOSE ... MainActivity numActivities=0`, the
+   launcher moved to front 19ms later, and process 8146 was still alive at 09:51:07 — still
+   JIT-compiling. Nothing crashed; one BACK finished the root activity. `open_settings` then relaunched
+   the app and called `dismiss_ime` again, whose next stale reading finished the fresh activity in
+   turn: a loop that killed the app once per retry and reported each attempt as a navigation failure.
+
+   The repair (#119, `c1a9ab4e5242`) stops trusting the reading on its own, with a second opinion from
+   outside the IME: `_focused_app()` reads the component from `dumpsys window`'s `mFocusedApp=`, and an
+   unreadable or unparsable dump answers `""` — unknown — so a device that words that dump differently
+   falls back to the previous behaviour rather than losing the keyboard dismissal. Two guards use it:
+   no BACK at all when the focused window is not the app, and a relaunch when the BACK left the app, so
+   the phase continues on a live app instead of dying on a tab bar that is not on screen. Both are
+   covered by a fake whose dump lies for the whole phase and whose focused window and relaunch count
+   are separate state, so a fix that only counted BACKs cannot pass it by accident. The three existing
+   `DismissIme` tests are unchanged and still pass — which is the part that matters, because defect 2's
+   fix is the behaviour they pin.
+
+### 40.3 What this release is, and what it is not
+
+It is a change to what the in-app Ubuntu install produces, argued where the decision is enforced, and a
+repair to the harness that produced the evidence for it.
+
+It is **not** a change to SSH, to the RDP client, to the vault, or to any settings screen, and it is
+not a claim that the two interruption phases now pass. The repair is dispatched — STANDARD
+`35332298506` on the repair branch, with the FULL run that owns those two phases after it — and this
+section will carry the result when it lands rather than predicting it. §39.2's rule applies unchanged:
+a fix to the channel the evidence travels on is recorded as that until the evidence arrives.
+
+One thing about this pass is worth carrying forward. Read the run's phase table beside its step
+conclusions and they disagree: `Run the E2E driver -> success`, while the log holds
+`PHASE interrupt-process: FAIL at UI` and `PHASE interrupt-network: FAIL at UI`. A reader who trusted
+the step alone would have concluded the opposite of what happened, which is the same shape §39.1
+recorded for the release gate, and the reason `phase-results.json` is written at all.
+
+### 40.4 `testing/README.md`'s dispatch example, one release along
+
+§39.4 moved it to `v1.1.19` under the rule that the example names the newest tag that actually exists.
+`v1.1.20` now exists and is published, so it moves to that.
