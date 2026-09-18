@@ -14,7 +14,29 @@ import sys
 
 
 def parse_suite(stdout_text):
-    """Parse AndroidJUnitRunner stdout into (passed, failed, failures)."""
+    """Parse AndroidJUnitRunner stdout into (ran, failed, failures).
+
+    `ran` is None when the runner never printed a summary, which is a different
+    statement from zero and has to be reported as one: the report's "Ran:" line
+    is read by a repair attempt deciding how much of the suite it is looking at.
+
+    The runner has two summaries and only one of them is unconditional. A green
+    run ends with `OK (47 tests)`. A red one ends with `FAILURES!!!` followed by
+    `Tests run: 47,  Failures: 1` - the count carries two spaces after the comma.
+    Reading only the green form, which is what this did until 2026-09-18, made
+    **every failing leg report `Ran: 0`**: the report v1.2.0's gate produced (run
+    35338666049) diagnosed a 47-test suite as a zero-test one, and a killed run
+    cannot print either form.
+    """
+    total = None
+    m = re.search(r"^OK \((\d+) tests?\)", stdout_text, flags=re.M)
+    if m:
+        total = int(m.group(1))
+    else:
+        m = re.search(r"^Tests run: (\d+),", stdout_text, flags=re.M)
+        if m:
+            total = int(m.group(1))
+
     failures = []
     # Failure blocks look like: "1) testName(ClassName)" followed by the stack.
     block = re.split(r"^(\d+)\) ", stdout_text, flags=re.M)
@@ -24,10 +46,25 @@ def parse_suite(stdout_text):
         header = rest.splitlines()[0] if rest else ""
         stack = rest[:4000]
         failures.append({"test": header, "stack": stack.strip()})
-    total = 0
-    m = re.search(r"^OK \((\d+) tests?\)", stdout_text, flags=re.M)
-    if m:
-        total = int(m.group(1))
+    if not failures:
+        # That numbered list is printed with the summary at the very end, so a run
+        # the workflow's `timeout` killed before reaching it has none - while the
+        # runner has already echoed each failure as it happened, as
+        # "Error in <method>(<class>):" over the stack. Reading those back is the
+        # difference between a killed run listing the tests it died on and listing
+        # nothing beside a FAIL verdict. Only consulted when the numbered list is
+        # absent, because when both are present they are the same failures and
+        # counting both would double every one of them.
+        echoed = re.split(r"^Error in (\S+\([^)]*\)):\s*$", stdout_text, flags=re.M)
+        it = iter(echoed[1:])
+        seen = set()
+        for header, rest in zip(it, it):
+            if header in seen:
+                continue
+            seen.add(header)
+            # The stack runs to the blank line that ends the echo.
+            stack = rest.strip().split("\n\n")[0]
+            failures.append({"test": header, "stack": stack[:4000]})
     return total, len(failures), failures
 
 
@@ -73,7 +110,12 @@ def main():
     lines.append("")
     lines.append("## Tests")
     lines.append("")
-    lines.append(f"- Ran: {ran}")
+    # None is not zero: a killed suite has no count, and printing 0 would claim
+    # the suite it died in the middle of never ran anything.
+    lines.append(
+        "- Ran: " + (str(ran) if ran is not None
+                     else "unknown (the suite printed no summary - killed or aborted)")
+    )
     lines.append(f"- Failed: {failed_count}")
     lines.append("")
     if failures:
