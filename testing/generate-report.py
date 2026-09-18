@@ -4,8 +4,15 @@ run's own evidence: the instrumented-suite stdout, the APK validation, and the
 logcat crash scan. Exit code 0 always - the report states the verdict, the
 workflow already knows it.
 
-Usage: generate-report.py <out-dir> <tag> <api-level> <commit> <repo>
+Usage: generate-report.py <out-dir> <label> <api-level> <commit> <repo>
                        <test-stdout> <validation-json> <crash-json|-> <passed:yes|no>
+
+`label` names what was under test, and the caller decides what that is: the
+release tag for a release event or an `apk_source=release` dispatch, or
+`<ref>@<commit>` for the `apk_source=build` dispatch that validates a branch
+without publishing anything. It is NOT always a tag - passing the tag there
+left the line below reading "Version: ``" on every build-source run, and issue
+#124 was filed from one (run 35343449935) with an empty title to match.
 """
 import json
 import os
@@ -85,7 +92,7 @@ def affected_files(failures):
 
 
 def main():
-    (out_dir, tag, api_level, commit, repo,
+    (out_dir, label, api_level, commit, repo,
      stdout_path, validation_path, crash_path, passed) = sys.argv[1:10]
 
     stdout_text = open(stdout_path, errors="replace").read() if os.path.exists(stdout_path) else ""
@@ -99,7 +106,8 @@ def main():
     lines = []
     lines.append("# Release Test Report")
     lines.append("")
-    lines.append(f"- Version: `{tag}` (versionName {version})")
+    lines.append(f"- Under test: `{label}`")
+    lines.append(f"- Version: `{version}` (versionName the APK's manifest declares)")
     lines.append(f"- Build: API {api_level} emulator, x86_64, pixel_6")
     lines.append(f"- Commit: `{commit}`")
     lines.append(f"- Repository: {repo}")
@@ -158,7 +166,7 @@ def main():
             "affectedFiles": affected_files(failures),
             "logcat": "logs/logcat.txt",
             "environment": {
-                "tag": tag,
+                "label": label,
                 "apiLevel": api_level,
                 "commit": commit,
             },

@@ -340,6 +340,11 @@ jobs:
         # beside it was still right. The cases in this test are the stdout shapes
         # that run's own artifacts contain, green and red, plus the shape a run
         # killed by the workflow's `timeout` leaves. No Android needed.
+        #
+        # It also pins the argument the workflow hands it: that slot is a label
+        # - the tag on a release run, `<ref>@<commit>` on the `apk_source=build`
+        # dispatch that publishes nothing - because reading it as always-a-tag
+        # is what gave issue #124 an empty title and an empty version line.
         run: python3 testing/test_generate_report.py
 
       - name: Set up JDK 17.0.13

@@ -125,7 +125,7 @@ class ParseSuiteTest(unittest.TestCase):
 class ReportRenderingTest(unittest.TestCase):
     """One end-to-end pass through main(), because the report is the artifact."""
 
-    def _run(self, stdout_text, passed):
+    def _run(self, stdout_text, passed, label="v1.2.1"):
         out_dir = tempfile.mkdtemp(prefix="eclipse-report-test-")
         stdout_path = os.path.join(out_dir, "test-stdout.txt")
         with open(stdout_path, "w") as f:
@@ -133,7 +133,7 @@ class ReportRenderingTest(unittest.TestCase):
         argv = sys.argv
         try:
             sys.argv = [
-                "generate-report.py", out_dir, "v1.2.1", "35", "deadbee",
+                "generate-report.py", out_dir, label, "35", "deadbee",
                 "maragung/EclipseSSH", stdout_path,
                 os.path.join(out_dir, "release-validation.json"), "-", passed,
             ]
@@ -166,6 +166,15 @@ class ReportRenderingTest(unittest.TestCase):
         self.assertIn("**PASS**", report)
         self.assertIn("- Ran: 47", report)
         self.assertIsNone(failure)
+
+    def test_the_report_names_what_was_under_test_not_only_a_tag(self):
+        # The label is the tag on a release run and `<ref>@<commit>` on an
+        # apk_source=build run, which publishes nothing. Reading the tag's slot
+        # as if it were always a tag is what left issue #124 titled
+        # "Release test failure: " with an empty version line in its report.
+        report, failure = self._run(KILLED_RUN, "no", label="fix/x@abc1234")
+        self.assertIn("- Under test: `fix/x@abc1234`", report)
+        self.assertEqual(failure["environment"]["label"], "fix/x@abc1234")
 
 
 if __name__ == "__main__":
