@@ -678,8 +678,10 @@ class E2eDriver:
         the card renders this same title, because the screen is named after the row
         that opens it. That bar's next text in dump order is the card's own header,
         and the row carrying the state is below it - so a candidate followed by
-        that header is the bar. Reading it as the row finds no state word at all,
-        which is how a live install gets reported as a lost one."""
+        that header is the bar. Reading it as the row loses the step label and the
+        periodic progress shots for an install watched in the window, which is the
+        evidence a hung install is diagnosed from (see STEP_SUBTITLES) - and the
+        verdicts below are `find`-based, so nothing else would notice."""
         texts = self._texts(elements)
         values = {texts[i + 1] for i, t in enumerate(texts)
                   if t == LABEL_LAST_OPERATION and i + 1 < len(texts)}
