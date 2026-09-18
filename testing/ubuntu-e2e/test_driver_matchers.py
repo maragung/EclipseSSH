@@ -25,6 +25,25 @@ from adbutil import Element  # noqa: E402
 
 DRIVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 
+# The app's bottom bar as run 35311046886's dump draws it: five labels in the window's
+# bottom band, with the active destination's own tab marked selected. The bounds are
+# that dump's, verbatim.
+BAR_BOUNDS = {"Hosts": (55, 144), "Terminal": (254, 387), "Files": (504, 577),
+              "Transfers": (688, 833), "Settings": (917, 1043)}
+
+
+def _bar(active, selected_attr=True):
+    """The bottom bar, on `active`. With selected_attr=False the dump carries no
+    selected attribute at all, which is the shape a stricter dumper would emit."""
+    els = []
+    for label, (left, right) in BAR_BOUNDS.items():
+        attrs = {"text": label, "content-desc": label,
+                 "bounds": "[%d,2190][%d,2232]" % (left, right)}
+        if selected_attr:
+            attrs["selected"] = "true" if label == active else "false"
+        els.append(Element(attrs))
+    return els
+
 # The Linux userspace section as a uiautomator dump renders it in the NotInstalled
 # state, in dump order, with the app's real strings (MainActivity's
 # LinuxUserspaceSection). Bounds are portrait values; only their ordering matters.
@@ -435,15 +454,168 @@ class OpenSettingsRecovery(unittest.TestCase):
     def test_the_app_is_put_back_and_settings_opened(self):
         self.driver.open_settings()
         self.assertEqual([("dev.eclipse.ssh", ".MainActivity")], self.adb.starts)
+        # One tap, on the bar the relaunched app draws - and the launch is what the
+        # tap follows: a screen with no bottom bar at all is not the app.
         self.assertEqual(1, len(self.adb.taps))
+        self.assertEqual("Settings", self.adb.active)
 
     def test_a_settings_tab_that_is_really_gone_still_fails(self):
         self.adb.shows_settings = False
         with self.assertRaises(RuntimeError) as caught:
             self.driver.open_settings()
-        self.assertIn("Settings tab was not found", str(caught.exception))
+        self.assertIn("Settings tab did not open", str(caught.exception))
         # Relaunched once, not in a loop: a real UI regression must stay a failure.
         self.assertEqual(1, len(self.adb.starts))
+        # And nothing was tapped on the screen that is not the app's.
+        self.assertEqual([], self.adb.taps)
+
+
+class OpenSettingsTabSwitch(unittest.TestCase):
+    """The Settings tab, and the two ways its tap disappears without a trace. The bar
+    is the bottom row of an edge-to-edge window, and a raised soft keyboard is drawn
+    OVER it - the IME does not resize this window - so the tap is delivered to the
+    keyboard's own window and the screen never changes. Run 35311046886 lost the whole
+    interrupt-process phase that way: the tap at 06:01:13 was swallowed, the old
+    open_settings tapped once and returned without looking, and the phase failed 100
+    seconds later blaming a settings section that was never missing. The version here
+    puts the keyboard away first, taps, and requires the bar's own `selected` to say
+    the switch happened."""
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.package = "dev.eclipse.ssh"
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        self.adb = _LauncherThenAppAdb()
+        self.adb.launched = True  # the app is already on screen
+        self.driver.adb = self.adb
+        self._sleep = driver.time.sleep
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def test_the_switch_is_proved_by_the_bars_own_selected_state(self):
+        self.driver.open_settings()
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(1, len(self.adb.taps))
+        self.assertEqual(0, self.adb.backs)
+
+    def test_a_keyboard_over_the_bar_is_put_away_before_the_tap(self):
+        self.adb.ime = True
+        self.driver.open_settings()
+        self.assertEqual(1, self.adb.backs)
+        self.assertEqual("Settings", self.adb.active)
+
+    def test_a_tap_the_emulator_ate_is_retried(self):
+        # Not the keyboard this time: the emulator's own flakiness, which the Ubuntu
+        # row's Open button already gets a second chance for.
+        self.adb.swallow = 1
+        self.driver.open_settings()
+        self.assertEqual(2, len(self.adb.taps))
+        self.assertEqual("Settings", self.adb.active)
+
+    def test_taps_that_are_all_eaten_fail_naming_the_screen(self):
+        self.adb.swallow = 99
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_settings()
+        message = str(caught.exception)
+        self.assertIn("Settings tab did not open", message)
+        # The screen it was really on, which is what a lost tap costs to work out
+        # from a screenshot: this is run 35311046886's failure mode, named where it
+        # happened instead of 100 seconds later on another phase's behalf.
+        self.assertIn("Search hosts, tags, or usernames", message)
+        # Three taps per screen and one relaunch between the two: bounded, so a tab
+        # that is genuinely unreachable fails here rather than looping.
+        self.assertEqual(6, len(self.adb.taps))
+        self.assertEqual(1, len(self.adb.starts))
+
+    def test_a_retried_tap_does_not_cost_a_relaunch(self):
+        self.adb.swallow = 1
+        self.driver.open_settings()
+        self.assertEqual(2, len(self.adb.taps))
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(0, len(self.adb.starts))
+
+    def test_a_single_label_is_not_the_apps_bar(self):
+        # The bar carries five labels on every destination the app has. One is not it,
+        # and tapping that guess is how a driver ends up in the system Settings app
+        # (the launcher's own icon) instead of on its own Settings tab.
+        els = [Element({"text": "Settings", "content-desc": "Settings",
+                        "bounds": "[900,2272][1080,2400]"})]
+        bar = self.driver._bottom_bar(els)
+        self.assertEqual({"Settings"}, bar)
+        self.assertLess(len(bar), 3)
+
+
+class TabActiveProof(unittest.TestCase):
+    """What proves which destination is showing, and what does not. Settings has no
+    top bar of its own, the word "Settings" appears exactly once on it and equally
+    once on every other destination (the tab), and MainActivity builds one
+    rememberScrollState() outside the destination `when` - one list offset shared by
+    every tab, so even Settings' own first row is not guaranteed to be in the dump.
+    The tab's `selected` semantics is the one scroll-independent answer."""
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+
+    def test_the_selected_tab_is_the_active_one(self):
+        els = _bar("Settings")
+        self.assertTrue(self.driver._tab_active(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_the_word_settings_proves_nothing(self):
+        # Pinned, not endorsed: this IS the screen run 35311046886's dumps show - the
+        # bar drawn, the Settings tab not the selected one, the search field's own row
+        # on screen. A check that matched the word would call this the Settings screen,
+        # which is what the old open_settings did when it tapped and returned.
+        els = _bar("Hosts")
+        self.assertIsNotNone(self.driver.find(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_dump_without_the_attribute_is_not_a_proof(self):
+        # The safe direction: a dump that carries no `selected` (an unexpected format)
+        # must never be read as "the switch happened" - the retry then fails the phase
+        # at the tap, which is the truth, instead of letting it walk the wrong screen.
+        els = _bar("Settings", selected_attr=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+
+class LinuxSectionWalkEvidence(unittest.TestCase):
+    """The walk that finds the userspace row, and what its failure says. Run
+    35311046886's walk spent its 24 swipes and 100 seconds on the HOSTS list and
+    reported "the Linux userspace settings section was never visible" - a section that
+    was never on that screen to be missing, which reads as a list that would not
+    scroll. The first screen the walk was handed is the whole diagnosis."""
+
+    HOSTS = [Element({"text": "All hosts", "bounds": "[21,477][192,540]"}),
+             Element({"text": "Search hosts, tags, or usernames",
+                      "bounds": "[180,308][785,371]"}),
+             Element({"text": "Production edge", "bounds": "[211,650][530,713]"})] + _bar("Hosts")
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        self._sleep = driver.time.sleep
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def test_the_failure_names_the_screen_the_walk_was_on(self):
+        self.driver.adb = _ScrollingAdb([self.HOSTS])
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.require_linux_section(max_swipes=2)
+        message = str(caught.exception)
+        self.assertIn("never visible", message)
+        self.assertIn("Production edge", message)
+        self.assertEqual(2, len(self.driver.adb.swipes))
+
+    def test_a_section_that_is_there_is_not_a_failure(self):
+        self.driver.adb = _ScrollingAdb([OpenWindowButton.LIST])
+        self.driver.require_linux_section()
+        self.assertEqual([], self.driver.adb.swipes)
 
 
 class StorageGateCleanup(unittest.TestCase):
@@ -509,6 +681,19 @@ class StageAttribution(unittest.TestCase):
             ("VERIFY stage: instrumentation phase 'write' - hardLinksShareOneInode", "VERIFY"),
         ):
             self.assertEqual(expected, self._stage(message, RuntimeError))
+
+    def test_the_evidence_a_navigation_failure_carries_is_not_a_stage(self):
+        # A navigation failure appends the screen it was on, and that text is the app's
+        # own: a host named "apt mirror" must not decide where a lost tap is published.
+        message = ("the Linux userspace settings section was never visible on the Settings"
+                   " list%s%s" % (driver.EVIDENCE_MARKER, ["apt mirror", "DNS server"]))
+        self.assertEqual("UI", self._stage(message, RuntimeError))
+
+    def test_without_the_marker_the_screen_would_decide_the_stage(self):
+        # Pinned, not endorsed: the same digest, unmarked. This is why EVIDENCE_MARKER
+        # exists - and why every message that appends a screen must use it.
+        message = "the Linux userspace settings section was never visible: ['apt mirror']"
+        self.assertEqual("APT", self._stage(message, RuntimeError))
 
 
 class ActionButtonWalk(unittest.TestCase):
@@ -602,21 +787,38 @@ class _DfAdb:
 
 class _LauncherThenAppAdb:
     """A screen that is the launcher until the app is started, like the dump from
-    run 35100526297's interruption phase (Search, Gallery, Phone, ... no app)."""
+    run 35100526297's interruption phase (Search, Gallery, Phone, ... no app), and
+    the app's own screen - bottom bar and all - once it is. The app lands on Hosts,
+    which is where a relaunched MainActivity starts, and a tap on a tab moves the
+    bar's `selected` to it the way the app does.
+
+    `ime` is the soft keyboard raised over the bar: every tap is then delivered to
+    the keyboard's own window and the screen never changes, which is the state run
+    35311046886's dumps show. `swallow` is the same outcome without the keyboard -
+    taps the emulator itself ate."""
 
     LAUNCHER = [Element({"text": "Phone", "content-desc": "Phone", "bounds": "[23,2106][230,2272]"}),
                 Element({"text": "Camera", "content-desc": "Camera", "bounds": "[851,2106][1057,2272]"})]
-    APP = [Element({"text": "Settings", "content-desc": "Settings", "bounds": "[900,2272][1080,2400]"})]
 
     def __init__(self):
         self.starts = []
         self.taps = []
+        self.backs = 0
         self.launched = False
         self.shows_settings = True
+        self.active = "Hosts"
+        self.ime = False
+        self.swallow = 0
+
+    def shell(self, cmd, timeout=None):
+        if "input_method" not in cmd:
+            return 1, ""
+        return 0, "    mInputShown=%s" % ("true" if self.ime else "false")
 
     def ui_dump(self):
         if self.launched and self.shows_settings:
-            return self.APP
+            return [Element({"text": "Search hosts, tags, or usernames",
+                             "bounds": "[180,308][785,371]"})] + _bar(self.active)
         return self.LAUNCHER
 
     def am_start(self, package, activity):
@@ -626,6 +828,19 @@ class _LauncherThenAppAdb:
 
     def tap(self, x, y):
         self.taps.append((x, y))
+        if self.swallow:
+            self.swallow -= 1
+            return True
+        if self.ime:
+            return True
+        for label, (left, right) in BAR_BOUNDS.items():
+            if left <= x <= right and 2190 <= y <= 2232:
+                self.active = label
+        return True
+
+    def back(self):
+        self.backs += 1
+        self.ime = False
         return True
 
 

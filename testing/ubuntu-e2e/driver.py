@@ -88,6 +88,32 @@ BUTTON_REPAIR = "Repair"
 LABEL_INSTALL_LOG = "Install log"
 BUTTON_VIEW = "View"
 
+# The bottom bar's tabs (MainActivity's NavigationBarItem) and the soft keyboard
+# that can be drawn over them. A tab tap is the one navigation the driver cannot
+# see fail on its own: the bar is the lowest row of an edge-to-edge window, and a
+# raised keyboard is drawn OVER it - the IME does not resize this window, so the
+# tabs stay at y=2190-2232 either way (run 35311046886's dumps, before and after).
+# A tap there is delivered to the IME's window, `input tap` still reports success,
+# and the screen simply never changes. That is how the whole interrupt-process
+# phase was lost: the tap at 06:01:13 was swallowed, open_settings returned
+# unverified, and 24 swipes and 100 seconds later the phase failed naming a
+# settings section that was never on the wrong screen to be missing.
+TAB_SETTINGS = "Settings"
+# Every label the bar draws. The bar is on screen - and carries all five - on every
+# destination the app has, so "is this the app's bottom bar" is answered by counting
+# them rather than by trusting one word that another screen may also carry.
+TAB_LABELS = ("Hosts", "Terminal", "Files", "Transfers", "Settings")
+# A tab is a bottom-bar row: its top edge sits in the window's bottom band. The
+# fraction is loose on purpose - the bar's own height is ~42px of a 2400px window
+# in portrait and of a 1080px one in landscape.
+TAB_BAND = 0.8
+# How Android reports a raised soft keyboard, in the two dumps that carry it:
+# InputMethodManagerService's `mInputShown` and InputMethodService's
+# `mIsInputViewShown`. A dump that says neither reads as "not shown", which is the
+# safe direction - the only thing a shown keyboard is answered with is a BACK
+# press, and a BACK pressed on a keyboard that is not up goes to the app instead.
+IME_SHOWN_RE = re.compile(r"m(InputShown|IsInputViewShown)\s*=\s*true")
+
 # Exceptions that mean this driver is broken, not the device or the app. The
 # failure report's stage column is a claim about WHERE a failure lives, and its
 # unattributed fallback is "UI" - so a bug in this file would be published as an
@@ -98,6 +124,13 @@ BUTTON_VIEW = "View"
 # the install and named the missing megabytes.
 DRIVER_BUG_KINDS = (TypeError, AttributeError, NameError, UnboundLocalError,
                     KeyError, IndexError, ZeroDivisionError)
+
+# What a navigation failure appends to its own message: the app's words for the
+# screen it was actually on (_screen_note). That text is evidence, not the message,
+# and the stage scan below must not read a stage word out of it - a host named "apt
+# mirror", or a row that mentions DNS, would otherwise decide the stage of a
+# failure that is about a tap not landing.
+EVIDENCE_MARKER = " | on screen: "
 
 # The install screen's step subtitles (UbuntuActivity's describeInstallStep /
 # describeSetupStep) - the line under the title that says WHERE the install is.
@@ -284,6 +317,14 @@ class E2eDriver:
         dumps are not otherwise uploaded."""
         return self._texts(self.dump())[:limit]
 
+    def _screen_note(self, limit=12):
+        """The screen's own words, as the tail of a failure message. A navigation
+        failure is diagnosed from what was on screen, so the message carries it;
+        nothing is appended when the dump holds nothing, so no message is padded
+        with an empty list."""
+        digest = self._screen_digest(limit)
+        return ("%s%s" % (EVIDENCE_MARKER, digest)) if digest else ""
+
     def wait_visible(self, needles, timeout_s, poll=POLL_SECONDS):
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
@@ -335,6 +376,9 @@ class E2eDriver:
         # dress a driver bug as a device finding.
         if kind is not None and issubclass(kind, DRIVER_BUG_KINDS):
             return "DRIVER"
+        # The evidence a navigation failure carries is the app's own text and is not
+        # part of the claim about where the failure lives (see EVIDENCE_MARKER).
+        message = message.split(EVIDENCE_MARKER)[0]
         m = re.search(r"([A-Z-]+(?: [A-Z-]+)*) stage", message)
         if m:
             return m.group(1)
@@ -410,20 +454,131 @@ class E2eDriver:
         time.sleep(4)
 
     def open_settings(self):
-        """Settings is a bottom tab; one tap away from anywhere the app is on
-        screen. When it is not, put the app back and ask again: several phases
-        reach here with the app stopped (pm clear) or just torn down by an
-        `am instrument` run, and the dump then shows whatever Android put in
-        front - the launcher, in run 35100526297, where the interruption phases
-        failed with "the Settings tab was not found on screen" while the app
-        was simply not running. A relaunch is idempotent (am start on a live
-        app only brings it forward), and a Settings tab that is genuinely gone
-        still fails here, one relaunch later."""
-        if not self.tap_last(self.dump(), "Settings"):
-            self.launch()
-            if not self.tap_last(self.dump(), "Settings"):
-                raise RuntimeError("the Settings tab was not found on screen")
-        time.sleep(2)
+        """Select the Settings tab, and prove it: a bottom-bar tap is the one
+        navigation the emulator can eat without a trace.
+
+        A tab is a tap away from anywhere the app is on screen, which is why every
+        phase comes through here - but the bar sits at the very bottom of an
+        edge-to-edge window, and a raised soft keyboard is drawn over it. `input tap`
+        reports success whether the app or the IME window received the tap, and when
+        it is the IME nothing happens at all: no error, no state change, just the
+        screen the driver was already on. Run 35311046886 lost the entire
+        interrupt-process phase that way (see TAB_SETTINGS).
+
+        So the keyboard is put away first, the tap is retried while it does not take,
+        and the switch is required to be visible before returning. The app not being
+        on screen at all is the other case, and it is the one that came first: several
+        phases reach here with the app stopped (`pm clear`) or just torn down by an
+        `am instrument` run, and the dump then shows whatever Android put in front -
+        the launcher, in run 35100526297, where the interruption phases failed with
+        "the Settings tab was not found on screen" while the app was simply not
+        running. A relaunch is idempotent (`am start` on a live app only brings it
+        forward), and a Settings tab that is genuinely gone still fails here, one
+        relaunch later."""
+        self.dismiss_ime()
+        if self._open_tab(TAB_SETTINGS):
+            return
+        self.launch()
+        self.dismiss_ime()
+        if self._open_tab(TAB_SETTINGS):
+            return
+        raise RuntimeError(
+            "the %s tab did not open: no bottom bar on screen carrying it, or every tap"
+            " on it left another tab selected%s" % (TAB_SETTINGS, self._screen_note()))
+
+    def _ime_shown(self):
+        """Whether the soft keyboard is up, read from the input method's own dump.
+        Anything unreadable answers False - see IME_SHOWN_MARKERS for why that is
+        the safe direction."""
+        rc, out = self.adb.shell("dumpsys input_method", timeout=30)
+        if rc != 0:
+            return False
+        return bool(IME_SHOWN_RE.search(out))
+
+    def dismiss_ime(self):
+        """Put the soft keyboard away, so a tap on the bottom bar reaches the app.
+
+        Two attempts: the first BACK is what normally dismisses a keyboard, and a
+        second is only sent if the dump still says it is up. Nothing is sent when it
+        is not, because a BACK with no keyboard on screen goes to the app and would
+        navigate it out from under the caller."""
+        for _ in range(2):
+            if not self._ime_shown():
+                return True
+            self.log("the soft keyboard is up; dismissing it before touching the tab bar")
+            self.adb.back()
+            time.sleep(1)
+        return not self._ime_shown()
+
+    def _bottom_bar(self, elements):
+        """Which of the bar's own labels are drawn in the window's bottom band.
+
+        The count is what says "this is the app's bottom bar": all five are drawn on
+        every destination the app has, so a screen carrying fewer than three of them is
+        not the app - or is not on the app's UI at all, which is the launcher and the
+        `am instrument` case alike."""
+        _, height = self._window_extent(elements)
+        if height < 100:
+            height = 2400
+        found = set()
+        for el in elements:
+            b = el.bounds
+            if not b or b[1] < height * TAB_BAND:
+                continue
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if attr in TAB_LABELS:
+                    found.add(attr)
+        return found
+
+    def _tab_active(self, elements, label):
+        """Whether `label`'s tab is the one showing, read from the tab's own
+        `selected` semantics.
+
+        This is the only proof of the active destination that does not depend on what
+        that destination happens to be drawing, and the alternatives all fail here.
+        Settings has no top bar of its own, so it carries no title to read; the word
+        "Settings" appears exactly once on it (the tab) and equally once on every
+        other destination; and there is no marker string that is at once unique to
+        Settings and always on screen, because MainActivity.kt:2362 builds one
+        `rememberScrollState()` outside the destination `when` - one list offset
+        shared by every tab, so a list left scrolled down opens scrolled down on the
+        next tab, and even Settings' own first row is not guaranteed to be in the dump.
+
+        `selected` is scroll-independent, and every destination sets it:
+        `NavigationBarItem(selected = destination == item)` puts Compose's
+        Modifier.selectable on the tab, which merges the item's label into the node it
+        marks selected, and uiautomator writes a `selected` attribute on every node it
+        dumps. So the node carrying text="Settings" carries selected="true" exactly
+        while the Settings destination is the one showing."""
+        for el in elements:
+            if el.attrs.get("selected") != "true":
+                continue
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if attr and label in attr:
+                    return True
+        return False
+
+    def _open_tab(self, label, attempts=3):
+        """Tap the bottom bar's tab for `label` until the bar itself says it took.
+        False means the app's bar is not on this screen (the caller's relaunch case)
+        or that every tap was eaten - `tap_last` matches the last node carrying the
+        label, which on this bar is the bar's own node, because the bar is dumped
+        after the screen above it."""
+        els = self.dump()
+        bar = self._bottom_bar(els)
+        if label not in bar or len(bar) < 3:
+            return False
+        for _ in range(attempts):
+            if self._tab_active(els, label):
+                return True
+            if not self.tap_last(els, label):
+                return False
+            time.sleep(2)
+            els = self.dump()
+        if self._tab_active(els, label):
+            return True
+        self.log("the %s tab is still not the selected one after %d taps" % (label, attempts))
+        return False
 
     def _window_extent(self, els):
         """The window's extent as the current dump reports it: the largest right
@@ -471,6 +626,27 @@ class E2eDriver:
             time.sleep(1.2)
         return self.visible("Ubuntu on this device", "Linux userspace")
 
+    def require_linux_section(self, max_swipes=24):
+        """scroll_to_linux_section, or the failure the phases reported blind.
+
+        The message names the screen the walk was actually on, because a walk that
+        finds nothing is a navigation failure far more often than it is a list that
+        would not scroll - and only the screen says which. Run 35311046886 is the
+        worked example: the Settings tab's tap was eaten by the soft keyboard, so the
+        walk spent its 24 swipes and 100 seconds on the HOSTS list and the phase
+        failed with "the Linux userspace settings section was never visible", which
+        reads as a list that would not scroll and names a section that was never on
+        that screen to be missing. The first screen, captured before the first swipe,
+        is the whole diagnosis."""
+        first = self._screen_digest(12)
+        if self.scroll_to_linux_section(max_swipes):
+            return
+        raise RuntimeError(
+            "the Linux userspace settings section was never visible on the Settings"
+            " list%s | and after %d swipes: %s"
+            % (("%s%s" % (EVIDENCE_MARKER, first)) if first else "",
+               max_swipes, self._screen_digest(12)))
+
     def _open_window_button(self, elements):
         """The Linux userspace row's own control - the Settings list's way into the
         window - or None.
@@ -504,8 +680,7 @@ class E2eDriver:
         the same string as the row just tapped, so its presence proves nothing about
         which screen is showing. A tap the emulator ate therefore fails here, naming
         the tap, instead of surfacing later as a list that would not scroll."""
-        if not self.scroll_to_linux_section(max_swipes):
-            raise RuntimeError("the Linux userspace settings section was never visible")
+        self.require_linux_section(max_swipes)
         button = self._open_window_button(self.dump())
         if not button:
             raise RuntimeError(
@@ -572,8 +747,7 @@ class E2eDriver:
         screen, with the window left open on it: this is the screen a user watches
         an install on, and it is where the step lines and the progress bar are."""
         self.open_settings()
-        if not self.scroll_to_linux_section():
-            raise RuntimeError("the Linux userspace settings section was never visible")
+        self.require_linux_section()
         if not self.find(self.dump(), LABEL_INSTALL_ROW, LABEL_NEEDS_REPAIR, LABEL_INSTALLED):
             raise RuntimeError("no Ubuntu row to install from - unexpected section state")
         self.open_ubuntu_window()
@@ -1016,7 +1190,11 @@ class E2eDriver:
             return
         self.launch()
         self.open_settings()
-        self.scroll_to_linux_section()
+        # Required, not discarded: everything below reads the install row, and a walk
+        # that never reached the section would read it off whatever screen is actually
+        # showing - which is how a lost tap becomes "nothing about the install on
+        # screen at all", a lifecycle failure this phase never had.
+        self.require_linux_section()
         seen, els = self._walk_linux_section()
         title, line = self.install_state(els)
         kind = self.install_state_kind(title, line)
@@ -1291,7 +1469,12 @@ class E2eDriver:
         time.sleep(3)
         self.launch()
         self.open_settings()
-        self.scroll_to_linux_section()
+        # Required, not discarded - the reason this phase cannot be fooled by the
+        # screen it is not on: the state it reads next is the Settings list's own row,
+        # and every other screen the app has answers "no recognizable state" two
+        # minutes later, which is how a navigation failure gets published as a
+        # userspace that never settled.
+        self.require_linux_section()
         # The recovery contract: NotInstalled (clean) or NeedsRepair (named) -
         # never Installed, never a wedged Installing forever.
         state = None
