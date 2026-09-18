@@ -262,6 +262,15 @@
 # touches", not "what survives today".
 -keep class dev.eclipse.ssh.linux.ProotCommandResult { *; }
 -keep class dev.eclipse.ssh.linux.HealthReport { *; }
+#
+# And the state hierarchy UbuntuE2eVerificationTest reads:
+# `check(state is LinuxUserspaceState.Stopped)`. Keeping the manager keeps the
+# *signature* of its `state` member, which names the sealed parent, but a name
+# in a signature does not stop R8 renaming the class or its subtypes, and the
+# suite resolves both at runtime. Green today, so this is defensive rather
+# than a repair of an observed failure - which is the honest way to state it.
+-keep class dev.eclipse.ssh.linux.LinuxUserspaceState { *; }
+-keep class dev.eclipse.ssh.linux.LinuxUserspaceState$* { *; }
 
 # ---------------------------------------------------------------------------
 # Stage 2: androidx.compose, narrowed from the whole-namespace keep in
