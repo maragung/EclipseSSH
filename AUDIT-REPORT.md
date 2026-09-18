@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 29 / versionName 1.2.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 30 / versionName 1.2.1 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.0 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2025.04.01 · Hilt 2.60.1 · KSP 2.3.11 · Room 2.7.1 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.79
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §40, *Releasing 1.2.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §41, *Releasing 1.2.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -4608,3 +4608,113 @@ came apart here for the first time, and the mechanism is worth knowing before it
 published deliberately afterwards, and the validation that runs on publication is what pulls it back if
 any leg is red. Between those two moments a tag exists whose release does not, and counting tags —
 which is what the earlier wording did — cannot see the difference.
+
+---
+
+## 41. Releasing 1.2.1
+
+`git diff --numstat v1.2.0..v1.2.1 -- app/src/main` returns nothing. This release does not change one
+line of the application: no composable, no screen, no repository, not the native modules. What it
+changes is which of the application's classes R8 is still allowed to rename, and it adds the check
+that would have caught the omission before a release was published instead of after.
+
+The other six files in the range are `app/proguard-instrumentation.pro` (+15),
+`scripts/check-instrumentation-keeps.sh` (+116, new), `.github/workflows/ci.yml` (+10, the guard's
+step), `testing/ubuntu-e2e/driver.py` (+72/−2), `testing/ubuntu-e2e/test_driver_matchers.py` (+80,
+new), and this file. Nothing under `app/src/androidTest` changes either. A patch number is the honest
+number for that: the artifact a user installs behaves as 1.2.0's does, and the difference is in what
+the pipeline will refuse to ship.
+
+### 41.1 The release that failed its own gate
+
+1.2.0 was published and then pulled back to draft by `android-release-test.yml`, and §40.6 exists
+because the first draft of this file claimed the opposite before the publication was checked. The
+failure was `NoClassDefFoundError: Landroidx/core/view/WindowCompat;` in `SystemBarAppearanceTest`, on
+the leg that installs the **release** APK — the one that matters, because a debug build does not
+minify and would have found the class exactly where the test left it. Issue #121 carries the report.
+
+The mechanism is the instrumentation pair's, and §36–§39's keep rules are the same mechanism:
+`assembleReleaseAndroidTest` compiles the test APK against the *minified release* dex, so a class the
+test names **by name** — `WindowCompat`, and `WindowInsetsControllerCompat`, which is what
+`WindowCompat.getInsetsController` returns and what the test reads `isAppearanceLightStatusBars` off —
+has to survive R8. The app itself calls `WindowCompat` from `EclipseTheme` and `MainActivity`, so the
+class existed in the dex; it had simply been renamed, and the test's own reference to it was the only
+thing left pointing at the old name.
+
+### 41.2 What a keep rule costs, and what it does not prove
+
+Two lines, and at runtime they cost nothing. A keep rule does not change what the app does: R8 renames
+the application's call sites consistently whether or not the class is kept, so a kept class and a
+renamed one are the same program. What it changes is that the *test* can still name it. That is the
+whole of the fix, and it is why 41's diff to `app/src/main` is empty and honestly so — a reader looking
+for the repair in the application will not find it, because the application was never broken.
+
+What the fix does not do is keep itself true. A keep list is a list, and it decays the moment a test
+starts referencing some other class by name: the omission is silent in every JVM run and every
+`ci.yml` run, and surfaces 25 minutes into a release validation, on a published artifact, which is the
+most expensive place this repository has to learn anything.
+
+### 41.3 The check that keeps the list true
+
+`scripts/check-instrumentation-keeps.sh` scans `app/src/androidTest` for source-level references to
+classes that live in the release APK's dex, and fails when one is not in the keep list. It runs in
+`ci.yml` (line 588) immediately before the step that compiles the instrumentation tests, so a test that
+introduces the next `WindowCompat` reddens the pull request that adds it rather than a release gate
+weeks later.
+
+The check reads **sources**, not the shipped dex, and that is forced rather than chosen: R8 renames the
+very classes at issue, so a scan of `classes.dex` would find no `Landroidx/core/view/WindowCompat;` at
+all and would sit silent through its own namesake failure. The source-side scan has the mirror-image
+weakness, stated here so it is not discovered later as a surprise: it can only reason about references
+that are spelled out — a class reached through reflection or a string, or through a package wildcard
+whose contents the script cannot enumerate, is outside what it can see. It is a check, and it is not a
+proof, and nothing in this release claims otherwise.
+
+### 41.4 The evidence
+
+The fix was validated before it was released, by the route `testing/README.md` documents for a fix that
+needs no release: `apk_source=build`, which assembles and signs its own release APK from the branch and
+runs the same gate over it. Run **35343449935 attempt 2** validated the rebuilt APK at head
+`2d2f6ea6cbc1`:
+
+- `Release APK on API 30` — **OK (47 tests)**, Verdict success.
+- `Release APK on API 35` — **OK (47 tests)**, Verdict success.
+- `scan-crashes.sh` clean on both legs (`crash-out.json`, 49 bytes), no `NoClassDefFoundError`.
+
+Attempt 1 of that same run failed on API 35, and it belongs on the record rather than in a retry
+button: `ReleaseChaosJourneyTest.rotatingThroughEveryDestinationKeepsTheScreenUsable` died with a
+`ComposeTimeoutException` in `awaitSeededRow` — a 10-second wait that gave up 12.6 s after a
+configuration change at 12:37:58.682Z — and the identical code passed 47/47 on attempt 2. It is a
+flake in the release suite's own timing under rotation, not a crash and not a defect the keep rules
+touch. The timeout was **not** lengthened to make it go away: inflating a wait hides the hang it exists
+to catch, and the repair rules in `auto-fix.sh` forbid exactly that. It stays as residual fragility of
+that suite.
+
+### 41.5 What ships that is not the application
+
+Four of the five changes in this range are the harness and the record, and none of them rides in an
+artifact:
+
+- **#119** stops the Ubuntu E2E driver from trusting the IME dump on its own — a FULL run proved the
+  dump can report a keyboard state the device is not in — and adds `test_driver_matchers.py` (80
+  lines) so the matcher logic is tested rather than exercised.
+- **#122** records that FULL run, which closed §40.3's open question.
+- **#125** corrects §40.6 and states the rule it was missing.
+- **#123** is 41.1–41.3.
+
+A user who installs 1.2.1 gets 1.2.0's application. What they get that 1.2.0's did not have is a
+release whose *published* APK has been through the gate green: v1.2.0's published asset never was —
+that is what the draft pull-back means — so 1.2.1 is the first artifact in the 1.2 line that a green
+validation run stands behind.
+
+### 41.6 One thing deliberately not merged first
+
+PR #126 widens the two native fetches' retry budgets — `:freerdp`'s `download` had **no retry at all**,
+and `:linux`'s window was about 50 seconds — after two reds in one day caused by third-party mirrors
+answering 5xx (GitHub 500 for `openssl-4.0.1.tar.gz`; samba.org 504 then 503 three times for
+`talloc-2.4.2`). It is a real fix and it is not in this release, on purpose: both fetch tasks' cache
+keys hash their module's build script, so merging it retires the `freerdp-native` and `linux-native`
+cache entries and forces a cold four-ABI native build of roughly half an hour. That cost must not land
+on the release whose whole point is a green publication, so #126 merges **after** `v1.2.1` is out. The
+trigger that reverses that order is stated with it: if a run reddens on the same download again before
+the tag, #126 goes first and the release waits.
