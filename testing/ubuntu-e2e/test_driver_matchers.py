@@ -126,6 +126,200 @@ class ActionButtonMatchers(unittest.TestCase):
                                     "'Install log': %s" % loose)
 
 
+class InstallStateAcrossSurfaces(unittest.TestCase):
+    """One install state, two spellings: the window's row (a title over the step) and
+    the Settings list's row (title and state folded into one summary line). Since
+    a30b276 the controls sit behind a row, so an install can be watched from either
+    screen, and the readings are not interchangeable:
+
+    - the window draws the row's own name twice - in the bar, and again as the card's
+      row - and _texts() deduplicates, so a pairing built on it sees the name once,
+      followed by the card's header, and the row that owns the state is unreachable;
+    - on the list the state is in the summary line rather than the title, so a reader
+      that only looks at titles sees no state at all - which made every lifecycle
+      exercise fired during an install walk a list with nothing left to reveal and
+      report the install as lost, the false failure install_state_kind's second
+      spelling exists to prevent."""
+
+    # The window mid-install, in dump order, with the app's real strings
+    # (UbuntuActivity's card): the bar, its back arrow, the card's header, then the
+    # card's row - "Installing <distro>" over the step - and the trace row below.
+    WINDOW_INSTALLING = [
+        Element({"text": "Ubuntu on this device", "bounds": "[155,190][588,250]"}),
+        Element({"content-desc": "Back", "bounds": "[24,190][120,286]"}),
+        Element({"text": "UBUNTU ON THIS DEVICE", "bounds": "[32,340][600,382]"}),
+        Element({"text": "Installing Ubuntu 22.04 LTS", "bounds": "[155,470][700,530]"}),
+        Element({"text": "Downloading · 512.0 MB of 1.2 GB", "bounds": "[155,530][881,572]"}),
+        Element({"text": "Install log", "bounds": "[220,900][520,960]"}),
+    ]
+
+    # The same window once the install has settled: the bar and the card's row now
+    # carry the same string, which is the case the dedup collapses.
+    WINDOW_SETTLED = [
+        Element({"text": "Ubuntu on this device", "bounds": "[155,190][588,250]"}),
+        Element({"content-desc": "Back", "bounds": "[24,190][120,286]"}),
+        Element({"text": "UBUNTU ON THIS DEVICE", "bounds": "[32,340][600,382]"}),
+        Element({"text": "Ubuntu on this device", "bounds": "[155,470][588,530]"}),
+        Element({"text": "Installed and verified · stopped", "bounds": "[155,530][881,572]"}),
+    ]
+
+    # The Settings list mid-install (MainActivity's LinuxUserspaceSection and
+    # linuxUserspaceSummary): the section header, the row, its summary line, and the
+    # row's control - a merged button node, labelled "Open" and named after its row.
+    LIST = [
+        Element({"text": "LINUX USERSPACE", "bounds": "[32,1177][345,1219]"}),
+        Element({"text": "Ubuntu on this device", "bounds": "[155,1277][588,1340]"}),
+    ]
+    LIST_INSTALLING = LIST + [
+        Element({"text": "Installing Ubuntu 22.04 LTS · Downloading · 512.0 MB of 1.2 GB",
+                 "bounds": "[155,1340][881,1382]"}),
+        Element({"text": "Open", "content-desc": "Ubuntu on this device",
+                 "bounds": "[888,1330][1043,1390]"}),
+    ]
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+
+    def test_the_window_names_the_step_while_it_installs(self):
+        # What the progress log and the periodic install-progress screenshots are
+        # read from: the driver logs the pair, so a hung install names its step.
+        self.assertEqual(
+            ("Installing Ubuntu 22.04 LTS", "Downloading · 512.0 MB of 1.2 GB"),
+            self.driver.install_state(self.WINDOW_INSTALLING))
+        self.assertEqual("Installing Ubuntu 22.04 LTS | Downloading · 512.0 MB of 1.2 GB",
+                         self.driver.install_label(self.WINDOW_INSTALLING))
+
+    def test_the_windows_bar_is_not_read_as_the_row(self):
+        # The bar carries the row's own name, so the reader has to return the card's
+        # row - the one below the card's header - and not the bar above it.
+        self.assertEqual(("Ubuntu on this device", "Installed and verified · stopped"),
+                         self.driver.install_state(self.WINDOW_SETTLED))
+
+    def test_the_deduped_view_is_why_the_pairing_is_built_on_the_raw_dump(self):
+        # Pinned as the trap it is, not endorsed: _texts() collapses the bar and the
+        # card's row into a single entry, and that entry is the bar's - so a pairing
+        # built on it can never reach the row that owns the state.
+        texts = self.driver._texts(self.WINDOW_SETTLED)
+        self.assertEqual(1, texts.count(driver.CARD_TITLE))
+        self.assertLess(texts.index(driver.CARD_TITLE), texts.index(driver.WINDOW_HEADER))
+
+    def test_the_list_folds_the_state_into_its_summary_line(self):
+        title, line = self.driver.install_state(self.LIST_INSTALLING)
+        self.assertEqual("Ubuntu on this device", title)
+        self.assertEqual("alive", self.driver.install_state_kind(title, line))
+        self.assertEqual("Installing Ubuntu 22.04 LTS · Downloading · 512.0 MB of 1.2 GB",
+                         self.driver.install_label(self.LIST_INSTALLING))
+
+    def test_a_settled_row_is_not_read_as_an_install_that_died(self):
+        # "ended" means the install died, and it is what makes a lifecycle exercise
+        # declare the install lost - so an intact userspace must read "alive" on
+        # whichever screen the exercise relaunched the app onto.
+        stopped_on_the_list = self.LIST + [
+            Element({"text": "Installed and verified · stopped", "bounds": "[155,1340][881,1382]"})]
+        for els in (self.WINDOW_SETTLED, stopped_on_the_list):
+            self.assertEqual("alive",
+                             self.driver.install_state_kind(*self.driver.install_state(els)))
+        self.assertEqual("ended", self.driver.install_state_kind(
+            *self.driver.install_state(stopped_on_the_list[:2] + [
+                Element({"text": "Needs repair · a previous install was interrupted",
+                         "bounds": "[155,1340][881,1382]"})])))
+
+    def test_the_apps_own_error_row_never_reads_as_a_live_install(self):
+        # The row that records why an operation ended is named after what failed, so
+        # it begins with the Installing label (E2E run 35051269460) - and reading it
+        # as a live install reports a dead one as alive.
+        els = [Element({"text": "Last operation", "bounds": "[155,700][500,760]"}),
+               Element({"text": "Installing base packages failed (exit 100)",
+                        "bounds": "[155,760][900,802]"})]
+        self.assertEqual((None, ""), self.driver.install_state(els))
+        self.assertIsNone(self.driver.install_label(els))
+
+
+class OpenWindowButton(unittest.TestCase):
+    """The Settings row's own control, and the step the promotion added: every acting
+    phase now goes list -> Open -> window -> action row. The row's title and its
+    button carry the same string and only the button is tappable, so the match is on
+    the row's own name - the same shape as the install-log row's View."""
+
+    # The list's userspace row, in dump order, as the merged node Compose draws: the
+    # button's label as the text, the row's name as its content-desc.
+    LIST = InstallStateAcrossSurfaces.LIST + [
+        Element({"text": "Not installed · real bash, apt, Node.js and Python, on the device",
+                 "bounds": "[155,1340][881,1382]"}),
+        Element({"text": "Open", "content-desc": "Ubuntu on this device",
+                 "bounds": "[888,1330][1043,1390]"}),
+    ]
+
+    # The window that button opens: the same name in the bar, the card's header, and
+    # the card's row under it.
+    WINDOW = InstallStateAcrossSurfaces.WINDOW_SETTLED
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        # wait_visible() runs against a wall-clock deadline, so a no-op sleep alone
+        # would spin for the real thirty seconds: the clock has to move with it.
+        self.addCleanup(setattr, driver, "time", driver.time)
+        driver.time = _AdvancingTime()
+
+    def test_the_rows_own_button_is_taken_by_its_name(self):
+        hit = self.driver._open_window_button(self.LIST)
+        self.assertIsNotNone(hit)
+        self.assertEqual(driver.BUTTON_OPEN, hit.attrs["text"])
+        self.assertEqual(driver.CARD_TITLE, hit.attrs["content-desc"])
+
+    def test_the_titles_own_row_is_never_tapped(self):
+        # A dump whose button has scrolled out of view, or a device that is not
+        # supported and draws none: the title is not tappable, so taking it would be
+        # a tap the driver could lose silently.
+        self.assertIsNone(self.driver._open_window_button(self.LIST[:2]))
+
+    def test_another_rows_button_is_never_taken(self):
+        others = [Element({"text": "Terminal font size", "bounds": "[155,300][700,360]"}),
+                  Element({"text": "Change", "content-desc": "Terminal font size",
+                           "bounds": "[888,300][1043,360]"})]
+        self.assertIsNone(self.driver._open_window_button(others))
+
+    def test_the_walk_opens_the_window_through_the_merged_button(self):
+        adb = _WindowAdb(self.LIST, window=self.WINDOW)
+        self.driver.adb = adb
+        self.driver.open_ubuntu_window()
+        self.assertEqual([], adb.swipes)  # the row was already on screen
+        self.assertEqual(1, len(adb.taps))
+        x, y = adb.taps[0]
+        self.assertTrue(888 <= x <= 1043, x)  # the button's own bounds, not the row's
+        self.assertTrue(1330 <= y <= 1390, y)
+
+    def test_a_button_that_is_really_absent_is_named(self):
+        self.driver.adb = _WindowAdb(self.LIST[:2])
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_ubuntu_window()
+        self.assertIn("Open button was not found", str(caught.exception))
+
+    def test_a_tap_the_emulator_ate_is_named_as_the_tap(self):
+        self.driver.adb = _WindowAdb(self.LIST, window=self.WINDOW, tap_ok=False)
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_ubuntu_window()
+        self.assertIn("could not be tapped", str(caught.exception))
+
+    def test_the_rows_own_name_cannot_prove_the_window_opened(self):
+        # Pinned, not endorsed: the list satisfies a wait on the name the window is
+        # named after - on the very screen the driver is trying to leave. The wait has
+        # to be on the card's header, which is the only string the window draws and
+        # the list does not; otherwise a tap the emulator ate leaves the driver
+        # hunting for action buttons on a screen they are not on.
+        self.assertIsNotNone(self.driver.find(self.LIST, driver.CARD_TITLE))
+        self.assertIsNone(self.driver.find(self.LIST, driver.WINDOW_HEADER))
+
+    def test_a_window_that_never_opens_fails_on_its_own_header(self):
+        self.driver.adb = _WindowAdb(self.LIST, window=None)
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_ubuntu_window()
+        self.assertIn(driver.WINDOW_HEADER, str(caught.exception))
+        self.assertIn("did not open", str(caught.exception))
+
+
 class InstallLogLines(unittest.TestCase):
     def test_a_failure_line_matches_the_event_pattern(self):
         line = ('[apt] bulk base-package install failed exit=100 '
@@ -467,6 +661,50 @@ class _ScrollingAdb:
     def tap(self, x, y):
         self.taps.append((x, y))
         return True
+
+
+class _WindowAdb:
+    """The Settings list, and - once a tap has been sent - the window it opens.
+    With `window` None the tap is eaten by the emulator and the screen never
+    changes, which is the failure the window's own header exists to catch."""
+
+    def __init__(self, settings, window=None, tap_ok=True):
+        self.settings = settings
+        self.window = window
+        self.tap_ok = tap_ok
+        self.taps = []
+        self.swipes = []
+
+    def ui_dump(self):
+        if self.taps and self.window:
+            return self.window
+        return self.settings
+
+    def tap(self, x, y):
+        self.taps.append((x, y))
+        return self.tap_ok
+
+    def swipe(self, x1, y1, x2, y2, duration):
+        self.swipes.append((x1, y1, x2, y2, duration))
+        return True
+
+
+class _AdvancingTime:
+    """A stand-in for the time module whose clock moves per call. wait_visible()
+    compares against a wall-clock deadline, so patching only sleep would leave it
+    spinning for the real timeout the test is trying not to wait out."""
+
+    STEP = 10.0
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        self.now += self.STEP
+        return self.now
+
+    def sleep(self, _seconds):
+        return None
 
 
 if __name__ == "__main__":

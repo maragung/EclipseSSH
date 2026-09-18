@@ -674,24 +674,33 @@ class E2eDriver:
         (exit 100)' - text that begins with the Installing label, which would
         report a dead install as alive.
 
-        And one thing rules out the first match: inside the window the bar above
-        the card renders this same title, because the screen is named after the row
-        that opens it. That bar's next text in dump order is the card's own header,
-        and the row carrying the state is below it - so a candidate followed by
-        that header is the bar. Reading it as the row loses the step label and the
-        periodic progress shots for an install watched in the window, which is the
-        evidence a hung install is diagnosed from (see STEP_SUBTITLES) - and the
-        verdicts below are `find`-based, so nothing else would notice."""
+        And in the window the name is drawn twice: the bar above the card renders it
+        because the screen is named after the row that opens it, and the card's own
+        row renders it again as the row's title. A candidate above the card's header
+        is therefore the bar, and the row carrying the state is below that header -
+        which is also why the pairing is built on the raw dump rather than on
+        _texts(): that one deduplicates, so the two identical titles collapse into
+        the bar's occurrence and the card's own row becomes unreachable. Reading the
+        bar as the row loses the step label and the periodic progress shots for an
+        install watched in the window, which is the evidence a hung install is
+        diagnosed from (see STEP_SUBTITLES) - and the verdicts below are `find`-based,
+        so nothing else would notice."""
         texts = self._texts(elements)
         values = {texts[i + 1] for i, t in enumerate(texts)
                   if t == LABEL_LAST_OPERATION and i + 1 < len(texts)}
-        for i, text in enumerate(texts):
+        # Every text in dump order, duplicates kept: a row's title and its line are a
+        # pair, and the same string can legitimately stand twice on one screen.
+        seen = [attr for el in elements
+                for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", ""))
+                if attr]
+        header = seen.index(WINDOW_HEADER) if WINDOW_HEADER in seen else -1
+        for i, text in enumerate(seen):
             if text in values:
                 continue
             if text == CARD_TITLE or text.startswith("Installing "):
-                line = texts[i + 1] if i + 1 < len(texts) else ""
-                if line == WINDOW_HEADER:
+                if i < header:
                     continue
+                line = seen[i + 1] if i + 1 < len(seen) else ""
                 return text, line
         return None, ""
 
