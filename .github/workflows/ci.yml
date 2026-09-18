@@ -723,7 +723,18 @@ jobs:
         # in the lockfile is a silent reproducibility loss. The check below
         # runs a `dependencies` task against the lockfile; any drift fails
         # the build rather than letting it through.
-        run: ./gradlew --stacktrace :app:dependencies --configuration releaseRuntimeClasspath --write-locks
+        #
+        # No --write-locks, deliberately: that flag is what makes the task
+        # rewrite the lockfile to match whatever it just resolved, so the run
+        # this step is documented to refuse is the one it silently accepted.
+        # A locked configuration that no longer resolves to its recorded
+        # versions fails resolution instead - the lock state is enforced as a
+        # `strictly` constraint - and that failure is this step's refusal. The
+        # remedy it prints is to re-run the same command with --write-locks and
+        # commit app/gradle.lockfile. Dependabot cannot run it at all, which is
+        # why a version bump it opens arrives here red rather than with its
+        # lockfile updated: the bump and the lockfile have to land together.
+        run: ./gradlew --stacktrace :app:dependencies --configuration releaseRuntimeClasspath
 
       # The artifact uploads are convenience copies, not verification: everything they
       # carry was already built and checked by the assemble and signature steps above.
