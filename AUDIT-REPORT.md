@@ -4515,9 +4515,10 @@ repair to the harness that produced the evidence for it.
 
 It is **not** a change to SSH, to the RDP client, to the vault, or to any settings screen, and it is
 not a claim that the two interruption phases now pass. The repair is dispatched — STANDARD
-`35332298506` on the repair branch, with the FULL run that owns those two phases after it — and this
-section will carry the result when it lands rather than predicting it. §39.2's rule applies unchanged:
-a fix to the channel the evidence travels on is recorded as that until the evidence arrives.
+`35332298506` on the repair branch, with the FULL run that owns those two phases after it — and §40.5
+carries the result, which landed after this section was written and is not predicted here. §39.2's rule
+applies unchanged: a fix to the channel the evidence travels on is recorded as that until the evidence
+arrives.
 
 One thing about this pass is worth carrying forward. Read the run's phase table beside its step
 conclusions and they disagree: `Run the E2E driver -> success`, while the log holds
@@ -4529,3 +4530,65 @@ recorded for the release gate, and the reason `phase-results.json` is written at
 
 §39.4 moved it to `v1.1.19` under the rule that the example names the newest tag that actually exists.
 `v1.1.20` now exists and is published, so it moves to that.
+
+### 40.5 The two interruption phases, and what the guards did on the device
+
+§40.3 left this open on purpose. This is the result it was waiting for, and it is a pass with a
+qualification rather than a clean one.
+
+STANDARD `35332298506` and FULL `35334867075` both ran on `c1a9ab4e5242`, the commit #119 carries, and
+FULL's phase table holds nine phases out of nine: `preflight` 6.2s, `storage-gate` 81.2s, **`install`
+204.0s**, `install-log` 28.1s, `verify` 5.0s, `terminal-ui` 21.9s, `persistence-restart` 11.8s,
+**`interrupt-process` 223.8s** and **`interrupt-network` 282.6s** — the last two being the ones that
+failed at UI on `35328758621`. Each carries its own screenshot, `interrupt-recovery-105641.png` and
+`network-cut-110110.png`.
+
+The useful evidence is not that the phases passed but how they passed, and this run's own logcat says
+why. The last IME show in the log is `showSoftInput` at 10:54:11.590 with `onShown` at 10:54:12.497;
+`onHidden` follows at 10:54:15.528, and from there to the log's last line — 8m17s later — there is no
+`showSoftInput`, no `onRequestShow` and no `onShown` at all, so the keyboard cannot have been up
+anywhere in that window. The dump reads one as up anyway, twice per phase, and the driver acts on the
+reading:
+
+- 10:54:07 and 10:57:51 — *"the keyboard reads as up, but com.android.launcher3 is the focused window,
+  not the app; not sending a BACK into a window that is not ours."* The first guard, on a false reading
+  with the app not even in front. Before the repair the BACK went out regardless and landed on whatever
+  was there.
+- 10:55:50 and 10:57:59 — *"the soft keyboard is up; dismissing it before touching the tab bar."* The
+  same false reading, now with the app focused, so the first guard has nothing to object to and the BACK
+  is sent.
+- 10:55:56 and 10:58:06 — *"the BACK that dismisses the keyboard left the app (com.android.launcher3 is
+  in front); relaunching it."* The second guard, and this is §40.2's fatal case reproduced on a device,
+  in a passing run: a BACK sent to dismiss a keyboard that was not there finished the app. Before the
+  repair that ended the phase with `the Settings tab did not open`, and the retry finished the fresh
+  activity in turn.
+
+The phase went on to do what it is for. Its own interruption is the kill at 10:55:41, its retry install
+completed at 10:57:49, and `interrupt-process` passed in 224s; `interrupt-network` ran the same sequence
+and passed in 283s. §40.2's second defect is visible in the same window and holding: at 10:54:21 the
+driver found the keyboard *still* reading as up six seconds after a BACK and declined to send a second
+one, which is the #117 fix keeping the line that #119 then made survivable to cross.
+
+So the repair is **not** that the stale reading can no longer happen — it happens twice per phase, and
+the run that proves the guards work is also the run that proves the reading is false. It is that a wrong
+reading is survivable. The credit for these two phases belongs to the guards and not to the app having
+stopped producing the condition, and a reader who takes "both phases pass" to mean "the condition is
+gone" has taken the wrong half.
+
+Two things bound the claim further. The run's own `Check the driver's own matchers` step passed in the
+same run, so the two new guard tests ran there as well — but a fake is not a device, and the lines
+quoted above are the part that is about the emulator. And this section landed after `v1.2.0` was tagged:
+the harness ships in no artifact, so nothing in the published release changes. What makes the run's
+verdict a verdict about #119 is that `driver.py`'s blob is byte-identical at `c1a9ab4e5242` and at the
+post-merge head `cde869fda657` — `432404f24b80` at both.
+
+The paragraph §40.3 closed on is worth pairing with this one, because the two are the same observation
+from opposite sides. §40.3 read a failing run's green step conclusion beside its failing phase rows;
+here a run passes both, and the point survives: `Run the E2E driver` reported success on `35328758621`
+too — the run whose last two phases failed. The step conclusion is not the thing to read, in either
+direction.
+
+### 40.6 `testing/README.md`'s dispatch example, one release along again
+
+§40.4 moved it to `v1.1.20` under the rule that the example names the newest tag that actually exists.
+`v1.2.0` now exists and is published, so the rule moves it again.
