@@ -403,16 +403,34 @@ class Adb:
             ["logcat", "-d", "-v", "brief", "-t", str(lines)], timeout=30)
         return out if rc == 0 else ""
 
-    def new_crash_lines(self):
+    def new_crash_lines(self, package=None):
         """Scan the tail of logcat for crash/ANR signatures not yet reported.
         Deduplication is by full line so a scan after every action does not
-        re-report the same stack on each step. Note the scan is not filtered
-        by package: a crash is attributed by the caller's context, and a
-        system_server fatal that takes the app down is still a finding."""
+        re-report the same stack on each step.
+
+        `package` scopes only the `force-close` signature, and should be passed
+        whenever the caller knows which app it is driving. That pattern matches
+        the lines Android emits when *any* process is evicted, and eviction under
+        memory or disk pressure is routine: in run 35323027141 the storage-gate
+        phase - which fills the disk on purpose - was flipped to a CRASH failure
+        by 17 `has died: cch+NN CEM` lines belonging to com.android.music,
+        printspooler, camera2, quicksearchbox and eight more, while the
+        package-scoped scan-crashes.sh reported `{"status": "clean"}`. Every one
+        of them was another app being cached out, none of them the app under test.
+
+        The other three labels stay unscoped on purpose. `jvm-fatal`, `anr` and
+        `native-crash` are loud, per-process and rare, and the reason to scan
+        without a package filter still holds for them: a system_server fatal or a
+        native tombstone that takes the app down may never name the app, and that
+        is exactly the crash the happy path misses. Narrowing those would trade a
+        false alarm for a blind spot."""
         fresh = []
         for line in self.logcat().splitlines():
             for label, pattern in CRASH_PATTERNS:
                 if pattern.search(line):
+                    if label == "force-close" and package and package not in line:
+                        # Some other process was evicted; not this app's crash.
+                        break
                     # A crash line is "ours" if it names the package, came from
                     # AndroidRuntime/system_server context, or is a bare fatal
                     # header - the surrounding lines are attached as evidence.

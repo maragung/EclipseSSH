@@ -8,7 +8,7 @@ Design contract (the pipeline's whole point):
 
   - No mocking anywhere. The app downloads the pinned Ubuntu Base rootfs over
     the network, verifies its SHA-256, extracts it, configures apt inside proot
-    and installs the toolchain. The driver only watches and pokes the UI.
+    and installs the base packages. The driver only watches and pokes the UI.
   - The UI says "Installed and verified" is NOT the pass criterion - it is the
     point where the deep verification starts. The instrumented
     UbuntuE2eVerificationTest then executes commands in the installed
@@ -166,8 +166,6 @@ STEP_SUBTITLES = (
     "Configuring package sources",
     "Updating package lists",
     "Installing the base packages",
-    "Installing Node.js",
-    "Installing pnpm and the OpenCode CLI",
     "Running the health check",
 )
 
@@ -419,7 +417,7 @@ class E2eDriver:
 
     def _scan_crashes(self, result):
         try:
-            fresh = self.adb.new_crash_lines()
+            fresh = self.adb.new_crash_lines(package=self.package)
         except Exception as exc:  # a broken scan must not mask the phase verdict
             self.log("crash scan failed: %s" % exc)
             return
@@ -525,20 +523,49 @@ class E2eDriver:
             return False
         return bool(IME_SHOWN_RE.search(out))
 
-    def dismiss_ime(self):
+    def dismiss_ime(self, settle=6.0):
         """Put the soft keyboard away, so a tap on the bottom bar reaches the app.
 
-        Two attempts: the first BACK is what normally dismisses a keyboard, and a
-        second is only sent if the dump still says it is up. Nothing is sent when it
-        is not, because a BACK with no keyboard on screen goes to the app and would
-        navigate it out from under the caller."""
-        for _ in range(2):
+        One BACK per call, and only a confirmed-gone keyboard ends the wait. When
+        the keyboard is not up nothing is sent at all, because a BACK with no
+        keyboard on screen goes to the app and would navigate it out from under
+        the caller.
+
+        The second BACK is what broke run 35323027141, and the shape of the
+        failure is why this waits instead of sleeping a fixed second and reading
+        once. On a freshly `pm clear`ed install the app raises its own keyboard on
+        the first screen (`InputMethodManager: showSoftInput()` at 08:37:08.165).
+        The first BACK at 08:37:11.759 was consumed by the IME
+        (`ImeTracker: onRequestHide ... reason HIDE_SOFT_INPUT_BY_BACK_KEY`), and
+        the IME only reported `onHidden` at 08:37:12.178 - after the old fixed
+        `sleep(1)`. The dump read at that point still said the keyboard was up, so
+        a second BACK was sent with no keyboard left to dismiss; it landed on the
+        app and exited it. The next dump was the launcher (`Search`, `Gallery`,
+        `Camera`), saved as `screen-interrupt-process-083723.txt`, and both
+        interruption phases died on "the Settings tab did not open" while the app
+        was simply gone - nothing had killed process 7436; the next phase's
+        `_clean_state()` did that at 08:37:23, six seconds later.
+
+        So: BACK once, then poll until the IME's own dump agrees it is gone. Only
+        a keyboard that is *still* up after this whole window is treated as
+        needing another BACK, and that decision is left to the caller's next
+        attempt rather than taken here."""
+        if not self._ime_shown():
+            return True
+        self.log("the soft keyboard is up; dismissing it before touching the tab bar")
+        self.adb.back()
+        deadline = time.monotonic() + settle
+        while True:
+            time.sleep(0.5)
             if not self._ime_shown():
                 return True
-            self.log("the soft keyboard is up; dismissing it before touching the tab bar")
-            self.adb.back()
-            time.sleep(1)
-        return not self._ime_shown()
+            if time.monotonic() >= deadline:
+                break
+        self.log(
+            "the soft keyboard is still up %.0fs after a BACK; not sending a second"
+            " one on a reading this stale - the caller's next attempt will retry"
+            % settle)
+        return False
 
     def _band_top(self, elements):
         """The y the window's bottom band starts at. The bar is the last row of an

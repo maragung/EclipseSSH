@@ -5265,7 +5265,7 @@ private fun linuxUserspaceSummary(ui: LinuxUserspaceUiState): String {
             if (ui.hasPendingWorkspaceBackup) {
                 "Not installed · a saved workspace will be restored"
             } else {
-                "Not installed · real bash, apt, Node.js and Python, on the device"
+                "Not installed · real bash, apt and git, on the device"
             }
         is LinuxUserspaceState.Stopped -> "Installed and verified · stopped"
         is LinuxUserspaceState.Starting -> "Starting…"
@@ -5301,8 +5301,6 @@ private fun describeSetupStep(step: SetupStep, detail: String?): String {
         SetupStep.CONFIGURE_APT -> "Configuring package sources"
         SetupStep.UPDATE_PACKAGES -> "Updating package lists"
         SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
-        SetupStep.INSTALL_NODEJS -> "Installing Node.js"
-        SetupStep.INSTALL_GLOBAL_TOOLS -> "Installing pnpm and the OpenCode CLI"
         SetupStep.VERIFY -> "Verifying"
     }
     // The newest command output beside the step's label: a slow-but-alive `apt-get update` shows

@@ -6,8 +6,8 @@ byte comes from, and why each layer is shaped the way it is. The native half has
 [`THIRD-PARTY.md`](THIRD-PARTY.md).
 
 The feature in one sentence: a real Ubuntu userland — whichever LTS series you pick, 20.04 through
-26.04 — bash, apt, Node.js, Python, git — running on the phone itself, inside the app's sandbox, with
-no VM, no root and no ISO.
+26.04 — bash, apt, git, curl, wget, sudo and an SSH client — running on the phone itself, inside
+the app's sandbox, with no VM, no root and no ISO.
 
 ## Table of contents
 
@@ -100,13 +100,12 @@ health check passes — "installed" and "works" are the same fact:
    - `/etc/apt/sources.list` pointed at the archive matching the architecture —
      `archive.ubuntu.com` carries amd64 only; every phone architecture needs
      `ports.ubuntu.com/ubuntu-ports`,
-   - `apt-get update` + the toolchain through apt itself (git, Python 3 + pip, curl, wget,
-     sudo, procps, …),
-   - Node.js 24 from the pinned NodeSource repository — the archive's own `nodejs` is far too old
-     for the toolchain the feature promises (jammy's is 12.x, end-of-life since 2022), which is why
-     the NodeSource line is pinned instead — then `pnpm` and
-     the OpenCode CLI via npm — best-effort, reported as warnings, because they come from
-     registries outside the pinned Ubuntu archive.
+   - `apt-get update`, then the base packages through apt itself — `bash-completion`,
+     `ca-certificates`, `curl`, `git`, `openssh-client`, `sudo`, `wget`. That list is the whole
+     of what the install adds, and it is minimal by decision rather than by omission: Python,
+     Node.js, an editor and a compiler are the user's own call, one `apt-get install` away inside
+     the terminal, so the install stays small, fast and away from registries outside the pinned
+     Ubuntu archive.
 5. **Health check** — a shell runs and prints a marker, `whoami` answers `ubuntu`, DNS resolves,
    `apt-get check` passes. Only then does the state machine reach Stopped.
 6. **Workspace restore** — if a previous keep-workspace uninstall parked a snapshot, it is
@@ -217,8 +216,8 @@ render as healthy. A stale "installed" flag can never present as a working insta
   Fake root exists only inside the scripted setup pipeline, where dpkg needs it.
 - **Pinned supply chain.** The rootfs tarball is verified against a hash pinned in the source
   before extraction; the proot/talloc sources are pinned tarballs with SHA256s in
-  `linux/build.gradle.kts`; Node.js comes from a pinned NodeSource repository, apt from the
-  distribution's own archive.
+  `linux/build.gradle.kts`; every package the install adds comes from the distribution's own
+  archive, through apt.
 - **No escape from filesDir.** Every archive the app extracts — the rootfs and its own workspace
   snapshots — goes through the same path-traversal guard. The rootfs never writes outside
   `filesDir/linux`. proot does bind the host's `/dev`, `/proc` and `/sys` into the guest, so that

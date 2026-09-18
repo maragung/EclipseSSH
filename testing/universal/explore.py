@@ -148,7 +148,7 @@ class Engine:
         obs["signature"] = screen_signature(elements)
         obs["blank"] = is_blank_screen(elements)
         obs["summary"] = screen_summary(elements)
-        crash = self.adb.new_crash_lines()
+        crash = self.adb.new_crash_lines(package=self.pkg)
         if expect_kill:
             crash = [c for c in crash if c["kind"] != "force-close"]
         if crash:

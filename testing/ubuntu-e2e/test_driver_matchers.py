@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "universal"))
 
 import driver  # noqa: E402
+import adbutil  # noqa: E402
 from adbutil import Element  # noqa: E402
 
 DRIVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
@@ -328,7 +329,7 @@ class OpenWindowButton(unittest.TestCase):
     # The list's userspace row, in dump order, as the merged node Compose draws: the
     # button's label as the text, the row's name as its content-desc.
     LIST = InstallStateAcrossSurfaces.LIST + [
-        Element({"text": "Not installed · real bash, apt, Node.js and Python, on the device",
+        Element({"text": "Not installed · real bash, apt and git, on the device",
                  "bounds": "[155,1340][881,1382]"}),
         Element({"text": "Open", "content-desc": "Ubuntu on this device",
                  "bounds": "[888,1330][1043,1390]"}),
@@ -637,6 +638,149 @@ class OpenSettingsTabSwitch(unittest.TestCase):
         self.assertEqual([(137, 1032)], self.adb.taps)
 
 
+class _LaggingImeAdb:
+    """The keyboard hide the way run 35323027141 saw it: the IME consumes the first
+    BACK and hides (its own log puts `onRequestHide ... HIDE_SOFT_INPUT_BY_BACK_KEY`
+    at 08:37:11.759 and `onHidden` at 08:37:12.178), but `dumpsys input_method` keeps
+    answering `mInputShown=true` for a further `lag` reads. A BACK arriving once the
+    keyboard is really gone reaches the app instead, and MainActivity is the app's
+    root activity, so that BACK exits to the launcher - which is what the phase's own
+    dump shows (`Search`, `Gallery`, `Camera`) and what `launched` records here.
+
+    The two states are deliberately separate. A fake where `back()` clears the same
+    flag `shell()` reports cannot express the defect at all: the dump would never
+    disagree with the device."""
+
+    def __init__(self, lag=2):
+        self.lag = lag
+        self.backs = 0
+        self.launched = True
+        self.ime_real = True  # what the device does with a BACK
+        self.logs = []
+
+    def shell(self, cmd, timeout=None):
+        if "input_method" not in cmd:
+            return 1, ""
+        if self.ime_real:
+            return 0, "    mInputShown=true"
+        if self.lag > 0:  # the dump has not caught up with the hide yet
+            self.lag -= 1
+            return 0, "    mInputShown=true"
+        return 0, "    mInputShown=false"
+
+    def back(self):
+        self.backs += 1
+        if self.ime_real:
+            self.ime_real = False  # the IME takes this one and hides
+        else:
+            self.launched = False  # no keyboard left: it reaches the app
+        return True
+
+    def log(self, message):
+        self.logs.append(message)
+
+
+class DismissIme(unittest.TestCase):
+    """dismiss_ime's BACK count, which is a correctness property and not pacing: one
+    BACK too many does not put the keyboard away, it exits the app. The interruption
+    phases reach Settings right after `pm clear`, where the app raises its own
+    keyboard on the first screen, so this is the state they always start from."""
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self._sleep = driver.time.sleep
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def _adb(self, lag):
+        adb = _LaggingImeAdb(lag=lag)
+        self.driver.adb = adb
+        self.driver.log = adb.log
+        return adb
+
+    def test_a_lagging_dump_does_not_cost_a_second_back(self):
+        adb = self._adb(lag=2)
+        self.assertTrue(self.driver.dismiss_ime())
+        # One BACK, and the keyboard it was for is gone.
+        self.assertEqual(1, adb.backs)
+        self.assertFalse(adb.ime_real)
+        # The assertion the phase actually died on: nothing sent the app to the launcher.
+        self.assertTrue(adb.launched)
+
+    def test_a_keyboard_that_never_clears_does_not_stack_a_second_back(self):
+        # A dump that stays stale past the whole window is the one case where the
+        # keyboard really might still be up - and even then this sends nothing more,
+        # because a second BACK on a reading this stale is the unrecoverable one.
+        adb = self._adb(lag=10 ** 9)
+        self.assertFalse(self.driver.dismiss_ime(settle=0.05))
+        self.assertEqual(1, adb.backs)
+        self.assertTrue(adb.launched)
+        self.assertTrue(any("still up" in m for m in adb.logs))
+
+    def test_no_keyboard_sends_no_back_at_all(self):
+        # A BACK with no keyboard on screen goes to the app, which is the same
+        # accident by the other road.
+        adb = self._adb(lag=0)
+        adb.ime_real = False
+        self.assertTrue(self.driver.dismiss_ime())
+        self.assertEqual(0, adb.backs)
+        self.assertTrue(adb.launched)
+
+
+class CrashScanScope(unittest.TestCase):
+    """adbutil's crash scan, whose `force-close` pattern is not package-scoped and
+    therefore matches every app the system evicts. In run 35323027141 the storage-gate
+    phase - which fills the disk on purpose, so evictions are the expected consequence
+    - was flipped from PASS to a CRASH failure by 17 `has died: cch+NN CEM` lines from
+    com.android.music, printspooler, camera2, quicksearchbox and nine more, while the
+    package-scoped scan-crashes.sh reported `{"status": "clean"}`. The scan lives in
+    the universal engine, but this file is the only Python test CI runs and it already
+    imports adbutil, so the regression is pinned here rather than in a file nothing
+    executes."""
+
+    EVICTIONS = [
+        "I ActivityManager: Process com.android.music (pid 4321) has died: cch+99 CEM",
+        "I ActivityManager: Process com.android.printspooler (pid 4322) has died: cch+99 CEM",
+        "I ActivityManager: Process com.android.quicksearchbox (pid 4323) has died: cch+99 CEM",
+    ]
+    OURS = "I ActivityManager: Process dev.eclipse.ssh (pid 7436) has died: cch+99 CEM"
+    OURS_STOPPED = "I ActivityManager: Force stopping package dev.eclipse.ssh"
+
+    def _adb(self, lines):
+        text = "\n".join(lines)
+        adb = adbutil.Adb.__new__(adbutil.Adb)
+        # The stack-pulling second read takes an argument, so the stand-in does too.
+        adb.logcat = lambda lines=2000: text
+        adb._seen_crash_lines = set()
+        return adb
+
+    def test_another_apps_eviction_is_not_this_apps_crash(self):
+        adb = self._adb(self.EVICTIONS)
+        self.assertEqual([], adb.new_crash_lines(package="dev.eclipse.ssh"))
+        # Unscoped - the old behaviour - is what reported the phase as a crash.
+        self.assertEqual(3, len(adb.new_crash_lines()))
+
+    def test_the_apps_own_death_is_still_a_finding(self):
+        # Scoping must not turn the label off: the app dying is exactly what the
+        # pattern is for, and it names the package.
+        for line in (self.OURS, self.OURS_STOPPED):
+            adb = self._adb([line])
+            fresh = adb.new_crash_lines(package="dev.eclipse.ssh")
+            self.assertEqual(1, len(fresh), line)
+            self.assertEqual("force-close", fresh[0]["kind"])
+
+    def test_a_system_server_fatal_is_still_a_finding(self):
+        # The other three labels stay unscoped deliberately: a fatal that takes the
+        # app down may never name it, and narrowing those would trade a false alarm
+        # for a blind spot.
+        adb = self._adb(["E AndroidRuntime: FATAL EXCEPTION: main",
+                         "F System.err: Fatal signal 11 (SIGSEGV), code 1"])
+        kinds = sorted(f["kind"] for f in adb.new_crash_lines(package="dev.eclipse.ssh"))
+        self.assertEqual(["jvm-fatal", "native-crash"], kinds)
+
+
 class TabActiveProof(unittest.TestCase):
     """What proves which destination is showing, and what does not. Settings has no
     top bar of its own, the word "Settings" appears exactly once on it and equally
@@ -926,7 +1070,7 @@ class ActionButtonWalk(unittest.TestCase):
 
     def test_the_walk_still_finds_install_the_way_it_always_did(self):
         top = [Element({"text": "Ubuntu on this device", "bounds": "[155,700][588,760]"}),
-               Element({"text": "Not installed · real bash, apt, Node.js and Python",
+               Element({"text": "Not installed · real bash, apt and git",
                         "bounds": "[155,760][991,844]"}),
                Element({"text": "Settings", "bounds": "[917,2190][1043,2232]"})]
         self.driver.adb = _ScrollingAdb([top, top + [

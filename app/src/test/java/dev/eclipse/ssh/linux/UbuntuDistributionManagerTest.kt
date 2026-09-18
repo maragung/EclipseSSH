@@ -27,9 +27,10 @@ import org.junit.Test
  * is named as DNS before a single package byte moves, and an offline device never reaches the
  * ladder at all.
  *
- * The NodeSource contract is here as well: the suite is `nodistro` and the repo pinned to one major —
- * the entry this replaced named `jammy` and 404'd on every install — and armhf devices skip the
- * step entirely, because NodeSource publishes no 32-bit ARM packages.
+ * The install's contents are pinned here too: one apt command naming the seven base packages, all
+ * of them from the archive the ladder picked — the NodeSource entry and the npm globals that used
+ * to follow it are gone with the curated toolchain (a product decision, 2026-09-18), so no step in
+ * the setup path reaches a third-party registry any more.
  */
 class UbuntuDistributionManagerTest {
 
@@ -627,12 +628,12 @@ class UbuntuDistributionManagerTest {
         harness.scripted.respond = { command ->
             when {
                 // The whole-list command is the only one naming two packages in a row.
-                command.contains("python3-pip sudo") -> {
+                command.contains("openssh-client sudo") -> {
                     fullListAttempts++
                     100 to "E: Unable to locate package some-package"
                 }
                 // One package is simply not available on this mirror: the per-package fallback
-                // turns it into a warning while the other thirteen install.
+                // turns it into a warning while the other six install.
                 command == "apt-get install -y --no-install-recommends git" ->
                     100 to "E: Unable to locate package git"
                 else -> baseline(command)
@@ -669,7 +670,7 @@ class UbuntuDistributionManagerTest {
                 "E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
         harness.scripted.respond = { command ->
             when {
-                command.contains("python3-pip sudo") -> 100 to refused
+                command.contains("openssh-client sudo") -> 100 to refused
                 command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to refused
                 else -> baseline(command)
             }
@@ -681,10 +682,10 @@ class UbuntuDistributionManagerTest {
         assertThat(thrown).isNotNull()
         assertThat(export).contains("update-alternatives: error: cannot create /etc/alternatives/rsh")
         assertThat(export).contains("dpkg: error processing package openssh-client")
-        // The fourteen per-package refusals are one fact, not fourteen entries: they all said the
+        // The seven per-package refusals are one fact, not seven entries: they all said the
         // same sentence, because it is the same half-configured package every apt command trips on.
         assertThat(export.lines().count { it.contains("base packages refused one by one") }).isEqualTo(1)
-        assertThat(export).contains("14/14 refused")
+        assertThat(export).contains("7/7 refused")
     }
 
     @Test
@@ -712,7 +713,7 @@ class UbuntuDistributionManagerTest {
                 "E: Sub-process /usr/bin/dpkg returned an error code (1)\n"
         harness.scripted.respond = { command ->
             when {
-                command.contains("python3-pip sudo") -> 100 to cascade
+                command.contains("openssh-client sudo") -> 100 to cascade
                 command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to cascade
                 else -> baseline(command)
             }
@@ -743,7 +744,7 @@ class UbuntuDistributionManagerTest {
         var repairPasses = 0
         harness.scripted.respond = { command ->
             when {
-                command.contains("python3-pip sudo") -> {
+                command.contains("openssh-client sudo") -> {
                     bulkAttempts++
                     // The attempt after the recovery pass is the one that works, and it is the
                     // only reason three attempts are spent: the retry is one command where the
@@ -830,32 +831,21 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
-    fun `the NodeSource entry uses the distro-agnostic suite and a pinned major`() = runTest {
+    fun `the install adds the base packages and nothing else`() = runTest {
         val harness = Harness(distro(arch = "arm64"))
         harness.distribution.setup()
 
-        val entry =
-            harness.scripted.commandsWith
-                .map { it.second }
-                .first { "nodesource" in it }
-        // nodistro: NodeSource publishes one suite for every distribution, not one per codename —
-        // the old jammy entry 404'd. And the major is pinned, so Node.js does not drift.
-        assertThat(entry).contains("https://deb.nodesource.com/node_24.x nodistro main")
-        assertThat(entry).contains("signed-by=/usr/share/keyrings/nodesource.gpg")
-        // The update is scoped to the NodeSource list alone; re-fetching the Ubuntu archive here
-        // would re-run the whole ladder's download for one new repository.
-        assertThat(entry).contains("-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/nodesource.list")
-    }
-
-    @Test
-    fun `armhf devices skip NodeSource with a warning, not a failure`() = runTest {
-        val harness = Harness(distro(arch = "armhf"))
-        val report = harness.distribution.setup()
-
-        // NodeSource publishes amd64 and arm64 only; a 32-bit ARM phone cannot run its packages,
-        // so the step must not run at all — and must not fail the install over it.
-        assertThat(harness.scripted.commandsWith.map { it.second }.none { "nodesource" in it }).isTrue()
-        assertThat(report.warnings.any { "armhf" in it }).isTrue()
+        val commands = harness.scripted.commandsWith.map { it.second }
+        // The whole of what the install adds, in one command, all seven from the pinned archive.
+        assertThat(commands).contains(
+            "apt-get install -y --no-install-recommends " +
+                "bash-completion ca-certificates curl git openssh-client sudo wget",
+        )
+        // And no third-party registry in the path: the NodeSource entry and the two npm globals
+        // that used to be here are gone with the curated toolchain, so a `deb.nodesource.com`
+        // outage can no longer decide whether "Ubuntu" installed.
+        assertThat(commands.none { "nodesource" in it || it.startsWith("npm install") }).isTrue()
+        assertThat(commands.none { "python3" in it || "pnpm" in it || "opencode" in it }).isTrue()
     }
 
     @Test
@@ -879,7 +869,7 @@ class UbuntuDistributionManagerTest {
         )
         harness.scripted.respond = { command ->
             when {
-                command.contains("python3-pip sudo") -> 100 to "dpkg: error processing package openssh-client (--configure):\n"
+                command.contains("openssh-client sudo") -> 100 to "dpkg: error processing package openssh-client (--configure):\n"
                 command.startsWith("apt-get install -y --no-install-recommends ") -> 100 to "E: dpkg was interrupted\n"
                 else -> baseline(command)
             }
@@ -1041,9 +1031,10 @@ class UbuntuDistributionManagerTest {
     }
 
     /**
-     * Whether a command is one of the ladder's rungs: scoped to the sources.list under test. The
-     * NodeSource update is scoped to its own list (`sources.list.d/nodesource.list`) and so, by
-     * the space after `sources.list`, never matches.
+     * Whether a command is one of the ladder's rungs: scoped to the sources.list under test. Every
+     * other apt command in the setup — the base-package install included — runs unscoped, so it
+     * never matches: `sourcelist=/etc/apt/sources.list ` carries a trailing space that only the
+     * scoped form has.
      */
     private fun isScopedRung(command: String): Boolean =
         command.contains("Dir::Etc::sourcelist=/etc/apt/sources.list ")

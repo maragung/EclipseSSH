@@ -250,7 +250,7 @@ class UbuntuE2eVerificationTest {
 
     @Test
     fun httpReachesTheInternet() {
-        // curl is a base package the setup pipeline installs, so this also proves the toolchain
+        // curl is a base package the setup pipeline installs, so this also proves the base-package
         // install really happened rather than the setup merely claiming it did.
         assumeWritePhase()
         sessionSucceeds("curl -I https://example.com", HTTP_TIMEOUT_MS)
