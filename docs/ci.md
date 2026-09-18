@@ -43,7 +43,7 @@ Seven jobs, so a failure lands on the thing that is actually broken instead of s
 | `native` | `:freerdp:assembleDebug`, `:linux:assembleDebug` | That both native modules still build from their pinned sources and patches: `:freerdp` on all four ABIs, and `:linux` on the three Ubuntu Base publishes for (`arm64-v8a`, `armeabi-v7a`, `x86_64` — there is no i386 Ubuntu Base image, so no `x86`). |
 | `lint` | `lintRelease` | Release-variant Android lint, including the manifest and resource checks that only run for `release`. |
 | `test` | `testDebugUnitTest` | The whole JVM suite, Robolectric included, with an isolated OpenSSH sandbox started for the tests that dial a real server. |
-| `assemble` | `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `:app:dependencies --configuration releaseRuntimeClasspath --write-locks` | That the `androidTest` sources still compile, that both APKs and the Play AAB build, that the dependency lockfiles are still satisfied, and that the release APK is signed. |
+| `assemble` | `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `assembleRelease` again on its own, `:app:dependencies --configuration releaseRuntimeClasspath --write-locks` | That the `androidTest` sources still compile, that both APKs and the Play AAB build, that the per-ABI splits build, that the dependency lockfiles are still satisfied, and that the release APK is signed. The second `assembleRelease` is the one that produces the splits: `splits.abi` stands down inside the first invocation because a `bundle` task shares it, so a run that stopped there would build no per-ABI APK at all — and the per-ABI APKs are what a GitHub release serves. |
 | `smoke` | Boots a headless AVD and launches both APKs | That the app starts and stays up. This is the crash-on-open gate — a window that dies in `onCreate` passes every JVM test there is. |
 | `stress` | `ECLIPSE_STRESS=1 :app:testDebugUnitTest --tests '*RealOpenSshInteropRobolectricTest'`, under a 90-minute job cap | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. The step asserts the class ran with `skipped="0"`, so a leg that quietly skipped is a failure rather than a pass. Runs only when a `workflow_dispatch` sets the `stress` input, which defaults to false — a dispatch that does not ask for it finishes with the other six. |
 
@@ -92,10 +92,12 @@ The difference is the source of the build. `release.yml` builds whatever the bra
 uploads the artifacts. `tagged-release.yml` asserts `git describe --exact-match` first — the build
 must be the tag, not a branch that resembles it — and then creates the GitHub release. Release
 notes are composed from the newest `## <n>.` section of `AUDIT-REPORT.md` **that names this tag's
-own version**, because the narrative stopped at §36 (*Releasing 1.1.4*) while the version kept
-moving: the unfiltered "latest section" was thirteen releases old and was being published as the
-summary of the one being released. A tag no section mentions gets no summary line, but the release
-still links the report rather than going out blank.
+own version**. The narrative and the version number advance independently — §36 is *Releasing 1.1.4*
+and §37 is *Releasing 1.1.18*, with the substantive §33 and §35 between them — so "the newest
+section" is not "the section for this release": when the filter was added, the unfiltered newest
+section was thirteen releases old and was being published as the summary of the one being released.
+A tag no section mentions gets no summary line, but the release still links the report rather than
+going out blank.
 
 The release is always created as a **draft**, so publishing it is a deliberate second step. The
 tag's own shape is not lost — a pre-release suffix (e.g. `v1.2.0-rc.1`) sets the release's
@@ -198,9 +200,11 @@ Everything else needs the toolchain:
 ```
 
 Reports land in `app/build/reports/`. It is the `test` job that uploads them, as the `reports`
-artifact, under `if: always()` — so a red suite still hands over its HTML and XML. No other job
-uploads them, and `lint` in particular does not: its only record is the log line that says the HTML
-and SARIF reports were written, so a lint count read off a run's artifact is not available.
+artifact, under `if: always()` — so a red suite still hands over its HTML and XML. The one other
+job that uploads any of them is `stress`, under its own `stress-reports` name and only on a
+dispatch that asked for it. `lint` uploads none of them: its only record is the log line that says
+the HTML and SARIF reports were written, so a lint count read off a run's artifact is not
+available.
 The emulator jobs cannot be reproduced this way — they need a booted device, which is what the five
 workflows above that boot one exist to provide. `focused-test.yml` is not among them: it runs a JVM
 task against a `--tests` filter and has no emulator in it.

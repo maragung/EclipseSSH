@@ -186,8 +186,13 @@ branch).
   ("could not get idle state"); the engine retries a bounded number of
   times and then records a dump failure rather than hanging.
 - **`am kill` only reaches background processes**; the process-death
-  journey backgrounds the app first, and if that fails the journey says
-  so rather than reporting a fake kill.
+  journey backgrounds the app first. Nothing checks that either step
+  happened — `home()` and `am_kill()` return a value no caller reads, and
+  the journey suppresses `force-close` signatures precisely because it
+  expects the process to die — so an `am kill` that reached nothing is
+  recorded as a pass. What the journey establishes is that the app is alive
+  and unblanked after the trip, not that the trip killed it. Until those
+  two return values are checked, read its process-death rows as unverified.
 - **Network testing is airplane-mode cycling**, not a proxy/latency fault
   matrix - no MITM, no DNS poisoning.
 - **No coverage claim**: the engine visits what it can discover and

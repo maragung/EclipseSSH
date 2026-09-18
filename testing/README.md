@@ -30,9 +30,13 @@ key's signing identity, and resource shrinking.
    run the suite via `am instrument` under `timeout` (the hang detector) →
    **scan logcat** for crashes/ANRs the suite cannot see → collect
    diagnostics → generate the report → upload evidence.
-3. **Gate** — all legs green: comment on the release. Any leg red: pull the
-   release back to **draft**, file a GitHub issue with the full report, and
-   fail the workflow. A release is only valid when it is green.
+3. **Gate** — all legs green: a "Release test passed" section on the run's own
+   summary. Any leg red: pull the release back to **draft**, file a GitHub issue
+   with the full report, and fail the workflow. A release is only valid when it is
+   green. The green record goes on the run and not on the release because a GitHub
+   release has no comment thread — `gh release` has no `comment` subcommand — and
+   the call that stood here failed on *every* green run, so a release whose APK
+   had passed every leg was reported as a gate failure.
 4. **Auto-fix** — gated on the `ANTHROPIC_AUTH_TOKEN` repository secret. See
    below.
 
