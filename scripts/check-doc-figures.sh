@@ -65,6 +65,31 @@ expect() {
   fi
 }
 
+# expect_section <file> <heading-text> <label> <wanted>
+#
+# The same check as `expect`, scoped to a section rather than to a line range. A range is a claim
+# about where a figure sits, and that is not what this check is about: `docs/THIRD-PARTY.md`'s range
+# was 75-95, editing a paragraph above it moved SLF4J to line 96, and a correct document was reported
+# as one that "names no 'SLF4J' figure". Scoping to the heading and the next `## ` keeps what the
+# range was for — a figure quoted in a different section is a different claim — without pinning the
+# document's line numbers, so a section may grow and shrink freely. A heading that no longer exists
+# fails loudly and names itself, which is how a rename gets noticed.
+expect_section() {
+  local file="$1" heading="$2" label="$3" want="$4" got
+  checked=$((checked + 1))
+  got="$(awk -v h="$heading" '
+    !seen && /^## / && index($0, h) { seen = 1; next }
+    seen && /^## / { exit }
+    seen' "$file" \
+    | grep -oE "\\b${label}\\b[[:space:]]*[=:]?[[:space:]]*[0-9][0-9A-Za-z.+-]*" \
+    | head -1 | grep -oE '[0-9][0-9A-Za-z.+-]*$' | sed -E 's/[.+-]+$//')"
+  if [ -z "$got" ]; then
+    fail "$file has no '$label' figure under a '$heading' heading; the build pins $want"
+  elif [ "$got" != "$want" ]; then
+    fail "$file says '$label $got' under a '$heading' heading; the build pins $want"
+  fi
+}
+
 # Every workflow a document names must exist, because the usual way a workflow reference rots is a
 # rename that leaves the prose pointing at a file nothing runs any more.
 expect_workflows_exist() {
@@ -292,8 +317,8 @@ fi
 # proot pin it quotes has to be the pin the build actually verifies against.
 # ---------------------------------------------------------------------------------------------
 
-expect docs/THIRD-PARTY.md 75 95 SSHD  "$v_sshd"
-expect docs/THIRD-PARTY.md 75 95 SLF4J "$v_slf4j"
+expect_section docs/THIRD-PARTY.md 'What ships inside the APK' SSHD  "$v_sshd"
+expect_section docs/THIRD-PARTY.md 'What ships inside the APK' SLF4J "$v_slf4j"
 
 proot_pin_build="$(value linux/build.gradle.kts "s/^val prootForkCommit = \"([0-9a-f]{40})\".*/\1/p")"
 proot_pin_doc="$(grep -oE '`[0-9a-f]{40}`' docs/THIRD-PARTY.md | tr -d '`' | head -1)"

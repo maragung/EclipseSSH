@@ -199,7 +199,8 @@ That service is `LinuxUserspaceService`, and its existence is derived: the users
 starts it when the state machine enters Running and stops it when the machine leaves, and the
 service itself watches the same state and stops itself if it is ever alive without a Running
 userspace. Its notification offers the two gestures that matter away from the app — Open (back to
-the terminal) and Stop Ubuntu (the same lifecycle verb as Settings → Stop) — and its Android 15
+the terminal) and Stop Ubuntu (the same lifecycle verb as Stop in the Ubuntu on this device
+window) — and its Android 15
 six-hour dataSync budget is shared with the SSH session service: when the budget runs out both post
 the same "background paused" text, under two notification ids of their own, so the second alert
 replaces nothing.
@@ -219,7 +220,10 @@ render as healthy. A stale "installed" flag can never present as a working insta
   archive, through apt.
 - **No escape from filesDir.** Every archive the app extracts — the rootfs and its own workspace
   snapshots — goes through the same path-traversal guard. The rootfs never writes outside
-  `filesDir/linux` (proot binds `/dev`, `/proc`, `/sys` read-only from the host).
+  `filesDir/linux`. proot does bind the host's `/dev`, `/proc` and `/sys` into the guest, so that
+  `ps` reports something and device nodes resolve — but those are the host's directories shared in
+  rather than private copies, and the argument vector asks for no read-only form of the bind:
+  `ProotRuntime.commandArgv` passes a plain `-b /dev`, `-b /proc`, `-b /sys`.
 - **No secrets in source.** No credentials, keys or tokens are needed by any of this — the
   environment is entered by process identity, the downloads are public.
 - **Sandboxed by construction.** The userspace runs under the app's Android uid: it has the app's
@@ -230,11 +234,11 @@ render as healthy. A stale "installed" flag can never present as a working insta
 
 | Symptom | Likely cause | Way out |
 |---|---|---|
-| Card never appears | Health probe failing — check Settings → Linux Userspace for the probe's field-by-field report | Repair |
+| Card never appears | Health probe failing — the probe's field-by-field report is the Health check row of the Ubuntu on this device window (Settings → Ubuntu on this device → Verify) | Repair |
 | "proot: cannot execute" at shell start | `nativeLibraryDir` mismatch after an app update changed the ABI | Restart the app: the directory is read once, when the userspace graph is built, so a Stop and Start inside the same process reads the same stale path. Reinstall if it persists |
 | `apt-get` fails with hash/404 errors | Stale archive pin or interrupted update | Repair (re-runs `apt-get update`); check DNS in the probe report |
 | `whoami` says a number | `/etc/passwd` entry lost (rootfs edited by hand) | Repair |
 | DNS does not resolve | Network changed since setup wrote `resolv.conf` | Repair rewrites it; the wiring layer passes the live resolvers |
 | Download dies mid-install | Network drop; the verified-tarball resume only covers completed downloads | Retry install; nothing half-extracted is left behind |
-| Sessions die when app is backgrounded | The foreground service was stopped by the user or the system | Settings → Linux Userspace → Start again; sessions cannot be revived (their ptys died) but the workspace is untouched |
+| Sessions die when app is backgrounded | The foreground service was stopped by the user or the system | Settings → Ubuntu on this device → Start; sessions cannot be revived (their ptys died) but the workspace is untouched |
 | Huge `filesDir` after many installs | A kept backup plus a new rootfs | Settings shows storage used; uninstall deletes the rootfs, keep-workspace keeps only the snapshot |

@@ -129,7 +129,7 @@ file's methods.
 `encrypted_ed25519`) used only to exercise key parsing against that in-process server. They are test
 data, they authorise nothing anywhere, and they must never be reused as real credentials.
 
-`app/src/androidTest/` holds the instrumentation tests — 46 test methods in 6 files — which
+`app/src/androidTest/` holds the instrumentation tests — 47 test methods in 7 files — which
 need a device or emulator.
 
 ## Continuous integration
