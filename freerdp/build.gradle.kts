@@ -179,20 +179,50 @@ val fetchFreerdpSource =
                 }
             }
 
-            /** Downloads [url] to [target], following redirects (GitHub releases redirect to a CDN). */
+            /**
+             * Downloads [url] to [target], following redirects (GitHub releases redirect to a CDN).
+             *
+             * The same bounded retry as `:linux`'s fetch task, for the same reason and with
+             * evidence of its own: on 2026-09-18 github.com answered HTTP 500 for
+             * openssl-4.0.1.tar.gz, and with no retry here at all that single response
+             * reddened a lint job whose diff could not have caused it. Roughly four minutes
+             * across seven attempts; the pinned sha256 still decides what gets built.
+             */
             fun download(url: String, target: File) {
-                val connection = URL(url).openConnection() as HttpURLConnection
-                connection.connectTimeout = 30_000
-                connection.readTimeout = 300_000
-                connection.instanceFollowRedirects = true
-                try {
-                    val code = connection.responseCode
-                    check(code in 200..299) { "downloading $url failed: HTTP $code" }
-                    connection.inputStream.use { input ->
-                        target.outputStream().use { output -> input.copyTo(output) }
+                fun fetchOnce(url: String, target: File): Int {
+                    val connection = URL(url).openConnection() as HttpURLConnection
+                    connection.connectTimeout = 30_000
+                    connection.readTimeout = 300_000
+                    connection.instanceFollowRedirects = true
+                    return try {
+                        val code = connection.responseCode
+                        if (code in 200..299) {
+                            connection.inputStream.use { input ->
+                                target.outputStream().use { output -> input.copyTo(output) }
+                            }
+                        }
+                        code
+                    } finally {
+                        connection.disconnect()
                     }
-                } finally {
-                    connection.disconnect()
+                }
+                val backoffMillis = longArrayOf(10_000, 20_000, 40_000, 60_000, 60_000, 60_000)
+                var code = fetchOnce(url, target)
+                var attempt = 1
+                while (code !in 200..299 && attempt <= backoffMillis.size) {
+                    logger.warn(
+                        "downloading $url failed: HTTP $code - attempt " +
+                            "$attempt/${backoffMillis.size + 1}, waiting " +
+                            "${backoffMillis[attempt - 1] / 1000}s",
+                    )
+                    target.delete()
+                    Thread.sleep(backoffMillis[attempt - 1])
+                    attempt++
+                    code = fetchOnce(url, target)
+                }
+                check(code in 200..299) {
+                    "downloading $url failed: HTTP $code after " +
+                        "${backoffMillis.size + 1} attempts over ~4 minutes"
                 }
             }
 
