@@ -32,16 +32,45 @@ BAR_BOUNDS = {"Hosts": (55, 144), "Terminal": (254, 387), "Files": (504, 577),
               "Transfers": (688, 833), "Settings": (917, 1043)}
 
 
+def _window_root():
+    """The hierarchy's own root node, which every real dump carries: it spans the
+    window, and it is the node the bottom band is measured from (the driver's
+    _window_extent takes the widest and tallest node as the window, which the root
+    is). A fixture without it is measured against its own tallest node instead, and
+    a synthetic bar that has drifted from the device's geometry stops being caught."""
+    return Element({"class": "hierarchy", "bounds": "[0,0][1080,2400]"})
+
+
 def _bar(active, selected_attr=True):
     """The bottom bar, on `active`. With selected_attr=False the dump carries no
     selected attribute at all, which is the shape a stricter dumper would emit."""
-    els = []
+    els = [_window_root()]
     for label, (left, right) in BAR_BOUNDS.items():
         attrs = {"text": label, "content-desc": label,
                  "bounds": "[%d,2190][%d,2232]" % (left, right)}
         if selected_attr:
             attrs["selected"] = "true" if label == active else "false"
         els.append(Element(attrs))
+    return els
+
+
+# The bar as run 35314746158's dump really draws it, which is the shape the device
+# emits and the shape the first version of this proof could not read: five label Texts
+# bearing the label's own box, and the `selected` state on five UNLABELLED item nodes
+# above them - the node Compose's Modifier.selectable puts the semantics on. A tab is a
+# fifth of a 1080 px bar and spans icon and label alike (~y 2074-2232), which is why the
+# label's 42-px-tall box is not the item's.
+ITEM_BOUNDS = {label: (216 * i, 216 * (i + 1)) for i, label in enumerate(BAR_BOUNDS)}
+
+
+def _bar_with_containers(active):
+    """The device's own shape: `selected` on the item node, never on the label's."""
+    els = [_window_root()]
+    for label, (left, right) in ITEM_BOUNDS.items():
+        els.append(Element({"class": "android.view.View", "clickable": "true",
+                            "selected": "true" if label == active else "false",
+                            "bounds": "[%d,2074][%d,2232]" % (left, right)}))
+    els.extend(_bar(None, selected_attr=False)[1:])
     return els
 
 # The Linux userspace section as a uiautomator dump renders it in the NotInstalled
@@ -501,6 +530,17 @@ class OpenSettingsTabSwitch(unittest.TestCase):
         self.assertEqual(1, len(self.adb.taps))
         self.assertEqual(0, self.adb.backs)
 
+    def test_the_switch_is_proved_on_the_shape_the_device_emits(self):
+        # open_settings() end to end against the dump the emulator really produces:
+        # labels with their own boxes, `selected` on the unlabelled item above each.
+        # The fixture used to put `selected` on the label node itself, so the suite
+        # stayed green while the device failed four phases - this is that gap closed.
+        self.adb.containers = True
+        self.driver.open_settings()
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(1, len(self.adb.taps))
+        self.assertEqual(0, self.adb.backs)
+
     def test_a_keyboard_over_the_bar_is_put_away_before_the_tap(self):
         self.adb.ime = True
         self.driver.open_settings()
@@ -554,7 +594,11 @@ class TabActiveProof(unittest.TestCase):
     once on every other destination (the tab), and MainActivity builds one
     rememberScrollState() outside the destination `when` - one list offset shared by
     every tab, so even Settings' own first row is not guaranteed to be in the dump.
-    The tab's `selected` semantics is the one scroll-independent answer."""
+    The tab's `selected` semantics is the one scroll-independent answer.
+
+    Where that semantics sits is the whole of run 35314746158: the app's bar marks the
+    ITEM node selected, and the label is a node of its own inside it, so a proof that
+    wants both on one node can never fire however many times the tap lands."""
 
     def setUp(self):
         self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
@@ -563,6 +607,32 @@ class TabActiveProof(unittest.TestCase):
         els = _bar("Settings")
         self.assertTrue(self.driver._tab_active(els, "Settings"))
         self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_the_item_node_carrying_the_state_proves_it_not_the_label(self):
+        # The device's own shape, and the case four phases died on: the label node
+        # carries no `selected` at all, and the state is on the unlabelled item above
+        # it that contains the label's box.
+        els = _bar_with_containers("Settings")
+        self.assertTrue(self.driver._tab_active(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_a_container_of_the_whole_bar_is_not_a_tab(self):
+        # Containment alone is not enough: the bar's own row, the Scaffold, or the
+        # window root would contain every label, and a dump with nothing selected
+        # would then read as every tab being active - the unsafe direction, a phase
+        # walking a screen it never opened.
+        els = [Element({"selected": "true", "bounds": "[0,2074][1080,2232]"})] \
+            + _bar(None, selected_attr=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_selected_node_above_the_bar_proves_nothing(self):
+        # A Settings row can itself be `selected` - a switch's semantics - and one
+        # stretched over the bar would satisfy containment from outside it, which is
+        # what the band test is for.
+        els = [Element({"selected": "true", "text": "Dark appearance",
+                        "bounds": "[864,1500][1080,2232]"})] \
+            + _bar(None, selected_attr=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
 
     def test_the_word_settings_proves_nothing(self):
         # Pinned, not endorsed: this IS the screen run 35311046886's dumps show - the
@@ -579,6 +649,18 @@ class TabActiveProof(unittest.TestCase):
         # at the tap, which is the truth, instead of letting it walk the wrong screen.
         els = _bar("Settings", selected_attr=False)
         self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_failed_proof_leaves_behind_what_it_read(self):
+        # The digest in the failure message cannot carry this - it prints only labelled
+        # nodes, and the selected node is unlabelled - so the proof logs the band itself.
+        # Without it, run 35314746158's diagnosis had to be inferred from a digest that
+        # had already discarded the answer.
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        self.driver._log_tab_proof(_bar_with_containers("Hosts"), "Settings")
+        logged = "\n".join(self.driver.lines)
+        self.assertIn("selected='true'", logged)
+        self.assertIn("[864,2074][1080,2232]", logged)
 
 
 class LinuxSectionWalkEvidence(unittest.TestCase):
@@ -809,6 +891,7 @@ class _LauncherThenAppAdb:
         self.active = "Hosts"
         self.ime = False
         self.swallow = 0
+        self.containers = False
 
     def shell(self, cmd, timeout=None):
         if "input_method" not in cmd:
@@ -817,8 +900,9 @@ class _LauncherThenAppAdb:
 
     def ui_dump(self):
         if self.launched and self.shows_settings:
+            bar = _bar_with_containers(self.active) if self.containers else _bar(self.active)
             return [Element({"text": "Search hosts, tags, or usernames",
-                             "bounds": "[180,308][785,371]"})] + _bar(self.active)
+                             "bounds": "[180,308][785,371]"})] + bar
         return self.LAUNCHER
 
     def am_start(self, package, activity):
