@@ -4660,10 +4660,11 @@ most expensive place this repository has to learn anything.
 ### 41.3 The check that keeps the list true
 
 `scripts/check-instrumentation-keeps.sh` scans `app/src/androidTest` for source-level references to
-classes that live in the release APK's dex, and fails when one is not in the keep list. It runs in
-`ci.yml` (line 588) immediately before the step that compiles the instrumentation tests, so a test that
-introduces the next `WindowCompat` reddens the pull request that adds it rather than a release gate
-weeks later.
+classes that live in the release APK's dex, and fails when one is not in the keep list. In `ci.yml` it is
+the step named *Check the instrumentation keep list against the test sources*, immediately before the
+one named *Compile instrumentation tests*, so a test that introduces the next `WindowCompat` reddens
+the pull request that adds it rather than a release gate weeks later. (Named rather than numbered:
+a line number in that file is stale the moment any earlier step gains a line.)
 
 The check reads **sources**, not the shipped dex, and that is forced rather than chosen: R8 renames the
 very classes at issue, so a scan of `classes.dex` would find no `Landroidx/core/view/WindowCompat;` at
@@ -4696,8 +4697,8 @@ that suite.
 
 ### 41.5 What ships that is not the application
 
-Four of the eight files in this range are the harness and the record, and none of them rides in an
-artifact:
+None of the eight files in this range is application code. The four changes behind that are the
+harness and the record, and none of them rides in an artifact:
 
 - **#119** stops the Ubuntu E2E driver from trusting the IME dump on its own — a FULL run proved the
   dump can report a keyboard state the device is not in — and adds `test_driver_matchers.py` (80
