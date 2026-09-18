@@ -800,6 +800,19 @@
 # room-testing 2.7.1) - MigrationInstrumentedTest only reaches it as the
 # implicit receiver of Room.databaseBuilder().addMigrations() - so R8
 # renamed the Builder and stripped addMigrations() from it.
+#
+# Follow-up from release-test run 35338666049 (2026-09-18, both legs, one
+# failure each, the same symbol). SystemBarAppearanceTest reads the window's
+# appearance back through WindowCompat.getInsetsController, whose return type
+# is WindowInsetsControllerCompat; neither name was in this list and neither
+# survived. A scan of the published v1.2.0 APK's dex finds
+# androidx.core.view.WindowInsetsCompat, ViewConfigurationCompat and
+# ConfigurationCompat - all kept below - and neither of these two. The app
+# itself calls WindowCompat from EclipseTheme and MainActivity, and R8 renames
+# those call sites along with the class, so the app is unaffected; it is the
+# test's reference that has to resolve by name. Both are kept with all members
+# for the reason at the top of this file: losing the getter is a
+# NoSuchMethodError where losing the class is a NoClassDefFoundError.
 # ---------------------------------------------------------------------------
 -keep class androidx.activity.ComponentActivity { *; }
 -keep class androidx.activity.compose.ComponentActivityKt { *; }
@@ -811,7 +824,9 @@
 -keep class androidx.core.os.LocaleListCompat { *; }
 -keep class androidx.core.view.ViewConfigurationCompat { *; }
 -keep class androidx.core.view.ViewGroupKt { *; }
+-keep class androidx.core.view.WindowCompat { *; }
 -keep class androidx.core.view.WindowInsetsCompat { *; }
+-keep class androidx.core.view.WindowInsetsControllerCompat { *; }
 -keep class androidx.lifecycle.Lifecycle { *; }
 -keep class androidx.lifecycle.Lifecycle$Event { *; }
 -keep class androidx.lifecycle.Lifecycle$State { *; }

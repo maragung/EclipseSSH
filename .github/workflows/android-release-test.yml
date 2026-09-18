@@ -64,6 +64,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      label: ${{ steps.meta.outputs.label }}
       apk_source: ${{ steps.meta.outputs.apk_source }}
       api_levels: ${{ steps.meta.outputs.api_levels }}
     env:
@@ -86,14 +87,27 @@ jobs:
           if [ "$SOURCE" = "release" ]; then
             test -n "$TAG" || { echo "no release tag to validate"; exit 1; }
           fi
+          # What the run is *about*, for every line of text it writes. `tag` is
+          # empty on an `apk_source=build` dispatch - the mode that validates a
+          # branch without publishing anything - and the report, the issue title
+          # and the run summary all read it: issue #124 was filed as
+          # "Release test failure: " with a body claiming a published release had
+          # been pulled back to draft, when run 35343449935 had validated a
+          # built APK and published nothing. The label names the build instead.
+          if [ -n "$TAG" ]; then
+            LABEL="$TAG"
+          else
+            LABEL="${GITHUB_REF_NAME}@${GITHUB_SHA:0:7}"
+          fi
           # The matrix comes in as "35,30" and leaves as a JSON array.
           LEVELS="${{ inputs.api_levels }}"
           [ -n "$LEVELS" ] || LEVELS='35,30'
           API_LEVELS="$(printf '%s' "$LEVELS" | tr ',' '\n' | sed 's/ //g' | grep -v '^$' | jq -R . | jq -sc .)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
           echo "apk_source=$SOURCE" >> "$GITHUB_OUTPUT"
           echo "api_levels=$API_LEVELS" >> "$GITHUB_OUTPUT"
-          echo "validating tag=$TAG source=$SOURCE levels=$API_LEVELS"
+          echo "validating tag=$TAG source=$SOURCE label=$LABEL levels=$API_LEVELS"
 
   test:
     name: Release APK on API ${{ matrix.api_level }}
@@ -107,6 +121,7 @@ jobs:
     env:
       SYSTEM_IMAGE: 'system-images;android-${{ matrix.api_level }};default;x86_64'
       TAG: ${{ needs.resolve.outputs.tag }}
+      LABEL: ${{ needs.resolve.outputs.label }}
       APK_SOURCE: ${{ needs.resolve.outputs.apk_source }}
       APP_PACKAGE: dev.eclipse.ssh
       TEST_PACKAGE: dev.eclipse.ssh.test
@@ -421,7 +436,7 @@ jobs:
           CRASH_OK="${{ steps.crashscan.outcome == 'success' && 'yes' || 'no' }}"
           if [ "$SUITE_OK" = "yes" ] && [ "$CRASH_OK" = "yes" ]; then PASSED=yes; else PASSED=no; fi
           if [ ! -f out/test-stdout.txt ]; then echo "(the suite never produced output)" > out/test-stdout.txt; fi
-          python3 pipeline/testing/generate-report.py out "$TAG" "${{ matrix.api_level }}" \
+          python3 pipeline/testing/generate-report.py out "$LABEL" "${{ matrix.api_level }}" \
             "$GITHUB_SHA" "$GITHUB_REPOSITORY" \
             out/test-stdout.txt out/release-validation.json \
             out/crash-report.json "$PASSED"
@@ -462,6 +477,8 @@ jobs:
       # || true on issue creation swallowed it, so no failure issue was filed.
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.resolve.outputs.tag }}
+      LABEL: ${{ needs.resolve.outputs.label }}
+      APK_SOURCE: ${{ needs.resolve.outputs.apk_source }}
     steps:
       - name: Download every matrix report
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
@@ -472,6 +489,21 @@ jobs:
       - name: Gate the release and file the failure
         run: |
           set -euo pipefail
+          # What was actually put under test. On a release event (or an
+          # `apk_source=release` dispatch) that is the published asset, and the
+          # gate pulls the release back to draft when a leg is red. On an
+          # `apk_source=build` dispatch it is a candidate the pipeline built and
+          # signed itself - nothing was published, so nothing can be pulled back
+          # and the sentences below must not say otherwise.
+          if [ "$APK_SOURCE" = "release" ]; then
+            ARTIFACT="the published release APK for $LABEL"
+            PULLED="Per the release gate, the release has been pulled back to draft until the failures are fixed and the pipeline is green."
+            HEADING="Release test passed: $LABEL"
+          else
+            ARTIFACT="the candidate APK built from $LABEL"
+            PULLED="Nothing was published and there is no release to pull back: with apk_source=build the pipeline assembles and signs its own APK and runs this same gate over it, so the failure is in the commit this run built."
+            HEADING="Release gate passed for the candidate build: $LABEL"
+          fi
           VERDICTS="$(find reports -name release-test-report.md -exec grep -m1 -A0 '^**\(PASS\|FAIL\)**$' {} \; || true)"
           FAILED_LEGS="$(find reports -name release-test-report.md -exec grep -l '^\*\*FAIL\*\*$' {} \; | wc -l)"
           if [ "$FAILED_LEGS" -eq 0 ]; then
@@ -482,18 +514,18 @@ jobs:
             # passed every leg was reported as a gate failure. Writing the release body instead
             # would replace the one `tagged-release.yml` generates, which is a contract.
             {
-              echo "### Release test passed: $TAG"
+              echo "### $HEADING"
               echo
-              echo "The published APK installed, launched, and passed the full instrumented suite with no crash or ANR signatures, on every matrix leg."
+              echo "The APK under test — $ARTIFACT — installed, launched, and passed the full instrumented suite with no crash or ANR signatures, on every matrix leg."
               echo
               echo "Report: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           {
-            echo "## Release test failure: $TAG"
+            echo "## Release test failure: $LABEL"
             echo
-            echo "The published release APK failed validation on $FAILED_LEGS emulator leg(s). Per the release gate, the release has been pulled back to draft until the failures are fixed and the pipeline is green."
+            echo "$ARTIFACT failed validation on $FAILED_LEGS emulator leg(s). $PULLED"
             echo
             echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo
@@ -514,7 +546,7 @@ jobs:
             gh release edit "$TAG" --draft --latest=false || true
           fi
           gh issue create \
-            --title "Release test failure: $TAG" \
+            --title "Release test failure: $LABEL" \
             --body-file failure-body.md \
             --label release-test-failure || true
           exit 1

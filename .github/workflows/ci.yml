@@ -331,6 +331,22 @@ jobs:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Test the release reporter, which decides what a failure report says
+        # testing/generate-report.py composes the report a repair attempt is
+        # handed. It read its test count only from the green summary line
+        # ("OK (47 tests)"), which a failing run never prints, so every failing
+        # leg reported "Ran: 0" - run 35338666049's report described a 47-test
+        # suite as a zero-test one, and nothing looked broken because the verdict
+        # beside it was still right. The cases in this test are the stdout shapes
+        # that run's own artifacts contain, green and red, plus the shape a run
+        # killed by the workflow's `timeout` leaves. No Android needed.
+        #
+        # It also pins the argument the workflow hands it: that slot is a label
+        # - the tag on a release run, `<ref>@<commit>` on the `apk_source=build`
+        # dispatch that publishes nothing - because reading it as always-a-tag
+        # is what gave issue #124 an empty title and an empty version line.
+        run: python3 testing/test_generate_report.py
+
       - name: Set up JDK 17.0.13
         uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v4.1.0
         with:
@@ -576,6 +592,16 @@ jobs:
             exit 1
           fi
           echo "androidTest sources: $COUNT"
+
+      - name: Check the instrumentation keep list against the test sources
+        # The release-test suite failed both legs on run 35338666049 with
+        # NoClassDefFoundError: Landroidx/core/view/WindowCompat; - an app
+        # dependency the test resolves by name out of the minified release dex,
+        # which R8 had renamed because nothing kept it. The failure surfaced a
+        # whole release later, on an emulator, in a workflow this branch cannot
+        # run. This is the same check, static and second-long, next to the step
+        # that compiles those sources.
+        run: scripts/check-instrumentation-keeps.sh
 
       - name: Compile instrumentation tests
         # Kept even though .github/workflows/instrumentation.yml now runs
