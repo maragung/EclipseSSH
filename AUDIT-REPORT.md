@@ -4588,7 +4588,23 @@ here a run passes both, and the point survives: `Run the E2E driver` reported su
 too — the run whose last two phases failed. The step conclusion is not the thing to read, in either
 direction.
 
-### 40.6 `testing/README.md`'s dispatch example, one release along again
+### 40.6 `testing/README.md`'s dispatch example, and the rule it was missing
 
-§40.4 moved it to `v1.1.20` under the rule that the example names the newest tag that actually exists.
-`v1.2.0` now exists and is published, so the rule moves it again.
+§40.4 moved it to `v1.1.20` under the rule that the example names the newest tag that actually
+exists. As first merged, this section moved it on to `v1.2.0`, on the grounds that `v1.2.0` "now
+exists and is published". **That was wrong when it was written, and the correction is the point of
+this section.** `v1.2.0` was published at 11:14:41Z and pulled back to draft by its own gate at
+11:36:49Z, the moment issue #121 was filed; it is still a draft. The example therefore named a tag
+whose asset the command it documents cannot fetch.
+
+A draft release is invisible to `GET /releases/tags/{tag}`, which answers 404 for one, and
+`gh release view --json tagName` with no tag skips drafts in silence. So the failure this would have
+produced is not an error naming the draft: it is a step that finds no asset to download.
+
+The example goes back to `v1.1.20`, and the rule is now stated as it should have been from the start:
+the example names the newest release that is **published**, not the newest tag that exists. The two
+came apart here for the first time, and the mechanism is worth knowing before it happens again.
+`tagged-release.yml` creates the tag and the release together, with the release held as a draft; it is
+published deliberately afterwards, and the validation that runs on publication is what pulls it back if
+any leg is red. Between those two moments a tag exists whose release does not, and counting tags —
+which is what the earlier wording did — cannot see the difference.
