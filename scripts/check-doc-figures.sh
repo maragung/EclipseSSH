@@ -320,6 +320,20 @@ fi
 expect_section docs/THIRD-PARTY.md 'What ships inside the APK' SSHD  "$v_sshd"
 expect_section docs/THIRD-PARTY.md 'What ships inside the APK' SLF4J "$v_slf4j"
 
+# Bouncy Castle is the one inventory entry expect_section cannot read: its version sits after a code
+# span rather than after the name ("**Bouncy Castle Licence** - `bcprov-jdk18on` 1.86"), and
+# expect_section wants the digits to follow the label with nothing between them. Read the line whole.
+# This figure went stale in exactly the way the check exists to prevent - a version bump updated the
+# About screen's copy and left this one behind - so it is worth the second reader.
+bcprov_doc="$(grep -oE '`bcprov-jdk18on` [0-9][0-9A-Za-z.+-]*' docs/THIRD-PARTY.md \
+  | head -1 | grep -oE '[0-9][0-9A-Za-z.+-]*$' | sed -E 's/[.+-]+$//')"
+checked=$((checked + 1))
+if [ -z "$v_bouncycastle" ]; then
+  fail "gradle/libs.versions.toml no longer declares bouncycastle - this script is out of date"
+elif [ "$bcprov_doc" != "$v_bouncycastle" ]; then
+  fail "docs/THIRD-PARTY.md lists bcprov-jdk18on at ${bcprov_doc:-nothing}; gradle/libs.versions.toml pins $v_bouncycastle"
+fi
+
 proot_pin_build="$(value linux/build.gradle.kts "s/^val prootForkCommit = \"([0-9a-f]{40})\".*/\1/p")"
 proot_pin_doc="$(grep -oE '`[0-9a-f]{40}`' docs/THIRD-PARTY.md | tr -d '`' | head -1)"
 checked=$((checked + 1))

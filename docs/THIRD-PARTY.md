@@ -91,7 +91,7 @@ The release APK's runtime classpath, by license:
   the AndroidX family the UI is built from: Compose and Material 3, Activity,
   Lifecycle, Navigation, Room, DataStore, WorkManager, Biometric and
   `core-splashscreen`.
-- **Bouncy Castle Licence** — `bcprov-jdk18on` 1.79.
+- **Bouncy Castle Licence** — `bcprov-jdk18on` 1.86.
 - **MIT** — [vernacular-vnc][vernacular-vnc] (commit `f39cbe2`, the VNC
   engine) and SLF4J 2.0.19.
 - **CC0-1.0 (public domain)** — `net.i2p.crypto:eddsa` 0.3.0, Ed25519 key
