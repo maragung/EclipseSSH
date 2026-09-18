@@ -131,6 +131,13 @@ DEST_MIN = 3
 # press, and a BACK pressed on a keyboard that is not up goes to the app instead.
 IME_SHOWN_RE = re.compile(r"m(InputShown|IsInputViewShown)\s*=\s*true")
 
+# The component line in `dumpsys window`'s `mFocusedApp=ActivityRecord{...}`. Used as
+# the second opinion on who a BACK would actually reach - see `_focused_app`. The
+# package is required to carry a dot so that the record's own fields (`u0`, `t13`)
+# cannot be mistaken for a component.
+FOCUSED_COMPONENT_RE = re.compile(
+    r"([A-Za-z0-9_]+\.[A-Za-z0-9_.]*[A-Za-z0-9_])/([A-Za-z0-9_.$]+)")
+
 # Exceptions that mean this driver is broken, not the device or the app. The
 # failure report's stage column is a claim about WHERE a failure lives, and its
 # unattributed fallback is "UI" - so a bug in this file would be published as an
@@ -549,23 +556,86 @@ class E2eDriver:
         So: BACK once, then poll until the IME's own dump agrees it is gone. Only
         a keyboard that is *still* up after this whole window is treated as
         needing another BACK, and that decision is left to the caller's next
-        attempt rather than taken here."""
+        attempt rather than taken here.
+
+        That still assumes the IME's dump is *right*, and run 35328758621 is the
+        counter-example: `mInputShown=true` with no `showSoftInput` or
+        `onRequestShow` anywhere in the run's logcat after 09:50:51, so the BACK
+        this sent at 09:50:56 was the only BACK on screen - it reached the app.
+        `ActivityTaskManager` logged `Transition ... type = CLOSE ... MainActivity
+        numActivities=0` and the launcher moved to front 19ms later, while process
+        8146 stayed alive (it was still JIT-compiling at 09:51:07), so the app had
+        not crashed: one BACK finished the root activity. `open_settings` then
+        relaunched it and called this again, whose next stale reading finished the
+        fresh activity in turn - a loop that killed the app once per retry and
+        reported it as "the Settings tab did not open".
+
+        So the reading is no longer trusted on its own. The app has to be the
+        window a BACK would actually reach, and it has to still be there
+        afterwards; when it is not, the app is relaunched rather than the phase
+        being lost to a keyboard that was never up."""
         if not self._ime_shown():
             return True
+        focused = self._focused_app()
+        if focused and self.package not in focused:
+            # Whatever has the keyboard, it is not the app - so a BACK here would
+            # land on a screen this phase does not own. Nothing to protect either:
+            # a tab bar on a window that is not the app is not a tab bar the caller
+            # can tap, and the caller's next step is a relaunch.
+            self.log(
+                "the keyboard reads as up, but %s is the focused window, not the app;"
+                " not sending a BACK into a window that is not ours" % focused)
+            return False
         self.log("the soft keyboard is up; dismissing it before touching the tab bar")
         self.adb.back()
         deadline = time.monotonic() + settle
+        gone = False
         while True:
             time.sleep(0.5)
             if not self._ime_shown():
-                return True
+                gone = True
+                break
             if time.monotonic() >= deadline:
                 break
+        after = self._focused_app()
+        if after and self.package not in after:
+            # The BACK reached the app, which means no keyboard was there to take
+            # it: the reading above was stale. MainActivity is the app's root
+            # activity, so that BACK finished it and the caller is now looking at
+            # the launcher. Give the app back instead of letting the phase die on a
+            # tab bar that is not on screen.
+            self.log(
+                "the BACK that dismisses the keyboard left the app (%s is in front);"
+                " relaunching it" % after)
+            self.launch()
+            return not self._ime_shown()
+        if gone:
+            return True
         self.log(
             "the soft keyboard is still up %.0fs after a BACK; not sending a second"
             " one on a reading this stale - the caller's next attempt will retry"
             % settle)
         return False
+
+    def _focused_app(self):
+        """The package window manager has focused, read from `dumpsys window`.
+
+        This is the second opinion dismiss_ime needs and the IME's own dump cannot
+        give: whether the app is the window a BACK would reach at all, and whether
+        it still is afterwards.
+
+        An unreadable or unparsable dump answers "" - unknown. Callers treat that as
+        "do what you would have done", never as either answer, so a device that
+        words this dump differently falls back to the older behaviour instead of
+        silently losing the keyboard dismissal."""
+        rc, out = self.adb.shell("dumpsys window", timeout=30)
+        if rc != 0:
+            return ""
+        for line in out.splitlines():
+            if "mFocusedApp=" in line:
+                match = FOCUSED_COMPONENT_RE.search(line)
+                return match.group(1) if match else ""
+        return ""
 
     def _band_top(self, elements):
         """The y the window's bottom band starts at. The bar is the last row of an
