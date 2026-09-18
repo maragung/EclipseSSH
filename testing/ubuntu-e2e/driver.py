@@ -176,6 +176,17 @@ LOG_INSTALL_ACTIONS = ("Install", "Repair")
 INSTALL_LOG_LINE = re.compile(r"^\[(storage|rootfs|download|proot|dns|apt)\] ")
 
 
+def _contains(outer, inner):
+    """Whether rect `outer` encloses rect `inner`, edges included.
+
+    Both are the dump's own (x1, y1, x2, y2) rects - never `Element.bounds`, which is
+    the tap centre and the size. A tab's item box and the label inside it are flush at
+    the bottom edge, so an exclusive test would read the bar's own item as not
+    containing its label."""
+    return (outer[0] <= inner[0] and outer[1] <= inner[1]
+            and outer[2] >= inner[2] and outer[3] >= inner[3])
+
+
 class PhaseResult:
     def __init__(self, name):
         self.name = name
@@ -510,25 +521,66 @@ class E2eDriver:
             time.sleep(1)
         return not self._ime_shown()
 
+    def _band_top(self, elements):
+        """The y the window's bottom band starts at. The bar is the last row of an
+        edge-to-edge window, so the band is measured from the window's own height
+        rather than from a constant; a dump too sparse to measure (a failed one, or
+        a screen with almost nothing on it) falls back to the emulator's portrait
+        height, which is the orientation every phase runs in."""
+        _, height = self._window_extent(elements)
+        if height < 100:
+            height = 2400
+        return height * TAB_BAND
+
     def _bottom_bar(self, elements):
         """Which of the bar's own labels are drawn in the window's bottom band.
 
         The count is what says "this is the app's bottom bar": all five are drawn on
         every destination the app has, so a screen carrying fewer than three of them is
         not the app - or is not on the app's UI at all, which is the launcher and the
-        `am instrument` case alike."""
-        _, height = self._window_extent(elements)
-        if height < 100:
-            height = 2400
+        `am instrument` case alike.
+
+        Membership is the node's top edge, read from the dump as `rect` rather than
+        derived from `bounds`: `bounds` is the tap centre and the size, and the two are
+        not interchangeable - a tall node's centre can sit inside the band while its
+        top is well above it."""
+        band = self._band_top(elements)
         found = set()
         for el in elements:
-            b = el.bounds
-            if not b or b[1] < height * TAB_BAND:
+            r = el.rect
+            if not r or r[1] < band:
                 continue
             for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
                 if attr in TAB_LABELS:
                     found.add(attr)
         return found
+
+    def _band_labels(self, elements, exclude=None):
+        """The bar's label nodes in the bottom band, in dump order."""
+        band = self._band_top(elements)
+        found = []
+        for el in elements:
+            r = el.rect
+            if not r or r[1] < band:
+                continue
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if attr in TAB_LABELS and attr != exclude:
+                    found.append(el)
+                    break
+        return found
+
+    def _tab_label_node(self, elements, label):
+        """The node in the bottom band whose whole text or content-desc is `label`,
+        or None."""
+        band = self._band_top(elements)
+        for el in elements:
+            r = el.rect
+            if not r or r[1] < band:
+                continue
+            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+                if attr == label:
+                    return el
+        return None
 
     def _tab_active(self, elements, label):
         """Whether `label`'s tab is the one showing, read from the tab's own
@@ -544,19 +596,73 @@ class E2eDriver:
         shared by every tab, so a list left scrolled down opens scrolled down on the
         next tab, and even Settings' own first row is not guaranteed to be in the dump.
 
-        `selected` is scroll-independent, and every destination sets it:
+        `selected` is scroll-independent, and every destination sets it -
         `NavigationBarItem(selected = destination == item)` puts Compose's
-        Modifier.selectable on the tab, which merges the item's label into the node it
-        marks selected, and uiautomator writes a `selected` attribute on every node it
-        dumps. So the node carrying text="Settings" carries selected="true" exactly
-        while the Settings destination is the one showing."""
+        Modifier.selectable on the tab, and uiautomator writes a `selected` attribute
+        on every node it dumps. What that node *carries* is the part this reads
+        carefully, because on this app's bar the label and the selected node are not
+        the same node.
+
+        Run 35314746158 is the worked example, and it cost four phases. The dump it
+        left behind draws the bar as five label nodes bearing the label's own box -
+        `text='Settings' bounds=[917,2190][1043,2232]`, 126x42 px, against a tab that
+        is a fifth of a 1080 px bar and spans icon and label alike, ~y 2074-2232. So
+        the node carrying the text is the label's own Text, not the selectable parent
+        Compose would merge it into, and a rule wanting `selected` and the label on
+        one node can never be satisfied: the app really was on Settings (the dump
+        shows its rows), three taps had been delivered, and the proof said otherwise.
+
+        So the container is what proves it: the tab's selectable node is the one in
+        the bottom band whose box contains the label's box. The band test is what
+        keeps that honest - a node that is selected, is in the band, and does not also
+        carry another bar label is the tab's own item, whereas a selected root or
+        whole window would contain every label and prove nothing."""
+        node = self._tab_label_node(elements, label)
+        if node is None:
+            return False
+        if node.attrs.get("selected") == "true":
+            return True
+        box = node.rect
+        if not box:
+            return False
+        band = self._band_top(elements)
+        others = [el.rect for el in self._band_labels(elements, exclude=label)]
         for el in elements:
-            if el.attrs.get("selected") != "true":
+            if el is node or el.attrs.get("selected") != "true":
                 continue
-            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
-                if attr and label in attr:
-                    return True
+            container = el.rect
+            if not container or container[1] < band:
+                continue
+            if not _contains(container, box):
+                continue
+            if any(o and _contains(container, o) for o in others):
+                continue
+            return True
         return False
+
+    def _log_tab_proof(self, elements, label):
+        """What a failed tab proof read, node by node.
+
+        The screen digest cannot carry this: it prints only the nodes that have text
+        or a content-desc, and the node Compose marks `selected` on this bar is
+        exactly one of the unlabelled ones. So a proof that fails has to leave its own
+        reading behind, or the next run guesses at the node layout again - which is
+        what run 35314746158 cost, a diagnosis made from a digest that had already
+        thrown the answer away."""
+        band = self._band_top(elements)
+        in_band = [el for el in elements if el.rect and el.rect[1] >= band]
+        selected = [el for el in elements if el.attrs.get("selected") == "true"]
+        self.log("tab proof for %s: %d node(s) in the bottom band (y >= %d), %d selected"
+                 " in the whole dump" % (label, len(in_band), band, len(selected)))
+        for el in in_band:
+            self.log("  band: class=%s selected=%r clickable=%r text=%r desc=%r bounds=%s"
+                     % (el.attrs.get("class", ""), el.attrs.get("selected"),
+                        el.attrs.get("clickable"), el.attrs.get("text", ""),
+                        el.attrs.get("content-desc", ""), el.attrs.get("bounds", "")))
+        for el in selected:
+            self.log("  selected elsewhere: class=%s text=%r desc=%r bounds=%s"
+                     % (el.attrs.get("class", ""), el.attrs.get("text", ""),
+                        el.attrs.get("content-desc", ""), el.attrs.get("bounds", "")))
 
     def _open_tab(self, label, attempts=3):
         """Tap the bottom bar's tab for `label` until the bar itself says it took.
@@ -578,6 +684,7 @@ class E2eDriver:
         if self._tab_active(els, label):
             return True
         self.log("the %s tab is still not the selected one after %d taps" % (label, attempts))
+        self._log_tab_proof(els, label)
         return False
 
     def _window_extent(self, els):
