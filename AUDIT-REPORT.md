@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 27 / versionName 1.1.19 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 28 / versionName 1.1.20 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.0 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2025.04.01 · Hilt 2.60.1 · KSP 2.3.11 · Room 2.7.1 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.79
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §38, *Releasing 1.1.19*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §39, *Releasing 1.1.20*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -4281,3 +4281,130 @@ This is where it differs from §38.5, and the difference is why one was fixed an
 There the `FAILED` row was the **application's** own report, so a test taught to tolerate it would
 have hidden a symptom of the app. Here the exception is thrown by the **test's own query** into a
 window that does not exist yet — nothing about the app is wrong, and the test is what was wrong.
+
+## 39. Releasing 1.1.20
+
+1.1.20 carries two changes, and `git diff --numstat v1.1.19..v1.1.20 -- app/src/main
+.github/workflows` returns exactly two files: 12 insertions and 3 deletions in
+`.github/workflows/android-release-test.yml`, and 32 insertions with **no** deletions in
+`app/src/main/java/dev/eclipse/ssh/presentation/MainViewModel.kt`. The rest of the diff between those
+two tags is this release's own version stamp and this section. The scoping is the point: the only
+change in the application is purely additive — no line of it was rewritten — and neither change alters
+anything a user can observe. It is published on §38's argument carried one step further: both changes
+are to the *evidence* CI produces, and a pipeline that keeps producing evidence it cannot read is the
+defect.
+
+### 39.1 The release gate reported every validated release as a failed one
+
+A published release starts its own APK validation on an emulator matrix, and that workflow ends in a
+gate job whose step does two opposite things: it reports a measurement (did the legs pass) and it
+performs a write. The success path's write was `gh release comment "$TAG" --body …`. **`gh release`
+has no `comment` subcommand.** The complete set is `create`, `delete`, `delete-asset`, `download`,
+`edit`, `list`, `upload`, `verify`, `verify-asset` and `view` — and a GitHub release has no comment
+thread for one to post into in any case.
+
+The step runs under `set -euo pipefail`, so that call aborted the script *before* it reached `exit 0`.
+The measurement and the record were therefore opposites, and the log says so plainly, with the
+conclusion printed above the error that contradicts it:
+
+```
+all matrix legs passed
+unknown flag: --body
+##[error]Process completed with exit code 1.
+```
+
+Two runs prove the shape. Run `35234101795` was validating **v1.1.18**; run `35284156445` was
+validating **v1.1.19** at `e4042635`, triggered by the publish itself. In both, `Release APK on API 35`
+and `Release APK on API 30` concluded `success` and `Release gate` concluded `failure`. Every green
+release validation this repository has ever run reported itself as a red one.
+
+What follows from a failed gate is a repair attempt, and that part was contained rather than harmless.
+The gate's own failure path — the one that opens an issue and pulls the release back to draft — never
+ran, because `set -e` had already ended the script; the published release was never silently
+un-published. But the `auto-fix` job — `Autonomous repair` — carries
+`if: failure() && inputs.run_repair != 'false'`, which on a publish event (no inputs at all, so the
+second clause cannot be `'false'`) and on a dispatch that leaves the default alone reduces to
+`failure()` exactly. So it woke on every green validation.
+It exits at `test -n "$REPORT"` with `no failure report artifact`, because a passing run produces none
+— confirmed in job `105254056954` — and `ANTHROPIC_AUTH_TOKEN` is empty in any case, so the repair
+script would have exited `78` had it got that far, as the workflow's own comment at that step says.
+Nothing was pushed, and nothing was changed.
+
+The fix reports to `$GITHUB_STEP_SUMMARY`, which is already this repository's idiom for exactly this
+(`android-ubuntu-e2e.yml` does it) and is where a maintainer looks at the result of a run.
+
+**It could not be fixed by writing the release body instead, and that is the point worth recording.**
+The intent behind the original line was a durable marker on the release page. A release's body is
+generated by `tagged-release.yml`, and its `### Audit summary` is produced by matching this report's
+own section heading — `grep -E '^## [0-9]+\.' AUDIT-REPORT.md | grep -F "Releasing $VERSION"`. Editing
+a published body from a second workflow would replace a generated artifact with hand-written text and
+break that match for every future release. The gate now records its verdict on the run, and the
+release page stays as `tagged-release.yml` wrote it.
+
+The proof is a before-and-after pair rather than a green check. Run `35284156445` is the *before*:
+both legs `success`, `Release gate` `failure`, `Autonomous repair` `failure`. Run `35289711506` is the
+*after*, dispatched against `main` at `e72a5db0` once the fix had landed: every job `success`, and
+`Autonomous repair` **skipped** — which is the correct outcome, and the one it had never once
+produced.
+
+### 39.2 A forward bind that failed threw away its own stack
+
+This one closes a deficiency §38.5 named and left open. Both `startForwardBatch` and `startHandForward`
+rendered a bind failure as `error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName`.
+MINA refuses a bind by throwing a `NoSuchElementException` that carries **no message**, so that
+expression yields the bare class name — the flaky-test report read
+`ForwardStatus(state=FAILED, error=NoSuchElementException)` and nothing anywhere held the stack. Not
+the user's row, not the test XML's `system-out`, which carried only MINA's own warnings, and not the
+reports artifact. §38.5's two occurrences, runs `35231586827` and `35249025845`, are dead ends for
+that reason and cannot be reopened.
+
+Both catches now call one helper:
+
+```kotlin
+private fun logForwardBindFailure(entry: ForwardEntry, error: Throwable) {
+    Log.e(TAG, "Forward bind failed: ${entry.describe()}", error)
+}
+```
+
+Two things about it are deliberate and are written down where they are done. The throwable is passed
+as the **third argument**, which no other call in this project does — `SessionLivenessProbe`,
+`TransferCoordinator` and this file everywhere else all interpolate the class name and message and
+never hand the object on. That convention is right almost everywhere, because the message is what a
+person reads; it is exactly what loses the evidence here. And the rule is named, because `ForwardEntry`
+holds only the ports, hosts and label the user typed and nothing secret, so a stack trace with no rule
+attached would still not say which bind it came from.
+
+The sentence a user reads is left unchanged, on purpose: a stack trace does not improve
+`"<rule>: NoSuchElementException"` for the person reading it.
+
+**What this does and does not establish.** The seven required checks that gated this release prove the
+change breaks nothing. They do not prove it works, and this release does not claim they do: the stack
+will be visible the next time `PortForwardingRobolectricTest`'s sibling-rebind test fails, and until
+that happens it is a fix to the channel the evidence travels on. **The rebind defect itself is still
+open.** It has not recurred since 2026-09-17 16:50, and the fix makes the next recurrence readable
+rather than making it stop.
+
+The mechanism was verified rather than assumed, since a log line nobody can read would be a second
+version of the same defect. Robolectric's `ShadowLog` is what captures this suite's output, and its
+`ShadowLog$LogItem.toString()` calls `Throwables.getStackTraceAsString(throwable)`, appending the
+result as `throwable=<stack>`; `ShadowLog` writes each item to its own stream. That was read out of the
+resolved `shadows-framework-4.16.1.jar` in the Gradle cache, not recalled.
+
+### 39.3 What this release is, and what it is not
+
+It is a fix to two pieces of CI machinery, one of which had been misreporting every release for as
+long as it has existed, and the other of which was discarding the only evidence a known flaky failure
+produces. The first is verified by a green run and a skipped repair job. The second is verified only
+as harmless; its proof is a future failure, and this report will carry that failure's stack when it
+happens rather than claiming beforehand that it will.
+
+It is not a fix to the forward-rebind defect, and it is not a change to any behaviour a user can
+observe. A device running 1.1.20 is running 1.1.19.
+
+### 39.4 `testing/README.md`'s dispatch example, one release along
+
+§38.3 moved `testing/README.md`'s dispatch example from `tag=v1.1.17` to `tag=v1.1.18`, and said it
+would stay there "rather than moving to `v1.1.19`", because a section written before the tag exists
+cannot name it. That reason has expired: `v1.1.19` now exists and is published, so the example moves
+to it. The rule §38.3 was applying is that the example should name the newest tag that is actually
+there, and this release is the first in which a newer one is.
