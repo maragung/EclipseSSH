@@ -57,12 +57,12 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
 
       - name: Set up JDK 17.0.13
-        uses: actions/setup-java@6a0805fcefea3d4657a47ac4c165951e33482018 # v4.1.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v4.1.0
         with:
           distribution: temurin
           java-version: '17.0.13'
@@ -88,7 +88,7 @@ jobs:
           ninja --version
 
       - name: Cache the FreeRDP native build tree
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -99,18 +99,18 @@ jobs:
       - name: Cache the Linux userspace native build tree
         # Read-only, like the FreeRDP entry above: relies on main's ci.yml
         # having saved this key; a cold build is the fallback on a fresh pin.
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: linux/build
           key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
         with:
           cache-read-only: true
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
         with:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
