@@ -103,10 +103,27 @@ TAB_SETTINGS = "Settings"
 # destination the app has, so "is this the app's bottom bar" is answered by counting
 # them rather than by trusting one word that another screen may also carry.
 TAB_LABELS = ("Hosts", "Terminal", "Files", "Transfers", "Settings")
-# A tab is a bottom-bar row: its top edge sits in the window's bottom band. The
-# fraction is loose on purpose - the bar's own height is ~42px of a 2400px window
-# in portrait and of a 1080px one in landscape.
+# A destination is drawn either in the bottom bar or in the leading rail, and which one
+# is a matter of the window's WIDTH rather than of the display's orientation:
+# MainActivity.kt:1217 sets `isWide = maxWidth >= 700.dp`, and :1222 then draws a
+# NavigationRail down the leading edge INSTEAD of the bottom NavigationBar. The emulator
+# is 1080x2400 at density 2.75 - 393dp in portrait, 873dp in landscape - so portrait gets
+# the bar and landscape the rail.
+#
+# Run 35317843457 is the worked example, and it cost the whole install phase: the rotation
+# disturbance turns the device to landscape and then navigates, the rail carries all five
+# labels but puts none of them in the bottom band, and a test that knew only the bottom
+# band found two of the five and gave up without leaving a word behind.
+#
+# A tab's own box sits in whichever container is on screen. The fractions are loose on
+# purpose: the bar is ~42px of a 2400px window in portrait and of a 1080px one in
+# landscape, and the rail is ~240px of a 2400px-wide one.
 TAB_BAND = 0.8
+RAIL_BAND = 0.25
+# Three of the five labels is what makes a layout the app's own workspace: the app draws
+# all five on every destination it has (see TAB_LABELS), so a layout carrying fewer is not
+# this app's - which is what keeps the launcher's own Settings icon from reading as a tab.
+DEST_MIN = 3
 # How Android reports a raised soft keyboard, in the two dumps that carry it:
 # InputMethodManagerService's `mInputShown` and InputMethodService's
 # `mIsInputViewShown`. A dump that says neither reads as "not shown", which is the
@@ -469,8 +486,9 @@ class E2eDriver:
         navigation the emulator can eat without a trace.
 
         A tab is a tap away from anywhere the app is on screen, which is why every
-        phase comes through here - but the bar sits at the very bottom of an
-        edge-to-edge window, and a raised soft keyboard is drawn over it. `input tap`
+        phase comes through here - but the navigation sits at the very edge of an
+        edge-to-edge window (the bottom bar, or the leading rail in a wide one -
+        _nav_region), and a raised soft keyboard is drawn over the bottom bar. `input tap`
         reports success whether the app or the IME window received the tap, and when
         it is the IME nothing happens at all: no error, no state change, just the
         screen the driver was already on. Run 35311046886 lost the entire
@@ -494,8 +512,9 @@ class E2eDriver:
         if self._open_tab(TAB_SETTINGS):
             return
         raise RuntimeError(
-            "the %s tab did not open: no bottom bar on screen carrying it, or every tap"
-            " on it left another tab selected%s" % (TAB_SETTINGS, self._screen_note()))
+            "the %s tab did not open: the app's destinations are in neither the bottom bar"
+            " nor the leading rail, or every tap on them left another one selected%s"
+            % (TAB_SETTINGS, self._screen_note()))
 
     def _ime_shown(self):
         """Whether the soft keyboard is up, read from the input method's own dump.
@@ -526,60 +545,111 @@ class E2eDriver:
         edge-to-edge window, so the band is measured from the window's own height
         rather than from a constant; a dump too sparse to measure (a failed one, or
         a screen with almost nothing on it) falls back to the emulator's portrait
-        height, which is the orientation every phase runs in."""
+        height, which is the orientation every phase starts in."""
         _, height = self._window_extent(elements)
         if height < 100:
             height = 2400
         return height * TAB_BAND
 
-    def _bottom_bar(self, elements):
-        """Which of the bar's own labels are drawn in the window's bottom band.
+    def _rail_edge(self, elements):
+        """The x the window's leading rail ends at, measured the same way and for the
+        same reason as `_band_top` - from the window, not from a constant."""
+        width, _ = self._window_extent(elements)
+        if width < 100:
+            width = 1080
+        return width * RAIL_BAND
 
-        The count is what says "this is the app's bottom bar": all five are drawn on
-        every destination the app has, so a screen carrying fewer than three of them is
-        not the app - or is not on the app's UI at all, which is the launcher and the
-        `am instrument` case alike.
+    def _dest_label(self, el):
+        """The destination label this node carries, or None. The whole text or
+        content-desc has to be one of the five: a row that merely mentions "Files"
+        is not the Files tab."""
+        for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
+            if attr in TAB_LABELS:
+                return attr
+        return None
 
-        Membership is the node's top edge, read from the dump as `rect` rather than
-        derived from `bounds`: `bounds` is the tap centre and the size, and the two are
-        not interchangeable - a tall node's centre can sit inside the band while its
-        top is well above it."""
-        band = self._band_top(elements)
-        found = set()
+    def _nav_region(self, elements):
+        """Where the app is drawing its destinations, as ("bar", top_edge) for the
+        bottom bar of a narrow window, ("rail", right_edge) for the leading rail of a
+        wide one, or None when neither carries them.
+
+        Which one is on screen is read from the dump rather than predicted from the
+        display's orientation, because the app's own rule is about width: a tablet in
+        portrait gets the rail too, and a rotation is not the only way there. The two
+        regions are then made disjoint - a label in the bottom band counts for the bar
+        and is not also counted for the rail - so the rail's own lowest items, which do
+        reach down into the bottom band, cannot make the bar look present on a rail
+        screen and be tapped as one.
+
+        Deciding by count is what keeps this honest when both regions hold a label:
+        the layout carrying more of the five is the container, and one carrying fewer
+        than DEST_MIN is not the app's workspace at all."""
+        width, height = self._window_extent(elements)
+        if width < 100 or height < 100:
+            return None
+        bar_top = height * TAB_BAND
+        rail_right = width * RAIL_BAND
+        on_bar = on_rail = 0
         for el in elements:
-            r = el.rect
-            if not r or r[1] < band:
+            if self._dest_label(el) is None:
                 continue
-            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
-                if attr in TAB_LABELS:
-                    found.add(attr)
-        return found
+            r = el.rect
+            if not r:
+                continue
+            if r[1] >= bar_top:
+                on_bar += 1
+            elif r[0] <= rail_right:
+                on_rail += 1
+        if on_bar >= DEST_MIN and on_bar >= on_rail:
+            return ("bar", bar_top)
+        if on_rail >= DEST_MIN:
+            return ("rail", rail_right)
+        return None
 
-    def _band_labels(self, elements, exclude=None):
-        """The bar's label nodes in the bottom band, in dump order."""
-        band = self._band_top(elements)
+    def _in_region(self, region, el):
+        """Whether `el` lies in the destination container `region` names. Membership is
+        the node's leading edge, read from the dump as `rect` rather than derived from
+        `bounds`: `bounds` is the tap centre and the size, and the two are not
+        interchangeable - a tall node's centre can sit inside the band while its top is
+        well above it."""
+        r = el.rect
+        if not r:
+            return False
+        _, edge = region
+        return r[1] >= edge if region[0] == "bar" else r[0] <= edge
+
+    def _nav_labels(self, elements, exclude=None):
+        """The destination labels' own nodes, in dump order: the five the container on
+        screen carries, or none at all when no region carries DEST_MIN of them.
+
+        This is what says "this is the app's own navigation": all five are drawn on
+        every destination the app has, so a screen carrying fewer than three is not the
+        app - or is not on the app's UI at all, which is the launcher and the
+        `am instrument` case alike."""
+        region = self._nav_region(elements)
+        if region is None:
+            return []
         found = []
         for el in elements:
-            r = el.rect
-            if not r or r[1] < band:
+            label = self._dest_label(el)
+            if label is None or label == exclude or not self._in_region(region, el):
                 continue
-            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
-                if attr in TAB_LABELS and attr != exclude:
-                    found.append(el)
-                    break
+            found.append(el)
         return found
 
+    def _nav_label_set(self, elements):
+        """The labels the container on screen carries, as a set."""
+        return {self._dest_label(el) for el in self._nav_labels(elements)}
+
     def _tab_label_node(self, elements, label):
-        """The node in the bottom band whose whole text or content-desc is `label`,
-        or None."""
-        band = self._band_top(elements)
+        """The node in the destination container whose whole text or content-desc is
+        `label`, or None."""
+        region = self._nav_region(elements)
+        if region is None:
+            return None
         for el in elements:
-            r = el.rect
-            if not r or r[1] < band:
-                continue
-            for attr in (el.attrs.get("text", ""), el.attrs.get("content-desc", "")):
-                if attr == label:
-                    return el
+            if self._dest_label(el) == label and self._in_region(region, el):
+                return el
         return None
 
     def _tab_active(self, elements, label):
@@ -612,11 +682,16 @@ class E2eDriver:
         one node can never be satisfied: the app really was on Settings (the dump
         shows its rows), three taps had been delivered, and the proof said otherwise.
 
-        So the container is what proves it: the tab's selectable node is the one in
-        the bottom band whose box contains the label's box. The band test is what
-        keeps that honest - a node that is selected, is in the band, and does not also
-        carry another bar label is the tab's own item, whereas a selected root or
-        whole window would contain every label and prove nothing."""
+        So the container is what proves it: the tab's selectable node is the one in the
+        destination container whose box contains the label's box - and the container is
+        the bottom bar in a narrow window and the leading rail in a wide one, whichever
+        the dump says is carrying the five labels (see _nav_region). The band test is
+        what keeps that honest - a node that is selected, is in the container, and does
+        not also carry another destination's label is the tab's own item, whereas a
+        selected root or whole window would contain every label and prove nothing."""
+        region = self._nav_region(elements)
+        if region is None:
+            return False
         node = self._tab_label_node(elements, label)
         if node is None:
             return False
@@ -625,15 +700,14 @@ class E2eDriver:
         box = node.rect
         if not box:
             return False
-        band = self._band_top(elements)
-        others = [el.rect for el in self._band_labels(elements, exclude=label)]
+        others = [el.rect for el in self._nav_labels(elements, exclude=label)]
         for el in elements:
             if el is node or el.attrs.get("selected") != "true":
                 continue
-            container = el.rect
-            if not container or container[1] < band:
+            if not self._in_region(region, el):
                 continue
-            if not _contains(container, box):
+            container = el.rect
+            if not container or not _contains(container, box):
                 continue
             if any(o and _contains(container, o) for o in others):
                 continue
@@ -644,35 +718,53 @@ class E2eDriver:
         """What a failed tab proof read, node by node.
 
         The screen digest cannot carry this: it prints only the nodes that have text
-        or a content-desc, and the node Compose marks `selected` on this bar is
+        or a content-desc, and the node Compose marks `selected` on this navigation is
         exactly one of the unlabelled ones. So a proof that fails has to leave its own
         reading behind, or the next run guesses at the node layout again - which is
         what run 35314746158 cost, a diagnosis made from a digest that had already
-        thrown the answer away."""
-        band = self._band_top(elements)
-        in_band = [el for el in elements if el.rect and el.rect[1] >= band]
+        thrown the answer away.
+
+        Run 35317843457 cost more for the want of it: there the container was not
+        recognised at all (a landscape rail, read by a bottom-bar-only test), so the
+        proof was never attempted and nothing was logged, and the run's evidence had to
+        be reconstructed from a screenshot after the fact. Every path that declines to
+        prove now comes through here."""
         selected = [el for el in elements if el.attrs.get("selected") == "true"]
-        self.log("tab proof for %s: %d node(s) in the bottom band (y >= %d), %d selected"
-                 " in the whole dump" % (label, len(in_band), band, len(selected)))
-        for el in in_band:
-            self.log("  band: class=%s selected=%r clickable=%r text=%r desc=%r bounds=%s"
-                     % (el.attrs.get("class", ""), el.attrs.get("selected"),
-                        el.attrs.get("clickable"), el.attrs.get("text", ""),
-                        el.attrs.get("content-desc", ""), el.attrs.get("bounds", "")))
+        region = self._nav_region(elements)
+        if region is None:
+            self.log("tab proof for %s: no destination container on screen - neither the"
+                     " bottom band (y >= %d) nor the leading rail (x <= %d) carries %d of"
+                     " the five labels (%d selected in the whole dump)"
+                     % (label, self._band_top(elements), self._rail_edge(elements),
+                        DEST_MIN, len(selected)))
+        else:
+            edge = "y >= %d" % region[1] if region[0] == "bar" else "x <= %d" % region[1]
+            in_region = [el for el in elements if self._in_region(region, el)]
+            self.log("tab proof for %s: the %s (%s) holds %d node(s), %d selected in the"
+                     " whole dump" % (label, region[0], edge, len(in_region), len(selected)))
+            for el in in_region:
+                self.log("  %s: class=%s selected=%r clickable=%r text=%r desc=%r"
+                         " bounds=%s"
+                         % (region[0], el.attrs.get("class", ""), el.attrs.get("selected"),
+                            el.attrs.get("clickable"), el.attrs.get("text", ""),
+                            el.attrs.get("content-desc", ""), el.attrs.get("bounds", "")))
         for el in selected:
             self.log("  selected elsewhere: class=%s text=%r desc=%r bounds=%s"
                      % (el.attrs.get("class", ""), el.attrs.get("text", ""),
                         el.attrs.get("content-desc", ""), el.attrs.get("bounds", "")))
 
     def _open_tab(self, label, attempts=3):
-        """Tap the bottom bar's tab for `label` until the bar itself says it took.
-        False means the app's bar is not on this screen (the caller's relaunch case)
-        or that every tap was eaten - `tap_last` matches the last node carrying the
-        label, which on this bar is the bar's own node, because the bar is dumped
-        after the screen above it."""
+        """Tap the destination `label` until the navigation itself says it took.
+        False means the app's navigation is not on this screen (the caller's relaunch
+        case) or that every tap was eaten - `tap_last` matches the last node carrying
+        the label, which on this navigation is the container's own node, because the
+        container is dumped after the screen above it."""
         els = self.dump()
-        bar = self._bottom_bar(els)
-        if label not in bar or len(bar) < 3:
+        if label not in self._nav_label_set(els):
+            # Declining to prove is itself something the next run has to be able to read:
+            # this is the path that cost run 35317843457 its diagnosis.
+            self.log("the %s tab is not on screen" % label)
+            self._log_tab_proof(els, label)
             return False
         for _ in range(attempts):
             if self._tab_active(els, label):

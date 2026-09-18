@@ -73,6 +73,42 @@ def _bar_with_containers(active):
     els.extend(_bar(None, selected_attr=False)[1:])
     return els
 
+
+# The same five destinations as the app draws them in a WIDE window: a NavigationRail down
+# the leading edge INSTEAD of the bottom bar (MainActivity.kt:1217 `isWide = maxWidth >=
+# 700.dp`, :1222 NavigationRail). The label bounds are run 35317843457's landscape dump
+# verbatim - `text='Hosts' bounds=[92,480][181,522]` … `text='Settings' bounds=[74,1031][200,1033]`
+# - against a 2400x1080 window, where the rail overflows the window and clips its last two
+# labels to a sliver. That clipping is the app's own shape in landscape, not the fixture's.
+RAIL_BOUNDS = {"Hosts": (92, 181, 480, 522), "Terminal": (70, 203, 638, 680),
+               "Files": (100, 173, 796, 838), "Transfers": (64, 209, 954, 957),
+               "Settings": (74, 200, 1031, 1033)}
+
+# The rail's item boxes, which are what a tap actually lands on: one per label, spanning
+# the label with the margin a NavigationRailItem gives it, and the last one running past
+# the window's own bottom edge the way the real rail does.
+RAIL_ITEM_BOUNDS = {label: (0, 240, 390 + 158 * i, 548 + 158 * i)
+                    for i, label in enumerate(RAIL_BOUNDS)}
+
+
+def _rail(active, containers=True):
+    """The app's landscape navigation: a 2400x1080 window, five labels stacked down the
+    leading edge, and - as on the device - `selected` on the unlabelled item node each
+    label sits in, never on the label's own node."""
+    els = [Element({"class": "hierarchy", "bounds": "[0,0][2400,1080]"})]
+    if containers:
+        for label, (left, right, top, bottom) in RAIL_ITEM_BOUNDS.items():
+            els.append(Element({"class": "android.view.View", "clickable": "true",
+                                "selected": "true" if label == active else "false",
+                                "bounds": "[%d,%d][%d,%d]" % (left, top, right, bottom)}))
+    for label, (left, right, top, bottom) in RAIL_BOUNDS.items():
+        attrs = {"text": label, "content-desc": label,
+                 "bounds": "[%d,%d][%d,%d]" % (left, top, right, bottom)}
+        if not containers:
+            attrs["selected"] = "true" if label == active else "false"
+        els.append(Element(attrs))
+    return els
+
 # The Linux userspace section as a uiautomator dump renders it in the NotInstalled
 # state, in dump order, with the app's real strings (MainActivity's
 # LinuxUserspaceSection). Bounds are portrait values; only their ordering matters.
@@ -578,14 +614,27 @@ class OpenSettingsTabSwitch(unittest.TestCase):
         self.assertEqual(0, len(self.adb.starts))
 
     def test_a_single_label_is_not_the_apps_bar(self):
-        # The bar carries five labels on every destination the app has. One is not it,
-        # and tapping that guess is how a driver ends up in the system Settings app
+        # The navigation carries five labels on every destination the app has. One is not
+        # it, and tapping that guess is how a driver ends up in the system Settings app
         # (the launcher's own icon) instead of on its own Settings tab.
         els = [Element({"text": "Settings", "content-desc": "Settings",
                         "bounds": "[900,2272][1080,2400]"})]
-        bar = self.driver._bottom_bar(els)
-        self.assertEqual({"Settings"}, bar)
-        self.assertLess(len(bar), 3)
+        self.assertEqual(set(), self.driver._nav_label_set(els))
+        self.assertIsNone(self.driver._nav_region(els))
+
+    def test_a_wide_window_opens_settings_through_the_rail(self):
+        # The app's other navigation: a landscape window draws a NavigationRail down the
+        # leading edge and no bottom bar at all, so a driver that knows only the bottom
+        # band finds two of the five labels there and gives up. Run 35317843457's rotation
+        # disturbance rotates first and navigates second, which is how that cost the whole
+        # install phase.
+        self.adb.wide = True
+        self.driver.open_settings()
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(1, len(self.adb.taps))
+        # The tap went to the rail item, not to a point the bottom-bar rule would pick:
+        # the label is clipped to a 2px sliver at the window's own bottom edge.
+        self.assertEqual([(137, 1032)], self.adb.taps)
 
 
 class TabActiveProof(unittest.TestCase):
@@ -661,6 +710,48 @@ class TabActiveProof(unittest.TestCase):
         logged = "\n".join(self.driver.lines)
         self.assertIn("selected='true'", logged)
         self.assertIn("[864,2074][1080,2232]", logged)
+
+    def test_the_destinations_prove_themselves_in_a_wide_window_too(self):
+        # The same proof against the app's other navigation. The rail's own lowest items
+        # reach down into the bottom band, so a region chosen by count has to keep the two
+        # apart - and the three labels above that band are what name the container.
+        els = _rail("Settings")
+        self.assertEqual(("rail", 600), self.driver._nav_region(els))
+        self.assertTrue(self.driver._tab_active(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_a_destination_label_in_the_bottom_band_does_not_make_it_a_bar(self):
+        # Two of the five rail labels sit below the bar band's own threshold, because the
+        # rail overflows the window and clips them. Counting them as bar labels would put
+        # the container in the wrong place and the proof would look for the tab there.
+        els = _rail("Hosts")
+        below = [el for el in els if el.rect and el.rect[1] >= 864
+                 and self.driver._dest_label(el)]
+        self.assertEqual(["Transfers", "Settings"],
+                         [self.driver._dest_label(el) for el in below])
+        self.assertEqual(("rail", 600), self.driver._nav_region(els))
+
+    def test_a_container_of_the_whole_rail_is_not_a_tab(self):
+        # The rail's own column would contain every label, exactly as the bar's row does.
+        els = [Element({"selected": "true", "bounds": "[0,390][240,1180]"})] \
+            + _rail(None, containers=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_declined_proof_leaves_behind_what_it_read_too(self):
+        # The path that cost run 35317843457 its diagnosis: the container was not
+        # recognised, so the proof was never attempted and nothing was written down. The
+        # run's evidence had to be rebuilt from a screenshot hours later.
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        els = [Element({"text": "Settings", "content-desc": "Settings",
+                        "bounds": "[900,2272][1080,2400]"})]
+        self.driver.adb = _ScrollingAdb([els])
+        self.assertFalse(self.driver._open_tab("Settings", attempts=1))
+        # Nothing was tapped at the guess: a lone label in a corner is not a tab.
+        self.assertEqual([], self.driver.adb.taps)
+        logged = "\n".join(self.driver.lines)
+        self.assertIn("the Settings tab is not on screen", logged)
+        self.assertIn("no destination container on screen", logged)
 
 
 class LinuxSectionWalkEvidence(unittest.TestCase):
@@ -877,7 +968,8 @@ class _LauncherThenAppAdb:
     `ime` is the soft keyboard raised over the bar: every tap is then delivered to
     the keyboard's own window and the screen never changes, which is the state run
     35311046886's dumps show. `swallow` is the same outcome without the keyboard -
-    taps the emulator itself ate."""
+    taps the emulator itself ate. `wide` is the same app in a landscape window, where
+    it draws the leading rail instead of the bottom bar (run 35317843457)."""
 
     LAUNCHER = [Element({"text": "Phone", "content-desc": "Phone", "bounds": "[23,2106][230,2272]"}),
                 Element({"text": "Camera", "content-desc": "Camera", "bounds": "[851,2106][1057,2272]"})]
@@ -892,6 +984,7 @@ class _LauncherThenAppAdb:
         self.ime = False
         self.swallow = 0
         self.containers = False
+        self.wide = False
 
     def shell(self, cmd, timeout=None):
         if "input_method" not in cmd:
@@ -900,9 +993,15 @@ class _LauncherThenAppAdb:
 
     def ui_dump(self):
         if self.launched and self.shows_settings:
-            bar = _bar_with_containers(self.active) if self.containers else _bar(self.active)
-            return [Element({"text": "Search hosts, tags, or usernames",
-                             "bounds": "[180,308][785,371]"})] + bar
+            if self.wide:
+                nav = _rail(self.active)
+                search = Element({"text": "Search hosts, tags, or usernames",
+                                  "bounds": "[300,120][1500,180]"})
+            else:
+                nav = _bar_with_containers(self.active) if self.containers else _bar(self.active)
+                search = Element({"text": "Search hosts, tags, or usernames",
+                                  "bounds": "[180,308][785,371]"})
+            return [search] + nav
         return self.LAUNCHER
 
     def am_start(self, package, activity):
@@ -916,6 +1015,14 @@ class _LauncherThenAppAdb:
             self.swallow -= 1
             return True
         if self.ime:
+            return True
+        if self.wide:
+            # The rail ITEM is the tap target, not the label inside it: the window's own
+            # bottom edge clips the last two labels to a sliver, which is the shape run
+            # 35317843457's dump has.
+            for label, (left, right, top, bottom) in RAIL_ITEM_BOUNDS.items():
+                if left <= x <= right and top <= y <= bottom:
+                    self.active = label
             return True
         for label, (left, right) in BAR_BOUNDS.items():
             if left <= x <= right and 2190 <= y <= 2232:
