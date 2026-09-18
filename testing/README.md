@@ -102,12 +102,22 @@ Honest limits, stated rather than hidden:
 
 ```
 gh workflow run android-release-test.yml \
-  -f tag=v1.2.0            # or omit for the latest release
+  -f tag=v1.1.20            # newest published release; or omit for the latest
   -f api_levels=35,30
   -f apk_source=release     # release asset | build from the current ref
   -f run_repair=true
 ```
 
+The tag must name a **published** release. A draft is invisible to
+`GET /releases/tags/{tag}` — the endpoint the pipeline resolves an asset with —
+and `gh release view --json tagName` skips drafts without saying so, so a tag
+whose release the gate has pulled back to draft fails as a step that finds no
+asset to download rather than as an error naming the draft. `tagged-release.yml`
+creates every tag with its release held as a draft, and the release is published
+deliberately afterwards — the validation that runs on publication is what pulls
+it back if a leg is red. So a tag can exist whose release does not.
+
 Pre-release validation of a branch: dispatch with `apk_source=build` from that
 branch — the pipeline assembles and signs its own release APK and runs the same
-gate, without publishing anything.
+gate, without publishing anything. This is the route a fix takes, since it needs
+no published release at all.
