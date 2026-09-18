@@ -98,7 +98,7 @@ Honest limits, stated rather than hidden:
 
 ```
 gh workflow run android-release-test.yml \
-  -f tag=v1.1.18            # or omit for the latest release
+  -f tag=v1.1.19            # or omit for the latest release
   -f api_levels=35,30
   -f apk_source=release     # release asset | build from the current ref
   -f run_repair=true
