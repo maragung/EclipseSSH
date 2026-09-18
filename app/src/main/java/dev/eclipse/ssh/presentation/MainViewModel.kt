@@ -3,6 +3,7 @@ package dev.eclipse.ssh.presentation
 import android.content.Context
 import android.os.SystemClock
 import android.net.Uri
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -1652,6 +1653,7 @@ class MainViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
+                logForwardBindFailure(entry, error)
                 val reason = error.message?.takeIf { it.isNotBlank() } ?: error::class.java.simpleName
                 setForwardState(entry, ForwardRuntime.FAILED, reason)
                 failures += "${entry.describe()}: $reason"
@@ -3602,6 +3604,7 @@ class MainViewModel @Inject constructor(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
+                logForwardBindFailure(entry, error)
                 reportForwardFailure(failureTitle, error)
                 setForwardState(
                     entry,
@@ -3627,6 +3630,28 @@ class MainViewModel @Inject constructor(
     private fun reportForwardFailure(what: String, error: Throwable) {
         if (error is CancellationException) throw error
         report(what, error)
+    }
+
+    /**
+     * Keeps the stack of a forward bind that failed, which no other channel here can carry.
+     *
+     * Everywhere else — in this file and across the project — a throwable is flattened to
+     * `error.message ?: error::class.java.simpleName` before it is shown or logged, and the throwable
+     * itself is never handed on. That is deliberate: the message is what a person reads, and a stack
+     * is noise beside it. A refused bind is the case where that inverts. MINA raises it as a
+     * `NoSuchElementException` carrying no message, so the flattened form is the bare class name —
+     * `ForwardStatus(state=FAILED, error=NoSuchElementException)` — and the user's row and the failing
+     * test say the same nothing. Here the stack is the entire evidence, and logcat is the only channel
+     * that fits it: [report] carries one sentence, [dev.eclipse.ssh.ssh.SessionDiagnostics] records
+     * events rather than traces, and an instrumented run captures logcat into its `system-out`.
+     *
+     * So this is the one call in the file that passes the throwable as the third argument, against the
+     * convention — on purpose, because the convention is exactly what loses this. The rule is named
+     * because [ForwardEntry] holds only the ports and hosts the user typed, nothing secret, and a
+     * stack with no rule attached would still not say which bind it came from.
+     */
+    private fun logForwardBindFailure(entry: ForwardEntry, error: Throwable) {
+        Log.e(TAG, "Forward bind failed: ${entry.describe()}", error)
     }
 
     fun stopForwarding(id: String) = stopForwardRule(id)
@@ -4892,6 +4917,13 @@ class MainViewModel @Inject constructor(
      * bounds.
      */
     internal companion object {
+        /**
+         * The logcat tag for the one thing in this file that goes to logcat rather than to
+         * [dev.eclipse.ssh.ssh.SessionDiagnostics] or a status message: a forward bind that failed,
+         * whose stack trace no other channel can carry. See [logForwardBindFailure].
+         */
+        const val TAG = "MainViewModel"
+
         const val MAX_TERMINAL_CHARS = 100_000
 
         /**
