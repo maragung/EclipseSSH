@@ -441,14 +441,28 @@ class Adb:
 _BOUNDS_RE = re.compile(r"^\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]$")
 
 
-def parse_bounds(text):
-    """'[x1,y1][x2,y2]' -> (center_x, center_y, width, height) or None."""
+def parse_rect(text):
+    """'[x1,y1][x2,y2]' -> (x1, y1, x2, y2) or None.
+
+    The rect, where parse_bounds gives the centre and the size: a tap wants the
+    centre, and a containment or band test wants the edges. Rebuilding one from the
+    other loses a pixel to the integer division in between, which is enough to move a
+    boundary - so both are read from the dump rather than derived."""
     m = _BOUNDS_RE.match(text or "")
     if not m:
         return None
     x1, y1, x2, y2 = (int(v) for v in m.groups())
     if x2 <= x1 or y2 <= y1:
         return None
+    return (x1, y1, x2, y2)
+
+
+def parse_bounds(text):
+    """'[x1,y1][x2,y2]' -> (center_x, center_y, width, height) or None."""
+    rect = parse_rect(text)
+    if not rect:
+        return None
+    x1, y1, x2, y2 = rect
     return ((x1 + x2) // 2, (y1 + y2) // 2, x2 - x1, y2 - y1)
 
 
@@ -468,6 +482,12 @@ class Element:
     @property
     def bounds(self):
         return parse_bounds(self.attrs.get("bounds", ""))
+
+    @property
+    def rect(self):
+        """The node's edges as (x1, y1, x2, y2), for tests that ask where a node is
+        rather than where to tap it."""
+        return parse_rect(self.attrs.get("bounds", ""))
 
     @property
     def center(self):

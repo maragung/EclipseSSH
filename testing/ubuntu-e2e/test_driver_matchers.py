@@ -25,6 +25,90 @@ from adbutil import Element  # noqa: E402
 
 DRIVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver.py")
 
+# The app's bottom bar as run 35311046886's dump draws it: five labels in the window's
+# bottom band, with the active destination's own tab marked selected. The bounds are
+# that dump's, verbatim.
+BAR_BOUNDS = {"Hosts": (55, 144), "Terminal": (254, 387), "Files": (504, 577),
+              "Transfers": (688, 833), "Settings": (917, 1043)}
+
+
+def _window_root():
+    """The hierarchy's own root node, which every real dump carries: it spans the
+    window, and it is the node the bottom band is measured from (the driver's
+    _window_extent takes the widest and tallest node as the window, which the root
+    is). A fixture without it is measured against its own tallest node instead, and
+    a synthetic bar that has drifted from the device's geometry stops being caught."""
+    return Element({"class": "hierarchy", "bounds": "[0,0][1080,2400]"})
+
+
+def _bar(active, selected_attr=True):
+    """The bottom bar, on `active`. With selected_attr=False the dump carries no
+    selected attribute at all, which is the shape a stricter dumper would emit."""
+    els = [_window_root()]
+    for label, (left, right) in BAR_BOUNDS.items():
+        attrs = {"text": label, "content-desc": label,
+                 "bounds": "[%d,2190][%d,2232]" % (left, right)}
+        if selected_attr:
+            attrs["selected"] = "true" if label == active else "false"
+        els.append(Element(attrs))
+    return els
+
+
+# The bar as run 35314746158's dump really draws it, which is the shape the device
+# emits and the shape the first version of this proof could not read: five label Texts
+# bearing the label's own box, and the `selected` state on five UNLABELLED item nodes
+# above them - the node Compose's Modifier.selectable puts the semantics on. A tab is a
+# fifth of a 1080 px bar and spans icon and label alike (~y 2074-2232), which is why the
+# label's 42-px-tall box is not the item's.
+ITEM_BOUNDS = {label: (216 * i, 216 * (i + 1)) for i, label in enumerate(BAR_BOUNDS)}
+
+
+def _bar_with_containers(active):
+    """The device's own shape: `selected` on the item node, never on the label's."""
+    els = [_window_root()]
+    for label, (left, right) in ITEM_BOUNDS.items():
+        els.append(Element({"class": "android.view.View", "clickable": "true",
+                            "selected": "true" if label == active else "false",
+                            "bounds": "[%d,2074][%d,2232]" % (left, right)}))
+    els.extend(_bar(None, selected_attr=False)[1:])
+    return els
+
+
+# The same five destinations as the app draws them in a WIDE window: a NavigationRail down
+# the leading edge INSTEAD of the bottom bar (MainActivity.kt:1217 `isWide = maxWidth >=
+# 700.dp`, :1222 NavigationRail). The label bounds are run 35317843457's landscape dump
+# verbatim - `text='Hosts' bounds=[92,480][181,522]` … `text='Settings' bounds=[74,1031][200,1033]`
+# - against a 2400x1080 window, where the rail overflows the window and clips its last two
+# labels to a sliver. That clipping is the app's own shape in landscape, not the fixture's.
+RAIL_BOUNDS = {"Hosts": (92, 181, 480, 522), "Terminal": (70, 203, 638, 680),
+               "Files": (100, 173, 796, 838), "Transfers": (64, 209, 954, 957),
+               "Settings": (74, 200, 1031, 1033)}
+
+# The rail's item boxes, which are what a tap actually lands on: one per label, spanning
+# the label with the margin a NavigationRailItem gives it, and the last one running past
+# the window's own bottom edge the way the real rail does.
+RAIL_ITEM_BOUNDS = {label: (0, 240, 390 + 158 * i, 548 + 158 * i)
+                    for i, label in enumerate(RAIL_BOUNDS)}
+
+
+def _rail(active, containers=True):
+    """The app's landscape navigation: a 2400x1080 window, five labels stacked down the
+    leading edge, and - as on the device - `selected` on the unlabelled item node each
+    label sits in, never on the label's own node."""
+    els = [Element({"class": "hierarchy", "bounds": "[0,0][2400,1080]"})]
+    if containers:
+        for label, (left, right, top, bottom) in RAIL_ITEM_BOUNDS.items():
+            els.append(Element({"class": "android.view.View", "clickable": "true",
+                                "selected": "true" if label == active else "false",
+                                "bounds": "[%d,%d][%d,%d]" % (left, top, right, bottom)}))
+    for label, (left, right, top, bottom) in RAIL_BOUNDS.items():
+        attrs = {"text": label, "content-desc": label,
+                 "bounds": "[%d,%d][%d,%d]" % (left, top, right, bottom)}
+        if not containers:
+            attrs["selected"] = "true" if label == active else "false"
+        els.append(Element(attrs))
+    return els
+
 # The Linux userspace section as a uiautomator dump renders it in the NotInstalled
 # state, in dump order, with the app's real strings (MainActivity's
 # LinuxUserspaceSection). Bounds are portrait values; only their ordering matters.
@@ -124,6 +208,200 @@ class ActionButtonMatchers(unittest.TestCase):
         loose = [c for c in calls if "exact=True" not in c]
         self.assertEqual([], loose, "these action-button matchers would satisfy "
                                     "'Install log': %s" % loose)
+
+
+class InstallStateAcrossSurfaces(unittest.TestCase):
+    """One install state, two spellings: the window's row (a title over the step) and
+    the Settings list's row (title and state folded into one summary line). Since
+    a30b276 the controls sit behind a row, so an install can be watched from either
+    screen, and the readings are not interchangeable:
+
+    - the window draws the row's own name twice - in the bar, and again as the card's
+      row - and _texts() deduplicates, so a pairing built on it sees the name once,
+      followed by the card's header, and the row that owns the state is unreachable;
+    - on the list the state is in the summary line rather than the title, so a reader
+      that only looks at titles sees no state at all - which made every lifecycle
+      exercise fired during an install walk a list with nothing left to reveal and
+      report the install as lost, the false failure install_state_kind's second
+      spelling exists to prevent."""
+
+    # The window mid-install, in dump order, with the app's real strings
+    # (UbuntuActivity's card): the bar, its back arrow, the card's header, then the
+    # card's row - "Installing <distro>" over the step - and the trace row below.
+    WINDOW_INSTALLING = [
+        Element({"text": "Ubuntu on this device", "bounds": "[155,190][588,250]"}),
+        Element({"content-desc": "Back", "bounds": "[24,190][120,286]"}),
+        Element({"text": "UBUNTU ON THIS DEVICE", "bounds": "[32,340][600,382]"}),
+        Element({"text": "Installing Ubuntu 22.04 LTS", "bounds": "[155,470][700,530]"}),
+        Element({"text": "Downloading · 512.0 MB of 1.2 GB", "bounds": "[155,530][881,572]"}),
+        Element({"text": "Install log", "bounds": "[220,900][520,960]"}),
+    ]
+
+    # The same window once the install has settled: the bar and the card's row now
+    # carry the same string, which is the case the dedup collapses.
+    WINDOW_SETTLED = [
+        Element({"text": "Ubuntu on this device", "bounds": "[155,190][588,250]"}),
+        Element({"content-desc": "Back", "bounds": "[24,190][120,286]"}),
+        Element({"text": "UBUNTU ON THIS DEVICE", "bounds": "[32,340][600,382]"}),
+        Element({"text": "Ubuntu on this device", "bounds": "[155,470][588,530]"}),
+        Element({"text": "Installed and verified · stopped", "bounds": "[155,530][881,572]"}),
+    ]
+
+    # The Settings list mid-install (MainActivity's LinuxUserspaceSection and
+    # linuxUserspaceSummary): the section header, the row, its summary line, and the
+    # row's control - a merged button node, labelled "Open" and named after its row.
+    LIST = [
+        Element({"text": "LINUX USERSPACE", "bounds": "[32,1177][345,1219]"}),
+        Element({"text": "Ubuntu on this device", "bounds": "[155,1277][588,1340]"}),
+    ]
+    LIST_INSTALLING = LIST + [
+        Element({"text": "Installing Ubuntu 22.04 LTS · Downloading · 512.0 MB of 1.2 GB",
+                 "bounds": "[155,1340][881,1382]"}),
+        Element({"text": "Open", "content-desc": "Ubuntu on this device",
+                 "bounds": "[888,1330][1043,1390]"}),
+    ]
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+
+    def test_the_window_names_the_step_while_it_installs(self):
+        # What the progress log and the periodic install-progress screenshots are
+        # read from: the driver logs the pair, so a hung install names its step.
+        self.assertEqual(
+            ("Installing Ubuntu 22.04 LTS", "Downloading · 512.0 MB of 1.2 GB"),
+            self.driver.install_state(self.WINDOW_INSTALLING))
+        self.assertEqual("Installing Ubuntu 22.04 LTS | Downloading · 512.0 MB of 1.2 GB",
+                         self.driver.install_label(self.WINDOW_INSTALLING))
+
+    def test_the_windows_bar_is_not_read_as_the_row(self):
+        # The bar carries the row's own name, so the reader has to return the card's
+        # row - the one below the card's header - and not the bar above it.
+        self.assertEqual(("Ubuntu on this device", "Installed and verified · stopped"),
+                         self.driver.install_state(self.WINDOW_SETTLED))
+
+    def test_the_deduped_view_is_why_the_pairing_is_built_on_the_raw_dump(self):
+        # Pinned as the trap it is, not endorsed: _texts() collapses the bar and the
+        # card's row into a single entry, and that entry is the bar's - so a pairing
+        # built on it can never reach the row that owns the state.
+        texts = self.driver._texts(self.WINDOW_SETTLED)
+        self.assertEqual(1, texts.count(driver.CARD_TITLE))
+        self.assertLess(texts.index(driver.CARD_TITLE), texts.index(driver.WINDOW_HEADER))
+
+    def test_the_list_folds_the_state_into_its_summary_line(self):
+        title, line = self.driver.install_state(self.LIST_INSTALLING)
+        self.assertEqual("Ubuntu on this device", title)
+        self.assertEqual("alive", self.driver.install_state_kind(title, line))
+        self.assertEqual("Installing Ubuntu 22.04 LTS · Downloading · 512.0 MB of 1.2 GB",
+                         self.driver.install_label(self.LIST_INSTALLING))
+
+    def test_a_settled_row_is_not_read_as_an_install_that_died(self):
+        # "ended" means the install died, and it is what makes a lifecycle exercise
+        # declare the install lost - so an intact userspace must read "alive" on
+        # whichever screen the exercise relaunched the app onto.
+        stopped_on_the_list = self.LIST + [
+            Element({"text": "Installed and verified · stopped", "bounds": "[155,1340][881,1382]"})]
+        for els in (self.WINDOW_SETTLED, stopped_on_the_list):
+            self.assertEqual("alive",
+                             self.driver.install_state_kind(*self.driver.install_state(els)))
+        self.assertEqual("ended", self.driver.install_state_kind(
+            *self.driver.install_state(stopped_on_the_list[:2] + [
+                Element({"text": "Needs repair · a previous install was interrupted",
+                         "bounds": "[155,1340][881,1382]"})])))
+
+    def test_the_apps_own_error_row_never_reads_as_a_live_install(self):
+        # The row that records why an operation ended is named after what failed, so
+        # it begins with the Installing label (E2E run 35051269460) - and reading it
+        # as a live install reports a dead one as alive.
+        els = [Element({"text": "Last operation", "bounds": "[155,700][500,760]"}),
+               Element({"text": "Installing base packages failed (exit 100)",
+                        "bounds": "[155,760][900,802]"})]
+        self.assertEqual((None, ""), self.driver.install_state(els))
+        self.assertIsNone(self.driver.install_label(els))
+
+
+class OpenWindowButton(unittest.TestCase):
+    """The Settings row's own control, and the step the promotion added: every acting
+    phase now goes list -> Open -> window -> action row. The row's title and its
+    button carry the same string and only the button is tappable, so the match is on
+    the row's own name - the same shape as the install-log row's View."""
+
+    # The list's userspace row, in dump order, as the merged node Compose draws: the
+    # button's label as the text, the row's name as its content-desc.
+    LIST = InstallStateAcrossSurfaces.LIST + [
+        Element({"text": "Not installed · real bash, apt, Node.js and Python, on the device",
+                 "bounds": "[155,1340][881,1382]"}),
+        Element({"text": "Open", "content-desc": "Ubuntu on this device",
+                 "bounds": "[888,1330][1043,1390]"}),
+    ]
+
+    # The window that button opens: the same name in the bar, the card's header, and
+    # the card's row under it.
+    WINDOW = InstallStateAcrossSurfaces.WINDOW_SETTLED
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        # wait_visible() runs against a wall-clock deadline, so a no-op sleep alone
+        # would spin for the real thirty seconds: the clock has to move with it.
+        self.addCleanup(setattr, driver, "time", driver.time)
+        driver.time = _AdvancingTime()
+
+    def test_the_rows_own_button_is_taken_by_its_name(self):
+        hit = self.driver._open_window_button(self.LIST)
+        self.assertIsNotNone(hit)
+        self.assertEqual(driver.BUTTON_OPEN, hit.attrs["text"])
+        self.assertEqual(driver.CARD_TITLE, hit.attrs["content-desc"])
+
+    def test_the_titles_own_row_is_never_tapped(self):
+        # A dump whose button has scrolled out of view, or a device that is not
+        # supported and draws none: the title is not tappable, so taking it would be
+        # a tap the driver could lose silently.
+        self.assertIsNone(self.driver._open_window_button(self.LIST[:2]))
+
+    def test_another_rows_button_is_never_taken(self):
+        others = [Element({"text": "Terminal font size", "bounds": "[155,300][700,360]"}),
+                  Element({"text": "Change", "content-desc": "Terminal font size",
+                           "bounds": "[888,300][1043,360]"})]
+        self.assertIsNone(self.driver._open_window_button(others))
+
+    def test_the_walk_opens_the_window_through_the_merged_button(self):
+        adb = _WindowAdb(self.LIST, window=self.WINDOW)
+        self.driver.adb = adb
+        self.driver.open_ubuntu_window()
+        self.assertEqual([], adb.swipes)  # the row was already on screen
+        self.assertEqual(1, len(adb.taps))
+        x, y = adb.taps[0]
+        self.assertTrue(888 <= x <= 1043, x)  # the button's own bounds, not the row's
+        self.assertTrue(1330 <= y <= 1390, y)
+
+    def test_a_button_that_is_really_absent_is_named(self):
+        self.driver.adb = _WindowAdb(self.LIST[:2])
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_ubuntu_window()
+        self.assertIn("Open button was not found", str(caught.exception))
+
+    def test_a_tap_the_emulator_ate_is_named_as_the_tap(self):
+        self.driver.adb = _WindowAdb(self.LIST, window=self.WINDOW, tap_ok=False)
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_ubuntu_window()
+        self.assertIn("could not be tapped", str(caught.exception))
+
+    def test_the_rows_own_name_cannot_prove_the_window_opened(self):
+        # Pinned, not endorsed: the list satisfies a wait on the name the window is
+        # named after - on the very screen the driver is trying to leave. The wait has
+        # to be on the card's header, which is the only string the window draws and
+        # the list does not; otherwise a tap the emulator ate leaves the driver
+        # hunting for action buttons on a screen they are not on.
+        self.assertIsNotNone(self.driver.find(self.LIST, driver.CARD_TITLE))
+        self.assertIsNone(self.driver.find(self.LIST, driver.WINDOW_HEADER))
+
+    def test_a_window_that_never_opens_fails_on_its_own_header(self):
+        self.driver.adb = _WindowAdb(self.LIST, window=None)
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_ubuntu_window()
+        self.assertIn(driver.WINDOW_HEADER, str(caught.exception))
+        self.assertIn("did not open", str(caught.exception))
 
 
 class InstallLogLines(unittest.TestCase):
@@ -241,15 +519,276 @@ class OpenSettingsRecovery(unittest.TestCase):
     def test_the_app_is_put_back_and_settings_opened(self):
         self.driver.open_settings()
         self.assertEqual([("dev.eclipse.ssh", ".MainActivity")], self.adb.starts)
+        # One tap, on the bar the relaunched app draws - and the launch is what the
+        # tap follows: a screen with no bottom bar at all is not the app.
         self.assertEqual(1, len(self.adb.taps))
+        self.assertEqual("Settings", self.adb.active)
 
     def test_a_settings_tab_that_is_really_gone_still_fails(self):
         self.adb.shows_settings = False
         with self.assertRaises(RuntimeError) as caught:
             self.driver.open_settings()
-        self.assertIn("Settings tab was not found", str(caught.exception))
+        self.assertIn("Settings tab did not open", str(caught.exception))
         # Relaunched once, not in a loop: a real UI regression must stay a failure.
         self.assertEqual(1, len(self.adb.starts))
+        # And nothing was tapped on the screen that is not the app's.
+        self.assertEqual([], self.adb.taps)
+
+
+class OpenSettingsTabSwitch(unittest.TestCase):
+    """The Settings tab, and the two ways its tap disappears without a trace. The bar
+    is the bottom row of an edge-to-edge window, and a raised soft keyboard is drawn
+    OVER it - the IME does not resize this window - so the tap is delivered to the
+    keyboard's own window and the screen never changes. Run 35311046886 lost the whole
+    interrupt-process phase that way: the tap at 06:01:13 was swallowed, the old
+    open_settings tapped once and returned without looking, and the phase failed 100
+    seconds later blaming a settings section that was never missing. The version here
+    puts the keyboard away first, taps, and requires the bar's own `selected` to say
+    the switch happened."""
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.package = "dev.eclipse.ssh"
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        self.adb = _LauncherThenAppAdb()
+        self.adb.launched = True  # the app is already on screen
+        self.driver.adb = self.adb
+        self._sleep = driver.time.sleep
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def test_the_switch_is_proved_by_the_bars_own_selected_state(self):
+        self.driver.open_settings()
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(1, len(self.adb.taps))
+        self.assertEqual(0, self.adb.backs)
+
+    def test_the_switch_is_proved_on_the_shape_the_device_emits(self):
+        # open_settings() end to end against the dump the emulator really produces:
+        # labels with their own boxes, `selected` on the unlabelled item above each.
+        # The fixture used to put `selected` on the label node itself, so the suite
+        # stayed green while the device failed four phases - this is that gap closed.
+        self.adb.containers = True
+        self.driver.open_settings()
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(1, len(self.adb.taps))
+        self.assertEqual(0, self.adb.backs)
+
+    def test_a_keyboard_over_the_bar_is_put_away_before_the_tap(self):
+        self.adb.ime = True
+        self.driver.open_settings()
+        self.assertEqual(1, self.adb.backs)
+        self.assertEqual("Settings", self.adb.active)
+
+    def test_a_tap_the_emulator_ate_is_retried(self):
+        # Not the keyboard this time: the emulator's own flakiness, which the Ubuntu
+        # row's Open button already gets a second chance for.
+        self.adb.swallow = 1
+        self.driver.open_settings()
+        self.assertEqual(2, len(self.adb.taps))
+        self.assertEqual("Settings", self.adb.active)
+
+    def test_taps_that_are_all_eaten_fail_naming_the_screen(self):
+        self.adb.swallow = 99
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.open_settings()
+        message = str(caught.exception)
+        self.assertIn("Settings tab did not open", message)
+        # The screen it was really on, which is what a lost tap costs to work out
+        # from a screenshot: this is run 35311046886's failure mode, named where it
+        # happened instead of 100 seconds later on another phase's behalf.
+        self.assertIn("Search hosts, tags, or usernames", message)
+        # Three taps per screen and one relaunch between the two: bounded, so a tab
+        # that is genuinely unreachable fails here rather than looping.
+        self.assertEqual(6, len(self.adb.taps))
+        self.assertEqual(1, len(self.adb.starts))
+
+    def test_a_retried_tap_does_not_cost_a_relaunch(self):
+        self.adb.swallow = 1
+        self.driver.open_settings()
+        self.assertEqual(2, len(self.adb.taps))
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(0, len(self.adb.starts))
+
+    def test_a_single_label_is_not_the_apps_bar(self):
+        # The navigation carries five labels on every destination the app has. One is not
+        # it, and tapping that guess is how a driver ends up in the system Settings app
+        # (the launcher's own icon) instead of on its own Settings tab.
+        els = [Element({"text": "Settings", "content-desc": "Settings",
+                        "bounds": "[900,2272][1080,2400]"})]
+        self.assertEqual(set(), self.driver._nav_label_set(els))
+        self.assertIsNone(self.driver._nav_region(els))
+
+    def test_a_wide_window_opens_settings_through_the_rail(self):
+        # The app's other navigation: a landscape window draws a NavigationRail down the
+        # leading edge and no bottom bar at all, so a driver that knows only the bottom
+        # band finds two of the five labels there and gives up. Run 35317843457's rotation
+        # disturbance rotates first and navigates second, which is how that cost the whole
+        # install phase.
+        self.adb.wide = True
+        self.driver.open_settings()
+        self.assertEqual("Settings", self.adb.active)
+        self.assertEqual(1, len(self.adb.taps))
+        # The tap went to the rail item, not to a point the bottom-bar rule would pick:
+        # the label is clipped to a 2px sliver at the window's own bottom edge.
+        self.assertEqual([(137, 1032)], self.adb.taps)
+
+
+class TabActiveProof(unittest.TestCase):
+    """What proves which destination is showing, and what does not. Settings has no
+    top bar of its own, the word "Settings" appears exactly once on it and equally
+    once on every other destination (the tab), and MainActivity builds one
+    rememberScrollState() outside the destination `when` - one list offset shared by
+    every tab, so even Settings' own first row is not guaranteed to be in the dump.
+    The tab's `selected` semantics is the one scroll-independent answer.
+
+    Where that semantics sits is the whole of run 35314746158: the app's bar marks the
+    ITEM node selected, and the label is a node of its own inside it, so a proof that
+    wants both on one node can never fire however many times the tap lands."""
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+
+    def test_the_selected_tab_is_the_active_one(self):
+        els = _bar("Settings")
+        self.assertTrue(self.driver._tab_active(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_the_item_node_carrying_the_state_proves_it_not_the_label(self):
+        # The device's own shape, and the case four phases died on: the label node
+        # carries no `selected` at all, and the state is on the unlabelled item above
+        # it that contains the label's box.
+        els = _bar_with_containers("Settings")
+        self.assertTrue(self.driver._tab_active(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_a_container_of_the_whole_bar_is_not_a_tab(self):
+        # Containment alone is not enough: the bar's own row, the Scaffold, or the
+        # window root would contain every label, and a dump with nothing selected
+        # would then read as every tab being active - the unsafe direction, a phase
+        # walking a screen it never opened.
+        els = [Element({"selected": "true", "bounds": "[0,2074][1080,2232]"})] \
+            + _bar(None, selected_attr=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_selected_node_above_the_bar_proves_nothing(self):
+        # A Settings row can itself be `selected` - a switch's semantics - and one
+        # stretched over the bar would satisfy containment from outside it, which is
+        # what the band test is for.
+        els = [Element({"selected": "true", "text": "Dark appearance",
+                        "bounds": "[864,1500][1080,2232]"})] \
+            + _bar(None, selected_attr=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_the_word_settings_proves_nothing(self):
+        # Pinned, not endorsed: this IS the screen run 35311046886's dumps show - the
+        # bar drawn, the Settings tab not the selected one, the search field's own row
+        # on screen. A check that matched the word would call this the Settings screen,
+        # which is what the old open_settings did when it tapped and returned.
+        els = _bar("Hosts")
+        self.assertIsNotNone(self.driver.find(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_dump_without_the_attribute_is_not_a_proof(self):
+        # The safe direction: a dump that carries no `selected` (an unexpected format)
+        # must never be read as "the switch happened" - the retry then fails the phase
+        # at the tap, which is the truth, instead of letting it walk the wrong screen.
+        els = _bar("Settings", selected_attr=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_failed_proof_leaves_behind_what_it_read(self):
+        # The digest in the failure message cannot carry this - it prints only labelled
+        # nodes, and the selected node is unlabelled - so the proof logs the band itself.
+        # Without it, run 35314746158's diagnosis had to be inferred from a digest that
+        # had already discarded the answer.
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        self.driver._log_tab_proof(_bar_with_containers("Hosts"), "Settings")
+        logged = "\n".join(self.driver.lines)
+        self.assertIn("selected='true'", logged)
+        self.assertIn("[864,2074][1080,2232]", logged)
+
+    def test_the_destinations_prove_themselves_in_a_wide_window_too(self):
+        # The same proof against the app's other navigation. The rail's own lowest items
+        # reach down into the bottom band, so a region chosen by count has to keep the two
+        # apart - and the three labels above that band are what name the container.
+        els = _rail("Settings")
+        self.assertEqual(("rail", 600), self.driver._nav_region(els))
+        self.assertTrue(self.driver._tab_active(els, "Settings"))
+        self.assertFalse(self.driver._tab_active(els, "Hosts"))
+
+    def test_a_destination_label_in_the_bottom_band_does_not_make_it_a_bar(self):
+        # Two of the five rail labels sit below the bar band's own threshold, because the
+        # rail overflows the window and clips them. Counting them as bar labels would put
+        # the container in the wrong place and the proof would look for the tab there.
+        els = _rail("Hosts")
+        below = [el for el in els if el.rect and el.rect[1] >= 864
+                 and self.driver._dest_label(el)]
+        self.assertEqual(["Transfers", "Settings"],
+                         [self.driver._dest_label(el) for el in below])
+        self.assertEqual(("rail", 600), self.driver._nav_region(els))
+
+    def test_a_container_of_the_whole_rail_is_not_a_tab(self):
+        # The rail's own column would contain every label, exactly as the bar's row does.
+        els = [Element({"selected": "true", "bounds": "[0,390][240,1180]"})] \
+            + _rail(None, containers=False)
+        self.assertFalse(self.driver._tab_active(els, "Settings"))
+
+    def test_a_declined_proof_leaves_behind_what_it_read_too(self):
+        # The path that cost run 35317843457 its diagnosis: the container was not
+        # recognised, so the proof was never attempted and nothing was written down. The
+        # run's evidence had to be rebuilt from a screenshot hours later.
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        els = [Element({"text": "Settings", "content-desc": "Settings",
+                        "bounds": "[900,2272][1080,2400]"})]
+        self.driver.adb = _ScrollingAdb([els])
+        self.assertFalse(self.driver._open_tab("Settings", attempts=1))
+        # Nothing was tapped at the guess: a lone label in a corner is not a tab.
+        self.assertEqual([], self.driver.adb.taps)
+        logged = "\n".join(self.driver.lines)
+        self.assertIn("the Settings tab is not on screen", logged)
+        self.assertIn("no destination container on screen", logged)
+
+
+class LinuxSectionWalkEvidence(unittest.TestCase):
+    """The walk that finds the userspace row, and what its failure says. Run
+    35311046886's walk spent its 24 swipes and 100 seconds on the HOSTS list and
+    reported "the Linux userspace settings section was never visible" - a section that
+    was never on that screen to be missing, which reads as a list that would not
+    scroll. The first screen the walk was handed is the whole diagnosis."""
+
+    HOSTS = [Element({"text": "All hosts", "bounds": "[21,477][192,540]"}),
+             Element({"text": "Search hosts, tags, or usernames",
+                      "bounds": "[180,308][785,371]"}),
+             Element({"text": "Production edge", "bounds": "[211,650][530,713]"})] + _bar("Hosts")
+
+    def setUp(self):
+        self.driver = driver.E2eDriver.__new__(driver.E2eDriver)
+        self.driver.lines = []
+        self.driver.log = self.driver.lines.append
+        self._sleep = driver.time.sleep
+        driver.time.sleep = lambda *_: None
+
+    def tearDown(self):
+        driver.time.sleep = self._sleep
+
+    def test_the_failure_names_the_screen_the_walk_was_on(self):
+        self.driver.adb = _ScrollingAdb([self.HOSTS])
+        with self.assertRaises(RuntimeError) as caught:
+            self.driver.require_linux_section(max_swipes=2)
+        message = str(caught.exception)
+        self.assertIn("never visible", message)
+        self.assertIn("Production edge", message)
+        self.assertEqual(2, len(self.driver.adb.swipes))
+
+    def test_a_section_that_is_there_is_not_a_failure(self):
+        self.driver.adb = _ScrollingAdb([OpenWindowButton.LIST])
+        self.driver.require_linux_section()
+        self.assertEqual([], self.driver.adb.swipes)
 
 
 class StorageGateCleanup(unittest.TestCase):
@@ -315,6 +854,19 @@ class StageAttribution(unittest.TestCase):
             ("VERIFY stage: instrumentation phase 'write' - hardLinksShareOneInode", "VERIFY"),
         ):
             self.assertEqual(expected, self._stage(message, RuntimeError))
+
+    def test_the_evidence_a_navigation_failure_carries_is_not_a_stage(self):
+        # A navigation failure appends the screen it was on, and that text is the app's
+        # own: a host named "apt mirror" must not decide where a lost tap is published.
+        message = ("the Linux userspace settings section was never visible on the Settings"
+                   " list%s%s" % (driver.EVIDENCE_MARKER, ["apt mirror", "DNS server"]))
+        self.assertEqual("UI", self._stage(message, RuntimeError))
+
+    def test_without_the_marker_the_screen_would_decide_the_stage(self):
+        # Pinned, not endorsed: the same digest, unmarked. This is why EVIDENCE_MARKER
+        # exists - and why every message that appends a screen must use it.
+        message = "the Linux userspace settings section was never visible: ['apt mirror']"
+        self.assertEqual("APT", self._stage(message, RuntimeError))
 
 
 class ActionButtonWalk(unittest.TestCase):
@@ -408,21 +960,48 @@ class _DfAdb:
 
 class _LauncherThenAppAdb:
     """A screen that is the launcher until the app is started, like the dump from
-    run 35100526297's interruption phase (Search, Gallery, Phone, ... no app)."""
+    run 35100526297's interruption phase (Search, Gallery, Phone, ... no app), and
+    the app's own screen - bottom bar and all - once it is. The app lands on Hosts,
+    which is where a relaunched MainActivity starts, and a tap on a tab moves the
+    bar's `selected` to it the way the app does.
+
+    `ime` is the soft keyboard raised over the bar: every tap is then delivered to
+    the keyboard's own window and the screen never changes, which is the state run
+    35311046886's dumps show. `swallow` is the same outcome without the keyboard -
+    taps the emulator itself ate. `wide` is the same app in a landscape window, where
+    it draws the leading rail instead of the bottom bar (run 35317843457)."""
 
     LAUNCHER = [Element({"text": "Phone", "content-desc": "Phone", "bounds": "[23,2106][230,2272]"}),
                 Element({"text": "Camera", "content-desc": "Camera", "bounds": "[851,2106][1057,2272]"})]
-    APP = [Element({"text": "Settings", "content-desc": "Settings", "bounds": "[900,2272][1080,2400]"})]
 
     def __init__(self):
         self.starts = []
         self.taps = []
+        self.backs = 0
         self.launched = False
         self.shows_settings = True
+        self.active = "Hosts"
+        self.ime = False
+        self.swallow = 0
+        self.containers = False
+        self.wide = False
+
+    def shell(self, cmd, timeout=None):
+        if "input_method" not in cmd:
+            return 1, ""
+        return 0, "    mInputShown=%s" % ("true" if self.ime else "false")
 
     def ui_dump(self):
         if self.launched and self.shows_settings:
-            return self.APP
+            if self.wide:
+                nav = _rail(self.active)
+                search = Element({"text": "Search hosts, tags, or usernames",
+                                  "bounds": "[300,120][1500,180]"})
+            else:
+                nav = _bar_with_containers(self.active) if self.containers else _bar(self.active)
+                search = Element({"text": "Search hosts, tags, or usernames",
+                                  "bounds": "[180,308][785,371]"})
+            return [search] + nav
         return self.LAUNCHER
 
     def am_start(self, package, activity):
@@ -432,6 +1011,27 @@ class _LauncherThenAppAdb:
 
     def tap(self, x, y):
         self.taps.append((x, y))
+        if self.swallow:
+            self.swallow -= 1
+            return True
+        if self.ime:
+            return True
+        if self.wide:
+            # The rail ITEM is the tap target, not the label inside it: the window's own
+            # bottom edge clips the last two labels to a sliver, which is the shape run
+            # 35317843457's dump has.
+            for label, (left, right, top, bottom) in RAIL_ITEM_BOUNDS.items():
+                if left <= x <= right and top <= y <= bottom:
+                    self.active = label
+            return True
+        for label, (left, right) in BAR_BOUNDS.items():
+            if left <= x <= right and 2190 <= y <= 2232:
+                self.active = label
+        return True
+
+    def back(self):
+        self.backs += 1
+        self.ime = False
         return True
 
 
@@ -467,6 +1067,50 @@ class _ScrollingAdb:
     def tap(self, x, y):
         self.taps.append((x, y))
         return True
+
+
+class _WindowAdb:
+    """The Settings list, and - once a tap has been sent - the window it opens.
+    With `window` None the tap is eaten by the emulator and the screen never
+    changes, which is the failure the window's own header exists to catch."""
+
+    def __init__(self, settings, window=None, tap_ok=True):
+        self.settings = settings
+        self.window = window
+        self.tap_ok = tap_ok
+        self.taps = []
+        self.swipes = []
+
+    def ui_dump(self):
+        if self.taps and self.window:
+            return self.window
+        return self.settings
+
+    def tap(self, x, y):
+        self.taps.append((x, y))
+        return self.tap_ok
+
+    def swipe(self, x1, y1, x2, y2, duration):
+        self.swipes.append((x1, y1, x2, y2, duration))
+        return True
+
+
+class _AdvancingTime:
+    """A stand-in for the time module whose clock moves per call. wait_visible()
+    compares against a wall-clock deadline, so patching only sleep would leave it
+    spinning for the real timeout the test is trying not to wait out."""
+
+    STEP = 10.0
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        self.now += self.STEP
+        return self.now
+
+    def sleep(self, _seconds):
+        return None
 
 
 if __name__ == "__main__":
