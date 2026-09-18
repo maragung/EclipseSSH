@@ -10,10 +10,13 @@ else here is notice.
 ## Proot (GPL-2.0) and talloc (LGPL-3.0) — the Linux userspace
 
 The `:linux` module cross-compiles [proot][proot] (GPL-2.0-or-later) and its
-dependency [talloc][talloc] (LGPL-3.0) from source, and the release APKs
-ship both as standalone executables (`libproot.so`, `libproot-loader.so` in
-`nativeLibraryDir` — executables renamed into the `lib*.so` namespace only so
-Android's packaging puts them on disk).
+dependency [talloc][talloc] (LGPL-3.0) from source. Only proot ships as an
+executable: the release APK carries `libproot.so` and `libproot-loader.so` in
+`nativeLibraryDir` (executables renamed into the `lib*.so` namespace only so
+Android's packaging puts them on disk). talloc is compiled to `libtalloc.a` and
+linked statically into proot, so it has no binary of its own in the APK — the
+module links proot with `-static`, which is why `libproot.so` carries no
+`DT_NEEDED` entries at all.
 
 The build uses [oonid/pr][oonid-pr], a fork of proot v5.4.0 with Android
 targetSdk 29+ fixes, pinned to an exact commit in `linux/build.gradle.kts`:
@@ -37,12 +40,15 @@ compiles exactly those bytes. (The build records what it applied in a
 `.patches-applied` fingerprint over every patch name and hash, so a tree that
 was built from different patches cannot pass as this one.)
 
-**Why the app's license is unaffected**: proot and talloc are compiled into
-standalone executables, not linked into EclipseSSH. The app starts them as
-separate processes (fork + execve via the `liblinuxpty.so` PTY bridge) and
-communicates over a pseudo-terminal; no GPL code is linked into, derived
-from, or combined with the app's code at build or run time. This is
-arm's-length aggregation, same as running a GPL program on the same machine.
+**Why the app's license is unaffected**: neither proot nor talloc is linked into
+EclipseSSH. proot is a standalone executable, and talloc is statically linked
+into *it* rather than into the app — which keeps the LGPL code inside the GPL-2.0
+program it was already part of, and out of EclipseSSH's own binary. The app
+starts that executable as a separate process (fork + execve via the
+`liblinuxpty.so` PTY bridge) and communicates over a pseudo-terminal; no GPL or
+LGPL code is linked into, derived from, or combined with the app's code at build
+or run time. This is arm's-length aggregation, same as running a GPL program on
+the same machine.
 
 ## FreeRDP (Apache-2.0) — the `:freerdp` module
 

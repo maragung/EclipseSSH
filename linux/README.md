@@ -89,9 +89,12 @@ unsupported.
 
 ## Licensing
 
-proot is GPL-2.0, talloc LGPL-3.0 (statically linked into proot). Both are
-built as standalone executables that the app runs as separate processes and
-talks to over a PTY — arm's-length aggregation, not linking. The source
+proot is GPL-2.0, talloc LGPL-3.0. Only proot is built as a standalone
+executable that the app runs as a separate process and talks to over a PTY —
+arm's-length aggregation, not linking. talloc is not a process and has no binary
+of its own: the module compiles it to `libtalloc.a` and links proot against it
+statically, so the talloc code is inside `libproot.so`, which the app never links
+into itself. The source
 offer is the pinned, SHA256-verified tarball URLs recorded in
 `build.gradle.kts` together with the patches in `proot-patches/` that the build
 applies to the extracted fork before compiling it; see `docs/THIRD-PARTY.md` for

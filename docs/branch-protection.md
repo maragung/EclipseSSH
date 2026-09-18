@@ -37,7 +37,7 @@ template, and none of them was left unset by accident.
 | --- | --- | --- |
 | Required approvals `1` | `0` | `maragung` is the only collaborator, and it authors every pull request. GitHub does not let an author approve their own pull request, so one required approval on a one-account repository makes `main` permanently unmergeable — it would have blocked the very pull request that applied this rule. The requirement that does the work here is the status checks, and `enforce_admins: true` is what makes them bind the administrator too. Raise this to `1` in the same breath as adding a second collaborator who can review. |
 | Require review from Code Owners `yes` | `no` | `.github/CODEOWNERS` exists and names `@maragung` on every pattern. Requiring code-owner review is the row above with a stricter resolver, so on one account it is the same deadlock and not a second safeguard. |
-| Require linear history `yes` | `no` | `main` carries 85 merge commits and its convention is `Merge pull request #NN from …`. Linear history forbids merge commits outright, so the setting does not distinguish a good merge from a bad one — it forbids the repository's own history, and any release merged the way every release has been merged. If the convention ever changes to squash, this row follows it; the convention does not follow this row. |
+| Require linear history `yes` | `no` | Every pull request that has landed on `main` landed as a merge commit — `Merge pull request #NN from …`, or `Merge PR #NN: …` before the repository moved to the GitHub UI — never as a squash. Linear history forbids merge commits outright, so the setting does not distinguish a good merge from a bad one; it forbids the repository's own history, and any release merged the way every release has been merged. Deliberately no count of them appears here: this row used to cite one, and a running total in a passage about a setting that forbids the thing being counted is a figure that can only rot. If the convention ever changes to squash, this row follows it; the convention does not follow this row. |
 
 ### Required status checks
 
@@ -48,7 +48,7 @@ deliberately not the job keys — add these *names*, not the keys.
 | Workflow | Check name (job key) | Covers |
 | --- | --- | --- |
 | `CI` | `Documentation figures` (`docs`) | `scripts/check-doc-figures.sh` — the figures the documents state against the files that pin them, the repository paths they name, and the check names in this table |
-| `CI` | `FreeRDP native (4 ABIs)` (`native`) | The four-ABI native build that every other job restores from cache |
+| `CI` | `FreeRDP native (4 ABIs)` (`native`) | The four-ABI native build that `lint`, `test` and `assemble` restore from cache instead of rebuilding. `smoke` and `stress` never need it — they consume an APK or a JVM task — and `docs` needs no JDK at all |
 | `CI` | `Lint (release variant)` (`lint`) | `lintRelease` |
 | `CI` | `Unit and integration tests` (`test`) | The JVM/Robolectric suite — debug variant only, because AGP 9 removed `testReleaseUnitTest` |
 | `CI` | `APKs, AAB and signatures` (`assemble`) | Debug and release APKs, the AAB, and the signature checks |
@@ -86,27 +86,36 @@ click before a release artifact is built and uploaded:
    release. One is enough for a single-maintainer repo.
 3. "Wait timer" -> 0 minutes (the maintainer approves when ready).
 
-**Open item.** `Tagged release` is *not* pinned to that environment — it is the
-only other workflow that touches the signing secrets, and it publishes a GitHub
-release from a tag without an approval step. Adding `environment: release` to its
-build job would close that, at the cost of making `git push --tags` wait for a
-click.
+**Open item.** Seven workflows read the signing secrets — `ci.yml`,
+`instrumentation.yml`, `release.yml`, `tagged-release.yml`,
+`android-release-test.yml`, `universal-apk-test.yml` and `android-ubuntu-e2e.yml`
+— and `release.yml` is the only one behind this environment, so the other six
+reach those secrets with no approval step. Five of those six use the secrets to
+sign something that is then *tested*: they run on a push, a pull request, a
+published release, or a dispatch, and what they hand to the tests is a validation
+build whose signature only has to be real enough for the install to succeed.
+`Tagged release` is the one that *publishes* — it runs on a tag push, it builds
+from the tag, and it attaches those APKs to a GitHub release with nobody looking.
+Adding `environment: release` to its build job would put an approval in front of
+that, at the cost of making `git push --tags` wait for a click.
 
 ## Secrets
 
-The two release workflows read these secrets:
+The seven workflows named above read these secrets:
 
 | Secret | Purpose |
 | --- | --- |
 | `RELEASE_KEYSTORE_BASE64` | `base64 -w0 keystore/eclipse-release.jks` — the upload key, no newlines |
 | `RELEASE_KEYSTORE_PROPERTIES` | The `keystore.properties` file contents, with a trailing newline |
 
-Both are written to `keystore.properties` and `keystore/eclipse-release.jks`
-inside the runner and `chmod 600`. A step named "Shred signing material"
-(`if: always()`, so it runs on failure too) then removes both — `rm -f
+All seven write both to `keystore.properties` and `keystore/eclipse-release.jks`
+inside the runner and `chmod 600` them. Each has a step named "Shred signing
+material" (`if: always()`, so it runs on failure too) that removes both — `rm -f
 keystore.properties` and `rm -rf keystore`. It is `rm`, not `shred(1)`: the
 material lives on an ephemeral hosted runner's disk, which is discarded with the
-VM, and neither workflow caches the workspace.
+VM, and no workflow caches the workspace — the only caches anywhere in
+`.github/workflows/` are the two native build directories (`freerdp/build` and
+`linux/build`) and the Robolectric jar cache under `~/.m2/repository`.
 
 Rotate by:
 
