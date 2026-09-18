@@ -263,7 +263,7 @@ class OpenWindowButton(unittest.TestCase):
     # The list's userspace row, in dump order, as the merged node Compose draws: the
     # button's label as the text, the row's name as its content-desc.
     LIST = InstallStateAcrossSurfaces.LIST + [
-        Element({"text": "Not installed · real bash, apt, Node.js and Python, on the device",
+        Element({"text": "Not installed · real bash, apt and git, on the device",
                  "bounds": "[155,1340][881,1382]"}),
         Element({"text": "Open", "content-desc": "Ubuntu on this device",
                  "bounds": "[888,1330][1043,1390]"}),
@@ -753,7 +753,7 @@ class ActionButtonWalk(unittest.TestCase):
 
     def test_the_walk_still_finds_install_the_way_it_always_did(self):
         top = [Element({"text": "Ubuntu on this device", "bounds": "[155,700][588,760]"}),
-               Element({"text": "Not installed · real bash, apt, Node.js and Python",
+               Element({"text": "Not installed · real bash, apt and git",
                         "bounds": "[155,760][991,844]"}),
                Element({"text": "Settings", "bounds": "[917,2190][1043,2232]"})]
         self.driver.adb = _ScrollingAdb([top, top + [

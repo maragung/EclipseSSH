@@ -13,11 +13,18 @@ import kotlinx.coroutines.withContext
 /**
  * Turns a freshly extracted Ubuntu Base rootfs into the distribution the feature promises: an
  * `ubuntu` account, a persisted workspace, working DNS, a package manager pointed at the archive
- * that actually serves this device's architecture, and the real toolchain the spec names — Node.js,
- * Python, git — installed through apt itself, not simulated.
+ * that actually serves this device's architecture, and the base packages — bash and its
+ * completions, apt, git, curl, wget, sudo and an SSH client — installed through apt itself, not
+ * simulated.
  *
- * Nothing here talks to the network except through the rootfs's own tools (`apt-get`, `curl`,
- * `npm`), run inside proot — with one deliberate exception: the [mirror list feed][fetchMirrorList],
+ * Deliberately minimal, by decision: the userspace is a real Ubuntu with a working `apt`, and
+ * everything past that base (Python, Node.js, an editor, a compiler) is the user's own
+ * `apt-get install` inside the terminal. The base is what makes that possible; guessing at the
+ * rest would put a curated toolchain and its third-party registries in the install path for
+ * everybody, and a `deb.nodesource.com` outage would then decide whether "Ubuntu" installed.
+ *
+ * Nothing here talks to the network except through the rootfs's own tools (`apt-get`, `curl`),
+ * run inside proot — with one deliberate exception: the [mirror list feed][fetchMirrorList],
  * which the app fetches itself because apt cannot run before its own sources are configured, and
  * because the feed only ever *reorders* candidates, never bypasses a pin.
  *
@@ -92,11 +99,11 @@ class UbuntuDistributionManager(
      * success, because the state machine only marks the userspace installed once everything below
      * (including [healthProbe]) has passed.
      *
-     * The softer steps are deliberately softer: [SetupStep.INSTALL_NODEJS] and
-     * [SetupStep.INSTALL_GLOBAL_TOOLS] depend on third-party registries outside the pinned Ubuntu
-     * archive, so a failure there is reported as a warning rather than an error — an outage at
-     * deb.nodesource.com or npmjs.com must not leave the user with "install failed" over a
-     * toolchain the Repair button can add later.
+     * Every step now comes from the pinned Ubuntu archive, reached through [aptUpdate]'s ladder, so
+     * there is no step whose failure is tolerable: the two that were (a Node.js install from
+     * NodeSource and two npm globals) are gone with the toolchain they brought, and [SetupReport]
+     * carries warnings for the two softer things that remain inside a step — a base package apt
+     * would only install on its own, and sudo.
      *
      * @param onStep invoked as each step begins, for the install screen's progress display
      * @param onProgress invoked with the newest output line of the long-running commands, so a
@@ -145,10 +152,6 @@ class UbuntuDistributionManager(
         onStep(SetupStep.INSTALL_BASE_PACKAGES)
         installBasePackages(onProgress, warnings)
         configureSudo(warnings)
-        onStep(SetupStep.INSTALL_NODEJS)
-        installNodeJs(warnings, onProgress)
-        onStep(SetupStep.INSTALL_GLOBAL_TOOLS)
-        installGlobalTools(warnings)
         onStep(SetupStep.VERIFY)
         return SetupReport(warnings.toList())
     }
@@ -318,10 +321,11 @@ class UbuntuDistributionManager(
 
     /**
      * Writes the primary archive into sources.list, and retires every apt source the rootfs
-     * shipped that the app did not write. Ubuntu Base's newer releases carry a deb822
-     * `ubuntu.sources` pointed at the primary archive: left alone, every rung would fetch the
-     * failing primary alongside the mirror under test and the ladder could never succeed. The
-     * app's own NodeSource entry is ours, not a shipped one — a repair must not retire it.
+     * shipped. Ubuntu Base's newer releases carry a deb822 `ubuntu.sources` pointed at the primary
+     * archive: left alone, every rung would fetch the failing primary alongside the mirror under
+     * test and the ladder could never succeed. All of them go, because every list in
+     * `sources.list.d` is a shipped one — the app's own entry lives in `sources.list` itself (see
+     * [writeSourcesList]) — so there is no entry here to make an exception for.
      */
     private fun configureAptSources() {
         disableShippedAptLists()
@@ -333,9 +337,8 @@ class UbuntuDistributionManager(
         val shipped = dir.listFiles() ?: return
         for (file in shipped) {
             val name = file.name
-            val ours = name == NODESOURCE_LIST_FILE
             val aptList = name.endsWith(".list") || name.endsWith(".sources")
-            if (!ours && aptList && !name.endsWith(".disabled")) {
+            if (aptList && !name.endsWith(".disabled")) {
                 if (file.renameTo(File(dir, "$name.disabled"))) {
                     diagnostics.record(
                         UserspaceDiagnosticCategory.APT,
@@ -359,8 +362,7 @@ class UbuntuDistributionManager(
      * Every rung runs *scoped* — `Dir::Etc::sourcelist` pinned to the sources.list it just wrote,
      * `sourceparts` pointed at /dev/null — so a rung's verdict is a fact about the archive under
      * test, not about whatever else the rootfs's `sources.list.d` carries. The winner is then
-     * confirmed by one unscoped update, which picks up the other lists too (a NodeSource entry,
-     * on a repair).
+     * confirmed by one unscoped update, which is what a later `apt-get install` sees.
      *
      * Three verdicts are not any mirror's, and the ladder treats them accordingly: a rung that
      * dies with the launcher's exit code (126/127/128+n) or with proot's own error text aborts
@@ -676,10 +678,10 @@ class UbuntuDistributionManager(
     }
 
     /**
-     * The apt-delivered toolchain. Node.js is *not* here: the Ubuntu archive's own `nodejs` lags
-     * years behind (jammy ships 12.x, end-of-life since 2022), and the spec's toolchain — `pnpm`,
-     * the OpenCode CLI — needs a modern runtime, so [installNodeJs] installs a current one from
-     * the pinned NodeSource repository instead.
+     * The base packages, and the whole of what the install adds: a shell and its completions, the
+     * package manager, TLS roots, the two fetch tools, git, sudo and an SSH client. Everything
+     * else — Python, Node.js, an editor, a compiler — is a `apt-get install` away inside the
+     * terminal, which is the point of installing a real Ubuntu rather than a curated toolbox.
      *
      * Not all-or-nothing: the whole list is asked for first; a failure retries once with
      * `--fix-missing` (a partially-populated cache from an interrupted earlier run is exactly
@@ -844,62 +846,6 @@ class UbuntuDistributionManager(
             file.setReadable(true, false)
         } catch (t: Throwable) {
             warnings += "sudo configuration skipped: ${t.message ?: t.javaClass.simpleName}"
-        }
-    }
-
-    /**
-     * Installs Node.js from the NodeSource repository, pinned to one major version in the sources
-     * entry. The key is fetched over HTTPS and dearmored with the `gnupg` from the base packages,
-     * then the entry is `signed-by` — the apt-native way to trust exactly one repository, not the
-     * whole keyring.
-     *
-     * The suite is `nodistro`: NodeSource publishes one suite for every distribution it supports,
-     * not one per Ubuntu codename — the entry this replaced named `jammy` and `apt-get update`
-     * 404'd on it. The NodeSource update is scoped to the NodeSource list alone, because the
-     * Ubuntu archive lists were fetched minutes ago and re-fetching them would re-run the entire
-     * ladder's download for one new repository.
-     *
-     * Best-effort, like the npm tools below: NodeSource is a third-party registry outside the
-     * pinned archive, and an outage there must not read as "Ubuntu install failed" — the warning
-     * names it, and Repair retries it. armhf is skipped outright: NodeSource publishes amd64 and
-     * arm64 only, and a 32-bit ARM phone cannot run its packages at all.
-     */
-    private suspend fun installNodeJs(warnings: MutableList<String>, onProgress: (String) -> Unit) {
-        if (distro.ubuntuArch == "armhf") {
-            warnings += "Node.js was not installed: NodeSource publishes no armhf packages"
-            return
-        }
-        val command =
-            listOf(
-                "curl -fsSL $NODESOURCE_KEY_URL -o /tmp/nodesource.key",
-                "gpg --dearmor -o /usr/share/keyrings/nodesource.gpg /tmp/nodesource.key",
-                "echo 'deb [signed-by=/usr/share/keyrings/nodesource.gpg] " +
-                    "$NODESOURCE_REPO $NODESOURCE_SUITE main' > /etc/apt/sources.list.d/nodesource.list",
-                "apt-get update $NODESOURCE_SCOPED_UPDATE_FLAGS",
-                "apt-get install -y nodejs",
-            ).joinToString(" && ")
-        val result = runRootCommand(command, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
-        if (result == null || result.exitCode != 0) {
-            warnings +=
-                "Node.js was not installed" +
-                    (failureTail(result?.outputText(), lines = 1)
-                        ?.let { ": $it" } ?: ": the install timed out")
-        }
-    }
-
-    /**
-     * The npm-delivered toolchain, one package at a time so one failure does not take the other
-     * down with it. Best-effort by design — see [setup].
-     */
-    private suspend fun installGlobalTools(warnings: MutableList<String>) {
-        for (tool in GLOBAL_TOOLS) {
-            val result = runRootCommand("npm install -g $tool", GLOBAL_TOOL_TIMEOUT_MS)
-            if (result == null || result.exitCode != 0) {
-                warnings +=
-                    "npm package '$tool' was not installed" +
-                        (failureTail(result?.outputText(), lines = 1)
-                            ?.let { ": $it" } ?: ": the install timed out")
-            }
         }
     }
 
@@ -1165,25 +1111,21 @@ class UbuntuDistributionManager(
         const val DEFAULT_MIRROR_LIST_URL = "https://mirrors.ubuntu.com/mirrors.txt"
 
         /**
-         * The apt-delivered toolchain: editors and file tools, certificates, git, Python, sudo and
-         * the gnupg [installNodeJs] needs. Node/npm/pip are installed by [installNodeJs] /
-         * arriving with their packages.
+         * The base packages the install adds, and the whole of the toolchain by decision: a shell
+         * and its completions, the package manager, TLS roots, curl/wget, git, sudo and an SSH
+         * client. Nothing here comes from outside the pinned Ubuntu archive, so a step that
+         * installs them has no third-party registry to survive — which is what makes the userspace
+         * minimal on purpose rather than by omission. Python, Node.js and everything else are one
+         * `apt-get install` away inside the terminal, on the user's own terms.
          */
         private val BASE_PACKAGES = listOf(
             "bash-completion",
             "ca-certificates",
             "curl",
             "git",
-            "gnupg",
-            "less",
             "openssh-client",
-            "procps",
-            "python3",
-            "python3-pip",
             "sudo",
-            "unzip",
             "wget",
-            "zip",
         )
 
         /**
@@ -1243,38 +1185,6 @@ class UbuntuDistributionManager(
             "update-alternatives: warning",
         )
 
-        /**
-         * npm packages installed globally. `opencode-ai` is the OpenCode CLI's published npm name;
-         * `pnpm` is fetched from npm exactly as its own docs install it.
-         */
-        private val GLOBAL_TOOLS = listOf("pnpm", "opencode-ai")
-
-        private const val NODESOURCE_KEY_URL =
-            "https://deb.nodesource.com/gpgkey/nodesource.gpg.key"
-
-        /** The file [installNodeJs] writes — ours, never to be retired by [disableShippedAptLists]. */
-        private const val NODESOURCE_LIST_FILE = "nodesource.list"
-
-        /** One pinned major Node series; a bump is a deliberate change, not drift. */
-        private const val NODESOURCE_REPO = "https://deb.nodesource.com/node_24.x"
-
-        /**
-         * NodeSource's one suite for every distribution it supports; a per-codename suite like
-         * `jammy` no longer exists on their repository.
-         */
-        private const val NODESOURCE_SUITE = "nodistro"
-
-        /**
-         * Updates only the NodeSource list: the Ubuntu lists were fetched by [aptUpdate]'s ladder
-         * minutes ago, and re-fetching them would re-download the whole archive for one new
-         * repository. `List-Cleanup=0` stops apt from deleting the other lists it was told not to
-         * look at.
-         */
-        private const val NODESOURCE_SCOPED_UPDATE_FLAGS =
-            "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/nodesource.list " +
-                "-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0 " +
-                "-o Acquire::Retries=3 -o Acquire::Languages=none -o Acquire::http::Timeout=30"
-
         private const val PROBE_MARKER = "eclipse-probe-ok"
 
         /** What the runtime smoke step echoes back; anything else — or nothing — is a launch failure. */
@@ -1303,7 +1213,6 @@ class UbuntuDistributionManager(
          */
         private const val APT_UPDATE_ATTEMPT_TIMEOUT_MS = 10 * 60_000L
         private const val INSTALL_TIMEOUT_MS = 45 * 60_000L
-        private const val GLOBAL_TOOL_TIMEOUT_MS = 15 * 60_000L
 
         /** The mirror feed must answer quickly or not participate at all. */
         // HttpURLConnection's timeouts are Int milliseconds, so the constant stays Int even though
@@ -1320,8 +1229,10 @@ class UbuntuDistributionManager(
         /**
          * The apt phase's disk budget: the base system is already on disk, so this is the
          * packages' unpacked size plus apt's own working space, as a multiple of the tarball the
-         * same way the installer's gate budgets. Base + toolchain + Node.js unpacked is a few
-         * multiples of the ~30 MB Base tarball in practice.
+         * same way the installer's gate budgets. The base packages are a few multiples of the
+         * ~30 MB Base tarball in practice, and the multiple is deliberately generous now that the
+         * list is seven packages: it is this gate's job to refuse before apt is asked anything, and
+         * a budget that guesses low fails as ENOSPC twenty minutes in.
          */
         private const val APT_TARBALL_MULTIPLE = 4L
 
@@ -1567,14 +1478,12 @@ enum class SetupStep {
     CONFIGURE_APT,
     UPDATE_PACKAGES,
     INSTALL_BASE_PACKAGES,
-    INSTALL_NODEJS,
-    INSTALL_GLOBAL_TOOLS,
     VERIFY,
 }
 
 /** What [UbuntuDistributionManager.setup] has to say beyond "done". */
 data class SetupReport(
-    /** Non-fatal problems: global npm tools that did not install, sudo not configured. */
+    /** Non-fatal problems: base packages that would not install, sudo not configured. */
     val warnings: List<String>,
 )
 

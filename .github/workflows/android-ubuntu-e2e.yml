@@ -8,7 +8,7 @@
 #   - the driver drives the UI a user would drive: Settings -> the Ubuntu on
 #     this device window -> Install -> confirm, then watches the real download
 #     (pinned Ubuntu Base rootfs over the network), SHA-256 verification,
-#     extraction, apt setup and the toolchain install inside proot;
+#     extraction, apt setup and the base-package install inside proot;
 #   - only THEN does the arg-gated UbuntuE2eVerificationTest execute commands
 #     in the installed environment (shell, os-release, account, DNS, apt,
 #     HTTP, persistence markers) through the app's own session argv;

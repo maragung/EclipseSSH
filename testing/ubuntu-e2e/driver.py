@@ -8,7 +8,7 @@ Design contract (the pipeline's whole point):
 
   - No mocking anywhere. The app downloads the pinned Ubuntu Base rootfs over
     the network, verifies its SHA-256, extracts it, configures apt inside proot
-    and installs the toolchain. The driver only watches and pokes the UI.
+    and installs the base packages. The driver only watches and pokes the UI.
   - The UI says "Installed and verified" is NOT the pass criterion - it is the
     point where the deep verification starts. The instrumented
     UbuntuE2eVerificationTest then executes commands in the installed
@@ -149,8 +149,6 @@ STEP_SUBTITLES = (
     "Configuring package sources",
     "Updating package lists",
     "Installing the base packages",
-    "Installing Node.js",
-    "Installing pnpm and the OpenCode CLI",
     "Running the health check",
 )
 

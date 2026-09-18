@@ -104,7 +104,7 @@ class LinuxUserspaceManagerTest {
         assertThat(harness.installer.rootfsDir.resolve("home/ubuntu/workspace").isDirectory).isTrue()
 
         // The setup pipeline really ran through the scripted proot: package lists updated, the
-        // toolchain installed, and both ran with fake root (the "-0" proot sessions need for dpkg).
+        // base packages installed, and both ran with fake root (the "-0" proot sessions need for dpkg).
         // The happy path never leaves the ladder's first rung - the primary archive succeeds and no
         // mirror is fetched - which is what pins the flags every rung carries.
         val rootCommands = harness.spawner.commandsWith.filter { it.first }

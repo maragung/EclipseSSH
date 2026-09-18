@@ -35,10 +35,11 @@ as the session is ready.
 and either opens in its own full-screen window riding the session's tunnel — so a machine that speaks
 RFB or RDP is driven from the app that already holds its credentials.
 
-**On-device Linux.** A real Ubuntu userland — bash, apt, git, Python, Node.js — installed into the
-app's own sandbox and run under proot: no VM, no root, no ISO, and a local shell that is the same
-terminal channel an SSH one is. Architecture and operating manual:
-[`docs/linux-userspace.md`](docs/linux-userspace.md).
+**On-device Linux.** A real Ubuntu userland — bash, apt, git, curl, wget, sudo and an SSH client
+— installed into the app's own sandbox and run under proot: no VM, no root, no ISO, and a local
+shell that is the same terminal channel an SSH one is. Anything past that base (Python, Node.js,
+an editor, a compiler) is one `apt-get install` away inside the terminal. Architecture and
+operating manual: [`docs/linux-userspace.md`](docs/linux-userspace.md).
 
 **Files.** A text editor for the files the app browses — opened from the explorer, a preview sheet or
 the New File dialog — in its own opaque window rather than a panel over the workspace. An archive
@@ -112,7 +113,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,749 JVM/Robolectric test methods in 152 test files and runs offline: the SSH and SFTP
+The suite is 1,748 JVM/Robolectric test methods in 152 test files and runs offline: the SSH and SFTP
 integration tests start a real Apache MINA SSHD server on a loopback port inside the test JVM, so
 nothing external is contacted and no public or shared SSH account is involved. That figure is the
 count of `@Test` methods in `app/src/test` — a few of them sit behind `assumeTrue` and report as

@@ -9,7 +9,7 @@ survive the app dying.
 
 Nothing here is mocked. The app downloads the pinned Ubuntu Base rootfs over
 the network, verifies its SHA-256, extracts it under proot, configures apt
-inside it and installs the toolchain — the driver only drives and watches.
+inside it and installs the base packages — the driver only drives and watches.
 
 ## Pieces
 

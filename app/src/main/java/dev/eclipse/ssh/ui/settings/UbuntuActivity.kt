@@ -219,7 +219,7 @@ class UbuntuActivity : SettingsDestinationActivity() {
                     if (ui.hasPendingWorkspaceBackup) {
                         "Not installed · a saved workspace will be restored"
                     } else {
-                        "Not installed · real bash, apt, Node.js and Python, on the device"
+                        "Not installed · real bash, apt and git, on the device"
                     },
                 ) {
                     // The version chooser lives here and only here: once anything is on disk the
@@ -384,9 +384,11 @@ class UbuntuActivity : SettingsDestinationActivity() {
                 title = { Text("Install ${distroTitle(ui)}?") },
                 text = {
                     Text(
-                        "A verified ${distroTitle(ui)} root filesystem (~30 MB) is downloaded and the " +
-                            "toolchain — bash, git, Python, Node.js — is installed through apt itself, " +
-                            "which needs a few hundred MB over your network. Nothing runs as root, and the " +
+                        "A verified ${distroTitle(ui)} root filesystem (~30 MB) is downloaded and its " +
+                            "base packages — bash, apt, git, curl, wget and an SSH client — are " +
+                            "installed through apt itself, which needs a few hundred MB over your " +
+                            "network. Anything else you want (Python, Node.js, an editor) is one " +
+                            "apt-get install away in the terminal. Nothing runs as root, and the " +
                             "workspace at /home/ubuntu/workspace survives Stop and Restart." +
                             if (ui.hasPendingWorkspaceBackup) {
                                 " Your saved workspace is restored after the install."
@@ -592,8 +594,6 @@ private fun describeSetupStep(step: SetupStep, detail: String?): String {
         SetupStep.CONFIGURE_APT -> "Configuring package sources"
         SetupStep.UPDATE_PACKAGES -> "Updating package lists"
         SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
-        SetupStep.INSTALL_NODEJS -> "Installing Node.js"
-        SetupStep.INSTALL_GLOBAL_TOOLS -> "Installing pnpm and the OpenCode CLI"
         SetupStep.VERIFY -> "Verifying"
     }
     // The newest command output beside the step's label: a slow-but-alive `apt-get update` shows
