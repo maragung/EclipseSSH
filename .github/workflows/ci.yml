@@ -577,6 +577,16 @@ jobs:
           fi
           echo "androidTest sources: $COUNT"
 
+      - name: Check the instrumentation keep list against the test sources
+        # The release-test suite failed both legs on run 35338666049 with
+        # NoClassDefFoundError: Landroidx/core/view/WindowCompat; - an app
+        # dependency the test resolves by name out of the minified release dex,
+        # which R8 had renamed because nothing kept it. The failure surfaced a
+        # whole release later, on an emulator, in a workflow this branch cannot
+        # run. This is the same check, static and second-long, next to the step
+        # that compiles those sources.
+        run: scripts/check-instrumentation-keeps.sh
+
       - name: Compile instrumentation tests
         # Kept even though .github/workflows/instrumentation.yml now runs
         # `connectedAndroidTest` on a hosted emulator: compiling the sources
