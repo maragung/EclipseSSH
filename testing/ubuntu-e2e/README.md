@@ -16,7 +16,7 @@ inside it and installs the toolchain — the driver only drives and watches.
 | Piece | Role |
 |---|---|
 | `.github/workflows/android-ubuntu-e2e.yml` | CI: builds the release x86_64 APK + androidTest APK, boots a hosted emulator, runs the driver, scans for crashes, reports, gates, and can run the autonomous repair loop. |
-| `driver.py` | The orchestrator: drives the real UI (Settings → Linux userspace → Install → confirm), watches the install, fires the lifecycle exercises and (FULL mode) the failure injections, runs the verification instrumentation, records per-phase results. |
+| `driver.py` | The orchestrator: drives the real UI (Settings → the **Ubuntu on this device** window → Install → confirm), watches the install, fires the lifecycle exercises and (FULL mode) the failure injections, runs the verification instrumentation, records per-phase results. |
 | `summary.py` | Renders `ubuntu-e2e-report.md` (the stage table) and, on failure, `failure-report.json` in the schema `testing/auto-fix.sh` consumes. |
 | `scripts/e2e-ubuntu.sh` | The local entry point: builds and installs a debug APK/test pair, then runs the driver. Its `--ci` flag skips that build and expects `$APK`/`$TEST_APK` already installed — no workflow uses it, because `android-ubuntu-e2e.yml` builds, signs and installs its own release pair and calls `driver.py` directly. |
 | `app/src/androidTest/.../UbuntuE2eVerificationTest.kt` | The deep verification, inside the app process: executes commands through the app's own session argv against the real installed userspace. Gated on `-e ubuntuE2e true`, so the ordinary release suite skips it. |
@@ -37,10 +37,13 @@ The driver reuses `testing/universal/adbutil.py` (guarded adb + UI dump/tap)
 Every executed phase green **and** no crash/ANR signature in the device log:
 a passing table with a crashed background service is a failed run.
 
-The install phase passing means the settings row reports *Installed and
+The install phase passing means the userspace row reports *Installed and
 verified* — which the app itself only reaches after its own health probe (a
-real shell, a real `getent`, a real `apt-get check`) passes. The verification
-phase then re-proves all of that independently, plus HTTP and the persistence
+real shell, a real `getent`, a real `apt-get check`) passes. The driver reads
+that row on whichever screen it is on: the window the install was started from
+while it runs, or the Settings row a lifecycle exercise relaunches the app
+onto, which reports the same state as one summary line. The verification phase
+then re-proves all of that independently, plus HTTP and the persistence
 markers, through the app's real session path.
 
 ## Local run

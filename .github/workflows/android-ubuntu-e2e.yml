@@ -5,10 +5,10 @@
 # What "for real" means here, end to end:
 #   - the release x86_64 APK (R8-minified, release-signed) is installed, not a
 #     debug build - the proot/native path must survive minification;
-#   - the driver drives the UI a user would drive: Settings -> Linux userspace
-#     -> Install -> confirm, then watches the real download (pinned Ubuntu
-#     Base rootfs over the network), SHA-256 verification, extraction, apt
-#     setup and the toolchain install inside proot;
+#   - the driver drives the UI a user would drive: Settings -> the Ubuntu on
+#     this device window -> Install -> confirm, then watches the real download
+#     (pinned Ubuntu Base rootfs over the network), SHA-256 verification,
+#     extraction, apt setup and the toolchain install inside proot;
 #   - only THEN does the arg-gated UbuntuE2eVerificationTest execute commands
 #     in the installed environment (shell, os-release, account, DNS, apt,
 #     HTTP, persistence markers) through the app's own session argv;
