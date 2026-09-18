@@ -4618,12 +4618,15 @@ line of the application: no composable, no screen, no repository, not the native
 changes is which of the application's classes R8 is still allowed to rename, and it adds the check
 that would have caught the omission before a release was published instead of after.
 
-The other six files in the range are `app/proguard-instrumentation.pro` (+15),
-`scripts/check-instrumentation-keeps.sh` (+116, new), `.github/workflows/ci.yml` (+10, the guard's
-step), `testing/ubuntu-e2e/driver.py` (+72/−2), `testing/ubuntu-e2e/test_driver_matchers.py` (+80,
-new), and this file. Nothing under `app/src/androidTest` changes either. A patch number is the honest
-number for that: the artifact a user installs behaves as 1.2.0's does, and the difference is in what
-the pipeline will refuse to ship.
+The rest of the range is eight files and not one of them is application code: this file, whose header
+figures and §41 are the bulk of its diff; `app/build.gradle.kts` (the two version lines);
+`app/proguard-instrumentation.pro` (+15, the keeps); `scripts/check-instrumentation-keeps.sh` (+116,
+new, the guard); `.github/workflows/ci.yml` (+10, the step that runs it); `testing/README.md`
+(+12/−2, the drafts warning §40.6's rule came with); and the Ubuntu E2E pair,
+`testing/ubuntu-e2e/driver.py` (+72/−2) and `testing/ubuntu-e2e/test_driver_matchers.py` (+80, new).
+Nothing under `app/src/androidTest` changes either. A patch number is the honest number for that: the
+artifact a user installs behaves as 1.2.0's does, and the difference is in what the pipeline will
+refuse to ship.
 
 ### 41.1 The release that failed its own gate
 
@@ -4679,7 +4682,8 @@ runs the same gate over it. Run **35343449935 attempt 2** validated the rebuilt 
 
 - `Release APK on API 30` — **OK (47 tests)**, Verdict success.
 - `Release APK on API 35` — **OK (47 tests)**, Verdict success.
-- `scan-crashes.sh` clean on both legs (`crash-out.json`, 49 bytes), no `NoClassDefFoundError`.
+- `scan-crashes.sh` clean on both legs — each artifact's `crash-report.json` reads
+  `{"status": "clean", "signatureMatches": 0}` — and no `NoClassDefFoundError` on either.
 
 Attempt 1 of that same run failed on API 35, and it belongs on the record rather than in a retry
 button: `ReleaseChaosJourneyTest.rotatingThroughEveryDestinationKeepsTheScreenUsable` died with a
@@ -4692,14 +4696,15 @@ that suite.
 
 ### 41.5 What ships that is not the application
 
-Four of the five changes in this range are the harness and the record, and none of them rides in an
+Four of the eight files in this range are the harness and the record, and none of them rides in an
 artifact:
 
 - **#119** stops the Ubuntu E2E driver from trusting the IME dump on its own — a FULL run proved the
   dump can report a keyboard state the device is not in — and adds `test_driver_matchers.py` (80
   lines) so the matcher logic is tested rather than exercised.
 - **#122** records that FULL run, which closed §40.3's open question.
-- **#125** corrects §40.6 and states the rule it was missing.
+- **#125** corrects §40.6, states the rule it was missing, and puts the same warning in
+  `testing/README.md`, where the dispatch example lives.
 - **#123** is 41.1–41.3.
 
 A user who installs 1.2.1 gets 1.2.0's application. What they get that 1.2.0's did not have is a
