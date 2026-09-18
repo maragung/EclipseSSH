@@ -21,6 +21,20 @@
 # It is a check, never a fixer. Adding a name the suite genuinely needs is a one-line edit to the
 # keep file, and that edit is a decision about what R8 may shrink - not one a script should make.
 #
+# What it does not cover, so that a green run is not read as more than it is. The scan reads
+# *imports*, and two shapes of reference need none:
+#
+#   - A class named from the test's own package. The suite lives in dev.eclipse.ssh.linux, so
+#     UbuntuE2eVerificationTest's `state is LinuxUserspaceState.Stopped` resolves without an import
+#     and this script never sees the name. The two LinuxUserspaceState keeps in the keep file are a
+#     manual entry for exactly that reason, and nothing here reddens if a future same-package
+#     reference is not kept.
+#   - The application's own namespace (dev.eclipse.ssh.*), which is left out on purpose rather than
+#     by omission. Most classes there are already protected by other rules - Hilt's generated
+#     components, the manifest's components, AGP's defaults - so requiring an explicit keep for each
+#     would produce a list of names that do not need keeping, and a guard that cries wolf is worse
+#     than one with a stated limit.
+#
 # Usage: scripts/check-instrumentation-keeps.sh [keep-file]
 set -uo pipefail
 
