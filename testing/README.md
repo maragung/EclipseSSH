@@ -37,6 +37,14 @@ key's signing identity, and resource shrinking.
    release has no comment thread — `gh release` has no `comment` subcommand — and
    the call that stood here failed on *every* green run, so a release whose APK
    had passed every leg was reported as a gate failure.
+   The gate names what it actually tested: for a release event or an
+   `apk_source=release` dispatch that is the published tag, and for
+   `apk_source=build` it is the candidate the run assembled itself, written as
+   `<ref>@<commit>`. That distinction is why the summary, the issue title and the
+   report are all built from a *label* rather than from the tag: the tag is empty
+   in build mode, and issue **#124** was filed as `Release test failure: ` with a
+   body claiming a published release had been pulled back to draft when the run
+   had published nothing.
 4. **Auto-fix** — gated on the `ANTHROPIC_AUTH_TOKEN` repository secret. See
    below.
 
@@ -50,7 +58,8 @@ key's signing identity, and resource shrinking.
 | `verify-release-splits.sh` | Runs `verify-split-apk.sh` over each of the four release splits in turn — stopping at the first bad one, since the script is `set -euo pipefail` and calls the verifier unguarded, so a red split reports that split rather than all four. Holds the per-ABI library mapping in one place (`:freerdp` builds four ABIs, `:linux` three, so x86 carries eight libraries to the others' eleven) and is called by both `ci.yml` and `tagged-release.yml` so a PR gate and a release gate cannot disagree. |
 | `scan-crashes.sh` | Post-suite logcat scan for JVM fatals, ANRs, native crashes, force-closes. A passing suite with a crashed background service still fails the gate. Writes `crash-report.json`. |
 | `collect-diagnostics.sh` | Deterministic evidence collection (always, pass or fail): logcat, dumpsys activity/package/meminfo/gfxinfo, ANR traces, screenshot, environment record. |
-| `generate-report.py` | Composes `release-test-report.md` (verdict, tests, crashes, APK validation, RELEASE / DO NOT RELEASE recommendation) and, on failure, `failure-report.json` with failing tests, stacks, and the app frames a fix will most likely touch. |
+| `generate-report.py` | Composes `release-test-report.md` (what was under test, verdict, tests, crashes, APK validation, RELEASE / DO NOT RELEASE recommendation) and, on failure, `failure-report.json` with failing tests, stacks, and the app frames a fix will most likely touch. Its parser reads both of the runner's summaries — `OK (N tests)` and `Tests run: N,  Failures: F` — and reports the count as unknown rather than zero when a killed run printed neither. Its first argument is the *label* the workflow resolved, not a tag: the line it writes is `- Under test: \`…\``, which is a tag on a release run and `<ref>@<commit>` on a build-source run. |
+| `test_generate_report.py` | That parser's own tests, against the stdout shapes run 35338666049's artifacts contain. Run by `ci.yml`; needs no emulator. |
 | `auto-fix.sh` | The autonomous repair loop. See below. |
 | `universal/` | The `universal-apk-test.yml` pipeline's own scripts (`explore.py`, `adbutil.py`, `discover-app.py`, `generate-report.py`, `scan-issues.py`, `verify-apk.sh`, `auto-fix.sh`) and its README, which is the reference for that workflow's modes and budgets. |
 | `ubuntu-e2e/` | The `android-ubuntu-e2e.yml` driver (`driver.py`, `summary.py`) and its README. It drives a device directly and calls back into this directory's `auto-fix.sh` and `collect-diagnostics.sh`. |

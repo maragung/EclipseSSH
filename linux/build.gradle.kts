@@ -200,10 +200,16 @@ val fetchLinuxSource =
             }
 
             fun download(url: String, target: File) {
-                // samba.org sits behind a CDN that intermittently answers
-                // 504; one transient gateway error must not fail the whole
-                // native build (it cost CI a run on 2026-09-15). Same URL,
-                // bounded retries with backoff, sha256 still decides.
+                // A third-party mirror answering 5xx at the wrong moment must not
+                // fail a release-blocking job. samba.org sits behind a CDN that
+                // answers 503/504 in bursts: it cost CI a run on 2026-09-15, and
+                // on 2026-09-18 it answered 504 and then 503 three times in a row
+                // for talloc-2.4.2 - the whole four-retry window this loop used to
+                // have, about 50 seconds - and reddened an assemble job whose diff
+                // could not have caused it. The window below is roughly four
+                // minutes across seven attempts. Same URL, and the pinned sha256
+                // still decides what gets built: this waits out a transient
+                // upstream error, it does not paper over a real one.
                 fun fetchOnce(url: String, target: File): Int {
                     val connection = URL(url).openConnection() as HttpURLConnection
                     connection.connectTimeout = 30_000
@@ -223,18 +229,24 @@ val fetchLinuxSource =
                         connection.disconnect()
                     }
                 }
+                val backoffMillis = longArrayOf(10_000, 20_000, 40_000, 60_000, 60_000, 60_000)
                 var code = fetchOnce(url, target)
-                var retry = 0
-                while (code !in 200..299 && retry < 4) {
-                    retry++
+                var attempt = 1
+                while (code !in 200..299 && attempt <= backoffMillis.size) {
                     logger.warn(
-                        "downloading $url failed: HTTP $code - retry $retry/4",
+                        "downloading $url failed: HTTP $code - attempt " +
+                            "$attempt/${backoffMillis.size + 1}, waiting " +
+                            "${backoffMillis[attempt - 1] / 1000}s",
                     )
                     target.delete()
-                    Thread.sleep(5_000L * retry)
+                    Thread.sleep(backoffMillis[attempt - 1])
+                    attempt++
                     code = fetchOnce(url, target)
                 }
-                check(code in 200..299) { "downloading $url failed: HTTP $code" }
+                check(code in 200..299) {
+                    "downloading $url failed: HTTP $code after " +
+                        "${backoffMillis.size + 1} attempts over ~4 minutes"
+                }
             }
 
             fun sha256Of(file: File): String {
