@@ -680,6 +680,57 @@ class _LaggingImeAdb:
         self.logs.append(message)
 
 
+class _StaleImeAdb:
+    """The keyboard dump that lies - run 35328758621's failure, not 35323027141's.
+
+    There, `mInputShown=true` was true and the IME ate the first BACK. Here the run's
+    logcat has no `showSoftInput` and no `onRequestShow` after 09:50:51 at all, so no
+    keyboard was up, and the dump said `mInputShown=true` anyway. The BACK
+    `dismiss_ime` sent at 09:50:56 was therefore the only BACK on screen and it reached
+    the app: `ActivityTaskManager` logged `Transition ... type = CLOSE ... MainActivity
+    numActivities=0`, the launcher moved to front 19ms later, and process 8146 stayed
+    alive (it was still JIT-compiling at 09:51:07) - nothing crashed, one BACK
+    finished the root activity. `open_settings` then relaunched the app and called
+    `dismiss_ime` again, whose next stale reading finished the fresh activity in turn.
+
+    The lie is deliberately sticky, because that is what turns the caller's
+    relaunch-and-retry into a loop that kills the app once per attempt. `focused` is
+    the second opinion (`dumpsys window`) and `am_start` is the relaunch, so a fix
+    that only counts BACKs cannot pass this by accident."""
+
+    LAUNCHER = "com.android.launcher3"
+
+    def __init__(self, focused="dev.eclipse.ssh", package="dev.eclipse.ssh"):
+        self.package = package
+        self.focused = focused
+        self.backs = 0
+        self.am_starts = 0
+        self.logs = []
+
+    def shell(self, cmd, timeout=None):
+        if "input_method" in cmd:
+            return 0, "    mInputShown=true"  # the lie, for the whole phase
+        if "window" in cmd:
+            return 0, ("  mFocusedApp=ActivityRecord{1a2b3c u0 %s/.MainActivity t13}"
+                       % self.focused)
+        return 1, ""
+
+    def back(self):
+        self.backs += 1
+        # No keyboard is up, so nothing takes this BACK: it reaches the app, and the
+        # app's root activity finishing is what puts the launcher in front.
+        self.focused = self.LAUNCHER
+        return True
+
+    def am_start(self, package, activity):
+        self.am_starts += 1
+        self.focused = self.package
+        return True, ""
+
+    def log(self, message):
+        self.logs.append(message)
+
+
 class DismissIme(unittest.TestCase):
     """dismiss_ime's BACK count, which is a correctness property and not pacing: one
     BACK too many does not put the keyboard away, it exits the app. The interruption
@@ -727,6 +778,35 @@ class DismissIme(unittest.TestCase):
         self.assertTrue(self.driver.dismiss_ime())
         self.assertEqual(0, adb.backs)
         self.assertTrue(adb.launched)
+
+    def test_a_dump_that_lies_costs_a_relaunch_not_the_phase(self):
+        # Run 35328758621: `mInputShown=true` with no keyboard ever shown since
+        # 09:50:51, so the BACK went to the app and finished MainActivity. What must
+        # not happen is the phase dying on a tab bar that is not on screen - the app
+        # has to be back in front by the time this returns.
+        adb = _StaleImeAdb()
+        self.driver.adb = adb
+        self.driver.log = adb.log
+        self.driver.package = adb.package
+        # The fake's dump never stops lying, so the "keyboard is gone" answer stays
+        # False for the whole phase; the state left behind is what this asserts.
+        self.assertFalse(self.driver.dismiss_ime(settle=0.05))
+        self.assertEqual(1, adb.backs)
+        self.assertEqual(1, adb.am_starts)
+        self.assertEqual(adb.package, adb.focused)
+        self.assertTrue(any("left the app" in m for m in adb.logs))
+
+    def test_no_back_is_sent_into_a_window_that_is_not_the_app(self):
+        # The other half: once the app is gone, the next reading must not send
+        # another BACK at whatever is in front, and must not claim to have fixed it.
+        adb = _StaleImeAdb(focused=_StaleImeAdb.LAUNCHER)
+        self.driver.adb = adb
+        self.driver.log = adb.log
+        self.driver.package = adb.package
+        self.assertFalse(self.driver.dismiss_ime(settle=0.05))
+        self.assertEqual(0, adb.backs)
+        self.assertEqual(0, adb.am_starts)
+        self.assertTrue(any("not ours" in m for m in adb.logs))
 
 
 class CrashScanScope(unittest.TestCase):
