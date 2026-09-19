@@ -188,10 +188,8 @@ import dev.eclipse.ssh.data.model.ForwardType
 import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.HostKeyChallenge
 import dev.eclipse.ssh.data.model.HostProfile
-import dev.eclipse.ssh.data.model.ProxyType
 import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeRemoteDesktop
-import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isEnded
 import dev.eclipse.ssh.data.model.isLive
@@ -259,6 +257,7 @@ import dev.eclipse.ssh.ui.remotedesktop.RdpConfigDialog
 import dev.eclipse.ssh.ui.settings.ClipboardClearActivity
 import dev.eclipse.ssh.ui.settings.DiagnosticsActivity
 import dev.eclipse.ssh.ui.settings.ExportBackupActivity
+import dev.eclipse.ssh.ui.hosts.HostDetailsActivity
 import dev.eclipse.ssh.ui.settings.HostFormActivity
 import dev.eclipse.ssh.ui.settings.KeepAliveActivity
 import dev.eclipse.ssh.ui.settings.KeyGenActivity
@@ -279,15 +278,17 @@ import dev.eclipse.ssh.ui.AdvancedHostSection
 import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
-import dev.eclipse.ssh.ui.PortForwardManagerSheet
 import dev.eclipse.ssh.ui.forward.ForwardFormActivity
 import dev.eclipse.ssh.ui.forward.ForwardRequests
+import dev.eclipse.ssh.ui.forward.PortForwardManagerActivity
 import dev.eclipse.ssh.ui.SecretFieldKeyboard
 import dev.eclipse.ssh.ui.SecretPasteButton
 import dev.eclipse.ssh.ui.actions.ActionAnswer
 import dev.eclipse.ssh.ui.actions.ActionRequests
 import dev.eclipse.ssh.ui.actions.ArchiveEntryActionKind
 import dev.eclipse.ssh.ui.actions.FileActionKind
+import dev.eclipse.ssh.ui.actions.ForwardRuleKind
+import dev.eclipse.ssh.ui.actions.HostDetailsKind
 import dev.eclipse.ssh.ui.actions.SnippetActionKind
 import dev.eclipse.ssh.ui.actions.TransferActionKind
 import dev.eclipse.ssh.ui.sessions.SessionWhyActivity
@@ -301,8 +302,6 @@ import dev.eclipse.ssh.ssh.symbolicPermissions
 import dev.eclipse.ssh.data.credentials.HostCredentialUpdate
 import dev.eclipse.ssh.data.credentials.KeyEdit
 import dev.eclipse.ssh.data.credentials.SecretEdit
-import dev.eclipse.ssh.data.credentials.StoredCredentials
-import dev.eclipse.ssh.data.credentials.describe
 import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
 import dev.eclipse.ssh.data.saf.LocalFile
@@ -1036,15 +1035,9 @@ private fun EclipseWorkspace(
             { reason -> viewModel.reportUiMessage("Biometric unlock not enabled: $reason") },
         )
     }
-    var showHostDetails by remember { mutableStateOf<HostProfile?>(null) }
-    // The host whose port-forwarding manager sheet is open, by id rather than by profile: the sheet
-    // edits the host's saved rules, so it must read the *current* profile from the hosts flow every
-    // recomposition - a snapshot taken at open time would keep showing the pre-save rules after its
-    // own Save button, and would keep showing a host the user has since removed.
-    var forwardManagerHostId by remember { mutableStateOf<String?>(null) }
-    // The host whose remote-desktop endpoint dialog is open, by id for the same reason as the
-    // forwarding manager above: the dialog saves into the live profile, and a snapshot taken at
-    // open time would write a stale host back over a change made elsewhere while it was open.
+    // The host whose remote-desktop endpoint dialog is open, by id for the same reason the dialogs
+    // that save into a live profile all are: a snapshot taken at open time would keep showing a host
+    // the user has since removed.
     var remoteDesktopHostId by remember { mutableStateOf<String?>(null) }
     // The RDP endpoint dialog's host, by id for the same reason as the VNC one beside it.
     var rdpDesktopHostId by remember { mutableStateOf<String?>(null) }
@@ -1336,13 +1329,24 @@ private fun EclipseWorkspace(
                         if (LocalLinuxHost.isLocalHost(host.id)) viewModel.connect(host) else showAuthHost = host
                     },
                     onReconnectSession = { reconnectAndOpen(it) },
-                    onShowDetails = { showHostDetails = it },
+                    onShowDetails = {
+                        context.startActivity(
+                            HostDetailsActivity.intent(context, it, state.serverStats[it.id]),
+                        )
+                    },
                     onEditHost = { openHostForm(context, it) },
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = requestDuplicateHost,
-                    onManageForwards = { forwardManagerHostId = it.id },
+                    // A window, and handed the runtime half of its own subject here: the state
+                    // of every rule and the forwards actually bound are this workspace's, which is
+                    // what the manager window cannot read for itself. See ActionSubject.ForwardManager.
+                    onManageForwards = {
+                        context.startActivity(
+                            PortForwardManagerActivity.intent(context, it, state.forwardStatuses, state.forwardings),
+                        )
+                    },
                     onRemoteDesktop = requestRemoteDesktop,
                     onWakeOnLan = viewModel::wakeHost,
                     onRdpDesktop = requestRdpDesktop,
@@ -1508,13 +1512,24 @@ private fun EclipseWorkspace(
                         if (LocalLinuxHost.isLocalHost(host.id)) viewModel.connect(host) else showAuthHost = host
                     },
                     onReconnectSession = { reconnectAndOpen(it) },
-                    onShowDetails = { showHostDetails = it },
+                    onShowDetails = {
+                        context.startActivity(
+                            HostDetailsActivity.intent(context, it, state.serverStats[it.id]),
+                        )
+                    },
                     onEditHost = { openHostForm(context, it) },
                     onRemoveHost = { pendingDeleteHost = it },
                     onToggleFavoriteHost = { viewModel.saveHost(it.copy(isFavorite = !it.isFavorite)) },
                     onExportAccount = { pendingAccountExportHost = it; showAccountExportDialog = true },
                     onDuplicateHost = requestDuplicateHost,
-                    onManageForwards = { forwardManagerHostId = it.id },
+                    // A window, and handed the runtime half of its own subject here: the state
+                    // of every rule and the forwards actually bound are this workspace's, which is
+                    // what the manager window cannot read for itself. See ActionSubject.ForwardManager.
+                    onManageForwards = {
+                        context.startActivity(
+                            PortForwardManagerActivity.intent(context, it, state.forwardStatuses, state.forwardings),
+                        )
+                    },
                     onRemoteDesktop = requestRemoteDesktop,
                     onWakeOnLan = viewModel::wakeHost,
                     onRdpDesktop = requestRdpDesktop,
@@ -1643,32 +1658,11 @@ private fun EclipseWorkspace(
         }
     }
 
-    showHostDetails?.let { host ->
-        HostDetailsSheet(
-            host = host,
-            stats = state.serverStats[host.id],
-            credentials = state.savedCredentials[host.id] ?: StoredCredentials(),
-            onDismiss = { showHostDetails = null },
-            onForgetCredentials = { viewModel.forgetCredentials(host) },
-            onRefreshStats = { viewModel.refreshStats(host) },
-        )
-    }
-    forwardManagerHostId?.let { hostId ->
-        // Resolved from the live hosts flow rather than a snapshot taken when the sheet opened: the
-        // sheet's own saves rewrite the host's rules, and a host removed while its manager was open
-        // closes the sheet rather than editing a profile that no longer exists.
-        state.hosts.firstOrNull { it.id == hostId }?.let { host ->
-            PortForwardManagerSheet(
-                host = host,
-                statuses = state.forwardStatuses,
-                runningForwards = state.forwardings,
-                onDismiss = { forwardManagerHostId = null },
-                onStartRule = { viewModel.startForwardRule(hostId, it) },
-                onStopRule = viewModel::stopForwardRule,
-                onSaveRules = { viewModel.saveForwardRules(hostId, it) },
-            )
-        }
-    }
+    // The host details sheet and the port-forwarding manager that stood here are windows of their
+    // own now ([HostDetailsActivity] and [PortForwardManagerActivity]), and what they answer comes
+    // back through [ActionRequests] on the workspace's next resume rather than through this
+    // composition - see [onResume]. Both subjects carry a snapshot of the half of themselves the
+    // workspace owns, which is why they are opened with a token rather than an id.
     remoteDesktopHostId?.let { hostId ->
         // Resolved from the live hosts flow, like the forwarding manager above: the dialog's own
         // saves rewrite this profile, and a host removed while the dialog was open closes it
@@ -2070,6 +2064,42 @@ private fun EclipseWorkspace(
                 TransferActionKind.OPEN_FILE_WITH ->
                     openTransferFileExternally(context, transfer, choose = true, onNoApp = viewModel::reportUiMessage)
                 TransferActionKind.COPY_DETAILS -> viewModel.copyToClipboard(transferDetails(transfer))
+            }
+        }
+        // The forwarding manager's own two halves. Both resolve the host from the live list first,
+        // for the reason the transfer above does: a host removed while its manager was open has no
+        // rules left to start, and the save path would otherwise write a column for a host that is
+        // gone. The rules themselves are the window's whole new list rather than a delta it computed
+        // - that is the engine's own contract, and it is what makes its stop-the-removed behaviour
+        // apply to this window exactly as it applies to a connect.
+        if (answer is ActionAnswer.ForwardRuleAction) {
+            val host = state.hosts.firstOrNull { it.id == answer.hostId }
+            if (host == null) {
+                viewModel.reportUiMessage("That host is no longer configured, so no rule was changed")
+            } else when (answer.action) {
+                ForwardRuleKind.START -> viewModel.startForwardRule(host.id, answer.ruleId)
+                // No host id: the engine's stop is keyed on the rule, because a tunnel is stopped
+                // where it was started and the rule already knows which host it belongs to.
+                ForwardRuleKind.STOP -> viewModel.stopForwardRule(answer.ruleId)
+            }
+        }
+        if (answer is ActionAnswer.ForwardRules) {
+            if (state.hosts.none { it.id == answer.hostId }) {
+                viewModel.reportUiMessage("That host is no longer configured, so no rule was saved")
+            } else {
+                viewModel.saveForwardRules(answer.hostId, answer.rules)
+            }
+        }
+        // The host details window's two rows. Both are view-model calls and neither is a read, which
+        // is the whole reason they are answers: forgetting the credentials also unregisters the
+        // host's live session, and a stats refresh is a connection this workspace owns.
+        if (answer is ActionAnswer.HostDetailsAction) {
+            val host = state.hosts.firstOrNull { it.id == answer.hostId }
+            if (host == null) {
+                viewModel.reportUiMessage("That host is no longer configured")
+            } else when (answer.action) {
+                HostDetailsKind.FORGET_CREDENTIALS -> viewModel.forgetCredentials(host)
+                HostDetailsKind.REFRESH_STATS -> viewModel.refreshStats(host)
             }
         }
         // Cleared for every kind this drain owns, and for the archive's too, which is drained in its
@@ -5486,57 +5516,3 @@ private fun openHostForm(context: Context, host: HostProfile? = null) {
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun HostDetailsSheet(
-    host: HostProfile,
-    stats: ServerStats?,
-    credentials: StoredCredentials,
-    onDismiss: () -> Unit,
-    onForgetCredentials: () -> Unit,
-    onRefreshStats: () -> Unit,
-) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 22.dp).navigationBarsPadding().padding(bottom = 18.dp)) {
-            Text(host.name, style = MaterialTheme.typography.headlineSmall); Text("${host.username}@${host.host}:${host.port}", color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(18.dp))
-            DetailLine("Authentication", host.authMethod.label)
-            DetailLine("Group", host.group)
-            DetailLine("Route", host.proxyType.label)
-            if (host.proxyType == ProxyType.PROXY_JUMP) DetailLine("Jump host", host.proxyJump ?: "—")
-            if (host.proxyType == ProxyType.SOCKS5 || host.proxyType == ProxyType.HTTP_CONNECT) {
-                DetailLine(if (host.proxyType == ProxyType.HTTP_CONNECT) "HTTP proxy" else "SOCKS5", "${host.socksHost}:${host.socksPort}")
-                if (!host.socksUsername.isNullOrBlank()) DetailLine("Proxy auth", host.socksUsername)
-            }
-            if (host.accentColor != null) DetailLine("Accent", "Custom")
-            DetailLine("Fingerprint", host.fingerprint ?: "Not verified yet")
-            DetailLine("Reconnect", "Automatic on network recovery")
-            // Shown for every host, including those with nothing saved: "Asked at every connect" is
-            // the answer to the question this line exists to answer, and leaving the row out when the
-            // answer is "nothing" makes its absence indistinguishable from the app not tracking it.
-            DetailLine("Credentials", credentials.describe())
-            // Only what the card's own menu does not already offer. Connect, Details, Port
-            // forwarding, Favorite, Export account, Edit and Remove are all one tap away on every
-            // row through the kebab, so repeating them here meant two paths to each act. What is
-            // left is the one action only this sheet can do: dropping the saved secrets, which
-            // lives here because it belongs with the Credentials line above it rather than in a menu
-            // the user opens for other reasons.
-            if (!credentials.isEmpty) {
-                OutlinedButton(onClick = onForgetCredentials) { Text("Forget credentials") }
-            }
-            Spacer(Modifier.height(18.dp))
-            Text("Monitoring".uppercase(), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.2.sp)
-            if (stats == null) {
-                TextButton(onClick = onRefreshStats) { Text("Load server stats") }
-            } else {
-                DetailLine("Hostname", stats.hostname)
-                DetailLine("Load average", stats.loadAverage)
-                DetailLine("Memory", "${stats.memoryUsed} / ${stats.memoryTotal}")
-                DetailLine("Disk /", "${stats.diskUsed} / ${stats.diskTotal}")
-                TextButton(onClick = onRefreshStats) { Text("Refresh stats") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DetailLine(label: String, value: String) { Row(Modifier.fillMaxWidth().padding(vertical = 7.dp)) { Text(label, Modifier.width(115.dp), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium); Text(value, Modifier.weight(1f), fontWeight = FontWeight.SemiBold) } }

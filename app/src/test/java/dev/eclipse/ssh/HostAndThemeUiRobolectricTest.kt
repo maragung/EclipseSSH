@@ -23,6 +23,10 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.ActionSubject
+import dev.eclipse.ssh.ui.forward.PortForwardManagerActivity
+import dev.eclipse.ssh.ui.hosts.HostDetailsActivity
 import dev.eclipse.ssh.ui.settings.HostFormActivity
 import java.time.Duration
 import kotlinx.coroutines.runBlocking
@@ -421,35 +425,43 @@ class HostAndThemeUiRobolectricTest {
     }
 
     /**
-     * The menu's Details item opens what only the sheet has: the saved configuration.
+     * The menu's Details item opens the host's own window, on that host, and none of the menu's own
+     * actions come with it.
      *
-     * The arrow this test used to drive sat beside the kebab as a second way into the same sheet, and
-     * the sheet carried buttons for the favourite flag and the export, which the menu now owns too. So
-     * the negative assertions are the ones that keep the duplication from creeping back, and the detail
-     * lines are what must survive: everything the menu has nowhere else to put.
+     * The detail lines used to be asserted here, by reading them out of the sheet's composition. They
+     * cannot be any more: the details are an Activity now, and under Robolectric a `startActivity` is
+     * recorded, not performed, so the target never composes and none of its text exists to query. Those
+     * assertions moved to `HostDetailsActivityRobolectricTest`, which launches the window directly with
+     * this same subject and reads the lines out of it.
+     *
+     * What is left is the wiring and the shape of the handoff, which is what this level can still see:
+     * the window opens, it is opened on the host the kebab belonged to, and it is a window rather than
+     * another dialog over the list.
      */
     @Test
-    fun detailsFromTheMenuOpensTheSheetAndLeavesTheMenuActionsToTheMenu() {
+    fun detailsFromTheMenuOpensTheHostsWindowOnThatHost() {
         val host = addHost("Detailed", hostname = "details.example.test", username = "reader", port = 2022)
+
+        // Drain whatever startup queued, so the peek below only ever reports this click's doing.
+        // Peeking does not consume, so a stale intent would mask the one under test.
+        while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
+        val dialogsBefore = ShadowDialog.getShownDialogs().size
 
         openKebabMenu(host.name, "Details")
         compose.onNodeWithText("Details").performClick()
-        pumpUntil(describe = { "the details sheet never composed" }) {
-            compose.onAllNodesWithText("Authentication").fetchSemanticsNodes().isNotEmpty()
-        }
+        pump()
 
-        // The detail half: what is saved about this host, and what the vault holds for it.
-        listOf("Authentication", "Fingerprint", "Credentials", "Route").forEach { label ->
-            assertWithMessage("the sheet no longer shows $label")
-                .that(compose.onAllNodesWithText(label).fetchSemanticsNodes()).isNotEmpty()
-        }
-        // And none of what the kebab now offers. "Connect securely" rather than "Connect": the sheet's
-        // old button carried that label, and matching the short form would also match the menu item
-        // behind it.
-        listOf("Connect securely", "Edit", "Delete", "Favorite", "Unfavorite", "Export account", "Duplicate").forEach { duplicate ->
-            assertWithMessage("$duplicate is back in the sheet, where the kebab already offers it")
-                .that(compose.onAllNodesWithText(duplicate).fetchSemanticsNodes()).isEmpty()
-        }
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        assertWithMessage("Details did not open ${HostDetailsActivity::class.simpleName}")
+            .that(intent?.component?.className).isEqualTo(HostDetailsActivity::class.java.name)
+        // The subject travels as a token rather than an extra, because the stats half of it has no
+        // singleton behind it. Resolving the token is therefore the only way to assert *which* host the
+        // window was opened on - and taking it here is safe: the test never launches the window itself.
+        val subject = ActionRequests.take(intent?.getStringExtra(ActionRequests.EXTRA_SUBJECT_TOKEN))
+        assertWithMessage("Details did not carry the host it was opened from")
+            .that((subject as? ActionSubject.HostDetails)?.hostId).isEqualTo(host.id)
+        assertWithMessage("Details still opened as a dialog over the list")
+            .that(ShadowDialog.getShownDialogs().size).isEqualTo(dialogsBefore)
     }
 
     /**
@@ -533,21 +545,33 @@ class HostAndThemeUiRobolectricTest {
     /**
      * Port forwarding lives on the host, and the kebab is the host's one way into everything besides
      * connect - so the manager opens from there, on the host it was opened for, and not from Settings.
+     *
+     * It used to be asserted where it composed, because a bottom sheet composes into the workspace's own
+     * window and can be waited on. It is an Activity now, and under Robolectric a `startActivity` is
+     * recorded rather than performed, so the window's own rows are asserted in
+     * `PortForwardManagerActivityRobolectricTest` instead. What this level still owns is the wiring: the
+     * manager opens, and the subject names the host whose kebab was used.
      */
     @Test
-    fun portForwardingInTheKebabOpensThePerHostManagerSheet() {
+    fun portForwardingInTheKebabOpensThePerHostManagerOnThatHost() {
         val host = addHost("Forwarder", hostname = "fwd.example.test", username = "forwarder")
+
+        // Peeking does not consume, so a stale intent would mask the one under test.
+        while (runCatching { shadowOf(compose.activity.application).nextStartedActivity }.getOrNull() != null) Unit
 
         openKebabMenu(host.name, "Port forwarding")
         compose.onNodeWithText("Port forwarding").performClick()
-        // Anchored on "Add rule" rather than the sheet's own "Port forwarding" title: the kebab item
-        // and the title are the same string, and this way the assertion is about the manager being
-        // up, not about text that could survive from the menu that just closed. A bottom sheet
-        // composes into the same window, so it can be waited on where a dialog cannot.
-        pumpUntil(describe = { "the forwarding manager never opened" }) {
-            compose.onAllNodesWithText("Add rule").fetchSemanticsNodes().isNotEmpty()
-        }
-        compose.onNodeWithText("Add rule").assertIsDisplayed()
+        pump()
+
+        val intent = shadowOf(compose.activity.application).peekNextStartedActivity()
+        assertWithMessage("Port forwarding did not open ${PortForwardManagerActivity::class.simpleName}")
+            .that(intent?.component?.className).isEqualTo(PortForwardManagerActivity::class.java.name)
+        // The token carries the host id *and* the runtime snapshot, and taking it is how this level can
+        // see which host the manager was opened on at all - an id extra would have been readable, but
+        // the statuses behind it are not something an intent can carry.
+        val subject = ActionRequests.take(intent?.getStringExtra(ActionRequests.EXTRA_SUBJECT_TOKEN))
+        assertWithMessage("Port forwarding did not carry the host it was opened from")
+            .that((subject as? ActionSubject.ForwardManager)?.hostId).isEqualTo(host.id)
     }
 
     /**

@@ -2,6 +2,9 @@ package dev.eclipse.ssh.ui.actions
 
 import dev.eclipse.ssh.archive.ArchiveEntry
 import dev.eclipse.ssh.data.fs.FsEntry
+import dev.eclipse.ssh.data.model.ForwardEntry
+import dev.eclipse.ssh.data.model.ForwardStatus
+import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionTab
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -35,6 +38,47 @@ sealed interface ActionSubject {
      * somebody is looking at it - and a frozen trace would be worse than no window at all.
      */
     data class SessionWhy(val tab: SessionTab) : ActionSubject
+
+    /**
+     * The port-forwarding manager for one host, and the half of its subject that has no singleton
+     * behind it.
+     *
+     * This is the one place where the id-versus-token rule above does not give a clean answer,
+     * because the screen is made of two halves that live in different places. The *rules* are the
+     * host's own saved column, and [dev.eclipse.ssh.data.HostRepository] is a singleton with a
+     * `Flow`, so they are read live by [hostId] - which is exactly what the manager needs, since
+     * saving a rule *is* the edit it makes and a list holding a copy from open time would be a window
+     * arguing with its own Save button.
+     *
+     * What a singleton does not hold is the runtime half: [statuses] and [runningForwards] are
+     * assembled by the workspace's own view model, out of the forwarding engine and the live sessions
+     * it rides on, and no second window can reach that. So they travel here as a snapshot - and a
+     * snapshot is a thing that ages, which is why every row that acts closes the window. The window's
+     * next open takes a fresh one. A row that stayed on screen after starting a tunnel, still showing
+     * the state from before the tap, would be a window lying about the one thing it exists to show.
+     */
+    data class ForwardManager(
+        val hostId: String,
+        val statuses: Map<String, ForwardStatus>,
+        val runningForwards: List<ForwardEntry>,
+    ) : ActionSubject
+
+    /**
+     * One host's details window, with the half of its subject the workspace owns.
+     *
+     * The split is the same shape as [ForwardManager]'s and falls the same way: the host itself and
+     * its saved credentials are read live from their own singletons by [hostId], because both of them
+     * can change while this window is open - the credentials one in particular changes *because* of a
+     * row in this window, and a header still saying "Password saved" after the user forgot it would be
+     * the window's own lie about the user's own act.
+     *
+     * [stats] is the snapshot, because the server stats map is the workspace's: it is filled by a
+     * refresh the workspace performs, keyed by host, and dropped when the host's last tab closes. The
+     * window cannot fetch them itself, so it is handed what the workspace last heard. That also makes
+     * this window's one asymmetry honest - "Load server stats" *is* a request back to the workspace,
+     * and the window closes to let it be answered.
+     */
+    data class HostDetails(val hostId: String, val stats: ServerStats?) : ActionSubject
 
     /**
      * The explorer row whose action window is open.
@@ -78,6 +122,39 @@ sealed interface ActionAnswer {
     data class TransferAction(val transferId: String, val action: TransferActionKind) : ActionAnswer
 
     /**
+     * One row of the port-forwarding manager.
+     *
+     * Start and Stop are here rather than done by the window because both are the engine's, reached
+     * through the view model that owns the forwarding runtime: a second window starting a tunnel would
+     * be a second tunnel, on a connection it does not hold.
+     */
+    data class ForwardRuleAction(
+        val hostId: String,
+        val ruleId: String,
+        val action: ForwardRuleKind,
+    ) : ActionAnswer
+
+    /**
+     * The manager's whole rule list, after an edit that changed the saved column.
+     *
+     * Enable, Disable, Delete and the add/edit form all produce one of these, and they produce it the
+     * same way: as the complete new list, never as a delta. That is the sheet's own contract kept
+     * whole - `saveForwardRules` is the only writer of the column, and handing it the whole list is
+     * what makes its stop-the-removed-keep-the-unchanged behaviour apply to this window exactly as it
+     * applies to a connect.
+     */
+    data class ForwardRules(val hostId: String, val rules: List<ForwardEntry>) : ActionAnswer
+
+    /**
+     * One row of the host details window.
+     *
+     * Both rows are workspace calls - forgetting credentials unregisters the host's live session as
+     * well as dropping the secrets, and a stats refresh is a connection the workspace owns - so
+     * neither is something this window could have done for itself.
+     */
+    data class HostDetailsAction(val hostId: String, val action: HostDetailsKind) : ActionAnswer
+
+    /**
      * One row of the snippets window.
      *
      * [snippetId] is null for [SnippetActionKind.SAVE_CURRENT], which is the one row of that window
@@ -116,6 +193,27 @@ enum class TransferActionKind {
     OPEN_FILE,
     OPEN_FILE_WITH,
     COPY_DETAILS,
+}
+
+/**
+ * The two rows of the port-forwarding manager's own controls, named for the same reason
+ * [TransferActionKind] is: the workspace's side of each is one expression taking the rule's id, so
+ * the drain is a `when` with one line per branch.
+ *
+ * Enable, Delete and the add/edit form are deliberately *not* here. They change the saved column and
+ * nothing else, they are already expressed as the whole new list the engine's save path takes, and
+ * routing them through an enum would mean this window holding the rules it is editing - which is the
+ * copy [ActionSubject.ForwardManager] exists to avoid keeping.
+ */
+enum class ForwardRuleKind {
+    START,
+    STOP,
+}
+
+/** The rows of the host details window. */
+enum class HostDetailsKind {
+    FORGET_CREDENTIALS,
+    REFRESH_STATS,
 }
 
 /**

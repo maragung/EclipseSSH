@@ -121,6 +121,28 @@ workspace's own code, and a second implementation in a second window is how the 
 cannot run the same action twice. The rest of the sheets follow the same route, one surface per
 change.
 
+**Two more sheets became windows**, and they are the pair whose subject is *half* live: what a
+singleton holds is read by id, and what the workspace owns travels in the subject.
+
+- **The port-forwarding manager** (`ui/forward/PortForwardManagerActivity`). Every rule a host has
+  saved, what each one is doing, and Start/Stop/Edit/Delete. The rules are read live from
+  `HostRepository` by the host's id — the window's own save is what its own list then shows — while
+  the runtime half (each rule's state, and which forwards are bound) arrives as a snapshot, because
+  the forwarding engine is the workspace's and no second window can reach it. That snapshot is also
+  why a row closes the window: a "Start" left on screen over a tunnel that is now coming up would be
+  the window lying about the one thing it shows.
+- **A host's details** (`ui/hosts/HostDetailsActivity`). How the host is reached, what the vault
+  holds for it, and the server's own numbers. The host and its credentials are read live by id, so the
+  Credentials line follows a password saved or forgotten while the window is open; the server stats
+  are the workspace's, handed over in the subject. Both Monitoring rows are therefore answers rather
+  than reads — the window cannot fetch stats, and the workspace only hears requests when it resumes.
+
+Both are opened with a **token** rather than an id in the intent, which is the one place they differ
+from the pair above: an intent can carry neither a statuses map nor a stats snapshot. The window reads
+the live half from the singleton by id and takes the snapshot from the subject, which is what
+`ActionSubject`'s own rule — pass an id when a singleton already holds the subject, a token when it
+does not — resolves to when the answer is *both*.
+
 The shared shell is `ui/settings/SettingsScaffold.kt` and the rows every screen draws are
 `ui/settings/SettingsComponents.kt`. The six screens that are just a list of choices — keep-alive,
 clipboard auto-clear, reconnect delay, auto-lock, terminal width and terminal height — are six
@@ -174,7 +196,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,900 JVM/Robolectric test methods in 170 test files and contacts nothing off the
+The suite is 1,918 JVM/Robolectric test methods in 172 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot
