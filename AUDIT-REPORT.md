@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §49, *Releasing 1.3.1*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §50, *Two sheets become windows*; the newest of them that releases a version is §49, *Releasing 1.3.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5426,3 +5426,82 @@ compares an artifact against what its tag promised. After the release is publish
 `testing/README.md`'s dispatch example moves from `v1.3.0` to `v1.3.1`, since §47's own rule is that
 the example names the newest release that is *published*: until then, `v1.3.1` is a tag with a draft
 beside it, and the command the example documents cannot fetch a draft.
+
+---
+
+## 50. Two sheets become windows
+
+**What this is.** Seven `ModalBottomSheet` surfaces were still in the app after the Settings, editor
+and preview promotions. This pass promotes the first two of the ones that **act** rather than merely
+show: the Transfers tab's per-item action sheet, and the session "why?" sheet that a `Why?` button
+raises from the tab strip or a session row. Each is now an Activity of its own —
+`ui/transfers/TransferActionsActivity` and `ui/sessions/SessionWhyActivity` — opened on top of the
+workspace and closed with the back arrow. The remaining five are the same change repeated and are not
+in this pass.
+
+**Why these two.** They are the two whose subject is *live*. A transfer's card is a progress row that
+keeps moving, and the why-sheet exists for a reconnect ladder that is still climbing; a sheet draws
+both inside a dialog window, over the very card it describes, through a slot at the bottom of the
+screen. The sheet also capped what the trace could show twice over — 45% of a panel that was itself
+capped at 85% of the display — which is a strange shape for the one surface a user opens precisely
+because they want to read something.
+
+**The handoff, and why it is two shapes.** There is no `@Parcelize` model in this app — not one:
+`grep -rn "@Parcelize\|: Parcelable\|: Serializable" app/src/main/java` returns nothing — so a
+window cannot be handed a transfer, a tab or a file entry in its intent. Two idioms already covered
+that (`PreviewRequests`, `EditorRequests`) and one covered answers (`ForwardRequests`); this pass
+generalises them into `ui/actions/ActionRequests.kt`, which carries both directions and states the
+rule for choosing between them: **pass an id when a singleton already holds the subject, a token
+when it does not.**
+
+- A transfer **is** held by a singleton — `TransferRepository` is Room-backed with a `Flow` — so
+  `TransferActionsActivity` takes a plain id and reads the item itself. That is not a workaround; it
+  is strictly better than the sheet was, and the difference is asserted: a download keeps counting up
+  in the window's header while its actions are on screen
+  (`TransferActionsActivityRobolectricTest.theHeaderFollowsTheTransferWhileTheWindowIsOpen`).
+- A `SessionTab` is **not**. It is assembled by `MainViewModel`, which is `@HiltViewModel` and
+  therefore activity-scoped — a second window resolving one would get a *different* instance with
+  different tabs — so the tab is snapshotted into `ActionSubject.SessionWhy` and read back by token.
+  The **trace** deliberately does not travel with it: `SessionWhyActivity` collects
+  `SessionDiagnostics` itself, because a frozen trace of a ladder mid-climb would be a window that
+  lies about the one thing it exists to show.
+
+**What the windows do not do is act.** Every row of the transfers window, including the ones that
+look self-contained, files an `ActionAnswer` and closes. View, Edit and Open are not self-contained:
+each resolves a `FileSystemProvider` from the transfer and opens a window with it, Open shells out to
+the platform's chooser, and Copy details writes to the vault-backed clipboard — all of them helpers
+that live in the workspace. Re-implementing them in a second window would be two implementations of
+the same act, which is how the two drift. `MainActivity.onResume` takes the answer — the same moment,
+and the same one-shot rule, as a confirmed port forward — hands it to the composition, and an
+exhaustive `when` over `ActionAnswer` acts on it. `takeAnswer` empties the slot as it reads it, so a
+rotation, a re-delivered intent or a second resume cannot run the same action twice; the test that
+says so from outside resumes the workspace twice and counts the editors that opened
+(`TransfersActionsRobolectricTest.theAnswerIsActedOnOnceEvenIfTheWorkspaceResumesTwice`).
+
+**What moved besides the two windows.** `statusColor` left `MainActivity` for `ui/SessionStatusColor.kt`,
+because the why-window is a third caller of the same five-branch `when` and a private copy in each is
+how one of them quietly starts disagreeing. The four-times-duplicated comment that described the
+Transfers sheet's close-then-act rule went with the sheet it described.
+
+**What the tests pin, and what they cannot.** Twenty new JVM methods in three files plus one existing
+suite: five in `ui/actions/ActionRequestsTest` (a token resolves to its own subject; a subject cannot
+be taken twice; an unknown or missing token resolves to nothing; an answer is delivered once and then
+gone; the later answer wins), seven in `TransferActionsActivityRobolectricTest` (the row matrix for a
+running, a paused and a completed transfer; the header following the item; a row filing its answer and
+closing; the window closing when its transfer leaves the list; an intent with no id opening nothing),
+seven in `SessionWhyActivityRobolectricTest` (the window opening on its own session; the heading
+worded from three states; no recorded reason said out loud; an event recorded *while the window is
+open* reaching it; a spent token closing the window; no token opening nothing; the copy row offered),
+and one in `TerminalScreenRobolectricTest` proving the strip's `Why?` starts the window and that the
+token its intent carries resolves back to the session that was on screen. `TransfersActionsRobolectricTest`
+was rewritten rather than extended: its row matrix moved to the window suite, and it now drives the two
+moments only the workspace can be seen at — the long-press that opens the window, and the answer
+acted on after a resume.
+
+What no JVM test here can prove is how the two windows *feel* on a device: a window that slides in
+over the workspace and returns to it is the platform's own animation, and no assertion in this suite
+looks at it. The claims above are about which surface composes, what it reads, and what the workspace
+does with the answer.
+
+The suite is now 1,878 JVM/Robolectric test methods in 167 test files — the README's figures, which
+`scripts/check-doc-figures.sh` re-derives on every run.
