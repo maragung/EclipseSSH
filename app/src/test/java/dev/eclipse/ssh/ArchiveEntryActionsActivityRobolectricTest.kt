@@ -194,12 +194,11 @@ class ArchiveEntryActionsActivityRobolectricTest {
             awaitRow("Copy path")
             compose.onNode(hasText("Copy path") and hasClickAction()).performClick()
 
-            pumpUntil(describe = { "the row's answer never reached the workspace" }) {
-                ActionRequests.takeAnswer() == ActionAnswer.ArchiveEntryAction(ArchiveEntryActionKind.COPY_PATH)
-            }
-            pumpUntil(describe = { "the window stayed up after its row was tapped" }) {
-                scenario.state == Lifecycle.State.DESTROYED
-            }
+            awaitAnswer(
+                ActionAnswer.ArchiveEntryAction(ArchiveEntryActionKind.COPY_PATH),
+                describe = { "the row's answer never reached the workspace" },
+            )
+            awaitClosing(scenario, describe = { "the window stayed up after its row was tapped" })
         }
     }
 
@@ -291,6 +290,46 @@ class ArchiveEntryActionsActivityRobolectricTest {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /**
+     * Waits for the window's answer, and returns what the one-shot slot handed over.
+     *
+     * Cached rather than read straight into the condition, because the slot is read-once: a
+     * `takeAnswer()` inside a condition is true on the evaluation that found the answer and null on
+     * the next, and [pumpUntil] asks twice — once to leave the loop and once to decide whether it
+     * timed out. Read straight, an answer that did arrive is reported as one that never did.
+     */
+    private fun awaitAnswer(expected: ActionAnswer, describe: () -> String): ActionAnswer {
+        var answer: ActionAnswer? = null
+        pumpUntil(describe = describe) {
+            answer = answer ?: ActionRequests.takeAnswer()
+            answer == expected
+        }
+        return checkNotNull(answer)
+    }
+
+    /**
+     * Waits for the window to have been asked to close, and asserts it on the activity.
+     *
+     * `activity.isFinishing` rather than `scenario.state == DESTROYED`, which is the same fact one
+     * looper-hop later: `finish()` sets the flag there and then, while the state the scenario reports
+     * only falls once the destroy it posts has been run — and waiting for that is a test of
+     * Robolectric's looper rather than of the window. See `ForwardFormActivityRobolectricTest` for the
+     * account of why the failure it produces is the confusing one.
+     *
+     * A window that reached DESTROYED before this looked counts too, because a destroyed activity
+     * cannot be showing a menu: `onActivity` throws once there is nothing live to run on. What cannot
+     * pass is a window that is neither finishing nor gone. The two tests that launch a window which
+     * closes *before* it is ever resumed — a spent token, no token — still assert the state directly:
+     * that one closes during the launch, and it is a different fact.
+     */
+    private fun awaitClosing(scenario: ActivityScenario<ArchiveEntryActionsActivity>, describe: () -> String) {
+        var closing = false
+        pumpUntil(describe = describe) {
+            runCatching { scenario.onActivity { activity -> closing = activity.isFinishing } }
+            closing || scenario.state == Lifecycle.State.DESTROYED
+        }
     }
 
     private companion object {
