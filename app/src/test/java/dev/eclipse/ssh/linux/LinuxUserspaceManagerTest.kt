@@ -106,7 +106,8 @@ class LinuxUserspaceManagerTest {
         assertThat(harness.installer.rootfsDir.resolve("home/ubuntu/workspace").isDirectory).isTrue()
 
         // The setup pipeline really ran through the scripted proot: package lists updated, the
-        // base packages installed, and both ran with fake root (the "-0" proot sessions need for dpkg).
+        // base packages installed, both with proot's `-0` — the identity dpkg insists on before it
+        // will unpack anything.
         // The happy path never leaves the ladder's first rung - the primary archive succeeds and no
         // mirror is fetched - which is what pins the flags every rung carries.
         val commands = harness.spawner.commands
@@ -308,9 +309,10 @@ class LinuxUserspaceManagerTest {
             assertThat(spawn.envp)
                 .contains("PROOT_SIGSYS_LOG=${harness.rootDir.resolve("sigsys-log.txt").absolutePath}")
         }
-        // Sessions never run fake root; the setup pipeline's scripted commands do (dpkg's chowns).
-        assertThat(spawns.last().argv.contains("-0")).isFalse()
-        assertThat(spawns.any { it.argv.contains("-0") }).isTrue()
+        // Every proot run carries `-0` — the session's own spawn included, which is the last one
+        // here and the one this assertion used to forbid. See ProotRuntimeExecModelTest for why,
+        // and for the session argv read back from the spawner directly.
+        assertThat(spawns.filterNot { it.argv.contains("-0") }.map { it.argv }).isEmpty()
     }
 
     @Test

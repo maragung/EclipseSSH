@@ -192,9 +192,12 @@ a desktop) to a path the uninstall does not delete, and the next install restore
 first shell opens. Uninstall without it deletes the snapshot too. **Stop and Restart never touch
 the workspace.**
 
-Because Android forbids the app to `chown`, every file under `filesDir` is owned by the app uid —
-which is why the rootfs needs no privilege model of its own: the shell's writes succeed by DAC, and
-the account identity comes from `/etc/passwd`, not from file ownership.
+Because Android forbids the app to `chown`, every file under `filesDir` is owned by the app uid.
+That is what the whole privilege story rests on, and it is worth separating from the identity the
+session reports: the shell's writes succeed by DAC — it is the owner — while `whoami` answers `root`
+because proot's fake identity says so and `/etc/passwd` has a `root` entry to put a name to it. Two
+different questions, and only the first is about the filesystem. Nothing in the rootfs needs a
+permission bit to be set for anyone, because the only process that ever opens them is the app.
 
 ## Lifecycle
 

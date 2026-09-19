@@ -1206,8 +1206,8 @@ class MainViewModel @Inject constructor(
      * over a forked proot pty instead of a dial.
      *
      * Everything the SSH path needs and this one does not is absent on purpose. No credentials to
-     * resolve — the session is entered by process identity, the app's uid *is* the `ubuntu`
-     * account. No retry loop — a fork either works or it does not, and retrying instantly would
+     * resolve — a local session is entered by process identity, never by authentication. No retry
+     * loop — a fork either works or it does not, and retrying instantly would
      * fork again into whatever just failed. No dial gate — there is no transport to serialize over.
      * What it keeps is the session-key contract: the key is the tab's id, the first terminal
      * claims [LocalLinuxHost.HOST_ID], and the collector, the channels map and the buffer are the
