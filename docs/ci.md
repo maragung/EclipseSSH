@@ -43,22 +43,28 @@ Seven jobs, so a failure lands on the thing that is actually broken instead of s
 | `native` | `:freerdp:assembleDebug`, `:linux:assembleDebug` | That both native modules still build from their pinned sources and patches: `:freerdp` on all four ABIs, and `:linux` on the three Ubuntu Base publishes for (`arm64-v8a`, `armeabi-v7a`, `x86_64` — there is no i386 Ubuntu Base image, so no `x86`). |
 | `lint` | `lintRelease` | Release-variant Android lint, including the manifest and resource checks that only run for `release`. |
 | `test` | `testDebugUnitTest` | The whole JVM suite, Robolectric included, with an isolated OpenSSH sandbox started for the tests that dial a real server. |
-| `assemble` | `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `assembleRelease` again on its own, `:app:dependencies --configuration releaseRuntimeClasspath` | That the `androidTest` sources still compile, that both APKs and the Play AAB build, that the per-ABI splits build, that the dependency lockfile is still satisfied, and that the release APK is signed. The second `assembleRelease` is the one that produces the splits: `splits.abi` stands down inside the first invocation because a `bundle` task shares it, so a run that stopped there would build no per-ABI APK at all — and the per-ABI APKs are what a GitHub release serves. |
+| `assemble` | `:app:dependencies --configuration releaseRuntimeClasspath`, `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `assembleRelease` again on its own | That the release classpath still resolves against `app/gradle.lockfile` (the report is read, and a `FAILED` row fails the job) before anything is compiled, that the `androidTest` sources still compile, that both APKs and the Play AAB build, that the per-ABI splits build, and that the release APK is signed. The second `assembleRelease` is the one that produces the splits: `splits.abi` stands down inside the first invocation because a `bundle` task shares it, so a run that stopped there would build no per-ABI APK at all — and the per-ABI APKs are what a GitHub release serves. |
 | `smoke` | Boots a headless AVD and launches both APKs | That the app starts and stays up. This is the crash-on-open gate — a window that dies in `onCreate` passes every JVM test there is. |
 | `stress` | `ECLIPSE_STRESS=1 :app:testDebugUnitTest --tests '*RealOpenSshInteropRobolectricTest'`, under a 90-minute job cap | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. The step asserts the class ran with `skipped="0"`, so a leg that quietly skipped is a failure rather than a pass. Runs only when a `workflow_dispatch` sets the `stress` input, which defaults to false — a dispatch that does not ask for it finishes with the other six. |
 
 The `assemble` job asserts, before it compiles them, that the `androidTest` sources contain at least
 one test, because a suite that compiles to nothing is indistinguishable from a suite that passes.
 
-Its last step is the dependency-lockfile check, and it is read-only on purpose. `app/gradle.lockfile`
-records the *resolved* version of every coordinate on `releaseRuntimeClasspath`, and a lock state is
-enforced as a `strictly` constraint, so a catalog bump that the lockfile does not carry fails
-resolution — `assembleRelease`, the AAB and `lintRelease` all resolve that configuration and all go
-red with it. Running the check with `--write-locks` would have rewritten the lockfile to match
-whatever it had just resolved, which is the one outcome the check exists to prevent, so the flag is
-not there: the job reports the drift and the fix is to run the same command with `--write-locks` and
-commit the file. A dependency bot cannot take that step — it can edit `gradle/libs.versions.toml` and
-nothing else — so its version bumps arrive red here until a human or a branch regenerates the lock.
+Its first Gradle step is the dependency-lockfile check. `app/gradle.lockfile` records the *resolved*
+version of every coordinate on `releaseRuntimeClasspath`, and a lock state is enforced as a
+`strictly` constraint, so a catalog bump that the lockfile does not carry — which is every dependency
+bot's bump, since a bot can edit `gradle/libs.versions.toml` and cannot run `--write-locks` — leaves
+that classpath unresolvable. It is first because of where that failure otherwise lands: the assemble
+steps below are what break, and they break with a message about a navigation resource file that
+cannot be serialized into the configuration cache, while the sentence that names the lockfile turns up
+in the `lint` job's log instead (issue #130).
+
+The refusal is a `grep`, and that is not decoration. `:app:dependencies` is a report task: it resolves
+leniently, prints `FAILED` beside the coordinate that will not resolve, and exits 0, so the report on
+its own cannot fail a build. The step reads that report and fails on the `FAILED` row. Running the
+same command with `--write-locks`, which is what the step used to do, rewrote the lockfile to match
+whatever it had just resolved — the drift the step is named for was the one outcome it could not
+produce. The remedy the failing step prints is that command, on a runner, with the file committed.
 
 ### What the `docs` job checks, and what it does not
 
