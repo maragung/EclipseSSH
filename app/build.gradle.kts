@@ -364,8 +364,13 @@ ksp {
 // different APK without the build noticing.
 //
 // Run `./gradlew --write-locks` once to populate `app/gradle.lockfile`,
-// commit the file, and the CI check `./gradlew --write-locks dependencies`
-// (see ci.yml) refuses to merge if a lockfile is out of date.
+// commit the file, and the CI check refuses to merge a lockfile that is out
+// of date: ci.yml's assemble job asks `:app:dependencies` for the same
+// configuration with no `--write-locks` and fails on the report when a
+// coordinate comes back FAILED, which is what a catalog bump with no matching
+// lockfile looks like. A dependency bot can edit the catalog and nothing else,
+// so its bumps arrive red until the lockfile is regenerated on a runner and
+// committed with them - see #130 and PR #132.
 dependencyLocking {
     lockAllConfigurations()
 }
