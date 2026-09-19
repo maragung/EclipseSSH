@@ -42,12 +42,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -481,83 +479,6 @@ fun ExplorerSelectionBar(
             TextButton(onClick = onDelete) { Text("Delete", color = MaterialTheme.colorScheme.error) }
         }
     }
-}
-
-/**
- * The per-entry action sheet: everything one entry can do, offered the same way for local and
- * remote, with the actions the active backend cannot serve simply absent.
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun ExplorerFileActionsSheet(
-    entry: FsEntry,
-    isLocal: Boolean,
-    supportsPermissions: Boolean,
-    onDismiss: () -> Unit,
-    onSelect: () -> Unit,
-    onPreview: () -> Unit,
-    onEdit: () -> Unit,
-    onRename: () -> Unit,
-    onCopy: () -> Unit,
-    onMove: () -> Unit,
-    onDelete: () -> Unit,
-    onProperties: () -> Unit,
-    onChmod: (() -> Unit)?,
-    onTransfer: (() -> Unit)?,
-    onSendToHost: (() -> Unit)?,
-    onOpenArchive: (() -> Unit)?,
-) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 22.dp).padding(bottom = 18.dp)) {
-            Text(entry.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            entry.size?.let {
-                Text(describeSize(it), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Spacer(Modifier.height(12.dp))
-            // Selection enters through here now: long-press used to be the gesture, and long-press
-            // opens this sheet, so this row is where that gesture lands. First, above Preview,
-            // because a started selection is the state the whole explorer reorganizes around.
-            ActionRow("Select", onSelect)
-            ActionRow("Preview", onPreview)
-            if (onOpenArchive != null) {
-                // Above Preview and Edit: for a 50 GB archive this is the only row that can
-                // answer without moving the archive, and it is the reason the row exists.
-                ActionRow("View Archive", onOpenArchive)
-            }
-            if (!entry.isDirectory) {
-                // "Edit as text", the preview sheet's own label, so both doors into the editor
-                // promise the same thing in the same words.
-                ActionRow("Edit as text", onEdit)
-            }
-            ActionRow("Rename", onRename)
-            ActionRow("Copy to…", onCopy)
-            ActionRow("Move to…", onMove)
-            if (onTransfer != null) {
-                ActionRow(if (isLocal) "Upload to server" else "Download to device", onTransfer)
-            }
-            if (onSendToHost != null) {
-                ActionRow("Send to another server", onSendToHost)
-            }
-            if (onChmod != null && supportsPermissions) {
-                ActionRow("Permissions", onChmod)
-            }
-            ActionRow("Properties", onProperties)
-            ActionRow("Delete", onDelete, destructive = true)
-        }
-    }
-}
-
-@Composable
-private fun ActionRow(label: String, onClick: () -> Unit, destructive: Boolean = false) {
-    Text(
-        label,
-        Modifier
-            .fillMaxWidth()
-            .combinedClickableCompat { onClick() }
-            .padding(vertical = 14.dp),
-        style = MaterialTheme.typography.bodyLarge,
-        color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
-    )
 }
 
 /** The entry's facts, each row drawn only when the value exists — an invented "0 B" is worse than none. */

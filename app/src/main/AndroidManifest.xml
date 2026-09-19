@@ -223,6 +223,49 @@
             android:parentActivityName=".MainActivity" />
 
         <!--
+          The archive entry window: everything one entry inside an archive can do, in a
+          window of its own rather than a sheet over the listing it was chosen from.
+          Like the session and explorer windows below it, its subject is a row of a
+          tree this app cannot parcel, so it travels through the ActionRequests token
+          handoff - hence singleTop and the configChanges list, both load-bearing: a
+          re-delivered intent finds its token spent and closes itself.
+        -->
+        <activity
+            android:name=".ui.archive.ArchiveEntryActionsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The explorer's per-entry window: everything one file or folder can do. Its
+          subject is an FsEntry - a row of a listing the explorer's controller holds,
+          which no intent can carry - so it uses the same token handoff, with the
+          session's own facts (local, permissions, archive-readable) as plain boolean
+          extras, because booleans do parcel.
+        -->
+        <activity
+            android:name=".ui.files.FileActionsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The snippets window: the saved commands, over the terminal they will be
+          typed into rather than a sheet covering it. It is the one window here with
+          no subject at all - the list is SnippetRepository, a singleton this activity
+          injects and watches - so nothing is carried and nothing is spent; singleTop
+          is the ordinary "one snippets window" rule rather than a token requirement.
+        -->
+        <activity
+            android:name=".ui.snippets.SnippetsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
           Terminal font size, the one Settings row whose value is a range rather than a
           menu of choices - hence its own Activity rather than the shared choice base,
           and its own entry rather than a comment on the block above.

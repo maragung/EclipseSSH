@@ -5517,3 +5517,87 @@ does with the answer.
 
 The suite is now 1,878 JVM/Robolectric test methods in 167 test files — the README's figures, which
 `scripts/check-doc-figures.sh` re-derives on every run.
+
+## 52. Three more sheets become windows
+
+The two windows of §50 proved the shape; this pass spends it on the three that were the actual
+complaint. A bottom sheet is a slot at the bottom of the screen, so every one of these menus was
+drawn by covering the thing it was a menu *for* — the shell a snippet was about to be typed into, the
+listing the file row was chosen from, the archive tree the entry sits in. Each is now a window of its
+own, and each one has a different answer to the question §50 left open: what does a window carry?
+
+**The snippets window carries nothing, and it is the only one that does not.** Every other promoted
+window takes a token or an id because the thing it acts on is held by the workspace. A snippet list is
+not a row of anything: it is `SnippetRepository`, a singleton with a `Flow`, and the window injects it
+in order to draw the rows. An id would be a second way to say what the repository already says. That
+degeneracy buys the one thing the sheet could not do — a command saved from the terminal appears in
+the list *while it is open*, because the window is watching the store rather than a copy of it taken
+at launch.
+
+**The explorer's window carries a token and three booleans.** The entry is a row of a listing held by
+the explorer's controller and nothing an intent can carry, so it travels through `ActionRequests`; but
+`isLocal`, `supportsPermissions` and `canOpenArchive` are booleans, so they ride the intent as plain
+extras. That split is the holder rule stated literally — a subject carries exactly what an intent
+cannot — and the window suite asserts both halves, because a window opened with the wrong extras on
+the right entry would pass every test the entry alone has: a local session's Permissions row offered
+on a remote listing, a View Archive row for a name no reader can open.
+
+**The archive entry window is the same shape one boolean lighter.** The entry comes by token, whether
+its bytes can be fetched by range comes as an extra, and the row vocabulary is the archive's own: no
+Rename, Move or Delete, because the archive is read-only where it stands on the server. Preview and
+Download appear only where the range read exists; a TAR entry gets one Extract row instead, because
+the honest answer for a format that cannot seek is the streaming path rather than a row that pretends.
+
+**One row is performed in its window, and it is the interesting one.** Delete on a snippet used to be
+an answer, and an answer is consumed in `MainActivity.onResume` — which does not fire until the window
+closes, so the row would sit there under the finger that removed it. The window already injects the
+repository in order to draw the list, so the write is one it can make itself, and making it is what
+lets the row go immediately. The rule in `ActionAnswer`'s doc was widened to say so: the test is not
+"is it an action" but "can the window reach it", and where a window already injects the singleton a
+row would write to, that row is performed there. Insert and the save-naming row still come back, and
+must: an insert is typed into the session on screen, and the naming dialog names the command bar's
+live text — a copy taken at launch would be a name for the wrong line the moment the user typed
+anything else.
+
+**Three drains, one slot, and why that is not a race.** The workspace's drain owns the transfer
+answers; the archive's lives inside its own `let`, where the browser's format, the extract picker and
+the properties dialog are all in scope; and the explorer's and the terminal's live in their own
+screens, each consuming only its own kind and clearing the slot for itself. Four `LaunchedEffect`s
+keyed on the same value is safe here for a reason worth writing down: they each ignore every kind but
+their own, so exactly one acts and exactly one clears — and a leaf screen is *guaranteed* composed
+when its answer arrives, because the workspace is stopped while a window is in front of it. The
+workspace's drain was changed to leave the slot alone for the two kinds its children consume, which is
+the one line that could silently clear an answer out from under the screen whose answer it is.
+
+**What moved besides the three windows.** `ArchivePropertiesDialog` and `ArchiveEntryPropertiesDialog`
+came out of the sheet file into a file of their own (`ui/archive/ArchivePropertiesDialogs.kt`), because
+the sheet they lived in is gone while both dialogs are still opened by the browser. The dead
+`deleteSnippet` plumbing went with the delete row it served — `MainViewModel.deleteSnippet`, its two
+argument objects and three `onDeleteSnippet` declarations — and `FilesExplorerUi.kt` lost the
+`ExplorerFileActionsSheet` composable and its private `ActionRow`.
+
+**What the tests pin.** Twenty-one new JVM methods in three files, plus one existing suite rewritten - and one test added to it, for the long-press the sheet-driven tests used to cover on the way to their row:
+seven in `FileActionsActivityRobolectricTest` (the full twelve-row order and presence for a readable
+remote file; a local file's subtractions and its one rename; a folder losing only the text editor;
+View Archive hidden when the caller says the name cannot be browsed; a row filing its answer and
+closing; a spent token and a bare intent each opening nothing), eight in
+`ArchiveEntryActionsActivityRobolectricTest` (Preview and Download where the range read exists, one
+Extract where it does not, a folder's single verb and absent size line, the size drawn for a file, the
+title naming the entry rather than its path, a row filing its answer and closing, the spent token, the
+bare intent), and six in `SnippetsActivityRobolectricTest` (the list following the store while the
+window is open; a row answering Insert with that row's id and closing; the save row answering with no
+snippet and closing; delete removing the row *and keeping the window up*; an empty store saying so; a
+bare intent opening the list). The order assertions are read off the semantics tree rather than listed
+from the window's own source, so they cannot agree with themselves.
+
+`FilesExplorerLayoutRobolectricTest` is the suite that had to be rewritten rather than extended. Three
+of its tests drove the old sheet inside the workspace's own composition — long-press, then tap a row,
+then assert what happened — and every one of those steps is now on the far side of an intent. What is
+left there is the half a window suite structurally cannot see: the long-press starting
+`FileActionsActivity` with a token that resolves to the row that was pressed, and the answer acted on
+when the workspace comes back — a selection starting the batch bar, an Edit answer opening the editor,
+a Preview answer opening the preview on the right entry. That last one is the only level that can
+check it, because the window it starts never composes in a Robolectric JVM.
+
+The suite is now 1,900 JVM/Robolectric test methods in 170 test files — the README's figures, which
+`scripts/check-doc-figures.sh` re-derives on every run.
