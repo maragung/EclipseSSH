@@ -4748,7 +4748,9 @@ drift, because a report task exits 0 (#133). Publication state lives in the Rele
 
 ## 43. Releasing 1.2.2
 
-Nine commits against `v1.2.1` (`git rev-list --count v1.2.1..HEAD`), 28 files, +1163/−201. Unlike 1.2.1,
+Nine commits on the branch against `v1.2.1` (`git rev-list --count v1.2.1..HEAD`), squashed on merge
+into the single commit `v1.2.2` names — so the range as `main` holds it is eight commits
+(`git rev-list --count v1.2.1..v1.2.2`) over the same 28 files and the same +1163/−201. Unlike 1.2.1,
 this range does change what a user installs, in two
 places: the pty on the Linux side (`linux/src/main/cpp/linuxpty.c`, +236/−11) and the library line the
 app is built against, seven versions in `gradle/libs.versions.toml`. The four lines under
@@ -4936,3 +4938,29 @@ release carries is a test file that no longer measures the emulator's rotation l
 arrival, as if either were the app's behaviour — and a test that had been passing without ever rotating
 anything now performs the rotation its name promises. The suite that gates this release is, for those
 reasons and no other, not quite the suite that gated 1.2.1.
+
+---
+
+## 44. The dispatch example, moved on again, and the figures pinned to the tag
+
+§42 moved `testing/README.md`'s dispatch example to `v1.2.1` on the rule §40.6 stated: the example
+names the newest release that is **published**, not the newest tag that exists. `v1.2.2` is now that
+release — published 2026-09-19T04:49:18Z with the same seven assets — so the example moves to it.
+Nothing else in that paragraph changes, and `v1.2.0` is still a draft, so it is still named nowhere:
+the command this example documents cannot fetch a draft, which is the whole of what §40.6 and §42
+were about, and a release nobody can install is not the release an example should point at.
+
+This move differs from §42's in how the release it names was published, and that difference is the
+carry-over from §43.5. The tag was pushed at `fbeccdc` with its release held as a draft;
+`tagged-release.yml` (run `35421393835`) built and signed the seven assets, and only then was the
+release published — which dispatched `android-release-test.yml` run `35422315815` over the
+**published** asset, the leg the three test repairs were finally measured on. §42's release had no
+such run at publication: it was validated by `35380659961`, dispatched by hand afterwards. So this is
+the first release in the 1.2.x line whose own gate is the workflow that publication starts.
+
+**Why §43's opening now quotes the tag.** It said `git rev-list --count v1.2.1..HEAD`, and a figure
+whose right-hand end is `HEAD` is falsified by the next commit — by this one. It now names both: nine
+commits on the branch, squashed on merge into the single commit `v1.2.2` names, so eight as `main`
+holds the range, over the same 28 files and the same +1163/−201. That is the same lesson the
+paragraphs above keep arriving at in a different currency: a measurement anchored to something that
+moves tells you about the anchor, not about the thing. The tag does not move.
