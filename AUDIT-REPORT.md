@@ -5547,6 +5547,52 @@ The suite is now 1,878 JVM/Robolectric test methods in 167 test files — the RE
 
 ---
 
+## 51. Twelve base packages, and what `cron` does not do
+
+**What this is.** The package list the userspace install adds to a fresh Ubuntu rootfs grew from
+seven to twelve: `apt-utils`, `zip`, `unzip`, `htop` and `cron` join `bash-completion`,
+`ca-certificates`, `curl`, `git`, `openssh-client`, `sudo` and `wget`. Nothing else about the install
+moved — the same pinned archive, the same health check before the state machine reaches Stopped, the
+same `APT_TARBALL_MULTIPLE` budget — and no new source is introduced: every one of the twelve is in
+the Ubuntu archive the install is already pinned to.
+
+**Why these five.** They are the utilities a recipe written for a real Ubuntu box assumes are already
+there. `apt-utils` is the one with a visible effect inside the app: without it `apt-get install`
+still works, but it prints `debconf: delaying package configuration, since apt-utils is not installed`
+into the log the user is watching, and configuration is deferred rather than run as each package
+unpacks. The archive pair (`zip`, `unzip`), `htop` and `cron` are
+the same kind of thing for the same reason — a script that unpacks a release, or a user who wants to
+watch a build, should not have to discover the gap and install the tool mid-task.
+
+**What is still deliberately absent, and why this is not drift.** Python, Node.js, a compiler and an
+editor. That is the curated toolchain, and it stays out because a registry outside the pinned Ubuntu
+archive must not be able to decide whether "Ubuntu" installed at all: a `deb.nodesource.com` outage
+is not this feature's failure to have. The decision recorded on 2026-09-18 was that the install stays
+small; this pass reads that as *no curated toolchain* rather than *no small utilities*, and the KDoc
+now says so in as many words, so the next person to find `htop` in the list reads a decision instead
+of an accident.
+
+**What `cron` does not do here.** It is installed and it is inert. This userspace has no init, so
+nothing starts the daemon at boot and a crontab will not fire by itself; a user who wants it running
+starts it by hand. That is stated in the KDoc and in `docs/linux-userspace.md` rather than left to be
+discovered — a scheduling tool that silently never schedules is worse than one that is absent, and
+the honest version of shipping it is saying what it does not do.
+
+**What the tests pin.** The install gate's refusal sentence names how many packages were refused, and
+it derives that number from `BASE_PACKAGES.size`; `UbuntuDistributionManagerTest` asserts the
+sentence, so the list's own length is pinned by a test rather than by a comment. Moving the list to
+twelve is what this branch's first CI run failed on — the test still expected `7/7 refused` against a
+reporter that had become `12/12 refused` — and that is the assertion doing its job: a list that grew
+without anyone reading the sentence a user would see is exactly the change it exists to catch. The
+literal, the neighbouring comment and the KDoc's "seven" moved together with the list.
+
+**What this cannot prove.** That the five packages install on each ABI. `apt` resolves them against
+the archive at install time, and no JVM test here runs an install; the closest thing is the E2E
+driver's phases in the public gate, which run the real flow on the emulator. A mirror that loses one
+of the five would be visible there and not here.
+
+---
+
 ## 52. Three more sheets become windows
 
 The two windows of §50 proved the shape; this pass spends it on the three that were the actual

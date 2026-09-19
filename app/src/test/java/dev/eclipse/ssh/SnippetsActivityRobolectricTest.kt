@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Looper
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasText
@@ -174,7 +175,9 @@ class SnippetsActivityRobolectricTest {
      * window staying is the difference a window makes over the sheet it replaced: a sheet's delete
      * closed the sheet, so removing three stale snippets meant opening it three times.
      *
-     * The delete button carries a content description rather than a label, so it is found by that.
+     * The delete button carries a content description rather than a label, and every row's button
+     * carries the same one - so the description alone names two rows here and [deleteRow] reaches the
+     * button through the row it belongs to instead.
      */
     @Test
     fun deletingASnippetRemovesTheRowAndKeepsTheWindowOpen() {
@@ -182,7 +185,7 @@ class SnippetsActivityRobolectricTest {
         val kept = seed(snippet("keep", "Tail the log", "tail -f /var/log/nginx/error.log"))
         launch().use { scenario ->
             awaitText("Old staging host")
-            compose.onNode(hasContentDescription("Delete snippet")).performClick()
+            deleteRow(labelled = "Old staging host")
 
             pumpUntil(describe = { "the deleted snippet's row never went" }) {
                 compose.onAllNodes(hasText("Old staging host")).fetchSemanticsNodes().isEmpty()
@@ -254,6 +257,26 @@ class SnippetsActivityRobolectricTest {
             compose.onAllNodes(hasText(text)).fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNode(hasText(text)).assertIsDisplayed()
+    }
+
+    /**
+     * Clicks the Delete that belongs to the row labelled [labelled].
+     *
+     * The button is reached through its row rather than by its content description, because that
+     * description is the same on every row and a bare lookup would match all of them - which is a
+     * failure, not a choice: `onNode` refuses an ambiguous match, and this window is drawn with two
+     * rows precisely so that "the row I removed" and "the row I did not" can be told apart.
+     *
+     * The wait is for exactly one match rather than at least one, because the row is named by text the
+     * Delete of the *other* row does not have: a count that never settles at one is the window having
+     * drawn something this test does not know how to talk about.
+     */
+    private fun deleteRow(labelled: String) {
+        val deleteOf = hasContentDescription("Delete snippet") and hasAnyAncestor(hasText(labelled))
+        pumpUntil(describe = { "the row \"$labelled\" never offered exactly one Delete" }) {
+            compose.onAllNodes(deleteOf).fetchSemanticsNodes().size == 1
+        }
+        compose.onNode(deleteOf).performClick()
     }
 
     /**
