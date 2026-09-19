@@ -1,13 +1,20 @@
 package dev.eclipse.ssh.ui.editor.highlight
 
 import androidx.compose.material3.ColorScheme
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 /**
  * The editor's syntax palette: one color per [TokenKind] the engine emits, resolved from the
@@ -130,6 +137,17 @@ data class SyntaxColors(
 private const val MAX_HIGHLIGHT_CHARS = 128 * 1024
 
 /**
+ * How long the text has to stand still before its colors are recomputed.
+ *
+ * A keystroke used to lex the document, build every span and hand Compose a fresh AnnotatedString
+ * before the character could be drawn, which is why typing felt heavy in a large file. The wait is
+ * short enough to be invisible at a pause and long enough that a burst of typing costs one lex
+ * instead of one per character. It buys the echo of the character, which is what the eye is waiting
+ * for; the color is a way of looking at the text and can arrive a moment later.
+ */
+internal const val HIGHLIGHT_DEBOUNCE_MS = 120L
+
+/**
  * Colors the editor's text by the syntax of [language], leaving the value itself untouched.
  *
  * A [VisualTransformation] rather than styled text in the field's value, for the same reason the
@@ -138,19 +156,42 @@ private const val MAX_HIGHLIGHT_CHARS = 128 * 1024
  * way of *looking* at the text. [OffsetMapping.Identity] because no character is inserted or
  * removed; only spans are layered on. A null [language] passes the text through unchanged, so a
  * caller that failed to resolve a name degrades to plain rather than crashing.
+ *
+ * [spans] is the escape hatch that keeps the lex off the keystroke path: when a caller has already
+ * computed the coloring for this document - on a background dispatcher, for the text as it stood a
+ * moment ago - it passes it here and `filter` does no work but the layering. See
+ * [debouncedSyntaxTransformationFor].
+ *
+ * Spans that no longer fit are dropped rather than applied, and that is not only a guard: they are
+ * kept while they fit, so a character typed at the end of a document keeps the coloring the rest of
+ * it already had. The engine reads left to right, so appending cannot change how the text before the
+ * caret was colored; it is only an edit in the middle that makes the old spans wrong, and that is
+ * the one case where they are thrown away and the text is drawn plain until the next lex lands.
  */
 class SyntaxHighlightTransformation(
     private val language: SyntaxLanguage?,
     private val colors: SyntaxColors,
+    private val spans: List<AnnotatedString.Range<SpanStyle>>? = null,
 ) : VisualTransformation {
     override fun filter(text: AnnotatedString): TransformedText {
         if (language == null) return TransformedText(text, OffsetMapping.Identity)
+        val usable = spans ?: coloredSpans(text.text, language, colors)
         return TransformedText(
-            AnnotatedString(text.text, coloredSpans(text.text, language, colors)),
+            AnnotatedString(text.text, if (usable.fitsWithin(text.text)) usable else emptyList()),
             OffsetMapping.Identity,
         )
     }
 }
+
+/**
+ * Whether a span list computed for one text can be drawn over another.
+ *
+ * The spans arrive in document order from the engine, so the last one carries the furthest offset and
+ * one comparison answers it. An empty list fits anything, which is what makes "not colored yet" and
+ * "colored, and none of it survived the edit" the same answer here.
+ */
+private fun List<AnnotatedString.Range<SpanStyle>>.fitsWithin(text: String): Boolean =
+    isEmpty() || last().end <= text.length
 
 /**
  * The transformation for a document's file name: its language's colors when the registry knows
@@ -160,6 +201,49 @@ class SyntaxHighlightTransformation(
 fun syntaxTransformationFor(fileName: String, colors: SyntaxColors): VisualTransformation {
     val language = SyntaxRegistry.forFileName(fileName)
     return if (language == null) VisualTransformation.None else SyntaxHighlightTransformation(language, colors)
+}
+
+/**
+ * The same transformation, with the lexing moved off the composition and off every keystroke.
+ *
+ * The document is lexed on [Dispatchers.Default] once [text] has been still for
+ * [HIGHLIGHT_DEBOUNCE_MS], and what it produced is handed to the field from a state a recomposition
+ * can see. Until then the field draws the text with whatever spans still fit it, which is usually
+ * all of them: typing at the end of a line appends past the last span and changes nothing else.
+ *
+ * The delay is skipped for the first coloring of a file, because that one is the document opening.
+ * A tab the user just opened must come up colored, not flash plain for a tenth of a second - the
+ * debounce exists for keystrokes, and there are none yet.
+ */
+@Composable
+fun debouncedSyntaxTransformationFor(
+    fileName: String,
+    colors: SyntaxColors,
+    text: String,
+): VisualTransformation {
+    val language = remember(fileName) { SyntaxRegistry.forFileName(fileName) }
+    if (language == null) return VisualTransformation.None
+    val spans = rememberDebouncedSpans(language, colors, text)
+    return remember(language, spans) { SyntaxHighlightTransformation(language, colors, spans) }
+}
+
+/** The coloring of [text], computed off the main thread once the typing stops. See [debouncedSyntaxTransformationFor]. */
+@Composable
+private fun rememberDebouncedSpans(
+    language: SyntaxLanguage,
+    colors: SyntaxColors,
+    text: String,
+): List<AnnotatedString.Range<SpanStyle>> {
+    val spans = remember(language, colors) { mutableStateOf(emptyList<AnnotatedString.Range<SpanStyle>>()) }
+    // Whether this file has been colored once already: the first pass is an open, not an edit.
+    val opened = remember(language, colors) { mutableStateOf(false) }
+    LaunchedEffect(language, colors, text) {
+        if (opened.value) delay(HIGHLIGHT_DEBOUNCE_MS)
+        val computed = withContext(Dispatchers.Default) { coloredSpans(text, language, colors) }
+        spans.value = computed
+        opened.value = true
+    }
+    return spans.value
 }
 
 /**
