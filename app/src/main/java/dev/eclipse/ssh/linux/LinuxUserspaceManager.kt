@@ -181,6 +181,19 @@ class LinuxUserspaceManager(
             "Start is only possible from Stopped or Needs Repair, not $current"
         }
         _state.value = LinuxUserspaceState.Starting
+        // Before the probe, and on every start rather than only at install time: the Android group
+        // IDs a session shows are a property of the running app, so an install made before the
+        // rootfs named them is corrected here — the first terminal it opens after this — instead of
+        // only by a reinstall. Recorded and not fatal: the userspace is fine either way, what
+        // changes is whether its `groups` output prints names or numbers, and the probe below is
+        // the real verdict on it.
+        runCatching { distribution.nameSupplementaryGroups() }.onFailure { failure ->
+            distribution.diagnostics.record(
+                UserspaceDiagnosticCategory.PROOT,
+                "supplementary group names",
+                detail = failure.message ?: failure.javaClass.simpleName,
+            )
+        }
         val health = try {
             distribution.healthProbe()
         } catch (t: Throwable) {

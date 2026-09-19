@@ -168,6 +168,14 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // syscall wrapper; on Android an app's primary gid is its own uid, which is the
             // value the runCatching fallback would land on anyway.
             appGid = runCatching { android.system.Os.getgid() }.getOrDefault(Process.myUid()),
+            // The app's supplementary Android groups, which proot passes through to the session
+            // untouched — the rootfs names them so `groups` and `id` do not report them by number.
+            // A lambda for the same reason the resolvers are one: this is read again on every
+            // start, and a permission granted since the install is one more group to name. An
+            // empty answer names nothing, which is exactly the behaviour without this wiring.
+            supplementaryGids = {
+                runCatching { android.system.Os.getgroups() }.getOrDefault(IntArray(0))
+            },
             // A lambda, not a snapshot: the resolvers are read each time setup writes
             // /etc/resolv.conf, so a network change between install and repair lands in the file
             // instead of pinning the DNS of the moment the graph was built.

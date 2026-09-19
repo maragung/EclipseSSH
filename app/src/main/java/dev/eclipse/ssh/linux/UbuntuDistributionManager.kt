@@ -57,6 +57,13 @@ class UbuntuDistributionManager(
     private val runtime: ProotRuntime,
     private val appUid: Int,
     private val appGid: Int,
+    /**
+     * The app process's supplementary Android group IDs, as `Os.getgroups()` answers them. A
+     * lambda for the same reason [dnsServers] is one: the groups belong to the running process,
+     * not to the graph, and a permission granted after the graph was built is one more of them.
+     * Empty by default, which names nothing — see [nameSupplementaryGroups].
+     */
+    private val supplementaryGids: () -> IntArray = { IntArray(0) },
     private val dnsServers: () -> List<String> = { DEFAULT_DNS_SERVERS },
     private val mirrorListUrl: String = DEFAULT_MIRROR_LIST_URL,
     private val networkOnline: () -> Boolean = { true },
@@ -122,6 +129,16 @@ class UbuntuDistributionManager(
         runtime.resetSigsysLog()
         onStep(SetupStep.REGISTER_USER)
         registerUbuntuUser()
+        // Still inside the account step, because it is the same subject — the two files a login
+        // shell reads its identity out of — and because a step of its own would move every
+        // percentage on the install screen for a write that takes no measurable time. Soft, on
+        // the reasoning [configureSudo] uses: the userspace is completely usable without these
+        // names, its `groups` output just shows numbers instead, so a rootfs that cannot be
+        // written here is a warning on the report rather than a failed install.
+        runCatching { nameSupplementaryGroups() }.onFailure { failure ->
+            warnings += "could not name the Android group IDs in /etc/group: " +
+                (failure.message ?: failure.javaClass.simpleName)
+        }
         onStep(SetupStep.PREPARE_WORKSPACE)
         prepareWorkspace()
         onStep(SetupStep.CONFIGURE_DNS)
@@ -218,6 +235,35 @@ class UbuntuDistributionManager(
         rewriteKeepingOthers(passwd, PASSWD_PREFIX, passwdLine)
         rewriteKeepingOthers(group, PASSWD_PREFIX, groupLine)
         rewriteKeepingOthers(shadow, PASSWD_PREFIX, shadowLine)
+    }
+
+    /**
+     * Names the Android group IDs the app process is in, by writing a line per unnamed ID into the
+     * rootfs's `/etc/group` — [AndroidGroupNames] is where the why of it lives. Called from
+     * [setup], and again from every start of the userspace, because the set of groups is a property
+     * of the *running* app rather than of the install: an install made before this naming existed
+     * is corrected the first time its terminal is opened, instead of staying wrong until the user
+     * reinstalls.
+     *
+     * Idempotent, and it writes only when the file does not already say the right thing, so the
+     * second call — and every call after it — is one read of a small text file and nothing else.
+     *
+     * @return whether `/etc/group` was rewritten
+     * @throws IOException when the file exists but cannot be read or replaced. Callers decide
+     *   whether that is fatal; for both of them it is not, because a userspace without these names
+     *   works — its `groups` output is the only thing that differs.
+     */
+    fun nameSupplementaryGroups(): Boolean {
+        val group = File(rootfs, "etc/group")
+        // Nothing to name when there is no file: [registerUbuntuUser] writes it on the line above
+        // this call, so a rootfs that has none is one the extractor did not finish, and its own
+        // verdict is what reports that — not this.
+        if (!group.isFile) return false
+        val existing = group.readLines()
+        val named = AndroidGroupNames.groupFile(existing, supplementaryGids())
+        if (named == existing) return false
+        writeAtomically(group, named.joinToString("\n", postfix = "\n"))
+        return true
     }
 
     /** Replaces any existing line starting with [prefix] with [line], preserving every other line. */

@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §47, *The dispatch example, moved on again*; the newest of them that releases a version is §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §48, *The groups a session is really in*; the newest of them that releases a version is §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5291,3 +5291,71 @@ release validation installs it and runs the suite against it. A tag pushed again
 version field had not yet been bumped builds a correctly-signed artifact of the wrong version, and
 all of them would pass it, because none of them is looking at what the tag promised. The one
 quantity that only a read of the tagged tree can settle is read.
+
+---
+
+## 48. The groups a session is really in
+
+**Symptom.** In the local Ubuntu terminal, `groups` printed one line of stderr per group ID it could
+not name — `groups: cannot find name for group ID 9997`, `20504`, `50504`, `3003` — and `id` and
+`ls -l` showed those IDs as bare numbers beside the named ones.
+
+**The numbers are the app's own Android groups, and proot passes them through.** A session runs with
+`-0`, which fakes the identity a program *asks for* — `getuid`, `geteuid`, `getgid`, `getegid` — and
+does not touch `getgroups`, which the kernel answers from the process itself. So the shell inside the
+rootfs is in exactly the groups the app process is in, and the four in the report are what the
+platform gives an app: `AID_INET` (3003), `AID_EVERYBODY` (9997), and the two per-app groups,
+`AID_CACHE_GID_START` (20000) and `AID_SHARED_GID_START` (50000), each plus the app id. 20504 and
+50504 differ by 30000 and both leave 504, which is the app id this device gave the install — uid
+10504 — and that arithmetic is the whole of the identification. The constants are read out of
+`libcutils/include/private/android_filesystem_config.h`, not remembered.
+
+**Root cause: nothing in the rootfs had a name for them.** `/etc/group` is a stock Ubuntu Base file
+plus the single `ubuntu:` line `registerUbuntuUser()` writes for the app's uid, so every one of the
+four was an ID with no entry — which is the one condition `groups`, `id` and `ls -l` report as
+`cannot find name for group ID`. It is a naming gap, not a permissions one: the session had those
+groups all along.
+
+**The fix names them where the tools look.** `AndroidGroupNames` (new, pure) takes `/etc/group`'s
+current lines and `Os.getgroups()` and returns the whole file: the rootfs's own lines untouched, one
+appended line per unnamed ID — `android_inet:x:3003:`, `android_everybody:x:9997:`,
+`android_cache_504:x:20504:`, `android_shared_504:x:50504:`, named from the platform's own table
+where it has a name and `android_gid_<n>` where it does not, never guessed — and every line carrying
+the `android_` prefix removed first, so a group the app loses does not stay named forever.
+`UbuntuDistributionManager.nameSupplementaryGroups()` writes it, and it is called twice:
+
+- from `setup()`, inside the `REGISTER_USER` step (a step of its own would move every percentage on
+  the install screen for a write that takes no measurable time), and
+- from `LinuxUserspaceManager.start()`, before the health probe — which is what makes this fix reach
+  the install that reported it. The groups belong to the *running* app, not to the install, so an
+  install made before the names existed is corrected the first time its terminal is opened after the
+  update, rather than by a reinstall or a Repair. It writes only when the file does not already say
+  the right thing, so every later start is one read of a small text file.
+
+Failure is soft at both sites, for the same reason: the userspace is complete without these names —
+what differs is whether `groups` prints names or numbers — so setup files a failure as a
+`SetupReport` warning and the start path records it in the install log rather than refusing to start.
+
+**What was declined, and why it matters.** The pinned proot fork already contains a handler for this
+complaint — `src/proot/src/extension/fake_id0/fake_id0.c`, whose own comment reads "On Android, the
+system is returning gids that our rootfs knows nothing about which is generating errors" — which
+cancels `getgroups`/`setgroups` so the session reports no supplementary groups. It is dead code in
+this build: it sits behind `#ifdef USERLAND`, and no build file anywhere in the fork defines
+`USERLAND` (a code search over the pinned commit returns eight files, all of them `#ifdef` users, no
+`#define`). Defining the flag wholesale is not the small change it looks like either: the `chown`
+handling that makes dpkg's unpack work lives under `#ifndef USERLAND` in the same file, so enabling
+it would delete that too. Hiding the groups would also make `id` describe a process that does not
+exist, since the kernel enforces those groups on every file the session opens.
+
+**What the tests pin, and what they cannot.** Thirteen JVM methods: seven in the new
+`AndroidGroupNamesTest` over the pure file (the four IDs from the report, an ID outside the table,
+an ID the rootfs already names, GID 0, a lost group losing its line, idempotence, a repeated ID),
+four in `UbuntuDistributionManagerTest` (setup names them without a warning, a second naming pass
+writes nothing, a rootfs with no group file is not an error, a group list that cannot be read is a
+warning rather than a failed install), and two in `LinuxUserspaceManagerTest` (a start corrects a
+rootfs that has no names — the reporter's case — and an unreadable group list does not stop the
+userspace starting, but is recorded). What no JVM test can prove is what a device's `groups` prints:
+that is the on-device loop's verdict, and the terminal's own output is where it is read.
+
+The suite is now 1,854 JVM/Robolectric test methods in 164 test files — the README's figures, which
+`scripts/check-doc-figures.sh` re-derives on every run.

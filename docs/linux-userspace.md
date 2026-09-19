@@ -95,6 +95,10 @@ health check passes — "installed" and "works" are the same fact:
    - the app's uid registered as the `ubuntu` account in `/etc/passwd`, `/etc/group`, `/etc/shadow`
      — home `/home/ubuntu`, shell `/bin/bash`, password `*` (locked; the account is entered by
      process identity, never by password),
+   - the app's own supplementary Android group IDs named in `/etc/group` (`android_inet:x:3003:`
+     and its siblings), so that `groups`, `id` and `ls -l` inside a session have a name for them
+     instead of printing `cannot find name for group ID`. Soft: a rootfs that cannot be written
+     here installs anyway, with a warning on the report,
    - `/home/ubuntu/workspace` created,
    - `/etc/resolv.conf` replaced with a real file (the base image ships a symlink into
      `/run/systemd/resolve`, which does not exist under proot),
@@ -168,6 +172,27 @@ editor and SFTP all live there, and a shell that started in root's own home woul
 nowhere near the user's files — and `/etc/passwd` keeps its `ubuntu` entry for the app's own
 Android uid, which is who really owns every file in the rootfs and the account `su - ubuntu` drops
 to. The `ubuntu` shadow entry stays `*` (locked): neither account is entered by password.
+
+The *groups* do move with it, and the rootfs had no name for any of them. `-0` fakes the identity a
+program asks for — `getuid`, `geteuid`, `getgid`, `getegid` — and leaves `getgroups` alone, so a
+session is really in the app's own Android groups: `AID_INET` (3003), `AID_EVERYBODY` (9997), and
+the per-app cache and shared groups the platform derives from the app id (`AID_CACHE_GID_START`
+20000 and `AID_SHARED_GID_START` 50000, each plus it). A stock Ubuntu Base `/etc/group` names none
+of them, so `groups` printed `cannot find name for group ID 3003` on stderr once per ID — the
+symptom this file's Troubleshooting table now answers. They are named in `/etc/group` instead, by
+`AndroidGroupNames` (`android_inet:x:3003:`, `android_cache_504:x:20504:`, and `android_gid_<n>`
+for an ID the platform's table does not know), written at setup and again at every start of the
+userspace — which is what corrects an install made before the names existed, the first time its
+terminal is opened.
+
+Naming them is deliberately the fix, rather than hiding them from the session. Hiding is what the
+pinned proot fork offers — a `getgroups`/`setgroups` handler whose own comment is this complaint
+("Android is returning gids that our rootfs knows nothing about which is generating errors") — but
+it is compiled out behind an `#ifdef USERLAND` that no build file in the fork defines, and enabling
+that flag wholesale would also delete the `chown` emulation dpkg needs to unpack anything. A
+userspace is also better off honest about this: those groups are enforced by the kernel on every
+file the session opens, so an `id` that did not list them would be describing a process that does
+not exist.
 
 The history is worth keeping, because the shape of the mistake is instructive: sessions used to run
 *without* `-0`, on the theory that the terminal account should never be root. That worked for
@@ -294,6 +319,7 @@ render as healthy. A stale "installed" flag can never present as a working insta
 | `apt-get` fails with hash/404 errors | Stale archive pin or interrupted update | Repair (re-runs `apt-get update`); check DNS in the probe report |
 | `whoami` is not `root` (a number, or `ubuntu`) | `/etc/passwd`'s root entry lost, or the shell did not get proot's `-0` — without it `apt install` and `su` cannot work | Repair |
 | DNS does not resolve | Network changed since setup wrote `resolv.conf` | Repair rewrites it; the wiring layer passes the live resolvers |
+| `groups: cannot find name for group ID 3003` (or 9997, 20504, 50504) | The names for the app's own Android groups are missing from the rootfs's `/etc/group` — an install made before the app wrote them | Nothing to repair: starting the userspace rewrites the file, so opening the terminal once after the update clears it. The IDs are the app's real groups (`inet`, `everybody`, and the cache and shared groups derived from its app id); `id` and `ls -l` print them by number until then |
 | Download dies mid-install | Network drop; the verified-tarball resume only covers completed downloads | Retry install; nothing half-extracted is left behind |
 | Sessions die when app is backgrounded | The foreground service was stopped by the user or the system | Settings → Ubuntu on this device → Start; sessions cannot be revived (their ptys died) but the workspace is untouched |
 | Huge `filesDir` after many installs | A kept backup plus a new rootfs | Settings shows storage used; uninstall deletes the rootfs, keep-workspace keeps only the snapshot |
