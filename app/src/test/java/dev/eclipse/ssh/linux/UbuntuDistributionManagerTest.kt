@@ -27,7 +27,7 @@ import org.junit.Test
  * is named as DNS before a single package byte moves, and an offline device never reaches the
  * ladder at all.
  *
- * The install's contents are pinned here too: one apt command naming the seven base packages, all
+ * The install's contents are pinned here too: one apt command naming the twelve base packages, all
  * of them from the archive the ladder picked — the NodeSource entry and the npm globals that used
  * to follow it are gone with the curated toolchain (a product decision, 2026-09-18), so no step in
  * the setup path reaches a third-party registry any more.
@@ -675,10 +675,10 @@ class UbuntuDistributionManagerTest {
         assertThat(thrown).isNotNull()
         assertThat(export).contains("update-alternatives: error: cannot create /etc/alternatives/rsh")
         assertThat(export).contains("dpkg: error processing package openssh-client")
-        // The seven per-package refusals are one fact, not seven entries: they all said the
+        // The twelve per-package refusals are one fact, not twelve entries: they all said the
         // same sentence, because it is the same half-configured package every apt command trips on.
         assertThat(export.lines().count { it.contains("base packages refused one by one") }).isEqualTo(1)
-        assertThat(export).contains("7/7 refused")
+        assertThat(export).contains("12/12 refused")
     }
 
     @Test
@@ -827,10 +827,10 @@ class UbuntuDistributionManagerTest {
         harness.distribution.setup()
 
         val commands = harness.scripted.commands
-        // The whole of what the install adds, in one command, all seven from the pinned archive.
+        // The whole of what the install adds, in one command, all twelve from the pinned archive.
         assertThat(commands).contains(
             "apt-get install -y --no-install-recommends " +
-                "bash-completion ca-certificates curl git openssh-client sudo wget",
+                "apt-utils bash-completion ca-certificates cron curl git htop openssh-client sudo unzip wget zip",
         )
         // And no third-party registry in the path: the NodeSource entry and the two npm globals
         // that used to be here are gone with the curated toolchain, so a `deb.nodesource.com`
