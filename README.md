@@ -41,11 +41,14 @@ shell that is the same terminal channel an SSH one is. Anything past that base (
 an editor, a compiler) is one `apt-get install` away inside the terminal. Architecture and
 operating manual: [`docs/linux-userspace.md`](docs/linux-userspace.md).
 
-**Files.** A text editor for the files the app browses — opened from the explorer, a preview sheet or
+**Files.** A text editor for the files the app browses — opened from the explorer, a preview window or
 the New File dialog — in its own opaque window rather than a panel over the workspace. An archive
 browser opens an archive before extracting anything from it: entries are listed, previewed and
 inspected, password-protected archives are unlocked on demand, and the extraction writes the entries
-you pick to a Storage Access Framework destination.
+you pick to a Storage Access Framework destination. Reading gets the screen in the same way writing
+does: a file's preview and an archive entry's preview are each a window of their own
+(`ui/preview/FilePreviewActivity`, `ui/archive/ArchiveEntryPreviewActivity`), where the text of a
+log is no longer letterboxed into a fraction of a sheet that was itself a fraction of the display.
 
 **Keys and secrets.** Generate RSA (2048/4096) or ECDSA P-256 keys on device, import and export
 them — Ed25519 keys generated elsewhere are read too — manage
@@ -62,20 +65,38 @@ widget and a Quick Settings tile; vault export/import.
 
 **Settings, one window per subject.** Every Settings entry opens an Activity of its own rather than
 a dialog over the list — key generation, PIN lock, auto-lock, known hosts, saved credentials,
-keep-alive, clipboard auto-clear, font size, the shortcut bar, terminal width, the encrypted backup
-export, reconnect delay, connection diagnostics, the Ubuntu userspace, and About — and Add Host /
+keep-alive, clipboard auto-clear, font size, the shortcut bar, terminal width and height, the
+encrypted backup export, reconnect delay, connection diagnostics, the Ubuntu userspace, and About —
+and Add Host /
 Edit host opens the same kind of window. Each one edits a store the Settings list already reads, so
 a change is visible when the list resumes without a result code being handed back. The one
 deliberate exception is **No active forwards**, which stays a live status row carrying the running
-forwards and their Stop buttons: a list of what is running right now is a status, not a screen.
+forwards and their Stop buttons: a list of what is running right now is a status, not a screen. What
+*is* a screen is the form that asks for one — **Add port forward** opens
+`ui/forward/ForwardFormActivity`, a window of its own, and the request it produces comes back to the
+workspace through `ForwardRequests` on the workspace's next resume. The host is named at launch
+rather than resolved on return, so the tunnel is opened on the server the user was looking at when
+they pressed Add. The two previews follow the same shape without being Settings entries: they are
+windows, and what they show travels through `PreviewRequests` on the same one-shot-token terms,
+because a live `FileSystemProvider` — and a closure over an open archive — cannot be parcelled into
+an intent.
 
 The shared shell is `ui/settings/SettingsScaffold.kt` and the rows every screen draws are
-`ui/settings/SettingsComponents.kt`. The five screens that are just a list of choices — keep-alive,
-clipboard auto-clear, reconnect delay, auto-lock and terminal width — are five Activities inside
+`ui/settings/SettingsComponents.kt`. The six screens that are just a list of choices — keep-alive,
+clipboard auto-clear, reconnect delay, auto-lock, terminal width and terminal height — are six
+Activities inside
 `ui/settings/SettingsDestinations.kt`, next to the base classes all of them extend. The ten remaining
 screens have a file each beside it: the nine heavier ones (key generation, PIN lock, known hosts,
 saved credentials, shortcut bar, font size, backup export, diagnostics, Ubuntu) and the host form.
 About keeps its own home in `ui/about/`.
+
+**Terminal width and height are not the same kind of setting**, and the two screens say so. Width is
+a floor: the app-wide value and a host's own combine into the wider of the two, the pty is told at
+least that many columns, and the overflow is reachable by panning. Height is a ceiling — a row past
+the bottom edge is nowhere — so a host's own height wins outright where it has one, the app-wide
+value is the fallback for every host that has none, and the screen itself has the last word:
+`TerminalGrid.atMostRows` cuts a taller request down to what fits, while a shorter one is honoured
+exactly, because telling a server the window is short is a real thing to want.
 
 ## Build
 
@@ -113,7 +134,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,748 JVM/Robolectric test methods in 152 test files and contacts nothing off the
+The suite is 1,824 JVM/Robolectric test methods in 160 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot
@@ -121,7 +142,7 @@ reproduce). No public or shared SSH account is involved either way. That figure 
 count of `@Test` methods in `app/src/test` — a few of them sit behind `assumeTrue` and report as
 skipped wherever their precondition cannot hold, which is why a green CI run reports a slightly
 smaller number than this. A file count is not a class count: one Kotlin file may declare several test
-classes, and `ChoiceActivitiesRobolectricTest.kt` declares six test classes, so a run executes more
+classes, and `ChoiceActivitiesRobolectricTest.kt` declares seven test classes, so a run executes more
 classes than there are files here. `scripts/check-doc-figures.sh` recounts both, so neither can drift
 silently again: it read 1,731 across 151 until that check existed, because one test file carried a
 literal NUL byte inside a string and every `grep`-based count of the suite stopped counting that

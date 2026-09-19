@@ -31,11 +31,16 @@ class DialogHeightsTest {
     }
 
     @Test
-    fun `the monospace preview body stays under the sheet that contains it`() {
-        // 0.55 of the screen inside a sheet capped at 0.85: both fractions of any height keep
-        // room for the header above the scroller.
+    fun `the monospace preview body fills its window without covering it`() {
+        // The preview is a window of its own now, so this fraction is of what the reader is looking
+        // at rather than of a sheet, and 0.7 has to carry two claims at once: more than the 0.55 the
+        // body was capped at inside a sheet — which is what the promotion bought, a log no longer
+        // read through a slot — and less than the window itself, so the title bar above the text and
+        // the actions below it stay on screen with the text they belong to.
         val screen = 891f
-        assertThat(dialogBodyMaxHeight(screen, 0.55f).value)
-            .isLessThan(dialogBodyMaxHeight(screen, 0.85f).value)
+        assertThat(dialogBodyMaxHeight(screen, 0.7f).value)
+            .isGreaterThan(dialogBodyMaxHeight(screen, 0.55f).value)
+        assertThat(dialogBodyMaxHeight(screen, 0.7f).value)
+            .isLessThan(dialogBodyMaxHeight(screen, 1.0f).value)
     }
 }

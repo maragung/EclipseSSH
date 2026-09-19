@@ -4531,6 +4531,7 @@ class MainViewModel @Inject constructor(
             settingsRepository.setReconnectBaseSeconds(settings.reconnectBaseSeconds)
             settingsRepository.setTerminalFontSize(settings.terminalFontSize)
             settingsRepository.setTerminalMinColumns(settings.terminalMinColumns)
+            settingsRepository.setTerminalRows(settings.terminalRows)
             settingsRepository.setLegacyAlgorithms(settings.legacyAlgorithms)
             settingsRepository.setTerminalTheme(settings.terminalTheme)
             settingsRepository.setBlockScreenshots(settings.blockScreenshots)

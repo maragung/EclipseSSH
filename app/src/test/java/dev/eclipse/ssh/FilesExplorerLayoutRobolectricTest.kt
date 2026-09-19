@@ -18,11 +18,14 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.getOrNull
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
+import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.preview.FilePreviewActivity
+import dev.eclipse.ssh.ui.preview.PreviewRequests
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -263,8 +266,62 @@ class FilesExplorerLayoutRobolectricTest {
         }
     }
 
-    // ---------------------------------------------------------------- driving the app
+    /**
+     * The sheet's Preview row opens the preview window for the file that was long-pressed, and the
+     * request behind it is that same file.
+     *
+     * The twin of the Edit-row test above, and the preview's half of the same change: the preview used
+     * to be a `ModalBottomSheet` at the root of MainActivity, so this row only raised a panel inside the
+     * same window, and "did it open" was a question about state no assertion could name. Now the row
+     * asks the platform for a window, and the intent it starts is the witness.
+     *
+     * Two halves are checked, because a preview has two: the intent names the window, and the token it
+     * carries resolves to the entry that was long-pressed. An intent started with the wrong request
+     * stored — or with none — would satisfy the first and fail the user, who would be looking at
+     * somebody else's file. The sheet leaving the tree is the third: it is the observable proof that
+     * the click ran this app's code rather than stalling in the harness.
+     */
+    @Test
+    fun theActionsSheetsPreviewRowOpensThePreviewWindow() {
+        connect()
+        openFiles()
+        openTheHostsListing()
+        pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
+            names().contains(bulkName(0))
+        }
+        val app = compose.activity.application
+        compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
+        // Drain whatever starts the setup made, so the peek below only ever reports this click's
+        // doing — peeking does not consume, so a stale intent would mask the preview's.
+        while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
+        clickSheetRow("Preview")
 
+        pumpUntil(describe = { "the sheet never closed after its Preview row was tapped: " + diagnose() }) {
+            compose.onAllNodes(hasText("Preview") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+        }
+        // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it, which fires
+        // on a later frame. Robolectric records every startActivity unconditionally, so a timeout here
+        // means the request never reached the effect — and the peeked intent is the honest witness of
+        // what did start instead.
+        pumpUntil(describe = {
+            "the preview activity never started (last start: " +
+                runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull() + "). " + diagnose()
+        }) {
+            runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull()
+                ?.component?.className == "dev.eclipse.ssh.ui.preview.FilePreviewActivity"
+        }
+
+        // The other half of the handoff, and the one only this level can see: the token in the intent
+        // is the entry that was long-pressed. The window itself never composes here, so nothing else
+        // would ever read it — leaving the suite to assert a window opened on whatever file happened to
+        // be in the slot.
+        val started = shadowOf(app).peekNextStartedActivity()
+        val request = PreviewRequests.takeFile(started?.getStringExtra(FilePreviewActivity.EXTRA_REQUEST_TOKEN))
+        assertWithMessage("the preview was opened on a file other than the one long-pressed")
+            .that(request?.entry?.name).isEqualTo(bulkName(0))
+    }
+
+    // ---------------------------------------------------------------- driving the app
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
 
     /**

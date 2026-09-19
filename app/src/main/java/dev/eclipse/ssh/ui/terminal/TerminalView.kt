@@ -137,6 +137,22 @@ internal fun minTerminalColumns(settingColumns: Int, hostColumns: Int): Int =
     maxOf(settingColumns.coerceAtLeast(0), hostColumns.coerceAtLeast(0))
 
 /**
+ * The height to give a host's pty: the host's own choice when it has one, otherwise the app-wide one.
+ *
+ * The host wins here where it loses for columns, and the asymmetry is the point. Two floors combine by
+ * taking the wider, because the screen can always show less than the server believes. Two ceilings have
+ * no such arithmetic: the app-wide height is what the user wants a terminal to look like *by default*,
+ * and a host that names a height is stating a fact about that server - the one place a per-host value
+ * has ever carried information the global one cannot. A host with no opinion, which is every host until
+ * someone edits it, takes the global value.
+ *
+ * Either way this is a request: what actually reaches the pty is this number passed through
+ * [atMostRows], so a value taller than the screen is cut down to the screen rather than obeyed.
+ */
+internal fun hostTerminalRows(settingRows: Int, hostRows: Int): Int =
+    if (hostRows > 0) hostRows else settingRows.coerceAtLeast(0)
+
+/**
  * The same grid, shortened to a host's chosen height when the screen can show that many rows.
  *
  * A height is the one dimension that cannot be a floor. Columns past the right edge are reachable by

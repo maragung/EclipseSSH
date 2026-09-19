@@ -22,17 +22,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -80,16 +77,19 @@ import org.json.JSONObject
  * first pages of a PDF, an honest hand-off for media — and for everything else, the file's
  * information rather than a pretended preview.
  *
- * The one rule the sheet never bends: **no unsafe automatic execution**. A preview only ever *reads*
- * bytes and draws pixels; "Open with another app" is the user's explicit tap, and it is offered only
- * for local files whose URI Android can hand to another process.
+ * This is the body of [dev.eclipse.ssh.ui.preview.FilePreviewActivity] and nothing but a body: it
+ * draws no surface, owns no dismissal and reads no theme, because the window around it does all
+ * three. It was the inside of a `ModalBottomSheet` until the preview became a window, and the
+ * content itself did not have to change for that — which is the point of having kept it separate.
+ *
+ * The one rule the preview never bends: **no unsafe automatic execution**. A preview only ever
+ * *reads* bytes and draws pixels; "Open with another app" is the user's explicit tap, and it is
+ * offered only for local files whose URI Android can hand to another process.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FilePreviewSheet(
+fun FilePreviewContent(
     entry: FsEntry,
     provider: FileSystemProvider,
-    onDismiss: () -> Unit,
     onEdit: (FsEntry) -> Unit,
 ) {
     val kind = remember(entry) { previewKind(entry) }
@@ -105,68 +105,64 @@ fun FilePreviewSheet(
         }
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier
-                .fillMaxWidth()
-                // 0.85 of the screen: a bottom sheet is the one surface where "as tall as the
-                // screen allows" is the point, and the column scrolls. Replaces a fixed 620dp
-                // that assumed one phone. Must stay above the monospace body's 0.55 below.
-                .heightIn(max = rememberDialogBodyMaxHeight(0.85f))
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 22.dp)
-                .navigationBarsPadding()
-                .padding(bottom = 18.dp),
-        ) {
-            PreviewHeader(entry)
-            Spacer(Modifier.height(12.dp))
+    Column(
+        Modifier
+            .fillMaxWidth()
+            // No height cap of its own any more: the window's body is the screen under the bar, and
+            // the sheet's 0.85 existed only to keep the panel off the bottom edge. The monospace
+            // body below still caps itself, so a long file scrolls inside a scroller rather than
+            // pushing the file's header and its actions off the window.
+            .verticalScroll(rememberScrollState())
+            .padding(bottom = 18.dp),
+    ) {
+        PreviewHeader(entry)
+        Spacer(Modifier.height(12.dp))
 
-            when (val current = state) {
-                is PreviewState.Loading -> Box(
-                    Modifier.fillMaxWidth().height(160.dp),
-                    contentAlignment = Alignment.Center,
-                ) { CircularProgressIndicator() }
+        when (val current = state) {
+            is PreviewState.Loading -> Box(
+                Modifier.fillMaxWidth().height(160.dp),
+                contentAlignment = Alignment.Center,
+            ) { CircularProgressIndicator() }
 
-                is PreviewState.Failed -> Text(
-                    current.message,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            is PreviewState.Failed -> Text(
+                current.message,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
-                is PreviewState.TooLarge -> Text(
-                    "This file is ${"%.1f".format(current.bytes / (1024.0 * 1024.0))} MB — too large " +
-                        "to preview on the device. It can still be downloaded, renamed or deleted.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            is PreviewState.TooLarge -> Text(
+                "This file is ${"%.1f".format(current.bytes / (1024.0 * 1024.0))} MB — too large " +
+                    "to preview on the device. It can still be downloaded, renamed or deleted.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
-                is PreviewState.Info -> FileInformation(entry)
+            is PreviewState.Info -> FileInformation(entry)
 
-                is PreviewState.Image -> ZoomableImage(current.bitmap)
+            is PreviewState.Image -> ZoomableImage(current.bitmap)
 
-                is PreviewState.PdfPages -> PdfPages(current.pages, current.totalPages)
+            is PreviewState.PdfPages -> PdfPages(current.pages, current.totalPages)
 
-                is PreviewState.Textual -> when (current.rendered) {
-                    is RenderedText.Text -> SelectionContainerMonospace(current.rendered.content)
-                    is RenderedText.Json -> SelectionContainerMonospace(current.rendered.content)
-                    is RenderedText.Markdown -> MarkdownDocument(current.rendered.blocks)
-                }
+            is PreviewState.Textual -> when (current.rendered) {
+                is RenderedText.Text -> SelectionContainerMonospace(current.rendered.content)
+                is RenderedText.Json -> SelectionContainerMonospace(current.rendered.content)
+                is RenderedText.Markdown -> MarkdownDocument(current.rendered.blocks)
             }
+        }
 
-            Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(16.dp))
 
-            // The actions, one row: what this kind can do, never a list of things it cannot.
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (kind in setOf(PreviewKind.TEXT, PreviewKind.JSON, PreviewKind.MARKDOWN) &&
-                    (state is PreviewState.Textual || state is PreviewState.Failed)
-                ) {
-                    FilledTonalButton(onClick = { onEdit(entry) }) { Text("Edit") }
-                }
-                if (provider.providerId == "local" &&
-                    kind in setOf(PreviewKind.IMAGE, PreviewKind.PDF, PreviewKind.MEDIA)
-                ) {
-                    val context = LocalContext.current
-                    FilledTonalButton(onClick = { openWithAnotherApp(context, entry) }) {
-                        Text("Open with another app")
-                    }
+        // The actions, one row: what this kind can do, never a list of things it cannot.
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (kind in setOf(PreviewKind.TEXT, PreviewKind.JSON, PreviewKind.MARKDOWN) &&
+                (state is PreviewState.Textual || state is PreviewState.Failed)
+            ) {
+                FilledTonalButton(onClick = { onEdit(entry) }) { Text("Edit") }
+            }
+            if (provider.providerId == "local" &&
+                kind in setOf(PreviewKind.IMAGE, PreviewKind.PDF, PreviewKind.MEDIA)
+            ) {
+                val context = LocalContext.current
+                FilledTonalButton(onClick = { openWithAnotherApp(context, entry) }) {
+                    Text("Open with another app")
                 }
             }
         }
@@ -177,7 +173,7 @@ fun FilePreviewSheet(
 // State
 // ---------------------------------------------------------------------------------------------
 
-/** What the sheet is showing. [Info] is a real answer, not a fallback of last resort. */
+/** What the preview is showing. [Info] is a real answer, not a fallback of last resort. */
 private sealed interface PreviewState {
     data object Loading : PreviewState
     data object Info : PreviewState
@@ -188,7 +184,7 @@ private sealed interface PreviewState {
     data class Textual(val rendered: RenderedText) : PreviewState
 }
 
-/** The kinds of preview the sheet knows how to draw. */
+/** The kinds of preview this knows how to draw. */
 private enum class PreviewKind { IMAGE, TEXT, JSON, MARKDOWN, PDF, MEDIA, OTHER }
 
 private fun previewKind(entry: FsEntry): PreviewKind {
@@ -330,7 +326,7 @@ private fun prettyJson(text: String): String? = try {
 }
 
 /**
- * Decodes [bytes] as a bitmap sized to something a sheet can show, rather than whatever the file
+ * Decodes [bytes] as a bitmap sized to something a screen can show, rather than whatever the file
  * happens to be — a 48-megapixel photo is not more useful at 3264 samples, and is 20× the memory.
  */
 private fun decodeSampledBitmap(bytes: ByteArray): Bitmap? {
@@ -350,7 +346,7 @@ private fun decodeSampledBitmap(bytes: ByteArray): Bitmap? {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pieces of the sheet
+// Pieces of the preview
 // ---------------------------------------------------------------------------------------------
 
 @Composable
@@ -404,7 +400,7 @@ private fun InfoRow(label: String, value: String) {
     }
 }
 
-/** An image that fits the sheet until the user pinches, and springs back to fitting on a double-tap. */
+/** An image that fits the window until the user pinches, and springs back to fitting on a double-tap. */
 @Composable
 private fun ZoomableImage(bitmap: Bitmap) {
     var scale by remember { mutableStateOf(1f) }
@@ -482,9 +478,12 @@ private fun SelectionContainerMonospace(content: String) {
                 Modifier
                     .fillMaxWidth()
                     .padding(12.dp)
-                    // 0.55 of the screen: the sheet this sits in gets 0.85, and the monospace
-                    // body must stay under it so the header and this scroller both fit.
-                    .heightIn(max = rememberDialogBodyMaxHeight(0.55f))
+                    // 0.7 of the screen: the preview is a window now, so this is a fraction of what
+                    // the reader is looking at rather than a fraction of a sheet's fraction. It
+                    // stays under 1 so the file's name and size above, and the actions below, are
+                    // on screen at once with the text - which on the shortest screen the app
+                    // supports is the whole point of the cap.
+                    .heightIn(max = rememberDialogBodyMaxHeight(0.7f))
                     .verticalScroll(rememberScrollState()),
                 fontFamily = TerminalMonoFontFamily,
                 fontSize = 12.sp,

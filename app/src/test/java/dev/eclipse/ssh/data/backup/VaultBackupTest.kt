@@ -179,6 +179,10 @@ class VaultBackupTest {
             keepAliveSeconds = 45,
             reconnectBaseSeconds = 17,
             terminalFontSize = 20,
+            // A height, not the default 0: a field whose default is also its "unset" sentinel
+            // round-trips perfectly even when the backup drops it, so it has to be set to something
+            // the reader could only have got from the file.
+            terminalRows = 42,
             pinEnabled = true,
             legacyAlgorithms = true,
             terminalTheme = TerminalTheme.AMBER.name,
@@ -279,6 +283,9 @@ class VaultBackupTest {
         // Absent from a v1 backup, so it resolves to the default (re-lock after 5 minutes) rather
         // than to zero (never re-lock) by accident.
         assertThat(settings.vaultAutoLockMinutes).isEqualTo(defaults.vaultAutoLockMinutes)
+        // Absent from a v1 backup, so it resolves to the default - which for a height is "fit the
+        // screen", the behaviour every install that predates the setting already had.
+        assertThat(settings.terminalRows).isEqualTo(defaults.terminalRows)
         // Same story for the editor blob: absent means "never configured", not a failed import.
         assertThat(settings.editorPrefsJson).isEqualTo(defaults.editorPrefsJson)
         assertThat(hosts).hasSize(1)

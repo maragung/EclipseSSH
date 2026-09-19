@@ -175,6 +175,37 @@ class TerminalGeometryTest {
         assertThat(visible.atMostRows(12).originY).isEqualTo(visible.originY)
     }
 
+    /**
+     * The app-wide height and a host's own, which combine the other way round from the widths.
+     *
+     * Two floors take the wider of the two, because the screen can always show less than the server
+     * believes and the overflow is reachable. Two ceilings have no such arithmetic, so the host's own
+     * height wins outright where it has one: the app-wide value is a default for every host, and a host
+     * that names a height is saying something about that server that the global setting cannot know.
+     */
+    @Test
+    fun `a host's height wins over the app-wide one, and the app-wide one is the fallback`() {
+        assertThat(hostTerminalRows(settingRows = 30, hostRows = 0)).isEqualTo(30)
+        assertThat(hostTerminalRows(settingRows = 30, hostRows = 50)).isEqualTo(50)
+        // Not the smaller of the two, which is what a ceiling-versus-ceiling reading would give: an
+        // explicit per-host height is a statement about that host, not a competing limit.
+        assertThat(hostTerminalRows(settingRows = 30, hostRows = 12)).isEqualTo(12)
+        // Neither side configured: "match the screen", the same sentinel the settings screen stores.
+        assertThat(hostTerminalRows(settingRows = 0, hostRows = 0)).isEqualTo(0)
+    }
+
+    @Test
+    fun `the app-wide height is still only a request the screen can refuse`() {
+        // The two helpers composed the way MainActivity composes them, which is the only place the
+        // guarantee matters: whatever a user picks, a pty is never told it has more rows than the
+        // screen it is drawn on.
+        val visible = cell.gridIn(widthPx = 500f, heightPx = 400f)
+
+        assertThat(visible.atMostRows(hostTerminalRows(settingRows = 60, hostRows = 0)).rows).isEqualTo(20)
+        assertThat(visible.atMostRows(hostTerminalRows(settingRows = 0, hostRows = 60)).rows).isEqualTo(20)
+        assertThat(visible.atMostRows(hostTerminalRows(settingRows = 12, hostRows = 0)).rows).isEqualTo(12)
+    }
+
     @Test
     fun `a stored width beyond what the pty accepts is bounded rather than obeyed`() {
         // A vault file is editable text; 4 000 columns in one would otherwise be sent to a server that

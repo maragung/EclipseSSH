@@ -15,6 +15,7 @@ import dev.eclipse.ssh.ui.settings.ClipboardClearActivity
 import dev.eclipse.ssh.ui.settings.KeepAliveActivity
 import dev.eclipse.ssh.ui.settings.ReconnectDelayActivity
 import dev.eclipse.ssh.ui.settings.TerminalFontSizeActivity
+import dev.eclipse.ssh.ui.settings.TerminalHeightActivity
 import dev.eclipse.ssh.ui.settings.TerminalWidthActivity
 import dev.eclipse.ssh.ui.settings.VaultAutoLockActivity
 import java.time.Duration
@@ -254,6 +255,38 @@ class TerminalWidthScreenRobolectricTest {
         val labels = listOf("Fit screen", "80 cols", "100 cols", "120 cols", "132 cols", "160 cols")
         assertWithMessage("the offered widths and the labels asserted here have drifted apart")
             .that(labels.size).isEqualTo(SettingsRepository.TERMINAL_MIN_COLUMN_CHOICES.size)
+        labels.forEach { compose.assertChoiceOffered(it) }
+    }
+}
+
+/**
+ * Terminal height: how many rows the server is told it has, up to what the screen can show.
+ *
+ * The mirror of the width screen above, and deliberately not worded like it. That one promises a
+ * minimum - pick 132 and the server is told at least 132 columns, with the grid panning for the
+ * overflow. This one cannot promise a size at all: there is nowhere for a row past the bottom edge to
+ * go, so what the user picks is a limit and the screen has the last word. The subtitle asserted here
+ * is that difference made visible, which is why it is pinned rather than left to the row's own text.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(application = EclipseApp::class, sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
+class TerminalHeightScreenRobolectricTest {
+
+    @get:Rule
+    val compose = createAndroidComposeRule<TerminalHeightActivity>()
+
+    @Test
+    fun theScreenOffersEveryHeightItCanStore() {
+        compose.waitForIdle()
+
+        compose.assertTitled("Terminal height")
+        compose.onNodeWithText("At most this many rows; a screen that fits fewer gets fewer")
+            .assertIsDisplayed()
+        compose.assertSectionHeader("Terminal height")
+
+        val labels = listOf("Fit screen", "24 rows", "30 rows", "40 rows", "50 rows", "60 rows")
+        assertWithMessage("the offered heights and the labels asserted here have drifted apart")
+            .that(labels.size).isEqualTo(SettingsRepository.TERMINAL_ROW_CHOICES.size)
         labels.forEach { compose.assertChoiceOffered(it) }
     }
 }

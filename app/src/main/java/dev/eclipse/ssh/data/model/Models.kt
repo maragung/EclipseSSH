@@ -857,6 +857,19 @@ data class AppSettings(
      * for anyone who would rather never pan.
      */
     val terminalMinColumns: Int = 80,
+    /**
+     * How many rows the pty is told it has, or 0 to use as many as the screen fits.
+     *
+     * The counterpart of [terminalMinColumns] and deliberately not its mirror image. A width is a
+     * floor - the screen can always show fewer columns than the server believes, because the rest is
+     * reachable by wrapping or panning - so the app-wide number and a host's own are combined by
+     * taking the wider, and nothing is ever cut off. A height is a *ceiling*: a row past the bottom
+     * edge is nowhere, so a shell told it has sixty rows on a screen that fits forty draws its prompt
+     * twenty rows below the last pixel. This value is therefore a request that the screen has the
+     * final word on (see `TerminalGrid.atMostRows`), and 0 - the default, and what every install
+     * predating the setting already had - means "exactly what fits".
+     */
+    val terminalRows: Int = 0,
     val pinEnabled: Boolean = false,
     /**
      * How long the app may sit in the background before the vault asks for the PIN (or biometric)

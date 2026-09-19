@@ -269,3 +269,24 @@ class TerminalWidthActivity : ChoiceDestinationActivity() {
     override suspend fun write(repository: SettingsRepository, value: Int) { repository.setTerminalMinColumns(value) }
     override fun optionLabel(option: Int) = if (option == 0) "Fit screen" else "$option cols"
 }
+
+/**
+ * Terminal height: how many rows the server is told it has, up to what the screen can show.
+ *
+ * Deliberately worded as a limit rather than a size. The width screen above it promises a *minimum* -
+ * whatever the user picks, the server is told at least that many columns and the grid pans for the
+ * rest. This one cannot make that promise, because there is nowhere for a row past the bottom edge to
+ * go: a pty told it has sixty rows on a screen that fits forty draws its prompt off the screen. So the
+ * subtitle says what actually happens, and "Fit screen" is the default for that reason.
+ */
+@AndroidEntryPoint
+class TerminalHeightActivity : ChoiceDestinationActivity() {
+    override val screenTitle = "Terminal height"
+    override val what = "the terminal height"
+    override val subtitle = "At most this many rows; a screen that fits fewer gets fewer"
+    override val icon = Icons.Default.Terminal
+    override val options = SettingsRepository.TERMINAL_ROW_CHOICES
+    override fun stored(settings: AppSettings) = settings.terminalRows
+    override suspend fun write(repository: SettingsRepository, value: Int) { repository.setTerminalRows(value) }
+    override fun optionLabel(option: Int) = if (option == 0) "Fit screen" else "$option rows"
+}
