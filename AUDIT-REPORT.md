@@ -1,6 +1,6 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 30 / versionName 1.2.1 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 31 / versionName 1.2.2 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
@@ -4743,3 +4743,101 @@ there for is worse than no guard — the same lesson the lockfile check ran into
 removed the flag that rewrote the file it was meant to check, and the step still could not refuse
 drift, because a report task exits 0 (#133). Publication state lives in the Releases API, and the
 `docs` job has no network.
+
+---
+
+## 43. Releasing 1.2.2
+
+Seven commits, 26 files, +859/−187. Unlike 1.2.1, this range does change what a user installs, in two
+places: the pty on the Linux side (`linux/src/main/cpp/linuxpty.c`, +236/−11) and the library line the
+app is built against, seven versions in `gradle/libs.versions.toml`. The four lines under
+`app/src/main` are the About screen catching up with three of those versions, and they are the whole of
+this release's change to the application's Kotlin: no composable, no screen, no repository, no
+ViewModel. `app/src/androidTest` does not change at all, so the suite that gates this release is the
+suite that gated 1.2.1.
+
+The patch number is for that second half and not in spite of the first: nothing a user can do has been
+added, removed or renamed. What changed is what happens *after* something has already gone wrong — a
+write to a pty whose reader has stopped, a child that outlives its `close()`, an `execve` that never
+happened, a fetch that meets a 5xx, a lockfile that has drifted, a report that cannot count the tests
+it just ran. The happy path is 1.2.1's, which is the whole of what a patch number claims.
+
+### 43.1 The write path, and the failures #129 could not fix by copy-paste
+
+`#86` and `#87` left residual work whose branch is `dirty` against a `main` that has since rewritten
+the same regions by other routes. Issue #129 listed each item with the reason it needs care rather
+than a copy-paste. Three of them are in this release, all three in `linuxpty.c`:
+
+- **The write JNI now polls.** It waits on `poll(POLLOUT)` with a timeout and re-checks the slot each
+  lap, which is what the read path already did. A bare blocking write on a pty whose reader has
+  stopped fills the buffer and parks forever, and `close()` on the fd cannot wake it.
+- **A child that outlives `close()` is no longer abandoned with its slot.** `close()` makes a single
+  non-blocking reap attempt; a child that misses it is kept in a deferred list that the next spawn or
+  teardown drains. That is how a child became a zombie the day it finally exited. The list holds as
+  many pids as the table has slots, and when it is full the pid is named in logcat rather than
+  dropped quietly.
+- **`report_child_progress` tells a real `execve` from a signal landing in the window between the
+  report byte and the call.** Both close the pipe, and only one of them means the program is running;
+  the other left the caller parked on the master for its whole timeout. The probe is
+  `waitid(WNOWAIT)` on purpose — the status must not be consumed, because that same child is reaped
+  through `awaitExit` for its exit code and a fast command can have exited inside the window. The
+  signal gets a stage of its own rather than reusing the execve one: the child reports an `errno` in
+  that slot and this reports a signal, and a message reading "failed at execve (errno 9)" for a
+  `SIGKILL` would send its reader to `EBADF`.
+
+The slave-to-master data path is probed at spawn and **logged, not gated**: the probe assumes a fresh
+pair echoes and nothing in that file sets termios, so failing a spawn on it would fail a healthy pty
+on any leg whose pair does not echo. It becomes a gate the day a red run names the data path, and the
+code says so where the probe is.
+
+Two `-keep` lines for `LinuxUserspaceState` come with it — the hierarchy `UbuntuE2eVerificationTest`
+resolves at runtime, which the keeps guard cannot see, because a name used from the test's own package
+needs no import and the scan reads imports. The guard's header now states that limit, and the second
+one beside it (the application's own namespace is excluded deliberately, or the list would fill with
+names that never needed keeping). The suite is green without the keeps; they are defensive, and the
+keep file says exactly that.
+
+### 43.2 The library line, and the lockfile that has to travel inside it
+
+Seven catalog versions move: AGP 9.4.0 → 9.4.1, KSP 2.3.11 → 2.3.12, Room 2.7.1 → 2.8.5, Compose BOM
+2025.04.01 → 2026.09.00, Navigation 2.8.9 → 2.10.1, BouncyCastle 1.79 → 1.86, Robolectric 4.16.1 →
+4.17. `app/gradle.lockfile` (65 insertions, 66 deletions) is the same bump seen from the resolver's
+side, and it has to be in the same commit rather than a later one: the lockfile pins resolution as a
+`strictly` constraint, so a catalog-only edit cannot resolve `releaseRuntimeClasspath` at all. That is
+what dependabot's #130 ran into, and why its bump reached `main` as #132 with the lockfile it resolves
+against.
+
+### 43.3 Most of the diff is the pipeline, and none of it rides in the artifact
+
+Nine workflow files change, plus the two guard scripts, the release reporter and its new tests. In
+order of what they cost when they are missing:
+
+- **#126** gives both native fetches one retry policy — seven attempts over roughly four minutes
+  (10s, 20s, 40s, 60s, 60s, 60s), logged attempt by attempt. `:freerdp`'s fetch had **no retry at
+  all**: one response, one red job, and that job is a release blocker. Same pinned URLs, same sha256
+  verification, which still decides what gets built.
+- **#128** makes the release gate report what it actually ran. `testing/generate-report.py` took its
+  test count from `^OK \((\d+) tests?\)` and nothing else, so a failing leg — which ends with
+  `FAILURES!!!` and `Tests run: 47,  Failures: 1` — reported `Ran: 0`. The evidence is the gate's own
+  output: v1.2.0's failed validation (run 35338666049, the one that pulled the release back to draft)
+  says "Ran: 0" for a suite of 47 tests on both legs. Three shapes are read now, and a run killed by
+  the workflow's `timeout` reports "unknown" instead of a 0 that claims it tested nothing.
+  `testing/test_generate_report.py` (181 lines) pins all of it against those artifacts.
+- **#133** makes the lockfile check able to refuse drift, which is two repairs in one step. The step
+  ran `:app:dependencies` — a report task, which resolves leniently, prints `FAILED` beside an
+  unresolvable coordinate and **exits 0** — and its `set -o pipefail` was not enough on its own: with
+  the Gradle command replaced by one that prints an error and exits 1, the pipeline still reached the
+  final echo and the step still exited 0, so a build script error, a daemon OOM or a lost network
+  would each have been reported as a satisfied lockfile. Measured, not assumed.
+- **#134** moves the dispatch example in `testing/README.md` to the newest release that is
+  *published*, which is the rule §40.6 stated and nothing checks — deliberately, and §42 says why.
+- **#100** bumps six GitHub Action versions.
+- `scripts/check-doc-figures.sh` gains a reader for the BouncyCastle line in `docs/THIRD-PARTY.md`
+  that `expect_section` cannot express, because that version sits after a code span rather than after
+  the name — a figure that had already gone stale the way the check exists to prevent.
+
+### 43.4 The change a user can see, and the change they cannot
+
+The visible one is in Settings → About: three library versions that now read as what the build pins.
+Everything else in this release is the shape 1.2.1 established — the artifact behaves as its
+predecessor does except where a failure was already in progress.
