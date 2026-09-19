@@ -193,7 +193,6 @@ import dev.eclipse.ssh.data.model.RemoteDesktopTarget
 import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.data.model.SessionConnectionState
-import dev.eclipse.ssh.data.model.isBusy
 import dev.eclipse.ssh.data.model.isEnded
 import dev.eclipse.ssh.data.model.isLive
 import dev.eclipse.ssh.data.model.Snippet
@@ -225,7 +224,6 @@ import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.linux.percent
 import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
-import dev.eclipse.ssh.presentation.sessionDiagnostics
 import dev.eclipse.ssh.presentation.transfersForDisplay
 import dev.eclipse.ssh.presentation.AuthFailurePrompt
 import dev.eclipse.ssh.presentation.ReconnectPrompt
@@ -287,7 +285,12 @@ import dev.eclipse.ssh.ui.forward.ForwardFormActivity
 import dev.eclipse.ssh.ui.forward.ForwardRequests
 import dev.eclipse.ssh.ui.SecretFieldKeyboard
 import dev.eclipse.ssh.ui.SecretPasteButton
-import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
+import dev.eclipse.ssh.ui.actions.ActionAnswer
+import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.TransferActionKind
+import dev.eclipse.ssh.ui.sessions.SessionWhyActivity
+import dev.eclipse.ssh.ui.statusColor
+import dev.eclipse.ssh.ui.transfers.TransferActionsActivity
 import dev.eclipse.ssh.ssh.PERMISSION_PRESETS
 import dev.eclipse.ssh.ssh.SshKeyProbe
 import dev.eclipse.ssh.ssh.probeSshKey
@@ -299,8 +302,6 @@ import dev.eclipse.ssh.data.credentials.StoredCredentials
 import dev.eclipse.ssh.data.credentials.describe
 import dev.eclipse.ssh.data.saf.readPickedKeyFile
 import dev.eclipse.ssh.ssh.RemoteFile
-import dev.eclipse.ssh.ssh.SessionDiagnosticEvent
-import dev.eclipse.ssh.ssh.scrub
 import dev.eclipse.ssh.data.saf.LocalFile
 import androidx.compose.ui.focus.FocusRequester
 import dev.eclipse.ssh.terminal.TerminalFrame
@@ -350,6 +351,18 @@ class MainActivity : FragmentActivity() {
     private val deepLink = MutableStateFlow<HostProfile?>(null)
 
     /**
+     * The most recent answer from one of the windows that used to be bottom sheets over the
+     * workspace - see [ActionAnswer].
+     *
+     * A flow rather than a plain field for the reason [deepLink] is one: [onResume] can run before the
+     * composition exists (the very first resume does), so the answer has to be somewhere the
+     * composition will *collect* rather than somewhere it has to have been watching. The composition
+     * clears it to null once it has acted, which is what makes `null` mean "nothing waiting" instead
+     * of "no answer was ever given".
+     */
+    private val pendingAction = MutableStateFlow<ActionAnswer?>(null)
+
+    /**
      * Set when this launch came from the "reconnect your sessions" notification, and consumed in
      * [onResume] once the activity is genuinely in the foreground.
      */
@@ -376,7 +389,13 @@ class MainActivity : FragmentActivity() {
         maybeQuickConnect(intent)
         setContent {
             val pending by deepLink.collectAsStateWithLifecycle()
-            EclipseWorkspace(deepLinkHost = pending, onDeepLinkConsumed = { deepLink.value = null })
+            val pendingAnswer by pendingAction.collectAsStateWithLifecycle()
+            EclipseWorkspace(
+                deepLinkHost = pending,
+                onDeepLinkConsumed = { deepLink.value = null },
+                pendingAction = pendingAnswer,
+                onActionHandled = { pendingAction.value = null },
+            )
         }
     }
 
@@ -396,6 +415,9 @@ class MainActivity : FragmentActivity() {
         // primary clip.
         runCatching { secureClipboard.resumePendingClear() }
         openConfirmedForward()
+        // And the same shape one more time: a window the user just came back from may have left an
+        // answer behind. Taken unconditionally, because nothing but a window ever writes one.
+        ActionRequests.takeAnswer()?.let { pendingAction.value = it }
         if (!restoreRequested) return
         // Cleared first so a second resume cannot start the service twice.
         restoreRequested = false
@@ -548,6 +570,15 @@ private fun EclipseWorkspace(
     viewModel: MainViewModel = hiltViewModel(),
     deepLinkHost: HostProfile? = null,
     onDeepLinkConsumed: () -> Unit = {},
+    /**
+     * What a window that has just been closed chose, if it chose anything - see [ActionAnswer].
+     *
+     * Handed down rather than read from [ActionRequests] here, because the one moment a returning
+     * window is noticed is `onResume` and a composition cannot observe that on its own. Null means
+     * nothing is waiting; [onActionHandled] clears it once the answer has been acted on.
+     */
+    pendingAction: ActionAnswer? = null,
+    onActionHandled: () -> Unit = {},
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -790,10 +821,6 @@ private fun EclipseWorkspace(
         }
         viewModel.reportUiMessage("Extract from \"$archiveName\": ${parts.joinToString("; ")}")
     }
-    // The Transfers tab's per-item sheet, held here (rather than inside the screen) for the same
-    // reason the preview target is: its file actions resolve against this workspace's context,
-    // clipboard and overlays, none of which the screen should know about.
-    var transferActionsFor by remember { mutableStateOf<TransferItem?>(null) }
     var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
     var showImportDialog by remember { mutableStateOf(false) }
     var pendingTextExport by remember { mutableStateOf<ByteArray?>(null) }
@@ -1335,7 +1362,6 @@ private fun EclipseWorkspace(
                         if (text.isNotEmpty()) viewModel.copyToClipboard(text)
                     },
                     onCopyTerminalText = viewModel::copyToClipboard,
-                    onCopyTrace = viewModel::copyToClipboard,
                     onPasteTerminal = viewModel::pasteFromClipboard,
                     onSaveSnippet = viewModel::saveSnippet,
                     onDeleteSnippet = viewModel::deleteSnippet,
@@ -1401,7 +1427,12 @@ private fun EclipseWorkspace(
                     onResumeAllTransfers = viewModel::resumeAllTransfers,
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
-                    onOpenTransferActions = { transferActionsFor = it },
+                    onOpenTransferActions = { transfer ->
+                        // A window of its own rather than a sheet over the card it acts on: the card
+                        // is a live progress row, and covering it to offer Pause is backwards. See
+                        // [TransferActionsActivity].
+                        context.startActivity(TransferActionsActivity.intent(context, transfer))
+                    },
                     // The host the Add-forward form will name at launch. It used to be reached for at
                     // *confirmation* time by the `onAddForward` lambda that stood here, which is how a
                     // forward ended up on whichever server the user had switched to while the form was
@@ -1502,7 +1533,6 @@ private fun EclipseWorkspace(
                         if (text.isNotEmpty()) viewModel.copyToClipboard(text)
                     },
                     onCopyTerminalText = viewModel::copyToClipboard,
-                    onCopyTrace = viewModel::copyToClipboard,
                     onPasteTerminal = viewModel::pasteFromClipboard,
                     onSaveSnippet = viewModel::saveSnippet,
                     onDeleteSnippet = viewModel::deleteSnippet,
@@ -1568,7 +1598,12 @@ private fun EclipseWorkspace(
                     onResumeAllTransfers = viewModel::resumeAllTransfers,
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
-                    onOpenTransferActions = { transferActionsFor = it },
+                    onOpenTransferActions = { transfer ->
+                        // A window of its own rather than a sheet over the card it acts on: the card
+                        // is a live progress row, and covering it to offer Pause is backwards. See
+                        // [TransferActionsActivity].
+                        context.startActivity(TransferActionsActivity.intent(context, transfer))
+                    },
                     // The host the Add-forward form will name at launch. It used to be reached for at
                     // *confirmation* time by the `onAddForward` lambda that stood here, which is how a
                     // forward ended up on whichever server the user had switched to while the form was
@@ -1962,41 +1997,43 @@ private fun EclipseWorkspace(
             )
         }
     }
-    // The Transfers sheet closes before each action runs, exactly as the Files sheet does — the
-    // preview and the editor that some rows open are their own windows, and none of them should
-    // have to fight this sheet for the bottom of the screen.
-    transferActionsFor?.let { item ->
-        TransferActionsSheet(
-            item = item,
-            onDismiss = { transferActionsFor = null },
-            onPause = { id -> transferActionsFor = null; viewModel.pauseTransfer(id) },
-            onResume = { id -> transferActionsFor = null; viewModel.resumeTransfer(id) },
-            onCancel = { id -> transferActionsFor = null; viewModel.cancelTransfer(id) },
-            onRunNow = { id -> transferActionsFor = null; viewModel.runTransferNow(id) },
-            onViewFile = { transfer ->
-                transferActionsFor = null
-                transferLocalTarget(context, transfer)?.let { target ->
-                    context.startActivity(FilePreviewActivity.intent(context, target.entry, target.provider))
-                } ?: viewModel.reportUiMessage("${transfer.name} has no local file to view")
-            },
-            onEditFile = { transfer ->
-                transferActionsFor = null
-                transferLocalTarget(context, transfer)?.let { editorRequest = EditorRequest(it.entry, it.provider) }
-                    ?: viewModel.reportUiMessage("${transfer.name} has no local file to edit")
-            },
-            onOpenFile = { transfer ->
-                transferActionsFor = null
-                openTransferFileExternally(context, transfer, choose = false, onNoApp = viewModel::reportUiMessage)
-            },
-            onOpenFileWith = { transfer ->
-                transferActionsFor = null
-                openTransferFileExternally(context, transfer, choose = true, onNoApp = viewModel::reportUiMessage)
-            },
-            onCopyDetails = { transfer ->
-                transferActionsFor = null
-                viewModel.copyToClipboard(transferDetails(transfer))
-            },
-        )
+    // What the windows that used to be sheets over this workspace answered, acted on here for the
+    // same reason the deep link above is: the answer needs something only this composition has. The
+    // view-model calls are the easy half; View/Edit/Open resolve a provider from the transfer and then
+    // open a window with it, and `editorRequest` and the preview launcher are this workspace's own.
+    //
+    // Consumed at the end, exactly as the deep link is, so a recomposition cannot run one answer
+    // twice. `takeAnswer` has already emptied the slot, so the worst a lost frame can do is drop an
+    // action the user would have seen had they waited - which is the right way round for a command.
+    LaunchedEffect(pendingAction) {
+        val answer = pendingAction ?: return@LaunchedEffect
+        if (answer is ActionAnswer.TransferAction) {
+            // Resolved from the list the window was opened from rather than trusted as an id: the item
+            // is live, and one that has since left the list has nothing left to act on.
+            val transfer = state.transfers.firstOrNull { it.id == answer.transferId }
+            if (transfer == null) {
+                viewModel.reportUiMessage("That transfer is no longer in the list")
+            } else when (answer.action) {
+                TransferActionKind.PAUSE -> viewModel.pauseTransfer(transfer.id)
+                TransferActionKind.RESUME -> viewModel.resumeTransfer(transfer.id)
+                TransferActionKind.CANCEL -> viewModel.cancelTransfer(transfer.id)
+                TransferActionKind.RUN_NOW -> viewModel.runTransferNow(transfer.id)
+                // The five below are why these answers come back here at all - see [ActionAnswer].
+                TransferActionKind.VIEW_FILE ->
+                    transferLocalTarget(context, transfer)?.let { target ->
+                        context.startActivity(FilePreviewActivity.intent(context, target.entry, target.provider))
+                    } ?: viewModel.reportUiMessage("${transfer.name} has no local file to view")
+                TransferActionKind.EDIT_FILE ->
+                    transferLocalTarget(context, transfer)?.let { editorRequest = EditorRequest(it.entry, it.provider) }
+                        ?: viewModel.reportUiMessage("${transfer.name} has no local file to edit")
+                TransferActionKind.OPEN_FILE ->
+                    openTransferFileExternally(context, transfer, choose = false, onNoApp = viewModel::reportUiMessage)
+                TransferActionKind.OPEN_FILE_WITH ->
+                    openTransferFileExternally(context, transfer, choose = true, onNoApp = viewModel::reportUiMessage)
+                TransferActionKind.COPY_DETAILS -> viewModel.copyToClipboard(transferDetails(transfer))
+            }
+        }
+        onActionHandled()
     }
     }
     }
@@ -2172,8 +2209,6 @@ private fun WorkspaceScaffold(
     onScrollTerminalTo: (String, Int) -> Unit = { _, _ -> },
     onCopySelection: (String, TerminalSelection) -> Unit = { _, _ -> },
     onCopyTerminalText: (String) -> Unit = {},
-    /** Puts one session's own diagnostic trace on the clipboard - see [SessionWhySheet]. */
-    onCopyTrace: (String) -> Unit = {},
     onPasteTerminal: (String) -> Unit = {},
     onSaveSnippet: (String, String) -> Unit = { _, _ -> },
     onDeleteSnippet: (String) -> Unit = {},
@@ -2200,7 +2235,7 @@ private fun WorkspaceScaffold(
     onResumeAllTransfers: () -> Unit = {},
     onCancelAllTransfers: () -> Unit = {},
     onRunTransferNow: (String) -> Unit = {},
-    /** Long-press on a transfer card: opens the per-item action sheet held above this scaffold. */
+    /** Long-press on a transfer card: opens [TransferActionsActivity]. */
     onOpenTransferActions: (TransferItem) -> Unit = {},
     /**
      * The host the Settings section's Add-forward form will open its tunnel through.
@@ -2273,7 +2308,6 @@ private fun WorkspaceScaffold(
             onScrollTo = onScrollTerminalTo,
             onCopySelection = onCopySelection,
             onCopyText = onCopyTerminalText,
-            onCopyTrace = onCopyTrace,
             onPaste = onPasteTerminal,
             onSaveSnippet = onSaveSnippet,
             onDeleteSnippet = onDeleteSnippet,
@@ -2374,7 +2408,6 @@ private fun WorkspaceScaffold(
                     // The session row knows its host's id; the manager above this scaffold wants the
                     // profile, which only the hosts flow can answer for.
                     onManageForwards = { hostId -> state.hosts.firstOrNull { it.id == hostId }?.let(onManageForwards) },
-                    onCopyTrace = onCopyTrace,
                     onGoToHosts = { onDestination(Destination.HOSTS) },
                 )
             }
@@ -2710,7 +2743,6 @@ private fun TerminalScreen(
     onScrollTo: (String, Int) -> Unit,
     onCopySelection: (String, TerminalSelection) -> Unit,
     onCopyText: (String) -> Unit,
-    onCopyTrace: (String) -> Unit,
     onPaste: (String) -> Unit,
     onSaveSnippet: (String, String) -> Unit,
     onDeleteSnippet: (String) -> Unit,
@@ -2945,10 +2977,6 @@ private fun TerminalScreen(
             showCommandBar = showCommandBar,
             showHistory = showHistory,
             terminalText = terminalText,
-            // Filtered to this session before it reaches the strip, so nothing on this screen can show
-            // one host another host's trace. See [sessionDiagnostics].
-            trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[activeTab.hostId]),
-            onCopyTrace = onCopyTrace,
             // The strip draws on the terminal's own background; these two are where every chrome
             // colour on it is derived from. See TerminalTabStrip's parameter docs.
             termBg = termBg,
@@ -3184,7 +3212,6 @@ private fun TerminalSessionsScreen(
     onReconnectSession: (String) -> Unit,
     /** Opens this session's host's port-forwarding manager - the forward note on its row. */
     onManageForwards: (String) -> Unit,
-    onCopyTrace: (String) -> Unit,
     onGoToHosts: () -> Unit,
 ) {
     if (state.tabs.isEmpty()) {
@@ -3231,15 +3258,10 @@ private fun TerminalSessionsScreen(
                         timeFormat.format(java.util.Date(tab.startedAt))
                     },
                     lastOutput = state.terminalOutput[tab.id],
-                    // This session's own lines only - see [sessionDiagnostics]. Computed per row and
-                    // not remembered: the ring changes while a ladder runs, which is exactly when the
-                    // sheet is open and reading it.
-                    trace = sessionDiagnostics(state.diagnostics, state.diagnosticsLabels[tab.hostId]),
                     onOpen = { onOpenSession(tab) },
                     // The row's own session key, for the same reason the shell above routes by tab.
                     onReconnect = { onReconnectSession(tab.id) },
                     onManageForwards = { onManageForwards(tab.hostId) },
-                    onCopyTrace = onCopyTrace,
                     onClose = { onCloseTab(tab) },
                 )
             }
@@ -3312,24 +3334,6 @@ internal fun statusLine(
 }
 
 /**
- * The colour that state should be said in: green while it is up, red when something failed, amber while
- * it is working on it, and plain body text once it is simply over.
- *
- * ERROR is worth its own colour. A shell that exited and a password that was refused both used to be
- * amber "Disconnected", and only one of those is something the user has to do something about.
- */
-@Composable
-private fun statusColor(state: SessionConnectionState, networkHeld: Boolean = false): Color = when {
-    // A held session is up but unusable until the network is back, which is exactly what amber says
-    // everywhere else in this app. Green would invite the user to type into it.
-    networkHeld && state.isLive -> EclipseWarning
-    state.isLive -> EclipseSuccess
-    state == SessionConnectionState.ERROR -> MaterialTheme.colorScheme.error
-    state.isBusy -> EclipseWarning
-    else -> MaterialTheme.colorScheme.onSurfaceVariant
-}
-
-/**
  * One session in [TerminalSessionsScreen]: what it is, whether it is alive, and the way into it.
  *
  * The whole row is the target that opens the shell, with Close and Reconnect as the only smaller ones
@@ -3342,15 +3346,15 @@ private fun SessionRow(
     host: HostProfile?,
     startedAt: String,
     lastOutput: String?,
-    trace: List<SessionDiagnosticEvent>,
     onOpen: () -> Unit,
     onReconnect: () -> Unit,
     /** Opens the host's port-forwarding manager; the forward note is the smaller target inside the row. */
     onManageForwards: () -> Unit,
-    onCopyTrace: (String) -> Unit,
     onClose: () -> Unit,
 ) {
-    var showWhy by remember { mutableStateOf(false) }
+    // The "why?" window is an Activity now, so this row needs a context and nothing else: the trace it
+    // used to be handed, and the copy callback it used to forward, both belong to that window.
+    val context = LocalContext.current
     val preview = remember(lastOutput) {
         lastOutput?.takeLast(SESSION_PREVIEW_SCAN_CHARS)
             ?.lineSequence()?.lastOrNull { it.isNotBlank() }?.trim()?.take(120)
@@ -3481,7 +3485,7 @@ private fun SessionRow(
             // a session that dropped while the app was elsewhere gets discovered.
             if (tab.state.explainable) {
                 TextButton(
-                    onClick = { showWhy = true },
+                    onClick = { context.startActivity(SessionWhyActivity.intent(context, tab)) },
                     contentPadding = PaddingValues(horizontal = 8.dp),
                     // Named by session, because there is one of these per row.
                     modifier = Modifier.semantics { contentDescription = "Why ${tab.title} is ${tab.state.name}" },
@@ -3493,14 +3497,6 @@ private fun SessionRow(
                 Icon(Icons.Default.Close, "Close ${tab.title} session", modifier = Modifier.size(18.dp))
             }
         }
-    }
-    if (showWhy) {
-        SessionWhySheet(
-            tab = tab,
-            trace = trace,
-            onCopy = onCopyTrace,
-            onDismiss = { showWhy = false },
-        )
     }
 }
 
@@ -3619,8 +3615,6 @@ private fun TerminalTabStrip(
     showCommandBar: Boolean,
     showHistory: Boolean,
     terminalText: String,
-    trace: List<SessionDiagnosticEvent>,
-    onCopyTrace: (String) -> Unit,
     /**
      * The terminal's own background and foreground, the pair the strip sits on. Every chrome colour
      * here is derived from these rather than from the app theme because the strip is drawn on top of
@@ -3632,7 +3626,7 @@ private fun TerminalTabStrip(
     termFg: Color,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
-    var showWhy by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     // The tab whose X was tapped, while the confirmation below is on screen. Closing a session kills
     // a live shell, and the X sits a thumb-width from the chip a user is aiming for - the same reason
     // Remove on a host card asks first.
@@ -3818,10 +3812,10 @@ private fun TerminalTabStrip(
         // Offered while a recovery is still running as well as after one has given up, because a ladder
         // that is halfway through its five attempts is exactly when a user wants to know what it is
         // answering - and the two-line status above can only ever show the latest sentence. See
-        // [SessionWhySheet].
+        // [SessionWhyActivity].
         if (activeTab.state.explainable) {
             TextButton(
-                onClick = { showWhy = true },
+                onClick = { context.startActivity(SessionWhyActivity.intent(context, activeTab)) },
                 contentPadding = PaddingValues(horizontal = 8.dp),
                 colors = ButtonDefaults.textButtonColors(contentColor = termFg),
                 modifier = Modifier.semantics { contentDescription = "Why this session is ${activeTab.state.name}" },
@@ -3872,14 +3866,6 @@ private fun TerminalTabStrip(
                 modifier = Modifier.padding(horizontal = 12.dp),
             )
         }
-    }
-    if (showWhy) {
-        SessionWhySheet(
-            tab = activeTab,
-            trace = trace,
-            onCopy = onCopyTrace,
-            onDismiss = { showWhy = false },
-        )
     }
     confirmClose?.let { tab ->
         // App-themed on purpose, unlike everything else on the strip: an AlertDialog is a modal
@@ -4827,96 +4813,6 @@ private fun formatTransferBytes(bytes: Long): String {
     return if (unit == "B") "$bytes B" else "${"%.1f".format(value)} $unit"
 }
 
-/**
- * The per-transfer action sheet: everything one transfer can do, opened by long-pressing its card.
- *
- * The card's own buttons remain the one-tap answers to the states a watched transfer cycles
- * through; this is the complete list, and like the Files explorer's action sheet it offers only
- * what the item's own state can serve — a control action for its current status, and the file
- * actions only when the local file actually exists in full.
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun TransferActionsSheet(
-    item: TransferItem,
-    onDismiss: () -> Unit,
-    onPause: (String) -> Unit,
-    onResume: (String) -> Unit,
-    onCancel: (String) -> Unit,
-    onRunNow: (String) -> Unit,
-    onViewFile: (TransferItem) -> Unit,
-    onEditFile: (TransferItem) -> Unit,
-    onOpenFile: (TransferItem) -> Unit,
-    onOpenFileWith: (TransferItem) -> Unit,
-    onCopyDetails: (TransferItem) -> Unit,
-) {
-    // The local file exists in full once a download completes, and from the very start for an
-    // upload — it is the source the bytes come from. A download in any other state has only a
-    // prefix on disk, and previewing or editing a prefix would show content the user would take
-    // for the whole file.
-    val hasLocalFile = item.localUri != null &&
-        (item.status == TransferStatus.COMPLETE || item.direction == TransferDirection.UPLOAD)
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 22.dp).padding(bottom = 18.dp)) {
-            Text(item.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                "${item.direction.label} · ${item.hostName} · ${item.status.name.lowercase()}",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(12.dp))
-            // The control the status asks for, in the card's own vocabulary: a retry is a resume
-            // the user chose to name differently, exactly as the card's icon does.
-            when (item.status) {
-                TransferStatus.RUNNING -> TransferActionRow("Pause") { onPause(item.id) }
-                TransferStatus.PAUSED -> TransferActionRow("Resume") { onResume(item.id) }
-                TransferStatus.FAILED -> TransferActionRow("Retry") { onResume(item.id) }
-                TransferStatus.QUEUED -> if (item.scheduledAt != null) {
-                    TransferActionRow("Run now") { onRunNow(item.id) }
-                } else {
-                    TransferActionRow("Resume") { onResume(item.id) }
-                }
-                TransferStatus.COMPLETE -> Unit
-            }
-            if (item.status != TransferStatus.COMPLETE) {
-                TransferActionRow("Cancel transfer", destructive = true) { onCancel(item.id) }
-            }
-            if (hasLocalFile) {
-                TransferActionRow("View file") { onViewFile(item) }
-                // Editing only a finished file: overwriting the source of a running upload, or a
-                // half-written download target, races the transfer that is still writing it.
-                if (item.status == TransferStatus.COMPLETE) {
-                    TransferActionRow("Edit") { onEditFile(item) }
-                }
-                TransferActionRow("Open") { onOpenFile(item) }
-                TransferActionRow("Open with") { onOpenFileWith(item) }
-            }
-            TransferActionRow("Copy details") { onCopyDetails(item) }
-            if (item.status == TransferStatus.COMPLETE) {
-                // Cancel for a finished transfer stops nothing — it only drops the row, so the
-                // sheet names it for what it does here.
-                TransferActionRow("Remove from list", destructive = true) { onCancel(item.id) }
-            }
-        }
-    }
-}
-
-/** One row of the transfer action sheet, red where the action removes something. */
-// The click goes last so every row reads as `TransferActionRow(label) { ... }` — with a trailing
-// Boolean the trailing lambda would have nothing to bind to.
-@Composable
-private fun TransferActionRow(label: String, destructive: Boolean = false, onClick: () -> Unit) {
-    Text(
-        label,
-        Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(vertical = 14.dp),
-        style = MaterialTheme.typography.bodyLarge,
-        color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
-    )
-}
-
 @Composable
 private fun SettingsScreen(
     state: MainUiState,
@@ -5186,15 +5082,6 @@ private fun SettingsScreen(
     // The Add-forward dialog that used to sit here is a window of its own now
     // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
     // workspace's next resume rather than through this composition - see [MainActivity.onResume].
-    // The Add-forward dialog that used to sit here is a window of its own now
-    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
-    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
-    // The Add-forward dialog that used to sit here is a window of its own now
-    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
-    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
-    // The Add-forward dialog that used to sit here is a window of its own now
-    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
-    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
     // The six choice dialogs that used to sit here - keep-alive, reconnect delay, clipboard
     // auto-clear, auto-lock vault, font size, terminal width - are now windows of their own, opened
     // from the rows above. Their values are written straight to the settings DataStore, which this
@@ -5206,111 +5093,6 @@ private fun SettingsScreen(
     // collect, so coming back here is not enough on its own. The known-hosts count in particular is a
     // snapshot the view model holds, and a fingerprint forgotten in that window would leave the row
     // above counting one that is gone; see the ON_RESUME refresh in the workspace.
-}
-
-/**
- * Why *this* session is in the state it is in: its own reason, and its own slice of the trace.
- *
- * The app has recorded all of this since the diagnostics work landed, and every word of it was two
- * screens and four taps away - Settings, Background processing, Connection diagnostics, View - in a
- * five-hundred-line ring shared by every host, at the moment when the user is looking at a tab that
- * will not stay connected. So the single most-reported problem with this app arrived as "it keeps
- * reconnecting", not because the app did not know why, but because nothing put the answer where the
- * question is asked.
- *
- * [trace] is already filtered to this session and ordered newest first by [sessionDiagnostics], and
- * every line is already scrubbed and carries an opaque `s1`/`s2` label rather than a host name - so
- * what Copy puts on the clipboard is safe to paste into a bug report as it stands. The reason line goes
- * through [scrub] as well: it is passed through from the transport library, which is the one string
- * here this app did not compose itself.
- */
-@Composable
-private fun SessionWhySheet(
-    tab: SessionTab,
-    trace: List<SessionDiagnosticEvent>,
-    onCopy: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val clock = remember {
-        DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault())
-    }
-    val reason = remember(tab.lastError) { tab.lastError?.let(::scrub) }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Text(
-                when {
-                    tab.state == SessionConnectionState.RECONNECTING -> "Why it is reconnecting"
-                    tab.state.isBusy -> "What it is waiting for"
-                    else -> "Why it ended"
-                },
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                reason ?: "No reason was recorded for this session.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = statusColor(tab.state, tab.networkHeld),
-            )
-            if (trace.isEmpty()) {
-                Text(
-                    "Nothing has been recorded for this session yet.",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                Text(
-                    "This session's last ${trace.size} event(s), newest first. No password, key or host " +
-                        "name is recorded, so this is safe to attach to a bug report.",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                LazyColumn(
-                    // 0.45 of the screen: a trace a page tall is a trace worth scrolling, and the
-                    // LazyColumn is the scroller. Replaces a fixed 320dp that assumed one phone.
-                    Modifier.heightIn(max = rememberDialogBodyMaxHeight(0.45f)),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    items(trace, key = { it.sequence }) { entry ->
-                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                            Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp)) {
-                                Text(
-                                    clock.format(Instant.ofEpochMilli(entry.atMs)),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Text(
-                                    // The epoch millis at the front of `line()` is for the exported
-                                    // file; the clock above says the same thing to a reader.
-                                    entry.line().substringAfter(' '),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontFamily = FontFamily.Monospace,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(
-                    onClick = {
-                        // Oldest first in the copy, the opposite of the display: on screen the answer
-                        // wanted is the last thing that happened, and in a pasted report the reader
-                        // needs to follow the session forwards.
-                        onCopy(
-                            buildString {
-                                append(tab.state.name)
-                                reason?.let { append(" · ").append(it) }
-                                trace.asReversed().forEach { append('\n').append(it.line()) }
-                            },
-                        )
-                    },
-                ) { Text("Copy") }
-                TextButton(onClick = onDismiss) { Text("Close") }
-            }
-        }
-    }
 }
 
 /**
