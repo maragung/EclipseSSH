@@ -7,6 +7,7 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isNotEnabled
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.performClick
 import androidx.lifecycle.Lifecycle
@@ -209,14 +210,17 @@ class PortForwardManagerActivityRobolectricTest {
         val host = seedHost(full)
 
         launchWindow(host).use {
-            // The label is there and the row is not tappable: a disabled TextButton keeps its text and
-            // loses its click action. Waited for rather than asserted on the first frame, because the
-            // row is drawn from the very first composition while the 32 rules that fill the cap arrive
-            // from the repository a frame or two later - read immediately, this sees the enabled
-            // empty-list state and fails on a row the user never gets to see.
+            // The row is there and it is disabled. Waited for, and waited for as `Disabled` rather
+            // than as the absence of a click action: `disabled()` is what a disabled control records,
+            // and whether a disabled clickable also drops its OnClick is a detail of the Compose
+            // version rather than something this window decides - the tree's other suites assert a
+            // dead row the same way. The wait is also what makes the test honest about when it looks:
+            // the row is drawn from the very first composition, while the 32 rules that fill the cap
+            // arrive from the repository a frame or two later, so an immediate assert reads the
+            // enabled empty-list frame and fails on a row the user never sees.
             awaitText("Add rule")
             pumpUntil(describe = { "the Add row never went disabled at the cap" }) {
-                compose.onAllNodes(hasText("Add rule") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+                compose.onAllNodes(hasText("Add rule") and isNotEnabled()).fetchSemanticsNodes().isNotEmpty()
             }
         }
     }
