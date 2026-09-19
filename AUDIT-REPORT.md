@@ -4724,3 +4724,22 @@ cache entries and forces a cold four-ABI native build of roughly half an hour. T
 on the release whose whole point is a green publication, so #126 merges **after** `v1.2.1` is out. The
 trigger that reverses that order is stated with it: if a run reddens on the same download again before
 the tag, #126 goes first and the release waits.
+
+---
+
+## 42. The dispatch example, moved on by the rule §40.6 stated
+
+§40.6 put `testing/README.md`'s dispatch example at `v1.1.20` and stated the rule it had been missing:
+the example names the newest release that is **published**, not the newest tag that exists. `v1.2.1`
+is now that release — published 2026-09-18T18:31:11Z with seven assets, and validated green by
+`35380659961` five seconds later — so the example moves to it. `v1.2.0` is still a draft and stays
+where §40.6 left it: a tag whose release the command this example documents cannot fetch.
+
+Nothing checks this one, and that is deliberate rather than overlooked. The only offline proxy
+available is "the version named by the last `## <n>. Releasing <version>` section", and a section is
+written before its release is published — so the proxy answers *pass* for exactly the mistake §40.6
+exists to prevent, a tag whose release is still a draft. A guard that is blind to the case it is
+there for is worse than no guard — the same lesson the lockfile check ran into in the same batch: #132
+removed the flag that rewrote the file it was meant to check, and the step still could not refuse
+drift, because a report task exits 0 (#133). Publication state lives in the Releases API, and the
+`docs` job has no network.
