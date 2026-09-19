@@ -1,16 +1,15 @@
 package dev.eclipse.ssh
 
+import android.content.Intent
 import android.os.Looper
 import androidx.compose.runtime.snapshots.Snapshot
-import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.semantics.getOrNull
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.data.TransferRepository
@@ -18,8 +17,13 @@ import dev.eclipse.ssh.data.model.TransferDirection
 import dev.eclipse.ssh.data.model.TransferItem
 import dev.eclipse.ssh.data.model.TransferStatus
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.actions.ActionAnswer
+import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.TransferActionKind
+import dev.eclipse.ssh.ui.transfers.TransferActionsActivity
 import java.time.Duration
 import kotlinx.coroutines.runBlocking
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -28,19 +32,26 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 /**
- * The Transfers tab's long-press action sheet.
+ * What the Transfers tab does with the transfers window, and what the workspace does with its answer.
  *
- * The sheet's contract is that it offers exactly what the row's own state can serve: the control
- * action matching the current status, the file actions only when the local file exists in full,
- * and Copy details always. Every test here pins one column of that matrix by long-pressing a row
- * of a known shape and asserting both the rows that appear and — just as deliberately — the ones
- * that must not. A sheet that offered "View file" on a half-downloaded file would pass any
- * "the row exists" assertion and still be lying about what is on disk.
+ * This suite used to pin the rows of a `ModalBottomSheet` that a long-press opened. The rows moved to
+ * `TransferActionsActivityRobolectricTest`, which drives that window directly — and what is left here
+ * is the half a window suite structurally cannot see: the two moments the workspace is involved. A
+ * long-press on a card opens the window, and the answer that window files is acted on when the
+ * workspace comes back to the foreground.
  *
- * No server is needed: a transfer is a Room row, and the two the clean install seeds (a running
- * download and a completed upload) cover the no-local-file halves of the matrix on their own. The
- * local-file halves are injected through the repository the view model itself writes through, so
- * the rows the sheet reads are the rows the app would have shown.
+ * The second half is the one that needs explaining, because it is the part that would be silently
+ * absent. Every window that used to be a sheet hands its choice back through
+ * [dev.eclipse.ssh.ui.actions.ActionRequests] rather than acting on it, and the workspace picks it up
+ * in `onResume` — the only moment a returning window is noticed. A window that opened perfectly and
+ * filed a perfect answer, with nothing on the other end of the handoff, would pass every test the
+ * window suite has. So the drain is driven here end to end: the answer is written, the workspace is
+ * stopped and resumed the way the real one is when a window above it closes, and the *effect* is
+ * asserted — a transfer that leaves the list, an editor that opens.
+ *
+ * No server is needed. The two transfers the clean install seeds cover the running and completed
+ * halves of the matrix on their own, and the rest are written through the repository the view model
+ * itself writes through, so the cards these tests long-press are the cards a user would have seen.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = EclipseApp::class, sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
@@ -49,148 +60,154 @@ class TransfersActionsRobolectricTest {
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
 
-    /** The seeded download: running, and with no local file the sheet could point at. */
-    @Test
-    fun longPressOnARunningTransferOffersTheControlsItsStateCanServe() {
-        openTransfers()
-        longPress("release-bundle.tar.gz")
-
-        // The control its status asks for, the removal, and the always-there facts row.
-        awaitRow("Pause")
-        awaitRow("Cancel transfer")
-        awaitRow("Copy details")
-        // Nothing else: no resume for a running transfer, no file actions without a local file,
-        // and nothing to remove from a list while the transfer is still in it.
-        assertRowAbsent("Resume")
-        assertRowAbsent("View file")
-        assertRowAbsent("Edit")
-        assertRowAbsent("Open with")
-        assertRowAbsent("Remove from list")
+    /** The answer slot is process-wide; a leftover would be read as this test's answer. */
+    @Before
+    fun drainAnswers() {
+        ActionRequests.takeAnswer()
     }
 
     /**
-     * A paused download has a localUri but only a *prefix* of the file behind it, so the sheet
-     * offers resume and cancel and deliberately not the file.
+     * A long-press on a transfer card opens the transfer's window, on that transfer.
      *
-     * This is the row that separates "actions appear when a localUri exists" from the actual rule:
-     * the file actions arrive when the local file exists *in full*, which for a download is only
-     * COMPLETE.
+     * The id is asserted and not just the class, because those are two different failures: a window
+     * that opened blank would be a menu with no transfer behind it, and one that opened on the wrong
+     * transfer is a menu of actions for something the user did not touch. Neither is visible from the
+     * card that was long-pressed.
      */
     @Test
-    fun longPressOnAPausedDownloadOffersResumeButNotTheHalfOfTheFileOnDisk() {
-        inject(
-            TransferItem(
-                id = "sheet-paused",
-                name = "nightly-dump.sql",
-                direction = TransferDirection.DOWNLOAD,
-                hostName = "Staging cluster",
-                progress = 0.4f,
-                status = TransferStatus.PAUSED,
-                sizeLabel = "900 MB",
-                hostId = "eclipse-staging",
-                remotePath = "/db/nightly-dump.sql",
-                localUri = "content://downloads/nightly-dump.sql",
-                transferredBytes = 377_487_360,
-                totalBytes = 943_718_400,
-            ),
+    fun longPressingATransferCardOpensThatTransfersWindow() {
+        val item = TransferItem(
+            id = "row-window",
+            name = "site-backup.tar",
+            direction = TransferDirection.DOWNLOAD,
+            hostName = "Production edge",
+            progress = 1f,
+            status = TransferStatus.COMPLETE,
+            sizeLabel = "2.1 GB",
+            hostId = "eclipse-demo",
+            remotePath = "/srv/backups/site-backup.tar",
+            localUri = "content://downloads/site-backup.tar",
+            transferredBytes = 2_254_856_192,
+            totalBytes = 2_254_856_192,
         )
-        openTransfers(rowName = "nightly-dump.sql")
-        longPress("nightly-dump.sql")
-
-        awaitRow("Resume")
-        awaitRow("Cancel transfer")
-        awaitRow("Copy details")
-        assertRowAbsent("Pause")
-        assertRowAbsent("View file")
-        assertRowAbsent("Edit")
-        assertRowAbsent("Open with")
-        assertRowAbsent("Remove from list")
-    }
-
-    /** The finished download: the file it produced, every way the app can hand it over. */
-    @Test
-    fun longPressOnACompletedTransferOffersTheFileItProduced() {
-        inject(
-            TransferItem(
-                id = "sheet-complete",
-                name = "site-backup.tar",
-                direction = TransferDirection.DOWNLOAD,
-                hostName = "Production edge",
-                progress = 1f,
-                status = TransferStatus.COMPLETE,
-                sizeLabel = "2.1 GB",
-                hostId = "eclipse-demo",
-                remotePath = "/srv/backups/site-backup.tar",
-                localUri = "content://downloads/site-backup.tar",
-                transferredBytes = 2_254_856_192,
-                totalBytes = 2_254_856_192,
-            ),
-        )
+        inject(item)
         openTransfers(rowName = "site-backup.tar")
+        drainStartedActivities()
         longPress("site-backup.tar")
 
-        awaitRow("View file")
-        awaitRow("Edit")
-        awaitRow("Open")
-        awaitRow("Open with")
-        awaitRow("Copy details")
-        awaitRow("Remove from list")
-        // A finished transfer has nothing to pause, resume or cancel; removal is the only way out.
-        assertRowAbsent("Pause")
-        assertRowAbsent("Resume")
-        assertRowAbsent("Cancel transfer")
+        val started = awaitStartedActivity("dev.eclipse.ssh.ui.transfers.TransferActionsActivity")
+        assertThat(started.getStringExtra(TransferActionsActivity.EXTRA_TRANSFER_ID)).isEqualTo(item.id)
     }
 
     /**
-     * The sheet's Edit row opens the full-window editor, the same way the Files sheet's does.
+     * The answer is acted on when the workspace comes back, and the effect is the workspace's own.
      *
-     * This is the wiring the sheet exists to expose: the transfer's local file handed to the editor
-     * as a provider-backed entry. The editor's own reading and saving have their own suites; what
-     * only this level can show is that the tap reaches the editor activity at all.
+     * Cancel on a finished transfer is the smallest answer with a visible consequence: the row leaves
+     * the list, which is something only the view model can have done. A workspace that opened the
+     * window correctly and then ignored it leaves the row sitting there.
      */
     @Test
-    fun theSheetsEditRowOpensTheEditor() {
-        inject(
-            TransferItem(
-                id = "sheet-edit",
-                name = "release-notes.md",
-                direction = TransferDirection.DOWNLOAD,
-                hostName = "Production edge",
-                progress = 1f,
-                status = TransferStatus.COMPLETE,
-                sizeLabel = "3 KB",
-                hostId = "eclipse-demo",
-                remotePath = "/srv/releases/release-notes.md",
-                localUri = "content://downloads/release-notes.md",
-                transferredBytes = 3_072,
-                totalBytes = 3_072,
-            ),
+    fun theWindowsAnswerIsActedOnWhenTheWorkspaceComesBack() {
+        val item = TransferItem(
+            id = "answer-cancel",
+            name = "site-backup.tar",
+            direction = TransferDirection.DOWNLOAD,
+            hostName = "Production edge",
+            progress = 1f,
+            status = TransferStatus.COMPLETE,
+            sizeLabel = "2.1 GB",
+            hostId = "eclipse-demo",
+            remotePath = "/srv/backups/site-backup.tar",
+            localUri = "content://downloads/site-backup.tar",
+            transferredBytes = 2_254_856_192,
+            totalBytes = 2_254_856_192,
         )
-        openTransfers(rowName = "release-notes.md")
-        longPress("release-notes.md")
-        val app = compose.activity.application
-        // Drain whatever starts the setup made, so the peek below only ever reports this
-        // click's doing — peeking does not consume, so a stale intent would mask the editor's.
-        while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
-        clickSheetRow("Edit")
+        inject(item)
 
-        // Stage 1: the row's own first act is closing the sheet it lives in, so the sheet
-        // leaving the tree is the observable proof that the click ran the app's code rather
-        // than stalling in the harness.
-        pumpUntil(describe = { "the sheet never closed after its Edit row was tapped" }) {
-            compose.onAllNodes(hasText("Edit") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+        ActionRequests.answer(ActionAnswer.TransferAction(item.id, TransferActionKind.CANCEL))
+        resumeTheWorkspace()
+
+        pumpUntil(describe = { "the answer to remove the transfer was never acted on" }) {
+            viewModel().uiState.value.transfers.none { it.id == item.id }
         }
-        // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it,
-        // which fires on a later frame. Robolectric records every startActivity
-        // unconditionally, so a timeout here means the request never reached the effect —
-        // and the peeked intent is the honest witness of what did start instead.
-        pumpUntil(describe = {
-            "the editor activity never started (last start: " +
-                runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull() + ")"
-        }) {
-            runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull()
-                ?.component?.className == "dev.eclipse.ssh.ui.editor.TextEditorActivity"
+    }
+
+    /**
+     * A file answer opens the editor, through the same helpers the sheet's Edit row used.
+     *
+     * This is why the answers come back to the workspace at all rather than being carried out by the
+     * window: View and Edit resolve a [dev.eclipse.ssh.data.fs.FileSystemProvider] from the transfer
+     * and open a window with it, and that resolution is the workspace's. A second implementation in a
+     * second window would be two answers to the same question, and this is the test that would not
+     * notice the difference — which is exactly why the resolution is not duplicated.
+     */
+    @Test
+    fun aFileAnswerOpensTheEditor() {
+        val item = TransferItem(
+            id = "answer-edit",
+            name = "release-notes.md",
+            direction = TransferDirection.DOWNLOAD,
+            hostName = "Production edge",
+            progress = 1f,
+            status = TransferStatus.COMPLETE,
+            sizeLabel = "3 KB",
+            hostId = "eclipse-demo",
+            remotePath = "/srv/releases/release-notes.md",
+            localUri = "content://downloads/release-notes.md",
+            transferredBytes = 3_072,
+            totalBytes = 3_072,
+        )
+        inject(item)
+        drainStartedActivities()
+
+        ActionRequests.answer(ActionAnswer.TransferAction(item.id, TransferActionKind.EDIT_FILE))
+        resumeTheWorkspace()
+
+        val started = awaitStartedActivity("dev.eclipse.ssh.ui.editor.TextEditorActivity")
+        assertThat(started.component?.className).isEqualTo("dev.eclipse.ssh.ui.editor.TextEditorActivity")
+    }
+
+    /**
+     * A second resume does not run the answer a second time.
+     *
+     * `takeAnswer` empties the slot as it reads it, and this is the test that says so from outside:
+     * two resumes in a row — a rotation after a window closed, say — must produce one editor, not two.
+     * The alternative is the one a result-code replay has, where the second delivery re-opens a window
+     * the user has already used and closed.
+     */
+    @Test
+    fun theAnswerIsActedOnOnceEvenIfTheWorkspaceResumesTwice() {
+        val item = TransferItem(
+            id = "answer-once",
+            name = "release-notes.md",
+            direction = TransferDirection.DOWNLOAD,
+            hostName = "Production edge",
+            progress = 1f,
+            status = TransferStatus.COMPLETE,
+            sizeLabel = "3 KB",
+            hostId = "eclipse-demo",
+            remotePath = "/srv/releases/release-notes.md",
+            localUri = "content://downloads/release-notes.md",
+            transferredBytes = 3_072,
+            totalBytes = 3_072,
+        )
+        inject(item)
+        drainStartedActivities()
+
+        ActionRequests.answer(ActionAnswer.TransferAction(item.id, TransferActionKind.EDIT_FILE))
+        resumeTheWorkspace()
+        awaitStartedActivity("dev.eclipse.ssh.ui.editor.TextEditorActivity")
+        resumeTheWorkspace()
+
+        // Every start recorded after the first one, until there are none left. A second editor would
+        // have to appear here.
+        val shadow = shadowOf(compose.activity.application)
+        val started = mutableListOf<String>()
+        while (true) {
+            val next = shadow.nextStartedActivity ?: break
+            next.component?.className?.let(started::add)
         }
+        assertThat(started).doesNotContain("dev.eclipse.ssh.ui.editor.TextEditorActivity")
     }
 
     // ---------------------------------------------------------------- driving the app
@@ -241,32 +258,24 @@ class TransfersActionsRobolectricTest {
     }
 
     /**
-     * Clicks a sheet row by invoking its own OnClick semantics action.
+     * Stops and resumes the workspace, which is what a window closing above it does.
      *
-     * A Material3 ModalBottomSheet lives in a Dialog window, and `performClick`'s injected touch
-     * never reaches content inside a dialog window under Robolectric — the node is found, the call
-     * returns, the lambda never runs. See `FilesExplorerLayoutRobolectricTest.clickSheetRow` for
-     * the full reasoning; the shape is copied so both suites fail in equally readable ways.
+     * [MainActivity.onResume] is where an answer is taken, and it is deliberately the only place: the
+     * alternative is a result callback replayed into a fresh composition, which is the same action
+     * taken twice. Nothing else in the suite can drive it, because a window opened by `startActivity`
+     * under Robolectric is recorded rather than launched — the resume is simulated here at exactly the
+     * point the real one would happen.
      */
-    private fun clickSheetRow(label: String) {
-        val row = compose.onNode(hasText(label) and hasClickAction()).fetchSemanticsNode()
-        val click = row.config.getOrNull(SemanticsActions.OnClick)?.action
-        checkNotNull(click) { "the \"$label\" sheet row has no OnClick action" }
-        compose.runOnUiThread { click() }
+    private fun resumeTheWorkspace() {
+        compose.activityRule.scenario.moveToState(Lifecycle.State.STARTED)
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        compose.waitForIdle()
     }
 
-    /** A row of the sheet that must be there, and on screen. */
-    private fun awaitRow(label: String) {
-        pumpUntil(describe = { "the sheet's \"$label\" row never appeared" }) {
-            compose.onAllNodes(hasText(label) and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
-        }
-        compose.onNode(hasText(label) and hasClickAction()).assertIsDisplayed()
-    }
-
-    /** A row that must not be there at all. */
-    private fun assertRowAbsent(label: String) {
-        assertThat(compose.onAllNodes(hasText(label) and hasClickAction()).fetchSemanticsNodes())
-            .isEmpty()
+    /** Throws away every activity started so far, so a later peek reports only this test's doing. */
+    private fun drainStartedActivities() {
+        val shadow = shadowOf(compose.activity.application)
+        while (runCatching { shadow.nextStartedActivity }.getOrNull() != null) Unit
     }
 
     /**
@@ -283,6 +292,22 @@ class TransfersActionsRobolectricTest {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+    }
+
+    /**
+     * Waits for an activity of [className] to have been started, and returns its intent.
+     *
+     * Peeked rather than taken, so the caller asserts on the same intent the wait saw instead of
+     * consuming it and reporting whatever the next one happens to be. Nothing is launched by
+     * `startActivity` under Robolectric — the target composes in the suite that drives it directly —
+     * so a recorded intent is the whole of the evidence available at this level, and it is enough:
+     * it carries the id the window will open on.
+     */
+    private fun awaitStartedActivity(className: String): Intent {
+        pumpUntil(describe = { "$className was never started" }) {
+            shadowOf(compose.activity.application).peekNextStartedActivity()?.component?.className == className
+        }
+        return checkNotNull(shadowOf(compose.activity.application).peekNextStartedActivity())
     }
 
     private companion object {

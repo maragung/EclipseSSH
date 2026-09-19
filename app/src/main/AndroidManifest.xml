@@ -194,6 +194,35 @@
             android:parentActivityName=".MainActivity" />
 
         <!--
+          The transfers window: everything one transfer can do, in a window of its own
+          rather than a sheet over the progress row it acts on. Its subject is a plain
+          id read back from TransferRepository, so - unlike the token-carrying windows
+          above - it does not need singleTop: a second launch is a different transfer
+          and correctly a different instance. The configChanges list is only so a
+          rotation is a recomposition; nothing breaks if this activity is recreated.
+        -->
+        <activity
+            android:name=".ui.transfers.TransferActionsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The session "why?" window: the reason a session is in the state it is, and
+          the diagnostic trace still being written for it. Its subject is a SessionTab,
+          which this app cannot parcel, so it travels through the same in-process
+          token handoff (ActionRequests) the editor and the previews use - hence
+          singleTop and the configChanges list, both of which are load-bearing here:
+          a re-delivered intent finds its token spent and closes itself.
+        -->
+        <activity
+            android:name=".ui.sessions.SessionWhyActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
           Terminal font size, the one Settings row whose value is a range rather than a
           menu of choices - hence its own Activity rather than the shared choice base,
           and its own entry rather than a comment on the block above.
