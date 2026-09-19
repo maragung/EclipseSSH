@@ -61,10 +61,13 @@ in the `lint` job's log instead (issue #130).
 
 The refusal is a `grep`, and that is not decoration. `:app:dependencies` is a report task: it resolves
 leniently, prints `FAILED` beside the coordinate that will not resolve, and exits 0, so the report on
-its own cannot fail a build. The step reads that report and fails on the `FAILED` row. Running the
-same command with `--write-locks`, which is what the step used to do, rewrote the lockfile to match
-whatever it had just resolved — the drift the step is named for was the one outcome it could not
-produce. The remedy the failing step prints is that command, on a runner, with the file committed.
+its own cannot fail a build. The step reads that report and fails on the `FAILED` row, and it checks
+Gradle's own exit status first — otherwise a build script error, a daemon OOM or a lost network would
+leave a report that was never written, no `FAILED` row to find, and a step that printed the sentence
+saying the classpath resolved. Running the same command with `--write-locks`, which is what the step
+used to do, rewrote the lockfile to match whatever it had just resolved — the drift the step is named
+for was the one outcome it could not produce. The remedy the failing step prints is that command, on a
+runner, with the file committed.
 
 ### What the `docs` job checks, and what it does not
 
