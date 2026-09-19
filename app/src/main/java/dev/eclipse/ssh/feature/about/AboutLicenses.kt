@@ -87,7 +87,7 @@ val OPEN_SOURCE_LICENSES: List<OpenSourceLicense> = listOf(
     ),
     OpenSourceLicense(
         name = "AndroidX",
-        version = "Compose BOM 2025.04.01",
+        version = "Compose BOM 2026.09.00",
         license = "Apache License 2.0",
         purpose = "UI toolkit",
         url = "https://github.com/androidx/androidx",
@@ -101,7 +101,7 @@ val OPEN_SOURCE_LICENSES: List<OpenSourceLicense> = listOf(
     ),
     OpenSourceLicense(
         name = "Room",
-        version = "2.7.1",
+        version = "2.8.5",
         license = "Apache License 2.0",
         purpose = "host database",
         url = "https://github.com/androidx/androidx",
@@ -150,7 +150,7 @@ val OPEN_SOURCE_LICENSES: List<OpenSourceLicense> = listOf(
     ),
     OpenSourceLicense(
         name = "Bouncy Castle (bcprov-jdk18on)",
-        version = "1.79",
+        version = "1.86",
         license = "Bouncy Castle Licence",
         purpose = "the provider that replaces the platform's stripped copy at startup",
         url = "https://www.bouncycastle.org/license.html",
@@ -179,7 +179,7 @@ val OPEN_SOURCE_LICENSES: List<OpenSourceLicense> = listOf(
     ),
     OpenSourceLicense(
         name = "Robolectric",
-        version = "4.16.1",
+        version = "4.17",
         license = "MIT License",
         purpose = "test-only, not shipped in the APK",
         url = "https://github.com/robolectric/robolectric",
