@@ -173,9 +173,10 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // A lambda for the same reason the resolvers are one: this is read again on every
             // start, and a permission granted since the install is one more group to name. An
             // empty answer names nothing, which is exactly the behaviour without this wiring.
-            supplementaryGids = {
-                runCatching { android.system.Os.getgroups() }.getOrDefault(IntArray(0))
-            },
+            //
+            // From /proc/self/status rather than Os.getgroups(), which the SDK does not publish:
+            // android-37.0's android.jar has getuid/geteuid/getgid/getegid and no getgroups.
+            supplementaryGids = { AndroidGroupNames.selfGroups() },
             // A lambda, not a snapshot: the resolvers are read each time setup writes
             // /etc/resolv.conf, so a network change between install and repair lands in the file
             // instead of pinning the DNS of the moment the graph was built.

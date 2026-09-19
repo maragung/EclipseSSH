@@ -58,7 +58,7 @@ class UbuntuDistributionManager(
     private val appUid: Int,
     private val appGid: Int,
     /**
-     * The app process's supplementary Android group IDs, as `Os.getgroups()` answers them. A
+     * The app process's supplementary Android group IDs, as `/proc/self/status` reports them. A
      * lambda for the same reason [dnsServers] is one: the groups belong to the running process,
      * not to the graph, and a permission granted after the graph was built is one more of them.
      * Empty by default, which names nothing — see [nameSupplementaryGroups].

@@ -1,5 +1,7 @@
 package dev.eclipse.ssh.linux
 
+import java.io.File
+
 /**
  * The names a userspace gives the Android group IDs its own process is in.
  *
@@ -22,6 +24,10 @@ package dev.eclipse.ssh.linux
  * USERLAND` that no build file in the fork defines, and enabling that flag wholesale would also
  * compile out the `chown` emulation dpkg needs to unpack anything at all.
  *
+ * Which IDs those are is [selfGroups]'s question and how to name them is [groupFile]'s; both are
+ * pure functions of text — a `/proc` status body, a group file — so every rule either follows is
+ * pinned by a JVM test rather than by a device.
+ *
  * The label is [PREFIX] plus the platform's own name for the ID wherever Android has one (the
  * numbers and the names come from `libcutils/include/private/android_filesystem_config.h`), the
  * derived name of the range for the two IDs the platform computes from the app id, and
@@ -35,11 +41,14 @@ internal object AndroidGroupNames {
     /** What every line this object writes starts with: the mark that says which lines are ours. */
     const val PREFIX = "android_"
 
+    /** The label of the `/proc/<pid>/status` line that carries the supplementary group IDs. */
+    private const val GROUPS = "Groups:"
+
     /**
      * The whole of `/etc/group`, given what it says today and the groups the app process is in.
      *
-     * Pure and total: [existing] is the file's current lines, [gids] whatever `Os.getgroups()`
-     * answered, and the result is what the file should say. A caller writes it when the result
+     * Pure and total: [existing] is the file's current lines, [gids] whatever [groupsIn] read off
+     * the process, and the result is what the file should say. A caller writes it when the result
      * differs from [existing], and does nothing when it does not.
      */
     fun groupFile(existing: List<String>, gids: IntArray): List<String> {
@@ -60,6 +69,37 @@ internal object AndroidGroupNames {
 
     /** The group ID a `/etc/group` line names — its third colon-separated field — or null. */
     private fun gidOf(line: String): Int? = line.split(':').getOrNull(2)?.trim()?.toIntOrNull()
+
+    /**
+     * The supplementary group IDs in a `/proc/<pid>/status` body: the `Groups:` line, which is the
+     * same answer `getgroups` reads.
+     *
+     * From the file rather than from `android.system.Os.getgroups()`, because that method is not in
+     * the public SDK — android-37.0's `android.jar` carries `getuid`, `geteuid`, `getgid` and
+     * `getegid` and no `getgroups` at all, so calling it does not compile. `/proc/self/status` is
+     * the kernel's own account of the process, needs no permission and no hidden API, and an app
+     * reading it about itself is the plainest form of the question. The line is tab-separated from
+     * its label and space-separated between IDs, so the label is dropped and each token trimmed
+     * before it is read as a number.
+     *
+     * Total: no `Groups:` line, or a token that is not a number, answers with the IDs that could be
+     * read — an empty array when that is none of them.
+     */
+    fun groupsIn(procStatus: String): IntArray {
+        val line = procStatus.lineSequence().firstOrNull { it.startsWith(GROUPS) } ?: return IntArray(0)
+        return line.removePrefix(GROUPS).split(' ').mapNotNull { it.trim().toIntOrNull() }.toIntArray()
+    }
+
+    /**
+     * The supplementary groups of the calling process, as `/proc/self/status` reports them.
+     *
+     * The empty array on any failure — an unreadable `/proc`, a status this platform words
+     * differently — because nothing here is fatal: naming no groups is exactly what the userspace
+     * did before this object existed, and a session whose `/etc/group` is a little short is a
+     * cosmetic difference, not a broken install.
+     */
+    fun selfGroups(status: File = File("/proc/self/status")): IntArray =
+        runCatching { groupsIn(status.readText()) }.getOrDefault(IntArray(0))
 
     /**
      * What one Android group ID is called inside the rootfs. The table below is a courtesy rather

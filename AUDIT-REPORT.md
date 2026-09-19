@@ -5317,7 +5317,8 @@ four was an ID with no entry — which is the one condition `groups`, `id` and `
 groups all along.
 
 **The fix names them where the tools look.** `AndroidGroupNames` (new, pure) takes `/etc/group`'s
-current lines and `Os.getgroups()` and returns the whole file: the rootfs's own lines untouched, one
+current lines and the group IDs [AndroidGroupNames.selfGroups] reads off `/proc/self/status` and
+returns the whole file: the rootfs's own lines untouched, one
 appended line per unnamed ID — `android_inet:x:3003:`, `android_everybody:x:9997:`,
 `android_cache_504:x:20504:`, `android_shared_504:x:50504:`, named from the platform's own table
 where it has a name and `android_gid_<n>` where it does not, never guessed — and every line carrying
@@ -5336,6 +5337,18 @@ Failure is soft at both sites, for the same reason: the userspace is complete wi
 what differs is whether `groups` prints names or numbers — so setup files a failure as a
 `SetupReport` warning and the start path records it in the install log rather than refusing to start.
 
+**Where the IDs come from, and the wall the first build hit.** The first version of this change asked
+`android.system.Os.getgroups()`, and `Instrumentation` run `35453490840` refused to compile it:
+`Unresolved reference 'getgroups'` at `LinuxUserspaceGraphProvider.kt:177`. It is not a typo — the
+method is `@hide`, and android-37.0's `android.jar` carries `getuid`, `geteuid`, `getgid` and
+`getegid` and no `getgroups` at all, which is checkable here in one command against the SDK in
+`.tools/android-sdk/platforms/android-37.0/android.jar` rather than taken on trust. The answer is the
+kernel's own account of the process: `/proc/self/status`, whose `Groups:` line is the same list the
+syscall reads, needs no permission and no hidden API, and an app reading it about itself is the
+plainest form of the question. `AndroidGroupNames.selfGroups()` reads it and `groupsIn()` parses it —
+both total, both answering an empty array when there is nothing to read, because an empty list of
+names is exactly what the userspace did before this change existed.
+
 **What was declined, and why it matters.** The pinned proot fork already contains a handler for this
 complaint — `src/proot/src/extension/fake_id0/fake_id0.c`, whose own comment reads "On Android, the
 system is returning gids that our rootfs knows nothing about which is generating errors" — which
@@ -5347,9 +5360,11 @@ handling that makes dpkg's unpack work lives under `#ifndef USERLAND` in the sam
 it would delete that too. Hiding the groups would also make `id` describe a process that does not
 exist, since the kernel enforces those groups on every file the session opens.
 
-**What the tests pin, and what they cannot.** Thirteen JVM methods: seven in the new
-`AndroidGroupNamesTest` over the pure file (the four IDs from the report, an ID outside the table,
-an ID the rootfs already names, GID 0, a lost group losing its line, idempotence, a repeated ID),
+**What the tests pin, and what they cannot.** Seventeen JVM methods: eleven in the new
+`AndroidGroupNamesTest` over the pure text — the four IDs from the report, an ID outside the table,
+an ID the rootfs already names, GID 0, a lost group losing its line, idempotence, a repeated ID, and
+four over `/proc/self/status` bodies (the `Groups:` line as the kernel writes it, a status with no
+such line, one whose line carries a token that is not a number, and one that cannot be read at all) —
 four in `UbuntuDistributionManagerTest` (setup names them without a warning, a second naming pass
 writes nothing, a rootfs with no group file is not an error, a group list that cannot be read is a
 warning rather than a failed install), and two in `LinuxUserspaceManagerTest` (a start corrects a
@@ -5357,5 +5372,5 @@ rootfs that has no names — the reporter's case — and an unreadable group lis
 userspace starting, but is recorded). What no JVM test can prove is what a device's `groups` prints:
 that is the on-device loop's verdict, and the terminal's own output is where it is read.
 
-The suite is now 1,854 JVM/Robolectric test methods in 164 test files — the README's figures, which
+The suite is now 1,858 JVM/Robolectric test methods in 164 test files — the README's figures, which
 `scripts/check-doc-figures.sh` re-derives on every run.

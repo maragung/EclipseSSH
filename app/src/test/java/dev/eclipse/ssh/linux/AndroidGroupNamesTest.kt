@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.linux
 
 import com.google.common.truth.Truth.assertThat
+import java.io.File
 import org.junit.Test
 
 /**
@@ -8,9 +9,9 @@ import org.junit.Test
  *
  * This is the whole of the fix for `groups: cannot find name for group ID 3003` — the file is the
  * database `groups`, `id` and `ls -l` read, so naming the IDs there is what makes the message go
- * away — and it is a pure function of the file's current lines and `Os.getgroups()`, so every rule
- * it follows is pinned here rather than on a device: which IDs get a name, what the names are,
- * which lines are left alone, and which of its own lines it takes back.
+ * away — and both halves of it are pure functions of text, so every rule they follow is pinned here
+ * rather than on a device: which IDs get a name, what the names are, which lines are left alone,
+ * which of its own lines it takes back, and which IDs a `/proc/self/status` body is read to say.
  */
 class AndroidGroupNamesTest {
 
@@ -92,5 +93,47 @@ class AndroidGroupNamesTest {
         val named = AndroidGroupNames.groupFile(stock, intArrayOf(3003, 3003, 3003))
 
         assertThat(named).containsExactlyElementsIn(stock + "android_inet:x:3003:").inOrder()
+    }
+
+    // ------------------------------------------------------------ where the IDs come from
+
+    /** A `/proc/self/status` body, trimmed to the lines a reader of it might land on. */
+    private val status = """
+        Name:	dev.eclipse.ssh
+        State:	S (sleeping)
+        Tgid:	10504
+        Pid:	10504
+        Uid:	10504	10504	10504	10504
+        Gid:	10504	10504	10504	10504
+        Groups:	3003 9997 20504 50504
+        VmPeak:	  123456 kB
+    """.trimIndent()
+
+    @Test
+    fun `the groups line of a status is what the session is in`() {
+        // The line is tab-separated from its label and space-separated between IDs, which is the
+        // shape the kernel writes and the shape this has to absorb.
+        assertThat(AndroidGroupNames.groupsIn(status)).asList()
+            .containsExactly(3003, 9997, 20504, 50504).inOrder()
+    }
+
+    @Test
+    fun `a status with no groups line is no groups`() {
+        // Total, not exception-throwing: an empty answer names nothing, which is what the userspace
+        // did before any of this existed — never a reason to fail an install over a missing line.
+        assertThat(AndroidGroupNames.groupsIn("Name:\tdev.eclipse.ssh\nUid:\t10504\n")).isEmpty()
+    }
+
+    @Test
+    fun `a groups line that is not all numbers answers with the numbers it has`() {
+        // Nothing on this line is worth a crash. The IDs that parse are the IDs that get named.
+        assertThat(AndroidGroupNames.groupsIn("Groups:\t3003  bogus  9997\n")).asList()
+            .containsExactly(3003, 9997).inOrder()
+    }
+
+    @Test
+    fun `a status that cannot be read is no groups`() {
+        assertThat(AndroidGroupNames.selfGroups(File("/proc/self/there-is-no-such-file")))
+            .isEmpty()
     }
 }
