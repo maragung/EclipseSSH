@@ -295,19 +295,23 @@ class TransfersActionsRobolectricTest {
     }
 
     /**
-     * Waits for an activity of [className] to have been started, and returns its intent.
+     * Waits for an activity of [className] to have been started, and takes its intent.
      *
-     * Peeked rather than taken, so the caller asserts on the same intent the wait saw instead of
-     * consuming it and reporting whatever the next one happens to be. Nothing is launched by
-     * `startActivity` under Robolectric — the target composes in the suite that drives it directly —
-     * so a recorded intent is the whole of the evidence available at this level, and it is enough:
-     * it carries the id the window will open on.
+     * Taken rather than peeked, and that is the whole point of the helper: a start recorded by
+     * `startActivity` under Robolectric is never launched, so the queue *is* the record of what the
+     * workspace asked for — and an intent left in it is indistinguishable from one a later resume
+     * asked for. The test that resumes twice asks exactly that question, and with a peek it would
+     * always answer "yes": the first resume's own editor would still be sitting there to be counted
+     * as the second one's. Nothing is launched by this call, so taking loses no evidence — the
+     * returned intent carries the id the window will open on, which is all this level can assert.
      */
     private fun awaitStartedActivity(className: String): Intent {
+        var taken: Intent? = null
         pumpUntil(describe = { "$className was never started" }) {
-            shadowOf(compose.activity.application).peekNextStartedActivity()?.component?.className == className
+            taken = taken ?: shadowOf(compose.activity.application).nextStartedActivity
+            taken?.component?.className == className
         }
-        return checkNotNull(shadowOf(compose.activity.application).peekNextStartedActivity())
+        return checkNotNull(taken)
     }
 
     private companion object {

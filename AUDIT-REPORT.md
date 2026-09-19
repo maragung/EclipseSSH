@@ -5510,6 +5510,33 @@ place — `generateSequence { shadow.nextStartedActivity }` resolved its type pa
 `performClick` was simply not imported. All three are test-side, and all three are the kind of thing
 only a compiler says.
 
+**What the second run found, and what each failure actually was.** Four failures out of 1,878 methods,
+and not one of them in the app. Three are worth naming because the *message* was wrong about the cause
+in each: a suite that timed out waiting for something that had already happened reads exactly like a
+suite waiting for something that never did.
+
+- `theHeaderFollowsTheTransferWhileTheWindowIsOpen` failed on its *second* assertion, not its first.
+  The header did catch up — the window's `Flow` re-emission works under Robolectric, which the earlier
+  reasoning had been doubting — and the row that never appeared was "View file", because a completed
+  download only offers its file when `localUri` is not null and the test's completion write kept the
+  fixture's `localUri = null`. The fixture's running transfer is deliberately file-less; finishing it
+  is what puts a file behind it, and the test now writes one as a real completion would.
+- `aRowFilesItsAnswerAndClosesTheWindow` failed on a `pumpUntil` whose condition *consumed* what it
+  tested: `ActionRequests.takeAnswer()` returns the answer once and null thereafter, and `pumpUntil`
+  asks twice — once to leave the loop, once to decide whether it timed out. The answer had arrived;
+  the helper threw it away and reported the timeout it had been handed. The condition caches what it
+  takes now, and the shape is worth remembering for any read-once slot.
+- The two waits for `scenario.state == DESTROYED` were the failure `ForwardFormActivityRobolectricTest`
+  already documents: the state the scenario reports falls one looper-hop after `finish()`, and waiting
+  for that is a test of Robolectric's looper rather than of the window. Both now assert
+  `activity.isFinishing`, which is the same fact at the moment it becomes true, and treat DESTROYED as
+  the same fact already reached.
+- `theAnswerIsActedOnOnceEvenIfTheWorkspaceResumesTwice` was the one failure that was about the *test's
+  own claim* rather than its driving: `awaitStartedActivity` **peeked** at the recorded intent, so the
+  first resume's editor was still in the queue when the test drained it after the second resume and
+  counted as one the second resume had opened. It takes now, which is what the test needs and what
+  nothing else in the suite loses — the returned intent is still the one the wait saw.
+
 What no JVM test here can prove is how the two windows *feel* on a device: a window that slides in
 over the workspace and returns to it is the platform's own animation, and no assertion in this suite
 looks at it. The claims above are about which surface composes, what it reads, and what the workspace

@@ -192,8 +192,19 @@ class TransferActionsActivityRobolectricTest {
             awaitRow("Pause")
             // The same row, written through the repository the window reads: the strings above are
             // derived from the item, so a header that stopped moving shows the old ones.
+            // The file it was writing is named here because finishing a download is what puts it
+            // there: the local file exists in full only at COMPLETE, so a completed transfer whose
+            // localUri stayed null would be a transfer with nothing on disk to offer.
             scenario.onActivity { activity ->
-                runBlocking { activity.transferRepository.save(item.copy(status = TransferStatus.COMPLETE, progress = 1f)) }
+                runBlocking {
+                    activity.transferRepository.save(
+                        item.copy(
+                            status = TransferStatus.COMPLETE,
+                            progress = 1f,
+                            localUri = "content://downloads/nightly-dump.sql",
+                        ),
+                    )
+                }
             }
             pumpUntil(describe = { "the header never caught up with the transfer's own state" }) {
                 compose.onAllNodes(hasText("Download · Production edge · complete")).fetchSemanticsNodes().isNotEmpty()
@@ -225,12 +236,15 @@ class TransferActionsActivityRobolectricTest {
             awaitRow("Pause")
             compose.onNode(hasText("Pause") and hasClickAction()).performClick()
 
+            // Cached, because the slot is read-once: a condition that *takes* the answer would be
+            // true on the one evaluation that found it and null on the next, and `pumpUntil` asks
+            // twice — once to leave the loop and once to decide whether it timed out.
+            var answer: ActionAnswer? = null
             pumpUntil(describe = { "the row's answer never reached the workspace" }) {
-                ActionRequests.takeAnswer() == ActionAnswer.TransferAction(item.id, TransferActionKind.PAUSE)
+                answer = answer ?: ActionRequests.takeAnswer()
+                answer == ActionAnswer.TransferAction(item.id, TransferActionKind.PAUSE)
             }
-            pumpUntil(describe = { "the window stayed up after its row was tapped" }) {
-                scenario.state == Lifecycle.State.DESTROYED
-            }
+            assertWindowIsClosing(scenario, describe = { "the window stayed up after its row was tapped" })
         }
     }
 
@@ -252,9 +266,7 @@ class TransferActionsActivityRobolectricTest {
             scenario.onActivity { activity ->
                 runBlocking { activity.transferRepository.delete(item.id) }
             }
-            pumpUntil(describe = { "the window stayed open on a transfer that no longer exists" }) {
-                scenario.state == Lifecycle.State.DESTROYED
-            }
+            assertWindowIsClosing(scenario, describe = { "the window stayed open on a transfer that no longer exists" })
         }
     }
 
@@ -313,6 +325,31 @@ class TransferActionsActivityRobolectricTest {
             compose.onAllNodes(hasText(label) and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
         }
         compose.onNode(hasText(label) and hasClickAction()).assertIsDisplayed()
+    }
+
+    /**
+     * Waits for the window to have been asked to close, and asserts it on the activity.
+     *
+     * `activity.isFinishing` rather than `scenario.state == DESTROYED`, which is the same fact one
+     * looper-hop later: `finish()` sets the flag there and then, while the state the scenario reports
+     * only falls once the destroy it posts has been run. Waiting for that would be a test of
+     * Robolectric's looper — see `ForwardFormActivityRobolectricTest` for the full account of why the
+     * failure it produces is the confusing one.
+     *
+     * A window that got all the way to DESTROYED before this looked also counts, because a destroyed
+     * activity cannot be showing a menu: `onActivity` throws once there is no live activity to run
+     * on, and the scenario's own state is then the same fact, already reached. What cannot pass is a
+     * window that is neither finishing nor gone — which is the failure this asserts.
+     */
+    private fun assertWindowIsClosing(
+        scenario: ActivityScenario<TransferActionsActivity>,
+        describe: () -> String,
+    ) {
+        var closing = false
+        pumpUntil(describe = describe) {
+            runCatching { scenario.onActivity { activity -> closing = activity.isFinishing } }
+            closing || scenario.state == Lifecycle.State.DESTROYED
+        }
     }
 
     /** A row that must not be there at all. */
