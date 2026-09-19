@@ -105,12 +105,16 @@ health check passes — "installed" and "works" are the same fact:
    - `/etc/apt/sources.list` pointed at the archive matching the architecture —
      `archive.ubuntu.com` carries amd64 only; every phone architecture needs
      `ports.ubuntu.com/ubuntu-ports`,
-   - `apt-get update`, then the base packages through apt itself — `bash-completion`,
-     `ca-certificates`, `curl`, `git`, `openssh-client`, `sudo`, `wget`. That list is the whole
-     of what the install adds, and it is minimal by decision rather than by omission: Python,
-     Node.js, an editor and a compiler are the user's own call, one `apt-get install` away inside
-     the terminal, so the install stays small, fast and away from registries outside the pinned
-     Ubuntu archive.
+   - `apt-get update`, then the base packages through apt itself — `apt-utils`,
+     `bash-completion`, `ca-certificates`, `cron`, `curl`, `git`, `htop`, `openssh-client`,
+     `sudo`, `unzip`, `wget`, `zip`. That list is the whole of what the install adds: a shell and
+     the package manager, the TLS roots and fetch tools to use it with, and the handful of small
+     utilities (an archive pair, a process viewer, cron) that recipes written for a real Ubuntu
+     box assume are already present. It stays deliberately short: Python, Node.js, an editor and
+     a compiler are the user's own call, one `apt-get install` away inside the terminal, so the
+     install stays small, fast and away from registries outside the pinned Ubuntu archive. One
+     caveat stated plainly — `cron` is installed but nothing starts it: this userspace has no
+     init, so a crontab fires only if the user starts the daemon themselves.
 5. **Health check** — a shell runs and prints a marker, `whoami` answers `root`, DNS resolves,
    `apt-get check` passes. Only then does the state machine reach Stopped.
 6. **Workspace restore** — if a previous keep-workspace uninstall parked a snapshot, it is
