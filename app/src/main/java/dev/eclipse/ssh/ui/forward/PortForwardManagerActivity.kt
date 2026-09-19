@@ -1,5 +1,11 @@
-package dev.eclipse.ssh.ui
+package dev.eclipse.ssh.ui.forward
 
+import android.content.Context
+import android.content.Intent
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -8,7 +14,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -17,15 +22,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,6 +39,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dagger.hilt.android.AndroidEntryPoint
+import dev.eclipse.ssh.data.HostRepository
 import dev.eclipse.ssh.data.model.DEFAULT_FORWARD_LISTEN_HOST
 import dev.eclipse.ssh.data.model.MAX_SAVED_FORWARDS
 import dev.eclipse.ssh.data.model.ForwardEntry
@@ -47,107 +54,191 @@ import dev.eclipse.ssh.data.model.decodeForwardRules
 import dev.eclipse.ssh.data.model.describe
 import dev.eclipse.ssh.data.model.isForwardHostName
 import dev.eclipse.ssh.data.model.toPortOrNull
+import dev.eclipse.ssh.data.settings.SettingsRepository
+import dev.eclipse.ssh.ui.EclipseSuccess
+import dev.eclipse.ssh.ui.EclipseWarning
+import dev.eclipse.ssh.ui.actions.ActionAnswer
+import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.ActionSubject
+import dev.eclipse.ssh.ui.actions.ForwardRuleKind
+import dev.eclipse.ssh.ui.settings.SettingsDestinationWindow
 import java.util.UUID
+import javax.inject.Inject
 
 /**
  * The per-host port-forwarding manager: every rule the host has saved, what each one is doing right
  * now, and the controls that change either.
  *
- * The rules come from [HostProfile.savedForwards] decoded fresh on every recomposition rather than
- * from a copy held at open time, because saving a rule *is* the edit this sheet makes - a list that
- * kept showing the pre-save state after its own Save button would be a sheet arguing with itself.
- * Runtime state comes from the UI state's statuses map, keyed by entry id, and a rule this process
- * has never touched (the host was edited elsewhere, or has not connected yet) falls back to what the
- * rule itself says it is: Disabled or Stopped. That fallback is what makes the sheet worth opening
- * on a host that is not connected - the list is the rules, and Start is how a disconnected host
- * answers (with the engine's "is not connected" report, which is that path's own message).
+ * It used to be a `ModalBottomSheet` opened from a host's kebab menu, and the reason it is a window
+ * now is the reason the rest of this app's sheets have become windows: the list is capped at
+ * [MAX_SAVED_FORWARDS] rules of two lines plus four controls each, and a sheet could show about four
+ * of them through a slot at the bottom of the screen. This one is the longest list in the app and it
+ * had the smallest viewport.
  *
- * Every structural change - enable, disable, edit, delete - goes through [onSaveRules] as a whole
- * new list, so the engine's own save path is the only writer of the column and its
- * stop-the-removed-keep-the-unchanged behaviour applies to the sheet exactly as it applies to a
- * connect.
+ * **It does not act, and it does not hold the rules.** Both halves of that are one decision, made in
+ * [ActionSubject.ForwardManager]: the saved rules are read live from [HostRepository] by the host's
+ * id, so the window's own saves appear in its own list without it keeping a copy, and the two rows
+ * that need the forwarding engine - Start and Stop - go back to the workspace as an [ActionAnswer],
+ * because the engine is the workspace's and a second window starting a tunnel would be a second
+ * tunnel on a connection it does not hold. The runtime half of the list is a snapshot taken when the
+ * window opened, which is why **every row that acts closes the window**: the state on screen is
+ * about to be one answer stale, and a row still showing "Stopped" over a tunnel that is now up would
+ * be this window lying about the only thing it exists to show.
+ *
+ * The Add-rule row is deliberately *not* the Settings list's Add-forward window
+ * ([ForwardFormActivity]). That one opens a forward by hand on the selected host, into the running
+ * `forwardings` list; this one edits the host's saved *rules*, which is a different column written
+ * by a different path. They are the two halves of the same feature and are not interchangeable.
+ *
+ * The subject travels as a token rather than as an id in the intent, unlike
+ * [dev.eclipse.ssh.ui.transfers.TransferActionsActivity]'s: the runtime snapshot has no singleton
+ * behind it, and an intent cannot carry a map. The manifest therefore gives this the editor's
+ * `configChanges` list *and* `singleTop`, both load-bearing - a re-delivered intent finds its token
+ * spent and closes itself.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@AndroidEntryPoint
+class PortForwardManagerActivity : ComponentActivity() {
+
+    @Inject lateinit var settingsRepository: SettingsRepository
+
+    @Inject lateinit var hostRepository: HostRepository
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        val subject = ActionRequests.take(intent?.getStringExtra(ActionRequests.EXTRA_SUBJECT_TOKEN))
+            as? ActionSubject.ForwardManager
+        if (subject == null) {
+            finish()
+            return
+        }
+        setContent {
+            // Null until the repository has answered, which is what tells a first frame apart from a
+            // host that has genuinely gone - the two are one frame apart and only one of them should
+            // close the window. A host deleted while its manager was open has no rules left to edit.
+            val hosts by hostRepository.hosts.collectAsStateWithLifecycle(initialValue = null)
+            val host = hosts?.firstOrNull { it.id == subject.hostId }
+            LaunchedEffect(hosts, host) {
+                if (hosts != null && host == null) finish()
+            }
+            SettingsDestinationWindow(
+                settingsRepository = settingsRepository,
+                // The host's own name, not "Port forwarding": the window has to say *which* host's
+                // tunnels these are, and this one is opened from a menu that offers the same entry on
+                // every row. Falls back only for the one frame before the repository answers.
+                title = host?.name ?: "Port forwarding",
+                onClose = { finish() },
+            ) {
+                host?.let { profile ->
+                    ForwardManagerBody(
+                        host = profile,
+                        statuses = subject.statuses,
+                        runningForwards = subject.runningForwards,
+                        onAnswer = { answer ->
+                            ActionRequests.answer(answer)
+                            finish()
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    companion object {
+
+        /**
+         * The intent that opens this window on [host].
+         *
+         * The saved rules are not in here and do not need to be - the window reads them from the
+         * repository by id. What travels is the runtime half: what each rule is doing right now, and
+         * which forwards are actually bound, both of which the workspace owns and a second window
+         * cannot reach.
+         */
+        fun intent(
+            context: Context,
+            host: HostProfile,
+            statuses: Map<String, ForwardStatus>,
+            runningForwards: List<ForwardEntry>,
+        ): Intent = Intent(context, PortForwardManagerActivity::class.java)
+            .putExtra(
+                ActionRequests.EXTRA_SUBJECT_TOKEN,
+                ActionRequests.put(ActionSubject.ForwardManager(host.id, statuses, runningForwards)),
+            )
+    }
+}
+
+/**
+ * The list itself: the rules the host has saved, each with its state and its four controls.
+ *
+ * The rules are decoded fresh on every recomposition of the host that comes out of the repository,
+ * which is what makes the window's own saves visible in it - a list held from open time would keep
+ * showing the pre-save state after its own Save button.
+ *
+ * A rule this process has never touched (the host was edited elsewhere, or has not connected yet)
+ * falls back to what the rule itself says it is: Disabled when it is switched off, Stopped when it
+ * simply has not been started. That fallback is what makes the window worth opening on a host that is
+ * not connected - the list is the rules, and Start is how a disconnected host answers (with the
+ * engine's own "is not connected" report, which is that path's message).
+ */
 @Composable
-fun PortForwardManagerSheet(
+private fun ForwardManagerBody(
     host: HostProfile,
     statuses: Map<String, ForwardStatus>,
-    /**
-     * The forwards that are actually bound right now, hand-opened ones included, from the UI state's
-     * running list. The add/edit dialog checks a candidate rule against these, because two hosts'
-     * rules never meet in one list - the conflict the engine pre-checks at start time is better
-     * caught in the form, before anything is saved.
-     */
     runningForwards: List<ForwardEntry>,
-    onDismiss: () -> Unit,
-    onStartRule: (String) -> Unit,
-    onStopRule: (String) -> Unit,
-    onSaveRules: (List<ForwardEntry>) -> Unit,
+    onAnswer: (ActionAnswer) -> Unit,
 ) {
-    // Re-derived whenever the saved column changes, which is whenever this sheet's own saves land -
-    // see the class comment for why the list must not be a copy held at open time.
     val rules = remember(host.savedForwards, host.id) { decodeForwardRules(host.savedForwards, host.id) }
-    // The dialog is open over the sheet, not instead of it, so the sheet's rows stay where they
-    // were; `editingRuleId` is null for an add, and the rule's id for an edit. Both are keyed on the
-    // host so a stale dialog can never write one host's rule into another host's list.
+    // The rule form is an `AlertDialog` over this window, not instead of it, so the rows stay where
+    // they were; `editingRuleId` is null for an add, and the rule's id for an edit. Both are keyed on
+    // the host so a stale form can never write one host's rule into another host's list.
     var editorOpen by remember(host.id) { mutableStateOf(false) }
     var editingRuleId by remember(host.id) { mutableStateOf<String?>(null) }
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier
-                .padding(horizontal = 22.dp)
-                // The host may legally carry 32 rules, and each row is two lines plus its actions,
-                // so the body scrolls. HostDetailsSheet has no scroller only because nothing in it
-                // repeats.
-                .verticalScroll(rememberScrollState())
-                .navigationBarsPadding()
-                .padding(bottom = 18.dp),
-        ) {
-            Text("Port forwarding", style = MaterialTheme.typography.headlineSmall)
+    Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
+        Text("${host.username}@${host.host}:${host.port}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(14.dp))
+        if (rules.isEmpty()) {
+            // One sentence, because the three kinds each get their own explanation the moment a rule
+            // exists to show it on: this line only has to say what the door is for.
             Text(
-                "${host.username}@${host.host}:${host.port}",
+                "Port forwarding tunnels connections between this device and the server - a local " +
+                    "rule reaches a service through the host, a remote rule opens something on this " +
+                    "device to it, and a dynamic rule is a SOCKS5 proxy.",
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Spacer(Modifier.height(14.dp))
-            if (rules.isEmpty()) {
-                // One sentence, because the three kinds each get their own explanation the moment a
-                // rule exists to show it on: this line only has to say what the door is for.
-                Text(
-                    "Port forwarding tunnels connections between this device and the server - a local " +
-                        "rule reaches a service through the host, a remote rule opens something on this " +
-                        "device to it, and a dynamic rule is a SOCKS5 proxy.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Spacer(Modifier.height(10.dp))
+        } else {
+            rules.forEach { rule ->
+                ForwardRuleRow(
+                    // A rule never started this process has no recorded state, and the honest thing
+                    // to say about it is what the rule itself says: Disabled when it is switched off,
+                    // Stopped when it simply has not been started.
+                    status = statuses[rule.id]
+                        ?: ForwardStatus(rule, if (rule.enabled) ForwardRuntime.STOPPED else ForwardRuntime.DISABLED),
+                    onToggleEnabled = { on ->
+                        onAnswer(
+                            ActionAnswer.ForwardRules(
+                                host.id,
+                                rules.map { if (it.id == rule.id) it.copy(enabled = on) else it },
+                            ),
+                        )
+                    },
+                    onStart = { onAnswer(ActionAnswer.ForwardRuleAction(host.id, rule.id, ForwardRuleKind.START)) },
+                    onStop = { onAnswer(ActionAnswer.ForwardRuleAction(host.id, rule.id, ForwardRuleKind.STOP)) },
+                    onEdit = { editingRuleId = rule.id; editorOpen = true },
+                    onDelete = { onAnswer(ActionAnswer.ForwardRules(host.id, rules.filterNot { it.id == rule.id })) },
                 )
-                Spacer(Modifier.height(10.dp))
-            } else {
-                rules.forEach { rule ->
-                    ForwardRuleRow(
-                        // A rule never started this process has no recorded state, and the honest
-                        // thing to say about it is what the rule itself says: Disabled when it is
-                        // switched off, Stopped when it simply has not been started.
-                        status = statuses[rule.id]
-                            ?: ForwardStatus(rule, if (rule.enabled) ForwardRuntime.STOPPED else ForwardRuntime.DISABLED),
-                        onToggleEnabled = { on ->
-                            onSaveRules(rules.map { if (it.id == rule.id) it.copy(enabled = on) else it })
-                        },
-                        onStart = { onStartRule(rule.id) },
-                        onStop = { onStopRule(rule.id) },
-                        onEdit = { editingRuleId = rule.id; editorOpen = true },
-                        onDelete = { onSaveRules(rules.filterNot { it.id == rule.id }) },
-                    )
-                }
-                Spacer(Modifier.height(4.dp))
             }
-            // Capped rather than left open because the column itself is capped (MAX_SAVED_FORWARDS),
-            // and a 33rd rule would be a button that saves a list the codec silently truncates.
-            TextButton(
-                onClick = { editingRuleId = null; editorOpen = true },
-                enabled = rules.size < MAX_SAVED_FORWARDS,
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Add rule") }
+            Spacer(Modifier.height(4.dp))
         }
+        // Capped rather than left open because the column itself is capped (MAX_SAVED_FORWARDS), and
+        // a 33rd rule would be a button that saves a list the codec silently truncates.
+        TextButton(
+            onClick = { editingRuleId = null; editorOpen = true },
+            enabled = rules.size < MAX_SAVED_FORWARDS,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Add rule") }
     }
 
     if (editorOpen) {
@@ -169,7 +260,7 @@ fun PortForwardManagerSheet(
                 } else {
                     rules.map { if (it.id == editingRuleId) entry else it }
                 }
-                onSaveRules(next)
+                onAnswer(ActionAnswer.ForwardRules(host.id, next))
             },
         )
     }

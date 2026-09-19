@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §50, *Two sheets become windows*; the newest of them that releases a version is §49, *Releasing 1.3.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §53, *The last two sheets, whose subject is half live*; the newest of them that releases a version is §49, *Releasing 1.3.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5544,3 +5544,127 @@ does with the answer.
 
 The suite is now 1,878 JVM/Robolectric test methods in 167 test files — the README's figures, which
 `scripts/check-doc-figures.sh` re-derives on every run.
+
+---
+
+## 53. The last two sheets, whose subject is half live
+
+**What this is.** §50 promoted the first two of the seven `ModalBottomSheet` surfaces and named the
+remaining five; a second pass took three of them. This pass takes the last two:
+`ui/PortForwardManagerSheet` — every forward a host has saved, what each one is doing, and
+Start/Stop/Edit/Delete — and `HostDetailsSheet` — how a host is reached, what the vault holds for it,
+and the server's own numbers. Both are now Activities of their own,
+`ui/forward/PortForwardManagerActivity` and `ui/hosts/HostDetailsActivity`, opened on top of the
+workspace and closed with the back arrow. These are the last two of the seven §50 counted — the three
+between them are the second pass's — and with them every surface that section named is a window.
+
+**Why these two, and why they are the awkward pair.** §50's two are live end to end and the second
+pass's three are snapshots end to end. These two are neither: each is **half** live and **half**
+snapshot, and the halves are owned by different things.
+
+- The port-forwarding manager's *rules* are the host's own `savedForwards` column, and a singleton
+  (`HostRepository`, a Room-backed `Flow`) holds it — so the window reads them by id, live. Its
+  *runtime* half is not: which rules are up, what state each is in, and which forwards are bound are
+  the workspace's forwarding engine, and no second window can reach it. That half arrives as a
+  snapshot in the subject. The split is not academic — it is the reason the window's own Save button
+  shows its result, because the write goes through the repository the list is reading.
+- A host's details are the same shape. The host and its credentials are read live by id from
+  `HostRepository` and `HostCredentialStore`, so the Credentials line follows a password saved or
+  forgotten while the window is open. The `ServerStats` block is the workspace's and travels in the
+  subject, which is why both Monitoring rows are *answers* rather than reads: the window cannot
+  fetch stats, and the workspace only hears a request when it resumes.
+
+**The handoff, and where the id-versus-token rule lands.** §50's rule is *pass an id when a
+singleton already holds the subject, a token when it does not*. Both of these resolve to **both**, so
+both are opened with a token: `ActionSubject.ForwardManager(hostId, statuses, runningForwards)` and
+`ActionSubject.HostDetails(hostId, stats)`. The id is in the token because it is what the live half
+is read by; the map and the stats snapshot are in the token because an intent cannot carry a
+`Map<String, ForwardStatus>` or a `ServerStats` — there is no `@Parcelize` model in this tree for
+either. `ActionRequests`' KDoc now states that resolution rather than leaving it to be inferred from
+the two call sites.
+
+**What travels live is also what decides when a window closes.** §50's rule that a window never acts
+holds here, and it has a sharper consequence for a half-snapshot subject: a row that files an answer
+closes the window. Start on a rule whose runtime half is a snapshot would otherwise leave a "Start"
+button sitting over a tunnel that is now coming up, and Refresh stats would leave the old numbers
+under a header that has already been replaced. `MainActivity` drains all of it in the same one place
+`takeAnswer` always was, gaining three branches — `ActionAnswer.ForwardRuleAction` (which calls
+`startForwardRule` or `stopForwardRule`), `ActionAnswer.ForwardRules` (one `saveForwardRules`, the
+whole new list, because the column is one write) and `ActionAnswer.HostDetailsAction`
+(`forgetCredentials` or `refreshStats`). Each reports "That host is no longer configured…" when the
+host has been deleted in the meantime, which is reachable without a race: the window that acts can be
+open when another window deletes the host it names.
+
+**Two things that are deliberately not in the `ActionAnswer` enum.** Enable, Delete and the rule
+form's Save all file the same `ActionAnswer.ForwardRules` as any other edit to the column — the
+engine's save path takes a whole list, so three separate kinds would be three names for one call.
+And `ui/forward/ForwardFormActivity` is a **different surface**, which is worth stating because the
+names invite the opposite conclusion: that Activity is the *Settings* "Add port forward" window,
+whose request comes back through `ForwardRequests` and opens a tunnel on the host named at launch.
+The manager's own Add and Edit rows write the host's `savedForwards` column through the in-window
+dialog, which is why `ForwardRuleDialog` moved into the window file rather than being replaced by a
+hand-off to the form.
+
+**Where the host's details window lives.** The first draft put it in `ui/settings`, beside the ten
+Settings screens that have a file each. The doc-figures check rejected it, and was right to: the
+README enumerates those ten by name — "the nine heavier ones … and the host form" — and a host's
+details window is not a Settings entry. It moved to a new `dev.eclipse.ssh.ui.hosts` package. The
+first check failure was a count and this one was a placement, and only the second was worth acting
+on.
+
+**Both windows own their scroller.** The manager's list is the longest in the app and the details
+window's is not far behind, and the sheet drew both inside its own `verticalScroll`. Both new windows
+take `SettingsDestinationWindow`'s default `scrollable = true` and give their bodies no scroller of
+their own — the arrangement the other promoted windows use, and the one that avoids the
+infinite-height crash a nested scroller produces. That retires the sheet's inline note that
+`HostDetailsSheet` "has no scroller only because nothing in it repeats"; the window has one, so the
+question no longer arises.
+
+**What is tested, and at which level.** Two new window suites, nine tests each.
+`PortForwardManagerActivityRobolectricTest` covers the state labels plus the fallback for a rule this
+process has never touched (Stopped when enabled, Disabled when switched off — the whole reason the
+window is worth opening on a host that is not connected), the rules being read live by writing
+through the window's own repository and watching the row appear, Start filing
+`ForwardRuleAction(…, START)` and closing, RECONNECTING being offered Stop rather than a Start that
+would race its rebind, Delete filing the whole list without that rule, Add disabled at
+`MAX_SAVED_FORWARDS`, the empty-list explanation, the window closing when its host is removed, and an
+intent with no token opening nothing. `HostDetailsActivityRobolectricTest` covers the saved
+configuration being read from the host (group, fingerprint, `user@host:port`), a host with nothing
+saved saying so and offering no Forget row, the vault's summary plus Forget filing
+`FORGET_CREDENTIALS` and closing, the Credentials line following the store while the window is open,
+the no-stats block offering "Load server stats" and showing no numbers, a stats snapshot drawn whole
+with the row becoming "Refresh stats", Refresh filing `REFRESH_STATS` and closing, the host-removed
+close, and the no-token case.
+
+`HostAndThemeUiRobolectricTest`'s two kebab tests were rewritten rather than extended, for the reason
+§50 gives: the row matrix moved to the window suites, and what is left at workspace level is the one
+thing only the workspace can show — that the menu's Details and the kebab's Port forwarding each
+start the right Activity and hand it the host that was on screen, asserted by draining the queued
+intent and resolving the token it carries back to that host's id.
+
+**What the text-level checks caught before CI did.** `HostDetailsActivity` was written without three
+imports — `SettingsRepository`, `javax.inject.Inject` and `SettingsDestinationWindow` — each of which
+a compiler refuses outright and none of which the doc-figures check can see. They were found by
+resolving every capitalised identifier in the new files against their import lists, the package they
+live in and the standard library, which is what §50's twenty-six CI errors suggest is worth doing
+before pushing rather than after. This pass is the first to have run that check, and it is why the
+section's CI has one fewer red round trip than §50's.
+
+**Two waits this pass inherited from §50's, and fixed before its own CI ran.** §50's second run found
+that a `pumpUntil` condition which *takes* the answer it is testing is true on the one evaluation that
+found it and null on the next — and the helper asks twice, once to leave the loop and once to decide
+whether it timed out — so an answer that did arrive is reported as one that never did. It also found
+that `scenario.state == DESTROYED` is `finish()`'s fact one looper-hop late, and that waiting for it is
+a test of Robolectric's looper rather than of the window. Both of this pass's suites used both idioms,
+because they were copied from the same shape. They now cache the answer in `awaitAnswer` and assert
+`activity.isFinishing` in `awaitClosing`; the one test that launches a window closing *before* it is
+ever resumed — an intent with no token — still asserts the state directly, because that close happens
+during the launch and is a different fact.
+
+**What no test here can prove.** The same limit §50 records: how a window slides in over the
+workspace is the platform's animation, and nothing in these suites looks at it. The claims above are
+about which surface composes, what it reads, and what the workspace does with the answer.
+
+The suite is now 1,896 JVM/Robolectric test methods in 169 test files — the README's figures, which
+`scripts/check-doc-figures.sh` re-derives on every run. §50's closing figures are left as that pass
+wrote them.
