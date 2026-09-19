@@ -4427,7 +4427,6 @@ class MainViewModel @Inject constructor(
     fun saveSnippet(label: String, command: String) = launchGuarded("Could not save the snippet") {
         if (label.isNotBlank() && command.isNotBlank()) snippetRepository.save(Snippet(label = label.trim(), command = command.trimEnd()))
     }
-    fun deleteSnippet(id: String) = launchGuarded("Could not delete the snippet") { snippetRepository.delete(id) }
     fun copyToClipboard(text: String) = launchGuarded("Could not copy to the clipboard") {
         val seconds = settingsRepository.settings.first().clearClipboardAfterSeconds
         secureClipboard.copy(text, seconds)
