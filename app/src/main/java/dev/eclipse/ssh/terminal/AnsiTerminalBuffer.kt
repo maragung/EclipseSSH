@@ -101,6 +101,13 @@ data class TerminalSnapshot(
  *
  * [revision] is the cheap way to know whether anything changed at all. It advances on every mutation
  * of the buffer, so a recomposition can skip redrawing without comparing several thousand cells.
+ *
+ * "Every mutation" includes a cursor that only moved, and that is not a detail: the renderer memoizes
+ * the layout it draws the cursor box from on this value, so a move that does not advance it is a move
+ * the user cannot see. The left arrow is the case that proves it - its byte is `^H`, a bare control
+ * character rather than a CSI, and it goes through [setCursorColumn] for exactly this reason. Every
+ * path that changes the cursor, the style or a cell reports it here, including the ones a caller also
+ * bumps for; a second increment costs nothing because only "did it change" is ever asked.
  */
 data class TerminalFrame(
     val lines: List<List<TerminalCell>>,
@@ -532,8 +539,15 @@ class AnsiTerminalBuffer(
                 C0_ESC -> escapeState = EscapeState.ESC
                 // VT and FF move down a line exactly as LF does on every terminal in practice.
                 C0_LF, C0_VT, C0_FF -> lineFeed()
-                C0_CR -> { cursorColumn = 0; wrapPending = false }
-                C0_BS -> { cursorColumn = (cursorColumn - 1).coerceAtLeast(0); wrapPending = false }
+                // CR and BS are the two cursor moves that arrive as bare control bytes rather than as
+                // a CSI, and they go through [setCursorColumn] so they advance the revision like every
+                // other move. BS in particular is what a left arrow costs: readline's `cub1` is `^H`
+                // while its `cuf1` is `ESC [ C`, so this branch is the only thing standing between a
+                // left arrow and a cursor that visibly moves. Setting the column directly here left the
+                // revision untouched, the frame was drawn from a layout memoized on that revision, and
+                // the cursor sat still until the next character was typed.
+                C0_CR -> setCursorColumn(0)
+                C0_BS -> setCursorColumn(cursorColumn - 1)
                 C0_HT -> tabForward(1)
                 // A bell has no display; padding NULs must not print as blanks over real output.
                 C0_NUL, C0_BEL -> Unit
@@ -552,6 +566,10 @@ class AnsiTerminalBuffer(
                 'P', 'X', '^', '_' -> { controlBuffer.clear(); escapeState = EscapeState.STRING }
                 '(' -> escapeState = EscapeState.CHARSET_G0
                 ')' -> escapeState = EscapeState.CHARSET_G1
+                // SS3, the three-byte single-shift sequences. `ESC O` had no case at all, so its final
+                // byte fell through to the printer: a program that sends `ESC O D` for cursor-left put
+                // a literal `D` on screen instead of moving anything. See [consumeSs3].
+                'O' -> escapeState = EscapeState.SS3
                 '7' -> { saveCursor(); escapeState = EscapeState.NORMAL }
                 '8' -> { restoreCursor(); escapeState = EscapeState.NORMAL }
                 'c' -> reset()
@@ -572,6 +590,10 @@ class AnsiTerminalBuffer(
                 g1Graphics = char == '0'
                 escapeState = EscapeState.NORMAL
                 revision++
+            }
+            EscapeState.SS3 -> {
+                consumeSs3(char)
+                escapeState = EscapeState.NORMAL
             }
             EscapeState.CSI -> {
                 controlBuffer.append(char)
@@ -604,6 +626,27 @@ class AnsiTerminalBuffer(
                 controlBuffer.length > MAX_CONTROL_LENGTH -> abandonControlSequence()
                 else -> controlBuffer.append(char)
             }
+        }
+    }
+
+    /**
+     * SS3: `ESC O` and exactly one final byte, the cursor, keypad and function keys of a VT220.
+     *
+     * Deliberately a copy of the handful of [executeCsi] meanings rather than a translation into a CSI
+     * string. SS3 carries no parameters at all, so every one of these moves by exactly one, and
+     * feeding them through the parameter parser would mean inventing a `1` for a sequence that has no
+     * syntax to hold one. Anything not listed here is consumed and dropped, which is the whole point:
+     * before this existed `ESC O` fell out of the ESC state and its final byte was printed as text.
+     */
+    private fun consumeSs3(char: Char) {
+        when (char) {
+            'A' -> moveCursorRow(cursorRow - 1)
+            'B' -> moveCursorRow(cursorRow + 1)
+            'C' -> setCursorColumn(cursorColumn + 1)
+            'D' -> setCursorColumn(cursorColumn - 1)
+            'H' -> setCursorColumn(0)
+            'F' -> setCursorColumn(columns - 1)
+            else -> Unit
         }
     }
 
@@ -867,7 +910,10 @@ class AnsiTerminalBuffer(
      * index into [lines] and the cost of getting it wrong is an exception, not a mis-drawn cell, so
      * the bound belongs here rather than in eleven separate expressions.
      */
-    private fun setCursorRow(row: Int) { cursorRow = row.coerceIn(0, lines.lastIndex) }
+    private fun setCursorRow(row: Int) {
+        cursorRow = row.coerceIn(0, lines.lastIndex)
+        revision++
+    }
 
     /**
      * A row move a sequence asked for, as opposed to one the output caused.
@@ -893,6 +939,7 @@ class AnsiTerminalBuffer(
     private fun setCursorColumn(column: Int) {
         cursorColumn = column.coerceIn(0, columns - 1)
         wrapPending = false
+        revision++
     }
 
     /** Absolute addressing: [row] counts from the top of the screen, or of the margin under DECOM. */
@@ -902,6 +949,7 @@ class AnsiTerminalBuffer(
         val limit = top + if (originMode) bottomMargin else rows - 1
         cursorRow = (base + row).coerceIn(top.coerceAtMost(limit), limit)
         wrapPending = false
+        revision++
     }
 
     /** The first line of the visible screen; everything before it is scrollback. */
@@ -919,6 +967,10 @@ class AnsiTerminalBuffer(
         setCursorColumn(savedColumn)
         style = savedStyle
         if (shiftedOut) g1Graphics = savedGraphics else g0Graphics = savedGraphics
+        // Its own bump, not just the ones the two moves above now carry: a program that saves, prints
+        // nothing and restores has changed only the style, and a restore onto the cell the cursor was
+        // already on would otherwise draw in the old style.
+        revision++
     }
 
     /** Drops an escape sequence that has run too long to be real, and resumes printing. */
@@ -972,6 +1024,7 @@ class AnsiTerminalBuffer(
             cursorColumn = column.coerceAtMost(columns - 1)
         }
         wrapPending = false
+        revision++
     }
 
     private fun tabBackward(count: Int) {
@@ -981,6 +1034,7 @@ class AnsiTerminalBuffer(
             cursorColumn = column.coerceAtLeast(0)
         }
         wrapPending = false
+        revision++
     }
 
     private fun resetTabStops() {
@@ -1118,6 +1172,7 @@ class AnsiTerminalBuffer(
         val end = (cursorColumn + count).coerceAtMost(columns)
         for (i in cursorColumn until end) line[i] = TerminalCell()
         wrapPending = false
+        revision++
     }
 
     private fun insertAtCursor() {
@@ -1228,7 +1283,7 @@ class AnsiTerminalBuffer(
         val bottomMargin: Int,
     )
 
-    private enum class EscapeState { NORMAL, ESC, CSI, OSC, STRING, CHARSET_G0, CHARSET_G1 }
+    private enum class EscapeState { NORMAL, ESC, CSI, SS3, OSC, STRING, CHARSET_G0, CHARSET_G1 }
 
     private companion object {
         /** What an untouched cell holds, for telling a row with nothing on it from one with a space. */
