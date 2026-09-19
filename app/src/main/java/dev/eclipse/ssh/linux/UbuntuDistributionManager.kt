@@ -1180,21 +1180,36 @@ class UbuntuDistributionManager(
         const val DEFAULT_MIRROR_LIST_URL = "https://mirrors.ubuntu.com/mirrors.txt"
 
         /**
-         * The base packages the install adds, and the whole of the toolchain by decision: a shell
-         * and its completions, the package manager, TLS roots, curl/wget, git, sudo and an SSH
-         * client. Nothing here comes from outside the pinned Ubuntu archive, so a step that
-         * installs them has no third-party registry to survive — which is what makes the userspace
-         * minimal on purpose rather than by omission. Python, Node.js and everything else are one
-         * `apt-get install` away inside the terminal, on the user's own terms.
+         * The base packages the install adds: a shell and its completions, the package manager and
+         * the tool that makes it talk, TLS roots, curl/wget, git, sudo, an SSH client, and the four
+         * things every "install something" recipe on the internet assumes are already there — an
+         * archive pair, a process viewer and cron.
+         *
+         * Every one of them comes from the pinned Ubuntu archive and nothing else, so no step of a
+         * setup has a third-party registry to survive. What is deliberately *not* here is the real
+         * weight — Python, Node.js, a compiler, an editor — because that is a curated toolchain,
+         * and putting it in the install path makes a `deb.nodesource.com` outage decide whether
+         * "Ubuntu" installed at all. The list below is the floor a user can build anything on, one
+         * `apt-get install` away, on their own terms; it is not a toolchain.
+         *
+         * `cron` is the one entry here that is inert on its own: this userspace has no init, so
+         * nothing starts `cron` at boot and a crontab will not fire by itself. It is installed
+         * because scripts written for a real Ubuntu box shell out to it, and because a user who
+         * wants it running can start the daemon by hand — not because the install makes it run.
          */
         private val BASE_PACKAGES = listOf(
+            "apt-utils",
             "bash-completion",
             "ca-certificates",
+            "cron",
             "curl",
             "git",
+            "htop",
             "openssh-client",
             "sudo",
+            "unzip",
             "wget",
+            "zip",
         )
 
         /**
@@ -1300,7 +1315,7 @@ class UbuntuDistributionManager(
          * packages' unpacked size plus apt's own working space, as a multiple of the tarball the
          * same way the installer's gate budgets. The base packages are a few multiples of the
          * ~30 MB Base tarball in practice, and the multiple is deliberately generous now that the
-         * list is seven packages: it is this gate's job to refuse before apt is asked anything, and
+         * list is twelve packages: it is this gate's job to refuse before apt is asked anything, and
          * a budget that guesses low fails as ENOSPC twenty minutes in.
          */
         private const val APT_TARBALL_MULTIPLE = 4L
