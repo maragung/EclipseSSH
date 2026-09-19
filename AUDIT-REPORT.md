@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §47, *The dispatch example, moved on again*; the newest of them that releases a version is §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5264,3 +5264,30 @@ The suite gains 93 JVM/Robolectric test methods across 11 new test files (1,748 
 `v1.2.2`, 1,841 in 163 here), and none of it is a claim that the editor is smooth or that a bar
 sweeps at the right speed — those are device judgements, and §46.2 and §46.5 say so rather than
 inventing a test for them.
+
+---
+
+## 47. The dispatch example, moved on again
+
+§44 moved `testing/README.md`'s dispatch example to `v1.2.2` on the rule §40.6 stated: the example
+names the newest release that is **published**, not the newest tag that exists. `v1.3.0` is now that
+release — published 2026-09-19T14:49:59Z, the same seven assets, its tag on `b2ddeb46e` — so the
+example moves to it. Nothing else in that paragraph changes, and `v1.2.0` is still the one draft, so
+it is still named nowhere: the command this example documents cannot fetch a draft, which is the
+whole of what §40.6 and §42 were about.
+
+The shape is §44's, and by now it is the shape of the line: the tag was pushed with the release held
+as a draft, `tagged-release.yml` (run `35448879770`) built and signed the seven assets, and only then
+was the release published — which dispatched `android-release-test.yml` run `35449935668` over the
+**published** asset. So this is the second release whose own gate is the workflow that publication
+starts, rather than one dispatched by hand afterwards.
+
+One thing this release does that the two before it did not. The tag was created only after
+`app/build.gradle.kts` at `main`'s head had been read back through the contents API and answered
+`versionName = "1.3.0"` — and that check exists because nothing else in the pipeline makes it. Every
+gate this repository has compares the artifact against itself: the split check verifies the APK's
+ABIs and `extractNativeLibs`, the signature check verifies it was signed with the release key, the
+release validation installs it and runs the suite against it. A tag pushed against a tree whose
+version field had not yet been bumped builds a correctly-signed artifact of the wrong version, and
+all of them would pass it, because none of them is looking at what the tag promised. The one
+quantity that only a read of the tagged tree can settle is read.
