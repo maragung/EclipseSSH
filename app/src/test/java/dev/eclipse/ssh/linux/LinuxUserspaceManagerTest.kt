@@ -28,6 +28,7 @@ class LinuxUserspaceManagerTest {
         // already written - before the manager is constructed: initialState() reads the flag at
         // construction, not on demand.
         val rootDir: File = Files.createTempDirectory("linux-userspace").toFile().apply { deleteOnExit() },
+        supplementaryGids: () -> IntArray = { IntArray(0) },
     ) {
         val spawner = ScriptedPtySpawner()
         var downloads = 0
@@ -37,7 +38,13 @@ class LinuxUserspaceManagerTest {
                 downloads++
                 TestTarballs.serving(FIXTURE).download("https://fixtures.invalid/rootfs.tar.gz", target, onChunk)
             })
-        val distribution = UbuntuDistributionManager(distro, runtime, appUid = 10150, appGid = 10150)
+        val distribution = UbuntuDistributionManager(
+            distro,
+            runtime,
+            appUid = 10150,
+            appGid = 10150,
+            supplementaryGids = supplementaryGids,
+        )
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime)
         val backupFile = File(rootDir.parentFile, "${rootDir.name}-workspace-backup.tar.gz")
@@ -60,8 +67,11 @@ class LinuxUserspaceManagerTest {
             )
         }
 
-        private fun newHarness(): Harness =
-            Harness(TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)))
+        private fun newHarness(supplementaryGids: () -> IntArray = { IntArray(0) }): Harness =
+            Harness(
+                TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)),
+                supplementaryGids = supplementaryGids,
+            )
     }
 
     @Test
@@ -186,6 +196,47 @@ class LinuxUserspaceManagerTest {
         // And with health restored, start now reaches Running.
         harness.manager.start()
         assertThat(harness.manager.state.value).isInstanceOf(LinuxUserspaceState.Running::class.java)
+    }
+
+    @Test
+    fun `start names the Android groups, so an install made before the naming is corrected`() = runTest {
+        // An install from a build that had no names to write, over a device whose app is in the
+        // four groups the report named. The set is read on every start rather than only at install
+        // time, so the terminal is correct the first time it is opened after the update — no
+        // reinstall, and no Repair, for a file the user never sees.
+        var gids = IntArray(0)
+        val harness = newHarness(supplementaryGids = { gids })
+        harness.manager.install()
+        val group = harness.installer.rootfsDir.resolve("etc/group")
+        assertThat(group.readText()).doesNotContain(AndroidGroupNames.PREFIX)
+
+        gids = intArrayOf(3003, 9997, 20504, 50504)
+        harness.manager.start()
+
+        assertThat(harness.manager.state.value).isInstanceOf(LinuxUserspaceState.Running::class.java)
+        assertThat(group.readLines()).containsAtLeast(
+            "android_inet:x:3003:",
+            "android_everybody:x:9997:",
+            "android_cache_504:x:20504:",
+            "android_shared_504:x:50504:",
+        )
+        // The account line the app writes for itself is still the only one, and still where it was.
+        assertThat(group.readLines().count { it.startsWith("ubuntu:") }).isEqualTo(1)
+    }
+
+    @Test
+    fun `a group list that cannot be read does not stop the userspace starting`() = runTest {
+        val harness = newHarness(supplementaryGids = { throw IllegalStateException("no groups for you") })
+        harness.manager.install()
+
+        harness.manager.start()
+
+        // Names beside four numbers are not worth a terminal the user cannot open, so this is
+        // recorded and not fatal — and recorded, rather than swallowed, because the install log is
+        // where someone asking "why does groups print numbers" has to be able to find the answer.
+        assertThat(harness.manager.state.value).isInstanceOf(LinuxUserspaceState.Running::class.java)
+        assertThat(harness.distribution.diagnostics.export()).contains("supplementary group names")
+        assertThat(harness.distribution.diagnostics.export()).contains("no groups for you")
     }
 
     @Test

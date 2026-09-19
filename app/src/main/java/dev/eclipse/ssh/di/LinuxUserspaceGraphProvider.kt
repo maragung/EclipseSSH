@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Process
 import androidx.annotation.VisibleForTesting
 import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.eclipse.ssh.linux.AndroidGroupNames
 import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxDistroCatalog
 import dev.eclipse.ssh.linux.LinuxPtySpawner
@@ -168,6 +169,15 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // syscall wrapper; on Android an app's primary gid is its own uid, which is the
             // value the runCatching fallback would land on anyway.
             appGid = runCatching { android.system.Os.getgid() }.getOrDefault(Process.myUid()),
+            // The app's supplementary Android groups, which proot passes through to the session
+            // untouched — the rootfs names them so `groups` and `id` do not report them by number.
+            // A lambda for the same reason the resolvers are one: this is read again on every
+            // start, and a permission granted since the install is one more group to name. An
+            // empty answer names nothing, which is exactly the behaviour without this wiring.
+            //
+            // From /proc/self/status rather than Os.getgroups(), which the SDK does not publish:
+            // android-37.0's android.jar has getuid/geteuid/getgid/getegid and no getgroups.
+            supplementaryGids = { AndroidGroupNames.selfGroups() },
             // A lambda, not a snapshot: the resolvers are read each time setup writes
             // /etc/resolv.conf, so a network change between install and repair lands in the file
             // instead of pinning the DNS of the moment the graph was built.

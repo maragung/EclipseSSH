@@ -958,6 +958,76 @@ class UbuntuDistributionManagerTest {
         assertThat(File(harness.runtime.rootDir, "sigsys-log.txt").exists()).isFalse()
     }
 
+    @Test
+    fun `setup names the Android group ids the session is in`() = runTest {
+        // The group set of the device this was reported on: 3003 inet, 9997 everybody, and the
+        // cache and shared groups the platform derives from the app id (here 504, from the app
+        // uid 10504 in the report). A shell in the rootfs is in all four — proot passes them
+        // through — and a stock group file names none of them, which is what `groups` complains
+        // about, once per ID.
+        val harness = Harness(
+            distro(arch = "arm64"),
+            supplementaryGids = { intArrayOf(3003, 9997, 20504, 50504) },
+        )
+
+        val report = harness.distribution.setup()
+
+        // A naming gap, not a failure: setup is clean, and the account file says what those
+        // numbers are called.
+        assertThat(report.warnings).isEmpty()
+        val group = File(harness.runtime.rootfsDir, "etc/group")
+        assertThat(group.readLines()).containsAtLeast(
+            "android_inet:x:3003:",
+            "android_everybody:x:9997:",
+            "android_cache_504:x:20504:",
+            "android_shared_504:x:50504:",
+        )
+        // The lines the rootfs shipped, and the account line, are still exactly what they were.
+        assertThat(group.readLines().first()).isEqualTo("root:x:0:")
+        assertThat(group.readLines().count { it.startsWith("ubuntu:") }).isEqualTo(1)
+    }
+
+    @Test
+    fun `naming the same groups again writes nothing`() = runTest {
+        val harness = Harness(distro(arch = "arm64"), supplementaryGids = { intArrayOf(3003, 9997) })
+        harness.distribution.setup()
+        val group = File(harness.runtime.rootfsDir, "etc/group")
+        val named = group.readText()
+
+        // Setup has already named them, so the call the start path makes — on every start, for an
+        // install that was written before the names existed — finds nothing to do. That is what
+        // keeps opening a terminal from rewriting a rootfs file.
+        assertThat(harness.distribution.nameSupplementaryGroups()).isFalse()
+        assertThat(group.readText()).isEqualTo(named)
+    }
+
+    @Test
+    fun `a rootfs with no group file to name is not an error`() = runTest {
+        val harness = Harness(distro(arch = "arm64"), supplementaryGids = { intArrayOf(3003) })
+        // The state a start can be asked for from NeedsRepair: a rootfs whose account files the
+        // extractor never wrote. Nothing to name, and nothing to fail over — the install that
+        // writes the file is the thing that has to complain, not this.
+        File(harness.runtime.rootfsDir, "etc/group").delete()
+
+        assertThat(harness.distribution.nameSupplementaryGroups()).isFalse()
+    }
+
+    @Test
+    fun `a group list that cannot be read is a warning, not a failed install`() = runTest {
+        val harness = Harness(
+            distro(arch = "arm64"),
+            supplementaryGids = { throw IllegalStateException("no groups for you") },
+        )
+
+        val report = harness.distribution.setup()
+
+        // The userspace is complete and usable; what it loses is the names beside four numbers,
+        // so the install says so and carries on rather than sending the user to Repair.
+        assertThat(report.warnings.any { it.contains("/etc/group") }).isTrue()
+        assertThat(File(harness.runtime.rootfsDir, "etc/passwd").readText())
+            .contains("ubuntu:x:10150:10150:Ubuntu:/home/ubuntu:/bin/bash")
+    }
+
     // ------------------------------------------------------------------ fixtures
 
     /**
@@ -976,6 +1046,7 @@ class UbuntuDistributionManagerTest {
         mirrorListUrl: String = "http://127.0.0.1:1/mirrors.txt",
         aptUpdateAttemptTimeoutMs: Long = 10 * 60_000L,
         freeBytes: () -> Long = { 0L },
+        supplementaryGids: () -> IntArray = { IntArray(0) },
     ) {
         /** The scripted fake every non-wedged spawn lands in, even when [wedgeOn] wraps it. */
         val scripted: ScriptedPtySpawner = scripted.apply { respond = { baseline(it) } }
@@ -993,6 +1064,7 @@ class UbuntuDistributionManagerTest {
                 runtime,
                 appUid = 10150,
                 appGid = 10150,
+                supplementaryGids = supplementaryGids,
                 dnsServers = dnsServers,
                 mirrorListUrl = mirrorListUrl,
                 networkOnline = networkOnline,
