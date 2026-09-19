@@ -23,12 +23,14 @@ import dev.eclipse.ssh.data.credentials.describe
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.ServerStats
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.security.StandInAndroidKeyStore
 import dev.eclipse.ssh.ui.actions.ActionAnswer
 import dev.eclipse.ssh.ui.actions.ActionRequests
 import dev.eclipse.ssh.ui.actions.HostDetailsKind
 import dev.eclipse.ssh.ui.hosts.HostDetailsActivity
 import java.time.Duration
 import kotlinx.coroutines.runBlocking
+import org.junit.After
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -69,6 +71,18 @@ class HostDetailsActivityRobolectricTest {
     @Before
     fun drainAnswers() {
         ActionRequests.takeAnswer()
+        // Before the first window, because the two rows that answer "what does the vault hold" and
+        // "forget it" go through the real credential store, and that store's first write asks
+        // `SecureVault` for a hardware-backed key. Robolectric has no `AndroidKeyStore` at all, so
+        // without this the write dies on `KeyStoreException: AndroidKeyStore not found` and the two
+        // rows are untestable off a device. See [StandInAndroidKeyStore] for what it does and does
+        // not stand in for.
+        StandInAndroidKeyStore.install()
+    }
+
+    @After
+    fun removeKeyStore() {
+        StandInAndroidKeyStore.uninstall()
     }
 
     /**

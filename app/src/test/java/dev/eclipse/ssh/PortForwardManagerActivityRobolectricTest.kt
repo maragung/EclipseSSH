@@ -184,8 +184,9 @@ class PortForwardManagerActivityRobolectricTest {
 
         launchWindow(host).use { scenario ->
             // The second row's own Delete: the list is the column's order, so the last Delete belongs
-            // to the dynamic rule.
-            awaitRow("Delete")
+            // to the dynamic rule. Both rows are waited for, not one - the click below indexes into
+            // them, and an await that settles for a single row would index a list still being drawn.
+            awaitRows("Delete", count = 2)
             compose.onAllNodes(hasText("Delete") and hasClickAction())[1].performClick()
 
             awaitAnswer(
@@ -209,10 +210,14 @@ class PortForwardManagerActivityRobolectricTest {
 
         launchWindow(host).use {
             // The label is there and the row is not tappable: a disabled TextButton keeps its text and
-            // loses its click action.
+            // loses its click action. Waited for rather than asserted on the first frame, because the
+            // row is drawn from the very first composition while the 32 rules that fill the cap arrive
+            // from the repository a frame or two later - read immediately, this sees the enabled
+            // empty-list state and fails on a row the user never gets to see.
             awaitText("Add rule")
-            assertThat(compose.onAllNodes(hasText("Add rule") and hasClickAction()).fetchSemanticsNodes())
-                .isEmpty()
+            pumpUntil(describe = { "the Add row never went disabled at the cap" }) {
+                compose.onAllNodes(hasText("Add rule") and hasClickAction()).fetchSemanticsNodes().isEmpty()
+            }
         }
     }
 
@@ -323,6 +328,20 @@ class PortForwardManagerActivityRobolectricTest {
     private fun awaitRow(label: String) {
         awaitText(label)
         compose.onNode(hasText(label) and hasClickAction()).assertIsDisplayed()
+    }
+
+    /**
+     * Waits until the window is drawing exactly [count] rows that carry [label].
+     *
+     * [awaitRow] asserts a single node on purpose, which is the right claim for the rows that are one
+     * per window. The rule list is one row per saved rule, so a two-rule host has two Deletes and the
+     * single-node form finds two and fails on the ambiguity rather than on anything being wrong.
+     */
+    private fun awaitRows(label: String, count: Int) {
+        awaitText(label)
+        pumpUntil(describe = { "the window never drew $count rows named \"$label\"" }) {
+            compose.onAllNodes(hasText(label) and hasClickAction()).fetchSemanticsNodes().size == count
+        }
     }
 
     /** A string the window must be showing, wherever on the surface it is drawn. */
