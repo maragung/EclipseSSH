@@ -14,6 +14,7 @@ import dev.eclipse.ssh.data.model.AppSettings
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.security.PinHasher
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
+import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import java.io.IOException
 import java.util.Base64
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +56,7 @@ internal object Keys {
         val terminalFontSize = intPreferencesKey("terminal_font_size")
         val terminalKeyRowVisible = booleanPreferencesKey("terminal_key_row_visible")
         val terminalMinColumns = intPreferencesKey("terminal_min_columns")
+        val terminalRows = intPreferencesKey("terminal_rows")
         val pinEnabled = booleanPreferencesKey("pin_enabled")
         val pinHash = stringPreferencesKey("pin_hash")
         val pinSalt = stringPreferencesKey("pin_salt")
@@ -88,6 +90,10 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     terminalFontSize = SettingsRepository.normalizeFontSize(prefs[Keys.terminalFontSize] ?: SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE),
     terminalKeyRowVisible = prefs[Keys.terminalKeyRowVisible] ?: true,
     terminalMinColumns = prefs[Keys.terminalMinColumns] ?: SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS,
+    // Clamped on the way out for the same reason as the columns below it: this number also arrives
+    // from a restored backup, and a height the pty would refuse is one the status line would report
+    // as being in force while the server was told something else.
+    terminalRows = SettingsRepository.normalizeRows(prefs[Keys.terminalRows] ?: SettingsRepository.DEFAULT_TERMINAL_ROWS),
     // Requires the hash to actually be present, not just the flag. `pinEnabled` alone gates the
     // entire app through MainActivity's lock screen, and `verifyPin` returns false when there is no
     // hash to compare against — so the flag surviving without its hash is a permanent lockout with
@@ -263,6 +269,23 @@ class SettingsRepository(private val context: Context) {
     suspend fun setTerminalMinColumns(columns: Int) = editPrefs {
         it[Keys.terminalMinColumns] = normalizeMinColumns(columns)
     }
+
+    /**
+     * How many rows the pty is told it has, or 0 for "as many as fit the screen".
+     *
+     * The mirror of [setTerminalMinColumns], and the opposite kind of number. A width is a floor: the
+     * screen can always show fewer columns than the server believes, because the rest is reachable by
+     * wrapping or by panning. A height is a ceiling, because a row past the bottom edge is nowhere -
+     * a shell told it has sixty rows on a screen that fits forty puts its prompt twenty rows below the
+     * last pixel. So this value is agreed with the screen (see `TerminalGrid.atMostRows`) rather than
+     * demanded of it, and the clamp here is only the range the pty and the buffer share.
+     *
+     * Normalized rather than trusted for the same reason as every other stored number: only
+     * [setTerminalRows] and a restored backup write it, and a backup is a file the user can hand-edit.
+     */
+    suspend fun setTerminalRows(rows: Int) = editPrefs {
+        it[Keys.terminalRows] = normalizeRows(rows)
+    }
     suspend fun setLegacyAlgorithms(enabled: Boolean) = editPrefs { it[Keys.legacyAlgorithms] = enabled }
 
     /**
@@ -338,6 +361,22 @@ class SettingsRepository(private val context: Context) {
         /** 0 stays 0; anything else is pulled inside the range the pty and the buffer share. */
         fun normalizeMinColumns(columns: Int): Int =
             if (columns <= 0) 0 else columns.coerceIn(TERMINAL_COLUMN_RANGE)
+
+        const val DEFAULT_TERMINAL_ROWS = 0
+
+        /**
+         * 0, meaning "as many rows as the screen fits", plus the heights worth offering above it.
+         *
+         * Short by convention rather than by ratio: 24 rows is the classic terminal, 30 and 40 are a
+         * phone held against a desktop's shape, and 50 is the point past which a "short" screen is
+         * mostly blank. Nothing here is above 60 because a phone screen fits fewer than that anyway,
+         * and a choice the screen overrules on every device is a choice that never does anything.
+         */
+        val TERMINAL_ROW_CHOICES = listOf(0, 24, 30, 40, 50, 60)
+
+        /** 0 stays 0; anything else is pulled inside the range the pty and the buffer share. */
+        fun normalizeRows(rows: Int): Int =
+            if (rows <= 0) 0 else rows.coerceIn(TERMINAL_ROW_RANGE)
 
         const val DEFAULT_RECONNECT_BASE_SECONDS = 5
         const val MIN_RECONNECT_BASE_SECONDS = 1

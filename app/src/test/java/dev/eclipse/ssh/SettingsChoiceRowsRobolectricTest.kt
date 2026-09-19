@@ -15,6 +15,7 @@ import dev.eclipse.ssh.ui.settings.ClipboardClearActivity
 import dev.eclipse.ssh.ui.settings.KeepAliveActivity
 import dev.eclipse.ssh.ui.settings.ReconnectDelayActivity
 import dev.eclipse.ssh.ui.settings.TerminalFontSizeActivity
+import dev.eclipse.ssh.ui.settings.TerminalHeightActivity
 import dev.eclipse.ssh.ui.settings.TerminalWidthActivity
 import dev.eclipse.ssh.ui.settings.VaultAutoLockActivity
 import java.time.Duration
@@ -181,6 +182,18 @@ class SettingsChoiceRowsRobolectricTest {
     @Test
     fun theTerminalWidthRowOpensTheWidthScreen() {
         assertRowOpens("Terminal width", TerminalWidthActivity::class.java)
+    }
+
+    /**
+     * Terminal height opens its own window, directly under the width row it is the counterpart of.
+     *
+     * The two are one question - how big is the terminal - and the pair is what makes the height row
+     * worth its own window rather than a number the user has to find: a grid sized on the width screen
+     * and not on the height one is a terminal that pans sideways over a prompt below the fold.
+     */
+    @Test
+    fun theTerminalHeightRowOpensTheHeightScreen() {
+        assertRowOpens("Terminal height", TerminalHeightActivity::class.java)
     }
 
     /**

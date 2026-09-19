@@ -123,12 +123,16 @@ class LinuxUserspaceManager(
                 workspace.snapshotTo(backupFile)
             }
             try {
+                // Whether this run has a rootfs half is decided before it can be consumed by the
+                // half itself: a repair that finds an extracted rootfs skips the download, and the
+                // percentage the user watches must start at 0 for the work that is actually left.
+                val plan = installPlan()
                 var extractionWarnings: List<String> = emptyList()
                 if (!installer.isExtracted()) {
                     storage.updateInstallLockPhase("download")
                     installer.install(
                         onProgress = { progress ->
-                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep(), plan)
                         },
                         onExtractionWarnings = { extractionWarnings = it },
                     )
@@ -137,26 +141,8 @@ class LinuxUserspaceManager(
                 // must fail here — an install failure the UI can name — rather than deep inside
                 // setup, where it surfaces as a missing-file error that reads like corruption.
                 check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
-                // The step the progress line belongs to: onStep and onProgress arrive as separate
-                // callbacks, and the emitted state must carry both.
                 storage.updateInstallLockPhase("setup")
-                var currentSetupStep = SetupStep.REGISTER_USER
-                val report = distribution.setup(
-                    onStep = { step ->
-                        currentSetupStep = step
-                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
-                    },
-                    onProgress = { line ->
-                        // Conflated by the StateFlow: a burst of apt lines collapses to the newest,
-                        // which is exactly the line a watcher wants to see.
-                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
-                    },
-                )
-                storage.updateInstallLockPhase("health")
-                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
-                val health = distribution.healthProbe()
-                _lastHealth.value = health
-                check(health.healthy) { "Ubuntu installed but failed its health check: ${health.describe()}" }
+                val report = setUpAndVerify(plan, "Ubuntu installed but failed its health check")
 
                 writeInstalledState()
                 val warnings = (extractionWarnings + report.warnings).toMutableList()
@@ -256,12 +242,13 @@ class LinuxUserspaceManager(
                 workspace.snapshotTo(backupFile)
             }
             try {
+                val plan = installPlan()
                 var extractionWarnings: List<String> = emptyList()
                 if (!installer.isExtracted()) {
                     storage.updateInstallLockPhase("download")
                     installer.install(
                         onProgress = { progress ->
-                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep())
+                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep(), plan)
                         },
                         onExtractionWarnings = { extractionWarnings = it },
                     )
@@ -270,21 +257,7 @@ class LinuxUserspaceManager(
                 // as a repair, not as setup's missing-file error.
                 check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
                 storage.updateInstallLockPhase("setup")
-                var currentSetupStep = SetupStep.REGISTER_USER
-                val report = distribution.setup(
-                    onStep = { step ->
-                        currentSetupStep = step
-                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step))
-                    },
-                    onProgress = { line ->
-                        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(currentSetupStep, line))
-                    },
-                )
-                storage.updateInstallLockPhase("health")
-                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth)
-                val health = distribution.healthProbe()
-                _lastHealth.value = health
-                check(health.healthy) { "Ubuntu was repaired but still fails its health check: ${health.describe()}" }
+                val report = setUpAndVerify(plan, "Ubuntu was repaired but still fails its health check")
                 writeInstalledState()
                 val warnings = (extractionWarnings + report.warnings).toMutableList()
                 if (backupFile.isFile) {
@@ -474,8 +447,67 @@ class LinuxUserspaceManager(
         when (this) {
             is RootfsInstaller.Progress.Downloading -> LinuxInstallStep.Downloading(received, total)
             is RootfsInstaller.Progress.Verifying -> LinuxInstallStep.Verifying
-            is RootfsInstaller.Progress.Extracting -> LinuxInstallStep.Extracting(entries)
+            is RootfsInstaller.Progress.Extracting -> LinuxInstallStep.Extracting(entries, fraction = fraction)
         }
+
+    /**
+     * Which halves this run will traverse, decided before either half can consume the answer:
+     * a rootfs already on disk and complete means the download, the verification and the extraction
+     * are not work this run has to do, and [LinuxInstallProgress] renormalizes its ladder so the
+     * percentage starts where the work does.
+     */
+    private fun installPlan(): InstallPlan =
+        if (installer.isExtracted()) InstallPlan.SETUP_ONLY else InstallPlan.FULL
+
+    /**
+     * The second half of both [install] and [repair]: the setup pipeline for real, then the health
+     * check, emitting the install state — and its percentage — as each step lands.
+     *
+     * Shared rather than duplicated, because the progress a user watches must not depend on which
+     * verb brought them here; the two callers disagree about one thing, the sentence a failed health
+     * check is reported with, and that is the parameter.
+     *
+     * @param healthFailure the start of the message a failing health check is reported with; the
+     *   probe's own [HealthReport.describe] completes it
+     * @throws IllegalStateException when the health check fails — the install is not done until the
+     *   environment has been proven usable, and a report that says otherwise would be the exact
+     *   "it installed" / "it works" conflation the pipeline exists to refuse
+     */
+    private suspend fun setUpAndVerify(plan: InstallPlan, healthFailure: String): SetupReport {
+        // The step the progress line belongs to: onStep and onProgress arrive as separate callbacks,
+        // and the emitted state must carry both. The within-step fraction is the *highest* apt has
+        // reported for the current step, never the latest: apt redraws its bar many times a second
+        // for its own reasons, and a bar that walked backwards would read as a step being undone.
+        var setupStep = SetupStep.REGISTER_USER
+        var setupDetail: String? = null
+        var setupWithin: Float? = null
+        val report = distribution.setup(
+            onStep = { step ->
+                setupStep = step
+                // Cleared, not carried: the previous step's line and its 90% both describe work
+                // that is over, and leaving either standing would attribute it to this step.
+                setupDetail = null
+                setupWithin = null
+                _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.SettingUp(step), plan)
+            },
+            onProgress = { line ->
+                // Conflated by the StateFlow: a burst of apt lines collapses to the newest, which is
+                // exactly the line a watcher wants to see.
+                setupWithin = maxOf(setupWithin ?: 0f, aptProgressFraction(line) ?: 0f).takeIf { it > 0f }
+                setupDetail = progressDetail(line) ?: setupDetail
+                _state.value = LinuxUserspaceState.Installing(
+                    LinuxInstallStep.SettingUp(setupStep, setupDetail, setupWithin),
+                    plan,
+                )
+            },
+        )
+        storage.updateInstallLockPhase("health")
+        _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth, plan)
+        val health = distribution.healthProbe()
+        _lastHealth.value = health
+        check(health.healthy) { "$healthFailure: ${health.describe()}" }
+        return report
+    }
 }
 
 /**
@@ -486,8 +518,16 @@ sealed interface LinuxUserspaceState {
     /** Nothing installed; the settings screen offers Install (or shows a pending backup hint). */
     data object NotInstalled : LinuxUserspaceState
 
-    /** An install or repair is in progress; [step] is the current phase for the progress display. */
-    data class Installing(val step: LinuxInstallStep) : LinuxUserspaceState
+    /**
+     * An install or repair is in progress; [step] is the current phase for the progress display,
+     * and [plan] says which halves this run traverses so its percentage starts where its work
+     * does. Both default to the whole pipeline, which is what a caller that has nothing to say
+     * about either means.
+     */
+    data class Installing(
+        val step: LinuxInstallStep,
+        val plan: InstallPlan = InstallPlan.FULL,
+    ) : LinuxUserspaceState
 
     /** Installed and verified but not held open; Start opens it. */
     data object Stopped : LinuxUserspaceState
@@ -511,14 +551,31 @@ sealed interface LinuxInstallStep {
 
     data object Verifying : LinuxInstallStep
 
-    data class Extracting(val entries: Int) : LinuxInstallStep
+    /** [fraction] of the tarball read, 0 to 1, when the file would report its length. */
+    data class Extracting(val entries: Int, val fraction: Float? = null) : LinuxInstallStep
 
     /**
      * A setup step is running. [detail], when present, is the newest output line of the command
      * behind the step — a slow-but-alive `apt-get update` shows "Get: 47 …" moving instead of a
-     * label that could be wedged for all the user can tell.
+     * label that could be wedged for all the user can tell. [fraction] is how far the step says it
+     * has got, 0 to 1, for the steps that can measure themselves.
      */
-    data class SettingUp(val step: SetupStep, val detail: String? = null) : LinuxInstallStep
+    data class SettingUp(
+        val step: SetupStep,
+        val detail: String? = null,
+        val fraction: Float? = null,
+    ) : LinuxInstallStep
 
     data object VerifyingHealth : LinuxInstallStep
 }
+
+/**
+ * The whole install's percentage for a state, 0 to 100 — what the Ubuntu window, the host list and
+ * the foreground notification all show.
+ *
+ * An extension on the state rather than a second call to [LinuxInstallProgress]: the step and the
+ * plan that qualify each other travel together, and every renderer that took the step alone would
+ * have to be handed the plan as well and could quietly be given the wrong one.
+ */
+val LinuxUserspaceState.Installing.percent: Int
+    get() = LinuxInstallProgress.percent(step, plan)

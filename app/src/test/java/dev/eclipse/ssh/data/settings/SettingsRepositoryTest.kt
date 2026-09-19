@@ -4,6 +4,7 @@ import androidx.datastore.preferences.core.mutablePreferencesOf
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
 import dev.eclipse.ssh.data.model.TerminalTheme
+import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
@@ -73,6 +74,7 @@ class SettingsRepositoryTest {
             repo.setTerminalKeyRowVisible(true)
             repo.setTerminalKeyBarJson("{}")
             repo.setTerminalMinColumns(SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS)
+            repo.setTerminalRows(SettingsRepository.DEFAULT_TERMINAL_ROWS)
             repo.setLegacyAlgorithms(false)
             repo.setTerminalTheme(TerminalTheme.DARK.name)
             repo.setBlockScreenshots(false)
@@ -124,6 +126,7 @@ class SettingsRepositoryTest {
         repo.setKeepAliveSeconds(15)
         repo.setReconnectBaseSeconds(12)
         repo.setTerminalFontSize(18)
+        repo.setTerminalRows(42)
         repo.setTerminalKeyRowVisible(false)
         repo.setLegacyAlgorithms(true)
         repo.setTerminalTheme(TerminalTheme.entries.last().name)
@@ -144,6 +147,9 @@ class SettingsRepositoryTest {
         assertThat(settings.keepAliveSeconds).isEqualTo(15)
         assertThat(settings.reconnectBaseSeconds).isEqualTo(12)
         assertThat(settings.terminalFontSize).isEqualTo(18)
+        // Set to something other than its default, because this setting's default (0) is also its
+        // "unset" sentinel and would round-trip even if the key were never written at all.
+        assertThat(settings.terminalRows).isEqualTo(42)
         assertThat(settings.terminalKeyRowVisible).isFalse()
         assertThat(settings.legacyAlgorithms).isTrue()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
@@ -200,6 +206,41 @@ class SettingsRepositoryTest {
         val repo = repository
         repo.setTerminalCursorStyle("oblique")
         assertThat(repo.settings.first().terminalCursorStyle).isEqualTo("block")
+    }
+
+    /**
+     * The terminal height is clamped to the range the pty accepts, and 0 stays 0.
+     *
+     * 0 is not a height, it is the sentinel for "as many rows as the screen fits", so it must survive
+     * the clamp unchanged - folding it to the lower bound would turn the default into a five-row
+     * terminal on every install. Everything else is a real number of rows and is pulled inside the
+     * range the pty and the buffer share, because the other writer of this field is a restored
+     * backup, which is a file the user can hand-edit.
+     */
+    @Test
+    fun `03d the terminal height is clamped, but zero still means fit the screen`() = runTest {
+        val repo = repository
+        val range = TERMINAL_ROW_RANGE
+
+        repo.setTerminalRows(0)
+        assertThat(repo.settings.first().terminalRows).isEqualTo(0)
+
+        repo.setTerminalRows(-40)
+        assertThat(repo.settings.first().terminalRows).isEqualTo(0)
+
+        repo.setTerminalRows(Int.MAX_VALUE)
+        assertThat(repo.settings.first().terminalRows).isEqualTo(range.last)
+
+        repo.setTerminalRows(1)
+        assertThat(repo.settings.first().terminalRows).isEqualTo(range.first)
+
+        // Every height the screen offers stores as itself, so choosing one never redraws as another.
+        SettingsRepository.TERMINAL_ROW_CHOICES.forEach { rows ->
+            repo.setTerminalRows(rows)
+            assertWithMessage("the height screen offers %s rows", rows)
+                .that(repo.settings.first().terminalRows)
+                .isEqualTo(rows)
+        }
     }
 
     @Test

@@ -152,6 +152,46 @@
             android:name=".ui.settings.TerminalWidthActivity"
             android:exported="false"
             android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.settings.TerminalHeightActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+        <!--
+          The Add-forward form. Reached from the Settings list rather than from a Settings row of its
+          own, so it sits beside the settings destinations rather than among them: it edits no
+          setting, and the forward it produces is handed back to the workspace's view model rather
+          than written to a store - see ForwardRequests.
+        -->
+        <activity
+            android:name=".ui.forward.ForwardFormActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!--
+          The two previews, promoted from `ModalBottomSheet`s over the workspace to windows of
+          their own. Both carry the editor's `configChanges` list, and here it is load-bearing
+          rather than a habit: what each one shows arrives through a one-shot token
+          (PreviewRequests) because a live FileSystemProvider, or a closure over an open archive,
+          cannot be parcelled - so a rotation that recreated either window would find its token
+          spent and close itself. A preview that vanishes when the phone turns is the one failure
+          this pair must not have. singleTop for the same reason the editor has it: opening a
+          second file while a preview is on screen replaces its subject instead of stacking a
+          window per file the user glances at.
+          Not exported - they are only ever started from inside the app, and their one extra is a
+          token into an in-process handoff rather than a path or a URI anyone else could name.
+        -->
+        <activity
+            android:name=".ui.preview.FilePreviewActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".MainActivity" />
+        <activity
+            android:name=".ui.archive.ArchiveEntryPreviewActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:parentActivityName=".MainActivity" />
 
         <!--
           Terminal font size, the one Settings row whose value is a range rather than a

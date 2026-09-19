@@ -1,7 +1,9 @@
 package dev.eclipse.ssh.linux
 
 import java.io.File
+import java.io.FileInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.io.PushbackInputStream
 import java.nio.file.FileVisitOption
 import java.nio.file.FileVisitResult
@@ -44,8 +46,27 @@ internal fun resolveInsideRoot(root: File, name: String): File {
  * (0x1f 0x8b) decides the wrap; anything else passes through untouched, so a plain tar still
  * works.
  */
-internal fun openTarStream(file: File, bufferSize: Int): TarArchiveInputStream {
-    val probe = PushbackInputStream(file.inputStream().buffered(bufferSize), 2)
+internal fun openTarStream(file: File, bufferSize: Int): TarArchiveInputStream =
+    openTarStream(file.inputStream(), bufferSize)
+
+/**
+ * [openTarStream] over a file that reports how much of itself it has handed over.
+ *
+ * An extraction's progress is the part of the *compressed* tarball consumed, and the only place
+ * that quantity exists is the read from the file: the tar layer above counts unpacked bytes, whose
+ * total nothing here knows in advance — the pin says what the tarball weighs, not what it unpacks
+ * to. [onBytesRead] is called with the running total on every read from [file], which is once per
+ * buffer fill, so the reading is as smooth as [bufferSize] is small.
+ */
+internal fun openTarStream(
+    file: File,
+    bufferSize: Int,
+    onBytesRead: (Long) -> Unit,
+): TarArchiveInputStream = openTarStream(CountingFileStream(file, onBytesRead), bufferSize)
+
+/** The read path both overloads share: sniff the gzip magic, then parse what follows as tar. */
+internal fun openTarStream(raw: InputStream, bufferSize: Int): TarArchiveInputStream {
+    val probe = PushbackInputStream(raw.buffered(bufferSize), 2)
     val magic = ByteArray(2)
     val read = probe.read(magic)
     if (read > 0) probe.unread(magic, 0, read)
@@ -55,6 +76,40 @@ internal fun openTarStream(file: File, bufferSize: Int): TarArchiveInputStream {
         probe
     }
     return TarArchiveInputStream(source)
+}
+
+/**
+ * The file a progress-reporting extraction reads through: a [FileInputStream] that adds up what it
+ * has handed out and reports the running total after each read.
+ *
+ * All three read entry points are overridden, and the third is the one that is easy to miss:
+ * `FileInputStream` overrides `read(byte[])` *and* `read(byte[], int, int)`, and both delegate to
+ * its own private native fill rather than to each other — so overriding the ranged form alone
+ * leaves the single-argument form uncounted, and a caller that fills a buffer with it would read as
+ * an extraction stuck at 0% while the tarball drained. The byte-at-a-time form is overridden for
+ * the same reason: a probe reads one byte at a time.
+ */
+internal class CountingFileStream(file: File, private val onBytesRead: (Long) -> Unit) : FileInputStream(file) {
+    private var total = 0L
+
+    override fun read(): Int {
+        val value = super.read()
+        if (value >= 0) report(1)
+        return value
+    }
+
+    override fun read(buffer: ByteArray): Int = read(buffer, 0, buffer.size)
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        val count = super.read(buffer, offset, length)
+        if (count > 0) report(count.toLong())
+        return count
+    }
+
+    private fun report(count: Long) {
+        total += count
+        onBytesRead(total)
+    }
 }
 
 /**

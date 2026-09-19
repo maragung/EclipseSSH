@@ -88,6 +88,7 @@ object VaultBackup {
             put("reconnectBaseSeconds", settings.reconnectBaseSeconds)
             put("terminalFontSize", settings.terminalFontSize)
             put("terminalMinColumns", settings.terminalMinColumns)
+            put("terminalRows", settings.terminalRows)
             put("pinEnabled", settings.pinEnabled)
             put("vaultAutoLockMinutes", settings.vaultAutoLockMinutes)
             put("legacyAlgorithms", settings.legacyAlgorithms)
@@ -205,6 +206,12 @@ object VaultBackup {
             // and the width it names has to be one the pty would actually accept.
             terminalMinColumns = SettingsRepository.normalizeMinColumns(
                 settingsObj.optInt("terminalMinColumns", defaults.terminalMinColumns),
+            ),
+            // Normalized on the way in for the same reason, and defaulted the same way: absent from
+            // backups written before the setting existed resolves to 0, which is "fit the screen" -
+            // exactly the behaviour those backups were taken from.
+            terminalRows = SettingsRepository.normalizeRows(
+                settingsObj.optInt("terminalRows", defaults.terminalRows),
             ),
             pinEnabled = settingsObj.optBoolean("pinEnabled", defaults.pinEnabled),
             // Normalized on the way in like every other imported number: a backup is untrusted

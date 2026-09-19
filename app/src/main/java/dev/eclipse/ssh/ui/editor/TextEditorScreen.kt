@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -53,6 +54,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,6 +74,7 @@ import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -90,7 +93,7 @@ import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
 import dev.eclipse.ssh.ui.editor.encoding.FileEncoding
 import dev.eclipse.ssh.ui.editor.highlight.SyntaxColors
-import dev.eclipse.ssh.ui.editor.highlight.syntaxTransformationFor
+import dev.eclipse.ssh.ui.editor.highlight.debouncedSyntaxTransformationFor
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
 import java.util.Locale
 import kotlinx.coroutines.CoroutineScope
@@ -806,9 +809,14 @@ private fun EditorBody(
     // field's own text color stays SyntaxColors.plain (see fromScheme) so uncolored runs and the
     // status bar keep agreeing; find-matches swap in over it because a match highlight must win
     // over grammar coloring while the bar is open.
-    val syntaxTransformation = syntaxTransformationFor(
+    //
+    // Debounced and lexed off this thread, because it is the one piece of work here proportional to
+    // the whole document: see [debouncedSyntaxTransformationFor]. Passing the document in is what
+    // makes it per-keystroke work otherwise.
+    val syntaxTransformation = debouncedSyntaxTransformationFor(
         request.entry.name,
         SyntaxColors.fromScheme(MaterialTheme.colorScheme),
+        textValue.text,
     )
 
     // Bring the requested offset into view — from go-to-line or from stepping through matches.
@@ -1018,9 +1026,27 @@ private fun EditorBody(
         // holds with wrap off too: an unwrapped line is simply one very tall-less visual line, so
         // the gutter's per-logical-line heights (which come from the same layout either way) still
         // match the field's, one visual line per logical line.
-        Row(Modifier.weight(1f).fillMaxWidth().verticalScroll(verticalScroll)) {
+        //
+        // The viewport is measured here rather than inside the gutter because this is the node the
+        // scroll clips: it is the only place that knows how much of the document is on screen, which
+        // is what lets the gutter compose the numbers for the lines the user can see and stand in for
+        // the rest with a single spacer of their exact combined height.
+        var viewportHeightPx by remember { mutableIntStateOf(0) }
+        Row(
+            Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .onSizeChanged { viewportHeightPx = it.height }
+                .verticalScroll(verticalScroll),
+        ) {
             if (prefs.showLineNumbers) {
-                LineNumberGutter(text = textValue.text, layout = layout, style = gutterStyle)
+                LineNumberGutter(
+                    text = textValue.text,
+                    layout = layout,
+                    style = gutterStyle,
+                    scrollOffsetPx = verticalScroll.value,
+                    viewportHeightPx = viewportHeightPx,
+                )
             }
             BasicTextField(
                 value = textValue,
@@ -1136,13 +1162,18 @@ private fun EditorBody(
             )
         }
 
-        val (line, column) = lineAndColumn(textValue.text, textValue.selection.start)
+        // One walk of the document answers all three of the status line's questions, and it is keyed
+        // on the text and the caret so a recomposition that changed neither - a theme flip, a sheet
+        // opening, the highlight landing - does not walk the document again.
+        val position = remember(textValue.text, textValue.selection.start) {
+            documentPosition(textValue.text, textValue.selection.start)
+        }
         Surface(tonalElevation = 2.dp) {
             // The encoding label, not a hard-coded "UTF-8": the status line is where the eye
             // already sits, so a non-UTF-8 tab has to say so here — otherwise the only hint a
             // save will write Windows-1252 is a refusal dialog after the fact.
             Text(
-                "Ln $line, Col $column    ${textValue.text.count { it == '\n' } + 1} lines    ${encoding.label}" +
+                "Ln ${position.line}, Col ${position.column}    ${position.lines} lines    ${encoding.label}" +
                     // The mode rides along in the status line — the one place the eye already
                     // rests for facts about the file — rather than a toolbar icon, because
                     // read-only is a fact, not an action.
@@ -1180,36 +1211,114 @@ private fun EditorBody(
  * The heights come from the text field's own [TextLayoutResult], which makes the gutter exact by
  * construction rather than by estimation — the lines a long wrapped line occupies in the field are
  * the same height its number is drawn at here.
+ *
+ * Only the lines inside the viewport are composed. A gutter that emits a text node per line is a
+ * thousand composables rebuilt on every keystroke in a thousand-line file, which is a cost the user
+ * pays for numbers they cannot see; the lines above and below stand in as one spacer each, of
+ * exactly the height they occupy, so what is on screen is identical and what is off it is arithmetic.
  */
 @Composable
 private fun LineNumberGutter(
     text: String,
     layout: TextLayoutResult?,
     style: TextStyle,
+    scrollOffsetPx: Int,
+    viewportHeightPx: Int,
 ) {
+    if (layout == null) return
+    val density = LocalDensity.current
+    // Every logical line's top edge in the field's own coordinates, cumulative, so a line's height is
+    // its top minus the next one's and the height of a run of them is a subtraction rather than a sum.
+    val tops = remember(text, layout) { lineTops(text, layout) }
+    val window = remember(tops, scrollOffsetPx, viewportHeightPx) {
+        gutterWindow(tops, scrollOffsetPx.toFloat(), viewportHeightPx.toFloat())
+    }
     Column(Modifier.width(44.dp).padding(top = 8.dp, start = 8.dp, end = 4.dp)) {
-        if (layout == null) return
-        val density = LocalDensity.current
-        // One visual line's height, for empty logical lines, which have no run of text to measure.
-        // Taken from visual line 0, which exists as soon as there is a layout at all.
-        val singleLine = (layout.getLineBottom(0) - layout.getLineTop(0)).coerceAtLeast(1f)
-        var offset = 0
-        for ((index, lineText) in text.split('\n').withIndex()) {
-            val heightPx = if (lineText.isEmpty()) {
-                singleLine
-            } else {
-                val first = layout.getLineForOffset(offset)
-                val last = layout.getLineForOffset(offset + lineText.length - 1)
-                (layout.getLineBottom(last) - layout.getLineTop(first)).coerceAtLeast(singleLine)
-            }
+        // The gutter's own top padding is inside the scrolled content, so it belongs to the first
+        // line's offset and not to the spacer: a line skipped above has to carry its full height.
+        if (window.first > 0) {
+            Spacer(Modifier.height(with(density) { tops[window.first].toDp() }))
+        }
+        for (index in window) {
+            val heightPx = (tops[index + 1] - tops[index]).coerceAtLeast(1f)
             Text(
                 "${index + 1}",
                 style = style,
                 modifier = Modifier.height(with(density) { heightPx.toDp() }),
             )
-            offset += lineText.length + 1
+        }
+        val below = tops.size - 1 - window.last
+        if (below > 0) {
+            val rest = layout.size.height - tops[window.last + 1]
+            Spacer(Modifier.height(with(density) { rest.coerceAtLeast(0f).toDp() }))
         }
     }
+}
+
+/**
+ * The top edge of every logical line, in the field's own pixel coordinates, ascending, with one
+ * entry past the end holding the bottom of the whole layout.
+ *
+ * The extra entry is what makes a line's height its top minus the next one's, and a run of lines a
+ * single subtraction rather than a sum. It is the layout's own bottom rather than the top of a line
+ * that does not exist, which is what gives the *last* line its height.
+ *
+ * The walk is bounded by the text the layout was built from, not by [text]: `onTextLayout` fires
+ * after layout, so a keystroke between the two leaves the caller holding a document one character
+ * ahead of the layout. Asking that layout for a line past its end is an offset it cannot address, so
+ * the extra line waits a frame for its number instead of taking the frame down with it.
+ *
+ * No line is ever materialised as a string — only its start offset is recorded — which is what keeps
+ * this off the allocator for a large file.
+ */
+private fun lineTops(text: String, layout: TextLayoutResult): FloatArray {
+    val known = layout.layoutInput.text.length
+    val starts = ArrayList<Int>()
+    starts.add(0)
+    for (index in 0 until minOf(text.length, known)) {
+        if (text[index] == '\n') starts.add(index + 1)
+    }
+    val tops = FloatArray(starts.size + 1)
+    for (position in starts.indices) {
+        val offset = starts[position].coerceIn(0, known)
+        tops[position] = layout.getLineTop(layout.getLineForOffset(offset))
+    }
+    tops[starts.size] = layout.size.height.toFloat()
+    return tops
+}
+
+/**
+ * Which logical lines to compose, given where they start and how much is on screen.
+ *
+ * Pure, and separate, because it is the whole of the windowing decision and a mistake in it is a
+ * gutter that drops lines or scrolls out of step with the text. [overscan] lines are composed past
+ * each edge so that a drag does not outrun the numbers, and the range is clamped to the lines that
+ * exist: an empty document still has one line, and a scroll past the end must not ask for one that
+ * is not there.
+ *
+ * [tops] is in the text field's coordinates while [scrollOffsetPx] is in the scrolled content's, and
+ * the two differ by the gutter's own top padding — a few pixels, less than a line. That is the other
+ * thing [overscan] buys: the window is generous enough that being a padding's worth of pixels out
+ * cannot put a line the user can see outside it.
+ */
+internal fun gutterWindow(
+    tops: FloatArray,
+    scrollOffsetPx: Float,
+    viewportHeightPx: Float,
+    overscan: Int = 6,
+): IntRange {
+    if (tops.size < 2) return 0..0
+    val lastLine = tops.size - 2
+    if (viewportHeightPx <= 0f) return 0..lastLine.coerceAtMost(overscan)
+    // The first line whose bottom edge is past the top of the viewport. Linear rather than a binary
+    // search on purpose: the walk is short (it starts near the scan line in every case that matters,
+    // because `tops` is ascending) and it is one comparison per line against the array.
+    var first = 0
+    while (first < lastLine && tops[first + 1] <= scrollOffsetPx) first++
+    var last = first
+    val bottom = scrollOffsetPx + viewportHeightPx
+    while (last < lastLine && tops[last] < bottom) last++
+    return (first - overscan).coerceAtLeast(0)..(last + overscan).coerceAtMost(lastLine)
 }
 
 /**
@@ -1536,18 +1645,36 @@ private fun replaceAllMatches(
 ): String = findAllMatches(text, query, caseSensitive).asReversed()
     .fold(text) { acc, range -> acc.replaceRange(range.start, range.end, replacement) }
 
-private fun lineAndColumn(text: String, offset: Int): Pair<Int, Int> {
+/**
+ * Where the caret is, and how many lines the file has, from a single walk of [text].
+ *
+ * The status line wants all three numbers on every recomposition, and counting them separately meant
+ * two passes — one stopping at the caret for the line and column, one to the end for the line count.
+ * One pass answers both: a document is a list of lines either way, and the caret's line is simply the
+ * last newline before it.
+ *
+ * [offset] past the end is clamped rather than refused, because a selection can briefly outlive the
+ * text it indexed into — a replace that shortens the document is one keystroke and two states.
+ */
+internal data class DocumentPosition(val line: Int, val column: Int, val lines: Int)
+
+internal fun documentPosition(text: String, offset: Int): DocumentPosition {
+    val caret = offset.coerceAtMost(text.length)
     var line = 1
     var column = 1
-    for (i in 0 until offset.coerceAtMost(text.length)) {
-        if (text[i] == '\n') {
-            line++
-            column = 1
-        } else {
+    var lines = 1
+    for (index in text.indices) {
+        if (text[index] == '\n') {
+            lines++
+            if (index < caret) {
+                line++
+                column = 1
+            }
+        } else if (index < caret) {
             column++
         }
     }
-    return line to column
+    return DocumentPosition(line, column, lines)
 }
 
 private fun lineStartOffset(text: String, line: Int): Int {

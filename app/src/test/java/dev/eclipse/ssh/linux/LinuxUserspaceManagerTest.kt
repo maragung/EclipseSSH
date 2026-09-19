@@ -86,7 +86,9 @@ class LinuxUserspaceManagerTest {
         assertThat(report.warnings).isEmpty()
         assertThat(harness.downloads).isEqualTo(1)
 
-        // The account: the app uid registered as ubuntu, never root.
+        // The account entry is the app uid's own name, not the identity a session runs as: the
+        // session is proot's fake root (see ProotRuntimeExecModelTest), and this line is what makes
+        // `su - ubuntu` land back on the uid that really owns every file in the rootfs.
         val passwd = harness.installer.rootfsDir.resolve("etc/passwd").readText()
         assertThat(passwd).contains("ubuntu:x:10150:10150:Ubuntu:/home/ubuntu:/bin/bash")
         // The group and shadow entries replaced any shipped ubuntu line rather than duplicating it.
@@ -104,21 +106,28 @@ class LinuxUserspaceManagerTest {
         assertThat(harness.installer.rootfsDir.resolve("home/ubuntu/workspace").isDirectory).isTrue()
 
         // The setup pipeline really ran through the scripted proot: package lists updated, the
-        // base packages installed, and both ran with fake root (the "-0" proot sessions need for dpkg).
+        // base packages installed, both with proot's `-0` — the identity dpkg insists on before it
+        // will unpack anything.
         // The happy path never leaves the ladder's first rung - the primary archive succeeds and no
         // mirror is fetched - which is what pins the flags every rung carries.
-        val rootCommands = harness.spawner.commandsWith.filter { it.first }
-        assertThat(rootCommands).isNotEmpty()
-        assertThat(rootCommands.map { it.second }).contains(
+        val commands = harness.spawner.commands
+        assertThat(commands).contains(
             "apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none -o Acquire::http::Timeout=30",
         )
         assertThat(
-            rootCommands.map { it.second }.any { it.startsWith("apt-get install -y --no-install-recommends") },
+            commands.any { it.startsWith("apt-get install -y --no-install-recommends") },
         ).isTrue()
 
-        // The probe is the only thing that runs without fake root, and it is what gated the state.
-        val probeCommands = harness.spawner.commandsWith.filterNot { it.first }
-        assertThat(probeCommands.map { it.second }).contains("whoami")
+        // The probe ran too, and it is the user-facing path.
+        assertThat(commands).contains("whoami")
+
+        // And every proot run carried `-0`, the probe's included: a session that is not fake root
+        // reports a non-zero uid, which is the state the user's own device was in when
+        // `apt install` answered "requested operation requires superuser privilege" and `su` died
+        // with a system error. Asserted over the raw argument vectors, so a builder that dropped
+        // the flag for one caller cannot pass by leaving the summary looking right.
+        assertThat(harness.spawner.spawns).isNotEmpty()
+        assertThat(harness.spawner.spawns.filterNot { it.argv.contains("-0") }.map { it.argv }).isEmpty()
 
         assertThat(states.first()).isEqualTo(LinuxUserspaceState.NotInstalled)
         assertThat(states.last()).isEqualTo(LinuxUserspaceState.Stopped)
@@ -153,19 +162,20 @@ class LinuxUserspaceManagerTest {
         val harness = newHarness()
         harness.manager.install()
 
-        // Break the one thing the probe trusts: whoami answers root, which would mean the
-        // never-root-by-default contract is broken even though every command still exits 0.
-        // Everything else stays healthy, so NeedsRepair names the account and nothing else.
+        // Break the one thing the probe trusts: whoami answers `ubuntu`, the app's own Android uid
+        // rather than proot's fake root — a userspace whose sessions are not uid 0, where dpkg and
+        // su cannot work, even though every command still exits 0. Everything else stays healthy,
+        // so NeedsRepair names the identity and nothing else.
         val healthyRespond = harness.spawner.respond
         harness.spawner.respond = { command ->
-            if (command == "whoami") 0 to "root\n" else healthyRespond(command)
+            if (command == "whoami") 0 to "ubuntu\n" else healthyRespond(command)
         }
 
         harness.manager.start()
         assertThat(harness.manager.state.value)
             .isInstanceOf(LinuxUserspaceState.NeedsRepair::class.java)
         assertThat((harness.manager.state.value as LinuxUserspaceState.NeedsRepair).detail)
-            .contains("'root'")
+            .contains("'ubuntu'")
 
         // Repair runs the pipeline again over the extracted rootfs - without re-downloading it.
         harness.spawner.respond = healthyRespond
@@ -299,9 +309,10 @@ class LinuxUserspaceManagerTest {
             assertThat(spawn.envp)
                 .contains("PROOT_SIGSYS_LOG=${harness.rootDir.resolve("sigsys-log.txt").absolutePath}")
         }
-        // Sessions never run fake root; the setup pipeline's scripted commands do (dpkg's chowns).
-        assertThat(spawns.last().argv.contains("-0")).isFalse()
-        assertThat(spawns.any { it.argv.contains("-0") }).isTrue()
+        // Every proot run carries `-0` — the session's own spawn included, which is the last one
+        // here and the one this assertion used to forbid. See ProotRuntimeExecModelTest for why,
+        // and for the session argv read back from the spawner directly.
+        assertThat(spawns.filterNot { it.argv.contains("-0") }.map { it.argv }).isEmpty()
     }
 
     @Test
@@ -368,15 +379,16 @@ class LinuxUserspaceManagerTest {
 
 /**
  * A [PtySpawner] that never forks: every proot command the runtime would run is answered from a
- * script, and recorded with whether it asked for fake root.
+ * script, and recorded.
  *
- * The recording is the test's window into the exec model: scripted setup commands must carry `-0`
- * (dpkg's chowns need proot's fake root) while the health probe must not (the user-facing session
- * path is never fake root).
+ * The recording is the test's window into the exec model: every spawn carries `-0` (proot's fake
+ * root — the setup pipeline needs it for dpkg's ownership changes, and a user-facing session needs
+ * it because a shell that is not uid 0 cannot run dpkg or `su` at all), and [spawns] is where that
+ * is asserted over the argument vectors rather than over a summary of them.
  */
 internal class ScriptedPtySpawner : PtySpawner {
-    /** Every spawn, as (ranWithFakeRoot, command). */
-    val commandsWith = mutableListOf<Pair<Boolean, String>>()
+    /** Every command that was run, in order; the flags it ran with are in [spawns]. */
+    val commands = mutableListOf<String>()
 
     /** One spawn's full argument vector and environment. */
     data class SpawnRecord(val argv: List<String>, val envp: List<String>)
@@ -394,7 +406,7 @@ internal class ScriptedPtySpawner : PtySpawner {
      */
     var respond: (String) -> Pair<Int, String> = { command ->
         if (command == "whoami") {
-            0 to "ubuntu\n"
+            0 to "root\n"
         } else if (command == "echo eclipse-runtime-ok") {
             0 to "eclipse-runtime-ok\n"
         } else if (command.startsWith("echo eclipse-probe-ok")) {
@@ -413,8 +425,7 @@ internal class ScriptedPtySpawner : PtySpawner {
     ): PtyProcess {
         spawns += SpawnRecord(argv, envp)
         val command = argv.lastOrNull() ?: ""
-        val asRoot = argv.contains("-0")
-        commandsWith += asRoot to command
+        commands += command
         val (exit, output) = respond(command)
         return ScriptedPtyProcess(exit, output.toByteArray(Charsets.UTF_8))
     }

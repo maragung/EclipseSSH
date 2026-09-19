@@ -59,6 +59,25 @@ class TerminalFramePublishOrderTest {
     }
 
     @Test
+    fun `a left arrow alone is enough to publish a new frame`() {
+        // A cursor that moved has to be a buffer that changed, and this is the one arrow where that
+        // is the whole story. readline writes `^H` for cursor-left and `ESC [ C` for cursor-right, so
+        // left is the only arrow whose entire effect is the cursor: every other one either arrives as
+        // a CSI or redraws the line, and both of those already advanced the revision. Setting the
+        // column without reporting it left the frame comparing equal to the one on screen, and the
+        // renderer memoizes the layout it draws the cursor box from on this value - so the user
+        // pressed left, the buffer moved, and the cursor sat still until the next character was typed.
+        buffer.feed("$ uname")
+        val before = buffer.frame()
+        buffer.feed("\u0008")
+        val after = buffer.frame()
+
+        assertThat(after.cursorColumn).isEqualTo(before.cursorColumn - 1)
+        assertThat(after.revision).isGreaterThan(before.revision)
+        assertThat(newerTerminalFrame(published = before, built = after)).isSameInstanceAs(after)
+    }
+
+    @Test
     fun `a rebuild of an unchanged buffer replaces the published frame`() {
         // Same revision, different viewport: scrolling back through the scrollback, a resize, and the
         // republish that happens when the app comes back to the foreground all rebuild a buffer that

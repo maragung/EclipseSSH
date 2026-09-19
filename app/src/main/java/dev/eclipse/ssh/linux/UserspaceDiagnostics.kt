@@ -98,12 +98,34 @@ class UserspaceDiagnostics {
  * file …`. The escapes are also what [UserspaceDiagnosticEvent.line] would quote into the export
  * and into logcat, where they read as noise around the sentence that names the cause.
  *
- * Only SGR ("colour") sequences and the cursor/erase families a progress line uses are removed:
- * this is presentation, and anything else in the text is evidence.
+ * Only presentation is removed — colour, cursor movement, erase, charset: anything else in the text
+ * is evidence. The shapes a pty actually emits, and the reason the list is longer than "CSI":
+ *
+ *  - **CSI** — `ESC [ params intermediates final`. SGR colour, the erase family, addressed cursor
+ *    moves.
+ *  - **SS3** — `ESC O final`. What a terminal in DECCKM mode sends for an arrow key, and it is three
+ *    bytes, not two: stopping at the introducer would leave the final byte behind as a letter.
+ *  - **Two-character escapes** — `ESC` and one byte, in both the private range (`ESC 7`, `ESC 8`,
+ *    `ESC =`, `ESC >`) and the Fe/Fs range (`ESC M`, `ESC D`, `ESC c`). This is the family a
+ *    CSI-only pattern misses, and the miss is visible rather than theoretical: `ESC 7` / `ESC 8` are
+ *    DECSC/DECRC — save and restore the cursor — which is exactly what dpkg wraps each progress-bar
+ *    redraw in, so their final byte survives as a literal digit glued to the front of the very line
+ *    this function exists to make readable.
+ *  - **Charset designations** — `ESC ( B` and its `)`, `#` and `%` siblings, whose third byte is a
+ *    designation rather than a letter.
+ *
+ * The two single-byte classes are written as ranges with `[` and `O` carved out, because those two
+ * introducers are the two shapes above and must not be consumed a byte at a time.
  */
 internal fun stripEscapes(text: String): String = ANSI_ESCAPES.replace(text, "")
 
-private val ANSI_ESCAPES = Regex("\\u001B\\[[0-9;?]*[ -/]*[@-~]")
+private val ANSI_ESCAPES = Regex(
+    "\\u001B\\[[0-9;?]*[ -/]*[@-~]" + // CSI
+        "|\\u001BO[@-~]" + // SS3
+        "|\\u001B[()#%][0-9A-Za-z]" + // charset designation
+        "|\\u001B[0-9:<=>?]" + // two-character escapes, private range: ESC 7 / ESC 8 / ESC =
+        "|\\u001B[@-NQ-Z\\\\^_a-np-z]", // two-character escapes, Fe/Fs range; [ is CSI, O is SS3
+)
 
 /**
  * The category prefix every line carries: the subsystems of an install — storage, the rootfs

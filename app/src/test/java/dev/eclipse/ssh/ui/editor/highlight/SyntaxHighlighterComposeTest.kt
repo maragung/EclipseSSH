@@ -2,6 +2,9 @@ package dev.eclipse.ssh.ui.editor.highlight
 
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.input.VisualTransformation
 import com.google.common.truth.Truth.assertThat
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -66,5 +69,74 @@ class SyntaxHighlighterComposeTest {
         assertThat(light.keyword).isNotEqualTo(light.comment)
         // And the schemes are not quietly producing one palette: primary itself differs.
         assertThat(dark.keyword).isNotEqualTo(light.keyword)
+    }
+
+    // --- The transformation as the debounced caller drives it ---
+
+    /** The editor's transformation for Kotlin, handed a coloring instead of lexing for one. */
+    private fun transformationFor(spans: List<AnnotatedString.Range<SpanStyle>>?): SyntaxHighlightTransformation {
+        val colors = SyntaxColors.fromScheme(darkColorScheme())
+        val language = requireNotNull(SyntaxRegistry.forFileName("Editor.kt"))
+        return SyntaxHighlightTransformation(language, colors, spans)
+    }
+
+    @Test
+    fun `a transformation handed spans colors the text without lexing it`() {
+        // This is the whole point of the debounce: the coloring was computed a moment ago on a
+        // background dispatcher, and the field's job is only to apply it. If `filter` lexed anyway,
+        // every keystroke would still pay the full document - and the seam would be a decoration.
+        val colors = SyntaxColors.fromScheme(darkColorScheme())
+        val spans = syntaxSpansFor("val x = 1", "Editor.kt", colors)
+        val transformed = transformationFor(spans).filter(AnnotatedString("val x = 1"))
+
+        assertThat(transformed.text.spanStyles).isEqualTo(spans)
+        assertThat(transformed.text.text).isEqualTo("val x = 1")
+    }
+
+    @Test
+    fun `coloring computed before a character was appended still fits the text`() {
+        // Typing at the end of a line is the overwhelmingly common edit, and the engine reads left to
+        // right: nothing before the caret can have been recolored by appending after it. Keeping the
+        // spans is what stops the whole document from flashing plain on every keystroke.
+        val colors = SyntaxColors.fromScheme(darkColorScheme())
+        val spans = syntaxSpansFor("val x = 1", "Editor.kt", colors)
+        val transformed = transformationFor(spans).filter(AnnotatedString("val x = 12"))
+
+        assertThat(transformed.text.spanStyles).isEqualTo(spans)
+    }
+
+    @Test
+    fun `coloring that no longer reaches the end of the text is dropped, not applied`() {
+        // The one case where the stale spans are wrong: an edit in the middle moved every offset after
+        // it. Applying them would color the wrong characters — worse than plain — so the text is drawn
+        // uncolored for the tenth of a second until the next lex lands.
+        val colors = SyntaxColors.fromScheme(darkColorScheme())
+        val spans = syntaxSpansFor("val x = 1", "Editor.kt", colors)
+        val shorter = "val x ="
+        val transformed = transformationFor(spans).filter(AnnotatedString(shorter))
+
+        assertThat(transformed.text.spanStyles).isEmpty()
+        assertThat(transformed.text.text).isEqualTo(shorter)
+    }
+
+    @Test
+    fun `the transformation never shifts a character`() {
+        // The identity offset mapping is what keeps the caret, the selection and the find offsets
+        // honest: the coloring is a way of looking at the text, never a rewrite of it.
+        val colors = SyntaxColors.fromScheme(darkColorScheme())
+        val spans = syntaxSpansFor("val x = 1", "Editor.kt", colors)
+        val transformed = transformationFor(spans).filter(AnnotatedString("val x = 1"))
+
+        assertThat(transformed.text.text).isEqualTo("val x = 1")
+        assertThat(transformed.offsetMapping.originalToTransformed(6)).isEqualTo(6)
+        assertThat(transformed.offsetMapping.transformedToOriginal(6)).isEqualTo(6)
+    }
+
+    @Test
+    fun `a file whose language is unknown has no transformation to debounce`() {
+        // The registry's stance carried to the composable's seam: an unknown extension gets plain
+        // text immediately rather than an empty coloring that later fills in.
+        val colors = SyntaxColors.fromScheme(darkColorScheme())
+        assertThat(syntaxTransformationFor("notes.xyz", colors)).isSameInstanceAs(VisualTransformation.None)
     }
 }

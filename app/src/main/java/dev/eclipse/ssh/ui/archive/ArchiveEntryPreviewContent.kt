@@ -18,9 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -52,10 +50,15 @@ import kotlinx.coroutines.withContext
  * The preview for one file inside an open archive — the epic's "view file inside archive" section:
  * reading only that entry's data, never the archive around it.
  *
+ * This is the body of [ArchiveEntryPreviewActivity] and nothing but a body: no surface, no
+ * dismissal, no theme, because the window around it owns all three. It drew inside a
+ * `ModalBottomSheet` until the preview became a window, and the content did not have to change for
+ * that — which is what having kept it separate bought.
+ *
  * The byte-fetch is bounded twice over: the entry's own size refuses what it cannot hold before
  * anything is read, and the fetch itself is the ranged read ([ArchiveReader.readEntry]) that
  * moves exactly the entry's bytes - the ZIP's compressed payload, or an uncompressed TAR's
- * data-offset slice. A compressed TAR cannot offer either and says so before the sheet opens.
+ * data-offset slice. A compressed TAR cannot offer either and says so before the window opens.
  * The rendering reuses the Files preview's shapes —
  * a zoomable image, a monospace text body — because a file inside an archive is still just a
  * file, and this app already knows how to show one.
@@ -65,9 +68,8 @@ import kotlinx.coroutines.withContext
  * write back to. Extract is the honest verb for "I want to change this file", and it lives in the
  * entry's action sheet, not here.
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ArchiveEntryPreviewSheet(
+fun ArchiveEntryPreviewContent(
     entry: ArchiveEntry,
     /**
      * The reader callback that fetches this entry's bytes, or null when the format cannot. Null is
@@ -76,13 +78,12 @@ fun ArchiveEntryPreviewSheet(
      * failure state says so rather than an empty body that looks like an empty file.
      */
     readEntry: (suspend () -> ByteArray?)?,
-    onDismiss: () -> Unit,
 ) {
     // Text is the only kind previewed in-archive beyond images: the MIME sniffing the Files
     // preview does over a provider's answer does not exist here (an archive entry has no MIME),
     // and a name's extension is the whole truth available. Media and PDF are downloads, honestly
     // labelled, because their renderers want seekable files or players, not byte arrays - the
-    // extract sheet is one tap away.
+    // extract is one tap away.
     val kind = remember(entry.path) { previewKindOf(entry) }
     var state by remember(entry.path) { mutableStateOf<EntryPreviewState>(EntryPreviewState.Loading) }
 
@@ -94,65 +95,64 @@ fun ArchiveEntryPreviewSheet(
         }
     }
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            Modifier
-                .fillMaxWidth()
-                // The Files preview's own rule: 0.85 of the screen for a sheet whose column
-                // scrolls, and the monospace body below stays under it.
-                .heightIn(max = rememberDialogBodyMaxHeight(0.85f))
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 22.dp)
-                .padding(bottom = 18.dp),
-        ) {
-            // The header is the entry's own name, not its path: the path is the breadcrumb's job,
-            // and the sheet already sits inside the folder that contains it.
-            Text(entry.path.substringAfterLast('/'), style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            entry.size?.let {
-                Text(describeSize(it), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            // The Files preview's own shape, one size up: no cap of its own now that the window's
+            // body is the screen under the bar, with the text body below still capped so a long
+            // entry scrolls inside a scroller.
+            .verticalScroll(rememberScrollState())
+            .padding(bottom = 18.dp),
+    ) {
+        // The header is the entry's own name, not its path: the path is the breadcrumb's job, and
+        // this window was opened from the folder that contains it.
+        Text(entry.path.substringAfterLast('/'), style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        entry.size?.let {
+            Text(describeSize(it), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.height(12.dp))
+
+        when (val current = state) {
+            is EntryPreviewState.Loading -> Box(
+                Modifier.fillMaxWidth().height(160.dp),
+                contentAlignment = Alignment.Center,
+            ) { CircularProgressIndicator() }
+
+            is EntryPreviewState.Failed -> Text(
+                current.message,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            is EntryPreviewState.TooLarge -> Text(
+                "This file is ${"%.1f".format(current.bytes / (1024.0 * 1024.0))} MB — too large " +
+                    "to preview inside the archive. It can still be extracted.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            is EntryPreviewState.Info -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "No preview for this file type inside the archive.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-            Spacer(Modifier.height(12.dp))
 
-            when (val current = state) {
-                is EntryPreviewState.Loading -> Box(
-                    Modifier.fillMaxWidth().height(160.dp),
-                    contentAlignment = Alignment.Center,
-                ) { CircularProgressIndicator() }
+            is EntryPreviewState.Image -> ZoomableImage(current.bitmap)
 
-                is EntryPreviewState.Failed -> Text(
-                    current.message,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+            is EntryPreviewState.Text -> SelectionContainer {
+                Text(
+                    current.content,
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp)
+                        // 0.7 of the screen, the Files preview's own cap: a window has room a
+                        // sheet never had, and 420dp was sized for one phone's sheet.
+                        .heightIn(max = rememberDialogBodyMaxHeight(0.7f))
+                        .verticalScroll(rememberScrollState()),
+                    fontFamily = TerminalMonoFontFamily,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
                 )
-
-                is EntryPreviewState.TooLarge -> Text(
-                    "This file is ${"%.1f".format(current.bytes / (1024.0 * 1024.0))} MB — too large " +
-                        "to preview inside the archive. It can still be extracted.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-
-                is EntryPreviewState.Info -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(
-                        "No preview for this file type inside the archive.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-
-                is EntryPreviewState.Image -> ZoomableImage(current.bitmap)
-
-                is EntryPreviewState.Text -> SelectionContainer {
-                    Text(
-                        current.content,
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp)
-                            .heightIn(max = 420.dp)
-                            .verticalScroll(rememberScrollState()),
-                        fontFamily = TerminalMonoFontFamily,
-                        fontSize = 12.sp,
-                        lineHeight = 17.sp,
-                    )
-                }
             }
         }
     }
@@ -195,7 +195,7 @@ private suspend fun loadEntryPreview(
     return try {
         val bytes = readEntry()
             // The reader's "cannot" - an entry this format or method cannot serve by range - is
-            // the sheet's Failed state, not an empty preview that reads as an empty file.
+            // the window's Failed state, not an empty preview that reads as an empty file.
             ?: return EntryPreviewState.Failed("This entry cannot be read from the archive as-is.")
         if (bytes.size > ceiling) return EntryPreviewState.TooLarge(bytes.size.toLong())
         when (kind) {

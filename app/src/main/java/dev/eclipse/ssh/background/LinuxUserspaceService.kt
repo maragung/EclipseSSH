@@ -17,6 +17,7 @@ import dev.eclipse.ssh.di.LinuxUserspaceGraph
 import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.SetupStep
+import dev.eclipse.ssh.linux.percent
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.presentation.linux.holdsProcess
 import javax.inject.Inject
@@ -233,7 +234,8 @@ class LinuxUserspaceService : LifecycleService() {
      */
     private fun notificationBody(state: LinuxUserspaceState, sessionCount: Int): String =
         when (state) {
-            is LinuxUserspaceState.Installing -> "Installing Ubuntu · ${describeInstallStep(state.step)}"
+            is LinuxUserspaceState.Installing ->
+                "Installing Ubuntu · ${describeInstallStep(state.step)} · ${state.percent}%"
             LinuxUserspaceState.Starting -> "Starting Ubuntu"
             LinuxUserspaceState.Stopping -> "Stopping Ubuntu"
             // Running, and — for the moment between a state change and this service's own

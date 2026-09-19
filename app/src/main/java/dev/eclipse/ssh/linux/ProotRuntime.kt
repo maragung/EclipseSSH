@@ -39,15 +39,28 @@ data class ProotCommandResult(
  *    executable) and dies with EACCES.
  *  - The rootfs itself lives under `filesDir` and is never exec'd by the kernel: proot's loader
  *    `mmap`s the rootfs binaries, and mmap-exec is permitted where execve is not.
- *  - Sessions run **without** `-0`. The shell runs as the app's own uid — which the setup pipeline
- *    registers as the `ubuntu` user in the rootfs `/etc/passwd`, so `whoami` says `ubuntu` with
- *    home `/home/ubuntu` and no fake root anywhere. This is deliberate: the default terminal
- *    account must never be root. Writing to the rootfs needs no privilege at all — on Android the
- *    app cannot `chown`, so every file under it is owned by the app uid — but *packaging* does:
- *    dpkg `chown`s the files it unpacks to `root:root`, and a real EPERM there aborts `apt-get
- *    install`. The setup pipeline therefore runs its scripted commands with `-0` (proot's fake
- *    root), under which proot swallows those ownership changes; the kernel-level owner stays the
- *    app uid either way, because proot cannot `chown` any more than the app can.
+ *  - Every invocation runs with `-0`, proot's fake root — sessions and scripted commands alike.
+ *    Inside the rootfs the process is uid 0; at the kernel level it is still the app's uid, so
+ *    nothing here escapes proot's sandbox or the app's SELinux domain. What fake root buys is the
+ *    only thing that makes the userspace usable: `dpkg` refuses to unpack anything unless
+ *    `getuid() == 0`, `apt install` therefore cannot work without it, and `su`/`sudo` have no way
+ *    to elevate — proot's fake identity is all-or-nothing per process tree, so a session that is
+ *    not fake root can never become root, and one that is, already is. The user's own report is
+ *    what settled it: `apt install zip` died with "requested operation requires superuser
+ *    privilege" and `su - root` with "su: System error", both inside a shell that was not uid 0.
+ *    On Android the app cannot `chown` at all, so ownership is proot's fiction end to end: the
+ *    kernel owner of every file stays the app uid, and the fork answers dpkg's `chown`/`lchown`
+ *    with a faked `getuid` (SELinux answers ENOENT there, and dpkg treats ENOENT as fatal where it
+ *    ignores EPERM). `getuid`/`geteuid` come from the fake identity too, while the zygote's seccomp
+ *    filter traps the `setuid` family and the fork's SIGSYS handler answers it 0 — which is what
+ *    lets `su` and `sudo` change identity at all.
+ *
+ *    The account the user meets is therefore `root` — `whoami` says so, and the prompt is
+ *    `root@localhost`. Two things deliberately do *not* move with it: `HOME` stays `/home/ubuntu`
+ *    and the app's `/etc/passwd` entry for the app's own Android uid stays as the `ubuntu`
+ *    account, because that is where the workspace, the editor and SFTP all live — a session that
+ *    started in `/root` would be standing nowhere near the user's files. `su - ubuntu` drops back
+ *    to that uid for anyone who wants the unprivileged view.
  *
  * @param rootDir the userspace root (`filesDir/linux`): rootfs, tmp, state and workspace live under it
  * @param nativeLibraryDir the APK's extracted native library directory
@@ -129,21 +142,32 @@ class ProotRuntime(
     /** The standalone loader, as proot's `PROOT_LOADER` expects it. */
     private val prootLoader: String get() = File(nativeLibraryDir, "libproot-loader.so").path
 
-    /** The user's home *inside* the rootfs. */
+    /**
+     * The home *inside* the rootfs: where every session starts, and where the app's own file
+     * surfaces point. It is `/home/ubuntu` rather than `/root` even though the session is fake
+     * root — see [baseEnv].
+     */
     val homePath: String = "/home/ubuntu"
 
     /** The persisted workspace *inside* the rootfs. */
     val workspacePath: String = "$homePath/workspace"
 
     /**
-     * The argument vector for an interactive shell session — the user-facing path, never fake root.
+     * The argument vector for an interactive shell session.
+     *
+     * One and the same as [commandArgv] today — a session is fake root for the same reason every
+     * scripted command is, and the name is kept because the two are read for different reasons:
+     * this is the argv the terminal gets, and that is the argv the setup pipeline gets.
      */
     fun sessionArgv(initialCommand: String? = null): List<String> =
-        commandArgv(initialCommand, asRoot = false)
+        commandArgv(initialCommand)
 
     /**
-     * The argument vector for a scripted command. [asRoot] adds `-0`, proot's fake root, which the
-     * setup pipeline needs for dpkg's `chown`s — see the class doc. Sessions never pass it.
+     * The argument vector for one proot run: `-0` first, then the bindings, then the shell.
+     *
+     * `-0` is unconditional and is the whole reason `apt install` and `su` work — see the class
+     * doc, which is where the argument for it lives rather than here, because no caller may ever
+     * choose otherwise again.
      *
      * `/dev`, `/proc` and `/sys` are bound because the Ubuntu Base rootfs ships empty mount points
      * for them — without the binds, `ps` shows nothing, `/proc/self/exe` is missing, and anything
@@ -152,21 +176,19 @@ class ProotRuntime(
      * shell: `/etc/profile` and `~/.profile` run, so PATH and prompt behave exactly as they would
      * over SSH.
      */
-    fun commandArgv(initialCommand: String?, asRoot: Boolean): List<String> {
+    fun commandArgv(initialCommand: String? = null): List<String> {
         val argv = mutableListOf(
             prootBinary,
             "--rootfs=${rootfsDir.absolutePath}",
-        )
-        if (asRoot) argv += "-0"
-        argv += listOf(
+            "-0",
             "-b", "/dev",
             "-b", "/proc",
             "-b", "/sys",
             "-w", homePath,
             "/bin/bash", "--login",
         )
-        // A command overrides the interactive shell: `bash --login -c '…'`. The setup pipeline uses
-        // this for scripted steps; a session never does.
+        // A command overrides the interactive shell: `bash --login -c '…'`. The setup pipeline and
+        // the health probe use this; an interactive session does not.
         if (initialCommand != null) {
             argv += listOf("-c", initialCommand)
         }
@@ -187,8 +209,10 @@ class ProotRuntime(
         // is the fork's own app's cache — unwritable here, which silently disabled the
         // diagnostic; see linux/proot-patches/0002). One line per event, append-only, small.
         "PROOT_SIGSYS_LOG=${sigsysLogFile.absolutePath}",
-        // Ubuntu-conventional values, not Android's: a login shell resolves HOME from /etc/passwd,
-        // but everything non-login reads the variable.
+        // Ubuntu-conventional values, not Android's. HOME is pinned here rather than left to the
+        // login shell: the session is fake root, whose /etc/passwd home is /root, and the app's
+        // whole file model — the workspace, the editor, SFTP — lives under /home/ubuntu. A shell
+        // that started in /root would be standing nowhere near the user's files.
         "HOME=$homePath",
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "TERM=xterm-256color",
@@ -199,9 +223,8 @@ class ProotRuntime(
     val spawnCwd: File get() = rootDir
 
     /**
-     * Forks one interactive session: the argv of [sessionArgv] (no fake root — the user-facing
-     * shell is the `ubuntu` account) and the environment of [baseEnv], on a pty of [rows] x
-     * [columns].
+     * Forks one interactive session: the argv of [sessionArgv] (fake root, like every other proot
+     * run — see the class doc) and the environment of [baseEnv], on a pty of [rows] x [columns].
      *
      * Storage is verified first: `PROOT_TMP_DIR` names [RuntimeStorageManager.tmpDir], and proot
      * that cannot write there dies with "can't create temporary directory: Permission denied" —

@@ -178,6 +178,7 @@ import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.data.model.AuthMethod
 import dev.eclipse.ssh.data.model.CONNECT_TIMEOUT_RANGE
 import dev.eclipse.ssh.data.model.DEFAULT_CONNECT_TIMEOUT_SECONDS
+import dev.eclipse.ssh.data.model.DEFAULT_FORWARD_LISTEN_HOST
 import dev.eclipse.ssh.data.model.DEFAULT_SOCKS_PORT
 import dev.eclipse.ssh.data.model.DEFAULT_SSH_PORT
 import dev.eclipse.ssh.data.model.KEEP_ALIVE_RANGE
@@ -221,6 +222,7 @@ import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.linux.SetupStep
+import dev.eclipse.ssh.linux.percent
 import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
@@ -237,7 +239,7 @@ import dev.eclipse.ssh.archive.ArchiveReader
 import dev.eclipse.ssh.archive.ArchiveUiState
 import dev.eclipse.ssh.ui.about.AboutActivity
 import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsSheet
-import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewActivity
 import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
 import dev.eclipse.ssh.ui.archive.ArchivePropertiesDialog
 import dev.eclipse.ssh.ui.archive.ArchiveActions
@@ -251,7 +253,7 @@ import dev.eclipse.ssh.ui.files.ExplorerList
 import dev.eclipse.ssh.ui.files.ExplorerPropertiesDialog
 import dev.eclipse.ssh.ui.files.ExplorerSelectionBar
 import dev.eclipse.ssh.ui.files.ExplorerTopBar
-import dev.eclipse.ssh.ui.preview.FilePreviewSheet
+import dev.eclipse.ssh.ui.preview.FilePreviewActivity
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopActivity
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopConfigDialog
 import dev.eclipse.ssh.ui.remotedesktop.RemoteDesktopRequest
@@ -272,6 +274,7 @@ import dev.eclipse.ssh.ui.settings.SettingRow
 import dev.eclipse.ssh.ui.settings.SettingsSection
 import dev.eclipse.ssh.ui.settings.ShortcutBarActivity
 import dev.eclipse.ssh.ui.settings.TerminalFontSizeActivity
+import dev.eclipse.ssh.ui.settings.TerminalHeightActivity
 import dev.eclipse.ssh.ui.settings.TerminalWidthActivity
 import dev.eclipse.ssh.ui.settings.UbuntuActivity
 import dev.eclipse.ssh.ui.settings.VaultAutoLockActivity
@@ -280,6 +283,8 @@ import dev.eclipse.ssh.ui.EclipseSuccess
 import dev.eclipse.ssh.ui.EclipseTheme
 import dev.eclipse.ssh.ui.EclipseWarning
 import dev.eclipse.ssh.ui.PortForwardManagerSheet
+import dev.eclipse.ssh.ui.forward.ForwardFormActivity
+import dev.eclipse.ssh.ui.forward.ForwardRequests
 import dev.eclipse.ssh.ui.SecretFieldKeyboard
 import dev.eclipse.ssh.ui.SecretPasteButton
 import dev.eclipse.ssh.ui.rememberDialogBodyMaxHeight
@@ -305,6 +310,7 @@ import dev.eclipse.ssh.ui.terminal.KeyBarPrefsCodec
 import dev.eclipse.ssh.ui.terminal.TerminalInputBridge
 import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
+import dev.eclipse.ssh.ui.terminal.hostTerminalRows
 import dev.eclipse.ssh.ui.terminal.minTerminalColumns
 import dev.eclipse.ssh.ui.terminal.rememberTerminalCellMetrics
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
@@ -389,6 +395,7 @@ class MainActivity : FragmentActivity() {
         // focus, which is what the platform requires before it will let an app read or replace the
         // primary clip.
         runCatching { secureClipboard.resumePendingClear() }
+        openConfirmedForward()
         if (!restoreRequested) return
         // Cleared first so a second resume cannot start the service twice.
         restoreRequested = false
@@ -402,6 +409,48 @@ class MainActivity : FragmentActivity() {
                 Intent(this, EclipseSessionService::class.java)
                     .setAction(EclipseSessionService.ACTION_RESTORE),
             )
+        }
+    }
+
+    /**
+     * Opens a forward the Add-forward form confirmed, if one is waiting.
+     *
+     * [onResume] rather than a result callback, for the reason every Settings window works the same
+     * way: the form's answer is *intent* - a request to open a port - and the only safe number of
+     * times to act on it is once. [ForwardRequests.takeConfirmed] empties the slot as it reads it, so
+     * the second resume of a rotation, or a process that comes back to a re-delivered intent, finds
+     * nothing and opens nothing. The alternative - a result code replayed into a fresh composition -
+     * is a second bind of the same port, which fails with a message about a socket rather than about
+     * what the user actually did.
+     *
+     * The host is looked up by the id the form was launched with, not by "whatever is selected now":
+     * a forward that changes server because the user browsed elsewhere in the meantime is a tunnel
+     * opened on the wrong machine, and nothing downstream could tell. A host deleted while the form
+     * was open is said out loud rather than dropped.
+     */
+    private fun openConfirmedForward() {
+        val request = ForwardRequests.takeConfirmed() ?: return
+        val host = viewModel.uiState.value.hosts.firstOrNull { it.id == request.hostId }
+        if (host == null) {
+            viewModel.reportUiMessage("That host is no longer configured, so no forward was opened")
+            return
+        }
+        when (request.type) {
+            ForwardType.LOCAL -> viewModel.startLocalForward(
+                host,
+                request.localPort,
+                // Unreachable by construction - the form will not confirm a Local forward without a
+                // destination - and kept as the dialog's own fallbacks so that a request built by
+                // anything else still opens a tunnel rather than throwing on the way to one.
+                request.remoteHost ?: DEFAULT_FORWARD_LISTEN_HOST,
+                request.remotePort ?: request.localPort,
+            )
+            ForwardType.REMOTE -> viewModel.startRemoteForward(
+                host,
+                request.remotePort ?: request.localPort,
+                request.localPort,
+            )
+            ForwardType.DYNAMIC -> viewModel.startDynamicForward(host, request.localPort)
         }
     }
 
@@ -677,16 +726,15 @@ private fun EclipseWorkspace(
             viewModel.filesExplorer.setLocalRoot(uri)
         }
     }
-    // The Files explorer's full-window surfaces. The preview is a sheet at this root because it is
-    // still part of the workspace; the editor is only *triggered* here — it opens in its own
-    // activity on top of the app (see the launch effect below), because a document being edited
-    // deserves a window of its own rather than a layer over whatever the workspace was showing.
+    // The Files explorer's full-window surfaces, all three of them now. The preview used to be a
+    // sheet at this root, on the theory that looking at a file was part of the workspace; reading is
+    // not, and a sheet letterboxes what it shows, so it opens in a window of its own like the editor
+    // — see [FilePreviewActivity]. Both are *triggered* here rather than composed here, which is why
+    // the launch sites below are `startActivity` calls and there is no target state to hold.
     var editorRequest by remember { mutableStateOf<EditorRequest?>(null) }
-    var previewTarget by remember { mutableStateOf<PreviewTarget?>(null) }
-    // The View Archive browser target, held here for the same reason as the preview target: the
-    // scan runs against this workspace's provider, and the browser is one archive at a time by
-    // design - opening a second archive closes the first, because each one holds an SFTP channel
-    // for as long as it is open.
+    // The View Archive browser target: the scan runs against this workspace's provider, and the
+    // browser is one archive at a time by design - opening a second archive closes the first,
+    // because each one holds an SFTP channel for as long as it is open.
     var archiveTarget by remember { mutableStateOf<ArchiveTarget?>(null) }
     /**
      * Opens one remote archive in the View Archive browser — the Files sheet's View Archive row.
@@ -1241,7 +1289,9 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     linuxUserspace = viewModel.linuxUserspace,
                     localLinuxCard = viewModel.localLinuxCard,
-                    onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
+                    onPreviewFile = { entry, provider ->
+                        context.startActivity(FilePreviewActivity.intent(context, entry, provider))
+                    },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
@@ -1352,15 +1402,11 @@ private fun EclipseWorkspace(
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
                     onOpenTransferActions = { transferActionsFor = it },
-                    onAddForward = { type, localPort, remoteHost, remotePort ->
-                        activeHost?.let { host ->
-                            when (type) {
-                                ForwardType.LOCAL -> viewModel.startLocalForward(host, localPort, remoteHost ?: "127.0.0.1", remotePort ?: localPort)
-                                ForwardType.REMOTE -> viewModel.startRemoteForward(host, remotePort ?: localPort, localPort)
-                                ForwardType.DYNAMIC -> viewModel.startDynamicForward(host, localPort)
-                            }
-                        }
-                    },
+                    // The host the Add-forward form will name at launch. It used to be reached for at
+                    // *confirmation* time by the `onAddForward` lambda that stood here, which is how a
+                    // forward ended up on whichever server the user had switched to while the form was
+                    // open — see [openConfirmedForward].
+                    activeHost = activeHost,
                     onStopForward = viewModel::stopForwarding,
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
@@ -1410,7 +1456,9 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     linuxUserspace = viewModel.linuxUserspace,
                     localLinuxCard = viewModel.localLinuxCard,
-                    onPreviewFile = { entry, provider -> previewTarget = PreviewTarget(entry, provider) },
+                    onPreviewFile = { entry, provider ->
+                        context.startActivity(FilePreviewActivity.intent(context, entry, provider))
+                    },
                     onEditFile = { entry, provider -> editorRequest = EditorRequest(entry, provider) },
                     onOpenArchive = ::openArchive,
                     onDestination = { destination = it },
@@ -1521,15 +1569,11 @@ private fun EclipseWorkspace(
                     onCancelAllTransfers = viewModel::cancelAllTransfers,
                     onRunTransferNow = viewModel::runTransferNow,
                     onOpenTransferActions = { transferActionsFor = it },
-                    onAddForward = { type, localPort, remoteHost, remotePort ->
-                        activeHost?.let { host ->
-                            when (type) {
-                                ForwardType.LOCAL -> viewModel.startLocalForward(host, localPort, remoteHost ?: "127.0.0.1", remotePort ?: localPort)
-                                ForwardType.REMOTE -> viewModel.startRemoteForward(host, remotePort ?: localPort, localPort)
-                                ForwardType.DYNAMIC -> viewModel.startDynamicForward(host, localPort)
-                            }
-                        }
-                    },
+                    // The host the Add-forward form will name at launch. It used to be reached for at
+                    // *confirmation* time by the `onAddForward` lambda that stood here, which is how a
+                    // forward ended up on whichever server the user had switched to while the form was
+                    // open — see [openConfirmedForward].
+                    activeHost = activeHost,
                     onStopForward = viewModel::stopForwarding,
                     onImportVault = { pickerActive = true; importPicker.launch(arrayOf("*/*")) },
                     onImportAccount = { pickerActive = true; accountImportPicker.launch(arrayOf("*/*")) },
@@ -1779,17 +1823,10 @@ private fun EclipseWorkspace(
             Intent(context, TextEditorActivity::class.java).putExtra(TextEditorActivity.EXTRA_REQUEST_TOKEN, token),
         )
     }
-    previewTarget?.let { target ->
-        FilePreviewSheet(
-            entry = target.entry,
-            provider = target.provider,
-            onDismiss = { previewTarget = null },
-            onEdit = { entry ->
-                previewTarget = null
-                editorRequest = EditorRequest(entry, target.provider)
-            },
-        )
-    }
+    // The file preview's sheet stood here, and its Edit button with it. Both are the preview
+    // window's now: it is opened where the file was, and its Edit hands the editor the same entry
+    // and provider through the same one-shot handoff this workspace uses. Nothing is reported back
+    // either way — a file the editor saves is read again by whoever lists it.
     // The View Archive browser, a full-window layer above the workspace for the same reason the
     // editor is one: browsing an archive is a task of its own, and a sheet over the explorer would
     // both fight the explorer's own bottom sheets and show one folder's worth of a 1M-entry tree in
@@ -1798,7 +1835,6 @@ private fun EclipseWorkspace(
     // The per-entry sheets live *here*, above the browser, not inside it: they act on this
     // workspace's clipboard and extract destination, which the browser layer knows nothing about.
     var archiveEntrySheet by remember { mutableStateOf<ArchiveEntry?>(null) }
-    var archivePreviewEntry by remember { mutableStateOf<ArchiveEntry?>(null) }
     var archiveEntryProperties by remember { mutableStateOf<ArchiveEntry?>(null) }
     var showArchiveProperties by remember { mutableStateOf(false) }
     // The extract that is waiting on the user to pick a destination folder. The entries are held
@@ -1835,6 +1871,23 @@ private fun EclipseWorkspace(
     }
     archiveTarget?.let { target ->
         val browser = target.browser
+        // The preview used to be a sheet in this layer, held as a target like the sheets that act on
+        // an entry. It is a window of its own now (see [ArchiveEntryPreviewActivity]), so opening
+        // one is a launch rather than a state change — and the reader it is launched with closes
+        // over *this* browser, so the bytes still come from the archive the user has open.
+        val openEntryPreview: (ArchiveEntry) -> Unit = { entry ->
+            context.startActivity(
+                ArchiveEntryPreviewActivity.intent(
+                    context = context,
+                    entry = entry,
+                    // Only ZIP can fetch one entry's bytes by range; a TAR entry gets no reader,
+                    // and the window says so rather than streaming the whole archive to show it.
+                    readEntry = if (ArchiveReader.supportsRandomAccess(browser.format)) {
+                        { ArchiveReader.readEntry(browser.format, browser.sourceForReading(), entry) }
+                    } else null,
+                ),
+            )
+        }
         ArchiveBrowserScreen(
             archiveName = browser.archiveName,
             state = browser.state,
@@ -1848,7 +1901,7 @@ private fun EclipseWorkspace(
                 // than a preview that would secretly stream the whole archive.
                 onOpenEntry = { entry ->
                     if (ArchiveReader.supportsRandomAccess(browser.format)) {
-                        archivePreviewEntry = entry
+                        openEntryPreview(entry)
                     } else {
                         archiveEntrySheet = entry
                     }
@@ -1867,25 +1920,16 @@ private fun EclipseWorkspace(
                 onShowProperties = { showArchiveProperties = true },
             ),
         )
-        // The entry preview reads through the same ranged source the scan did - one entry's bytes,
-        // never the archive around it (the sheet's own KDoc holds the full reasoning).
-        archivePreviewEntry?.let { entry ->
-            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
-            ArchiveEntryPreviewSheet(
-                entry = entry,
-                readEntry = if (readable) {
-                    { ArchiveReader.readEntry(browser.format, browser.sourceForReading(), entry) }
-                } else null,
-                onDismiss = { archivePreviewEntry = null },
-            )
-        }
+        // The entry preview's sheet stood here. It reads through the same ranged source the scan
+        // did - one entry's bytes, never the archive around it - but it is a window now, opened
+        // from the two rows that lead to it (the browser's own tap and the entry sheet's Preview).
         archiveEntrySheet?.let { entry ->
             val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
             ArchiveEntryActionsSheet(
                 entry = entry,
                 canReadEntry = readable,
                 onDismiss = { archiveEntrySheet = null },
-                onPreview = if (readable) ({ archiveEntrySheet = null; archivePreviewEntry = entry }) else null,
+                onPreview = if (readable) ({ archiveEntrySheet = null; openEntryPreview(entry) }) else null,
                 // Extract (and single-entry Download, which is extract of one file by another
                 // name): hand the entries to the destination picker, and the extract itself runs
                 // when the picker answers. The archive stays remote throughout - what moves is
@@ -1931,8 +1975,9 @@ private fun EclipseWorkspace(
             onRunNow = { id -> transferActionsFor = null; viewModel.runTransferNow(id) },
             onViewFile = { transfer ->
                 transferActionsFor = null
-                transferLocalTarget(context, transfer)?.let { previewTarget = it }
-                    ?: viewModel.reportUiMessage("${transfer.name} has no local file to view")
+                transferLocalTarget(context, transfer)?.let { target ->
+                    context.startActivity(FilePreviewActivity.intent(context, target.entry, target.provider))
+                } ?: viewModel.reportUiMessage("${transfer.name} has no local file to view")
             },
             onEditFile = { transfer ->
                 transferActionsFor = null
@@ -2157,7 +2202,15 @@ private fun WorkspaceScaffold(
     onRunTransferNow: (String) -> Unit = {},
     /** Long-press on a transfer card: opens the per-item action sheet held above this scaffold. */
     onOpenTransferActions: (TransferItem) -> Unit = {},
-    onAddForward: (ForwardType, Int, String?, Int?) -> Unit = { _, _, _, _ -> },
+    /**
+     * The host the Settings section's Add-forward form will open its tunnel through.
+     *
+     * Passed rather than reached for, because the form is a window of its own now: it has to be *named*
+     * the host at the moment the user taps Add, and the name has to survive the trip out and back. The
+     * alternative - resolving "whatever is active" when the user returns - is what the dialog did, and
+     * it silently re-points a forward at a server the user switched to while the form was open.
+     */
+    activeHost: HostProfile? = null,
     onStopForward: (String) -> Unit = {},
     onImportVault: () -> Unit = {},
     onImportAccount: () -> Unit = {},
@@ -2374,7 +2427,7 @@ private fun WorkspaceScaffold(
                     onOpenTransferActions,
                 )
                 Destination.SETTINGS -> SettingsScreen(
-                    state, linuxUserspace, onBiometric, onDarkTheme, onAddForward, onStopForward,
+                    state, activeHost, linuxUserspace, onBiometric, onDarkTheme, onStopForward,
                     onImportVault,
                     onLegacyAlgorithms = onLegacyAlgorithms,
                     onBlockScreenshots = onBlockScreenshots,
@@ -2935,7 +2988,9 @@ private fun TerminalScreen(
                     // The host's own width is a floor here as well as an argument to the pty: a
                     // viewport report resizes the pty, and the first one arrives before any output does.
                     minColumns = minTerminalColumns(state.settings.terminalMinColumns, hostGeometry.first),
-                    hostRows = hostGeometry.second,
+                    // The host's height when it has one, the app-wide setting otherwise, and the
+                    // screen's own size over both — see [hostTerminalRows] and [atMostRows].
+                    hostRows = hostTerminalRows(state.settings.terminalRows, hostGeometry.second),
                     selection = selection,
                     onSelectionChange = { selection = it },
                     onSelectionFinished = { finished ->
@@ -4865,10 +4920,10 @@ private fun TransferActionRow(label: String, destructive: Boolean = false, onCli
 @Composable
 private fun SettingsScreen(
     state: MainUiState,
+    activeHost: HostProfile?,
     linuxUserspace: LinuxUserspaceController,
     onBiometric: (Boolean) -> Unit,
     onDarkTheme: (Boolean) -> Unit,
-    onAddForward: (ForwardType, Int, String?, Int?) -> Unit,
     onStopForward: (String) -> Unit,
     onImportVault: () -> Unit,
     // Six `onXxx: (Int) -> Unit` callbacks used to sit here - keep-alive, clipboard, font size,
@@ -4895,7 +4950,17 @@ private fun SettingsScreen(
     // The six rows below that open a window of their own start an Activity from here, which is the
     // one thing this screen now needs from the platform that a callback could not give it.
     val context = LocalContext.current
-    var showForwardDialog by remember { mutableStateOf(false) }
+    // Launches the forward form on whichever host the workspace is pointed at. Null when there is no
+    // host at all, which is the state the old dialog handled by quietly doing nothing after the user
+    // had filled it in: the buttons below are disabled rather than accepting a form that cannot be
+    // acted on.
+    val openForwardForm = activeHost?.let { host ->
+        {
+            context.startActivity(
+                ForwardFormActivity.intent(context, hostId = host.id, hostName = host.name),
+            )
+        }
+    }
     // Hosts with at least one secret saved. `savedCredentials` only ever contains entries the store
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
@@ -4962,6 +5027,19 @@ private fun SettingsScreen(
                 "At least ${state.settings.terminalMinColumns} columns; drag sideways for the rest"
             },
         ) { TextButton(onClick = { context.startActivity(Intent(context, TerminalWidthActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Terminal width" }) { Text("Change") } }
+        // Directly under the width, because they are the two halves of one question - how big is the
+        // terminal - and the subtitles have to be read together to make sense: width is a floor the
+        // server may exceed, height is a request the screen may cut down. A row that said "Terminal
+        // height" with no explanation would read as the same kind of number as the one above it.
+        SettingRow(
+            Icons.Default.Terminal,
+            "Terminal height",
+            if (state.settings.terminalRows <= 0) {
+                "As many rows as the screen fits; fewer, and the pty is told so"
+            } else {
+                "Up to ${state.settings.terminalRows} rows, or the screen's own count if it fits fewer"
+            },
+        ) { TextButton(onClick = { context.startActivity(Intent(context, TerminalHeightActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Terminal height" }) { Text("Change") } }
         SettingRow(Icons.Default.Terminal, "Terminal theme", "Colours the grid and its background") {
             SettingDropdown(
                 label = "Terminal theme",
@@ -4983,8 +5061,26 @@ private fun SettingsScreen(
     }
     Spacer(Modifier.height(14.dp))
     SettingsSection("Port forwarding") {
+        // The list of what is running stays a row — a status, not a screen — and only the *asking*
+        // moved into a window. The subtitle under "No active forwards" therefore has to say what the
+        // button will do when there is no host to do it through, rather than offering a form whose
+        // Start button could never work.
         if (state.forwardings.isEmpty()) {
-            SettingRow(Icons.Default.SwapVert, "No active forwards", "Local, remote, and dynamic (SOCKS5)") { TextButton(onClick = { showForwardDialog = true }) { Text("Add") } }
+            SettingRow(
+                Icons.Default.SwapVert,
+                "No active forwards",
+                if (openForwardForm == null) {
+                    "Local, remote, and dynamic (SOCKS5) — connect to a host to add one"
+                } else {
+                    "Local, remote, and dynamic (SOCKS5)"
+                },
+            ) {
+                TextButton(
+                    onClick = { openForwardForm?.invoke() },
+                    enabled = openForwardForm != null,
+                    modifier = Modifier.semantics { contentDescription = "Add port forward" },
+                ) { Text("Add") }
+            }
         } else {
             state.forwardings.forEach { entry ->
                 val hostName = entry.hostId?.let { id -> state.hosts.firstOrNull { it.id == id }?.name }
@@ -4998,7 +5094,13 @@ private fun SettingsScreen(
                     ).joinToString(" · "),
                 ) { TextButton(onClick = { onStopForward(entry.id) }) { Text("Stop") } }
             }
-            TextButton(onClick = { showForwardDialog = true }, modifier = Modifier.fillMaxWidth()) { Text("Add forward") }
+            TextButton(
+                onClick = { openForwardForm?.invoke() },
+                enabled = openForwardForm != null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics { contentDescription = "Add port forward" },
+            ) { Text("Add forward") }
         }
     }
     Spacer(Modifier.height(14.dp))
@@ -5081,12 +5183,18 @@ private fun SettingsScreen(
         }
     }
 
-    if (showForwardDialog) {
-        ForwardDialog(
-            onDismiss = { showForwardDialog = false },
-            onConfirm = { type, localPort, remoteHost, remotePort -> showForwardDialog = false; onAddForward(type, localPort, remoteHost, remotePort) },
-        )
-    }
+    // The Add-forward dialog that used to sit here is a window of its own now
+    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
+    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
+    // The Add-forward dialog that used to sit here is a window of its own now
+    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
+    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
+    // The Add-forward dialog that used to sit here is a window of its own now
+    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
+    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
+    // The Add-forward dialog that used to sit here is a window of its own now
+    // ([ForwardFormActivity]), and what it produces comes back through [ForwardRequests] on the
+    // workspace's next resume rather than through this composition - see [MainActivity.onResume].
     // The six choice dialogs that used to sit here - keep-alive, reconnect delay, clipboard
     // auto-clear, auto-lock vault, font size, terminal width - are now windows of their own, opened
     // from the rows above. Their values are written straight to the settings DataStore, which this
@@ -5205,41 +5313,6 @@ private fun SessionWhySheet(
     }
 }
 
-@Composable
-private fun ForwardDialog(onDismiss: () -> Unit, onConfirm: (ForwardType, Int, String?, Int?) -> Unit) {
-    var type by remember { mutableStateOf(ForwardType.LOCAL) }
-    var localPort by remember { mutableStateOf("8080") }
-    var remoteHost by remember { mutableStateOf("") }
-    var remotePort by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Add port forward") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ForwardType.entries.forEach { t -> FilterChip(selected = type == t, onClick = { type = t }, label = { Text(t.label) }) }
-                }
-                OutlinedTextField(localPort, { localPort = it }, label = { Text("Local port") }, singleLine = true)
-                when (type) {
-                    ForwardType.LOCAL -> {
-                        OutlinedTextField(remoteHost, { remoteHost = it }, label = { Text("Remote host") }, singleLine = true)
-                        OutlinedTextField(remotePort, { remotePort = it }, label = { Text("Remote port") }, singleLine = true)
-                    }
-                    ForwardType.REMOTE -> OutlinedTextField(remotePort, { remotePort = it }, label = { Text("Remote bind port") }, singleLine = true)
-                    ForwardType.DYNAMIC -> Text("Creates a SOCKS5 proxy on the local port for on-demand tunneling.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = { onConfirm(type, localPort.toIntOrNull() ?: return@Button, remoteHost.trim().takeIf(String::isNotBlank), remotePort.toIntOrNull()) },
-                enabled = localPort.toIntOrNull() != null,
-            ) { Text("Start") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
 /**
  * The one line the Settings list keeps about the userspace, for every state it can be in.
  *
@@ -5260,7 +5333,7 @@ private fun linuxUserspaceSummary(ui: LinuxUserspaceUiState): String {
         // compiler's proof of that invariant rather than a state any device can reach.
         null -> "Not installed"
         is LinuxUserspaceState.Installing ->
-            "Installing ${ui.distro?.displayName ?: "…"} · ${describeInstallStep(state.step).first}"
+            "Installing ${ui.distro?.displayName ?: "…"} · ${describeInstallStep(state.step)} · ${state.percent}%"
         is LinuxUserspaceState.NotInstalled ->
             if (ui.hasPendingWorkspaceBackup) {
                 "Not installed · a saved workspace will be restored"
@@ -5278,19 +5351,17 @@ private fun linuxUserspaceSummary(ui: LinuxUserspaceUiState): String {
 }
 
 /**
- * One install phase as the progress line renders it: the label, and the download's fraction when
- * the phase has one (only the download does — verification, extraction and setup are steps whose
- * length the pipeline honestly cannot know, and a fake progress bar is worse than none).
+ * One install phase as the progress line renders it. The percentage beside it is the state's own,
+ * so this is the phase alone — the install's overall figure is what the user is watching, and a
+ * phase-local one would start over at every step.
  */
-private fun describeInstallStep(step: LinuxInstallStep): Pair<String, Float?> = when (step) {
-    is LinuxInstallStep.Downloading -> {
-        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}" to
-            (step.received.toFloat() / step.total.toFloat().coerceAtLeast(1f))
-    }
-    LinuxInstallStep.Verifying -> "Verifying the download" to null
-    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files" to null
-    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail) to null
-    LinuxInstallStep.VerifyingHealth -> "Running the health check" to null
+private fun describeInstallStep(step: LinuxInstallStep): String = when (step) {
+    is LinuxInstallStep.Downloading ->
+        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}"
+    LinuxInstallStep.Verifying -> "Verifying the download"
+    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files"
+    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail)
+    LinuxInstallStep.VerifyingHealth -> "Running the health check"
 }
 
 private fun describeSetupStep(step: SetupStep, detail: String?): String {

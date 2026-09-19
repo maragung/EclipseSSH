@@ -14,6 +14,7 @@ the app's sandbox, with no VM, no root and no ISO.
 1. [Architecture](#architecture)
 2. [The rootfs source](#the-rootfs-source)
 3. [The install process](#the-install-process)
+   - [The percentage](#the-percentage)
 4. [The runtime model](#the-runtime-model)
 5. [ABI support](#abi-support)
 6. [The filesystem contract](#the-filesystem-contract)
@@ -106,10 +107,34 @@ health check passes — "installed" and "works" are the same fact:
      Node.js, an editor and a compiler are the user's own call, one `apt-get install` away inside
      the terminal, so the install stays small, fast and away from registries outside the pinned
      Ubuntu archive.
-5. **Health check** — a shell runs and prints a marker, `whoami` answers `ubuntu`, DNS resolves,
+5. **Health check** — a shell runs and prints a marker, `whoami` answers `root`, DNS resolves,
    `apt-get check` passes. Only then does the state machine reach Stopped.
 6. **Workspace restore** — if a previous keep-workspace uninstall parked a snapshot, it is
    restored into the fresh rootfs before the first shell opens.
+
+### The percentage
+
+The Ubuntu window, the host-list line and the foreground notification all show the same number, and
+it is one number rather than three because it is computed in one place: `LinuxInstallProgress`
+turns the current `LinuxInstallStep` into a whole percent, and every renderer reads that. The bar
+beside the label is drawn from the same value, so the two cannot disagree.
+
+What the number is, precisely, is a **schedule refined by measurement**. An install is not one
+measurable quantity: the download has a known byte total, extraction consumes a known tarball, the
+two apt steps draw a bar of their own, and the rest are steps whose length nothing can know in
+advance. So each phase is given a share of the whole from how long it actually takes on a phone —
+setup the largest by a wide margin — and the phases that can measure themselves move *inside* their
+share instead of jumping to its end. The download moves on bytes received, extraction on the
+fraction of the tarball read, and `apt-get install` on apt's own `Progress: [ 45%]` line, which
+counts completed package steps over the whole dpkg run. Reading it as a stopwatch would be wrong;
+what it does promise is that it starts at 0, never walks backwards, and reaches 100 when the work
+is done.
+
+A repair over a rootfs that is already extracted skips the download half entirely, and the shares
+are renormalized to match — otherwise a repair would open at 36% for work that is not happening. The
+health check is the last phase and is measured in seconds, so it reads 100%: the work is finished,
+and what remains is the verdict. A check that fails does not leave a 100% standing — the window
+replaces the row with the failure.
 
 ## The runtime model
 
@@ -120,15 +145,36 @@ translates their path arguments and syscalls at the ptrace boundary. `PROOT_LOAD
 the standalone `libproot-loader.so` in the same directory, or proot extracts an embedded loader
 into `PROOT_TMP_DIR` (inside `filesDir`, never executable) and dies with EACCES.
 
-Two session modes, deliberately different:
+**Every proot run carries `-0`, proot's fake root — interactive sessions and scripted commands
+alike.** Inside the rootfs the process is uid 0; at the kernel level it is still the app's own uid,
+so nothing escapes proot's sandbox or the app's SELinux domain. Fake root is not a privilege
+escalation here — it is the only identity under which the userspace is usable at all:
 
-- **Interactive sessions run without `-0`.** The shell runs as the app's own uid, which setup
-  registered as user `ubuntu` — so `whoami` says `ubuntu`, home is `/home/ubuntu`, and the default
-  terminal account is never root.
-- **Scripted setup commands run with `-0`** (proot's fake root) — dpkg `chown`s the files it
-  unpacks to `root:root`, and a real EPERM there aborts `apt-get install`. Under `-0` proot
-  swallows those ownership changes; the kernel-level owner stays the app uid either way, because
-  proot cannot `chown` any more than the app can.
+- `dpkg` refuses to unpack anything unless `getuid() == 0`, so `apt install` cannot work without
+  it. dpkg also `chown`s what it unpacks to `root:root`, and SELinux answers a real `chown` with
+  ENOENT (a masqueraded EPERM) — which dpkg treats as fatal where it ignores EPERM. The proot fork
+  answers `chown`/`lchown` with a faked `getuid` instead; the kernel-level owner stays the app uid
+  either way, because nothing here can `chown` for real.
+- `su` and `sudo` have nowhere to go from a non-root shell: proot's fake identity is all-or-nothing
+  per process tree, so a session that is not fake root can never become root, and one that is,
+  already is. `su`'s PAM stack (`pam_rootok`) lets an effective uid of 0 through without a
+  password, so no password is ever asked for or needed — and the `setuid`/`setgid`/`setgroups`
+  calls it makes are trapped by the zygote's seccomp filter and answered by the fork's SIGSYS
+  handler.
+
+What a session presents is therefore `root`: `whoami` says `root`, the prompt is `root@localhost`.
+Two things deliberately do not move with it. `HOME` stays `/home/ubuntu` — the workspace, the
+editor and SFTP all live there, and a shell that started in root's own home would be standing
+nowhere near the user's files — and `/etc/passwd` keeps its `ubuntu` entry for the app's own
+Android uid, which is who really owns every file in the rootfs and the account `su - ubuntu` drops
+to. The `ubuntu` shadow entry stays `*` (locked): neither account is entered by password.
+
+The history is worth keeping, because the shape of the mistake is instructive: sessions used to run
+*without* `-0`, on the theory that the terminal account should never be root. That worked for
+everything the app itself did and broke the moment a user typed `apt install zip` — "requested
+operation requires superuser privilege" — or `su - root` — "System error". The pipeline's own
+commands already carried `-0` and had done for as long as dpkg had been involved; the session was
+the one path that did not.
 
 `/dev`, `/proc` and `/sys` are bind-mounted into every session (the base rootfs ships empty mount
 points for them), and the environment is **replaced**, not extended: an Android environment inside
@@ -171,9 +217,12 @@ a desktop) to a path the uninstall does not delete, and the next install restore
 first shell opens. Uninstall without it deletes the snapshot too. **Stop and Restart never touch
 the workspace.**
 
-Because Android forbids the app to `chown`, every file under `filesDir` is owned by the app uid —
-which is why the rootfs needs no privilege model of its own: the shell's writes succeed by DAC, and
-the account identity comes from `/etc/passwd`, not from file ownership.
+Because Android forbids the app to `chown`, every file under `filesDir` is owned by the app uid.
+That is what the whole privilege story rests on, and it is worth separating from the identity the
+session reports: the shell's writes succeed by DAC — it is the owner — while `whoami` answers `root`
+because proot's fake identity says so and `/etc/passwd` has a `root` entry to put a name to it. Two
+different questions, and only the first is about the filesystem. Nothing in the rootfs needs a
+permission bit to be set for anyone, because the only process that ever opens them is the app.
 
 ## Lifecycle
 
@@ -215,9 +264,11 @@ render as healthy. A stale "installed" flag can never present as a working insta
 
 ## Security
 
-- **No root, anywhere.** The app never elevates; the default terminal account is `ubuntu`
-  (the app's own uid), never root, and the account has no password to attack (`*` in shadow).
-  Fake root exists only inside the scripted setup pipeline, where dpkg needs it.
+- **No root, anywhere.** The app never elevates: it holds no Android privilege it did not already
+  have, and proot's fake root is a fiction that stays inside the rootfs — the kernel still sees
+  the app's own uid for every process in that tree. What fake root buys is `dpkg`'s uid check and
+  somewhere for `su` to go; it grants nothing the app's sandbox did not already allow. Neither
+  account has a password to attack (`*` in shadow for both), and `su` never asks for one.
 - **Pinned supply chain.** The rootfs tarball is verified against a hash pinned in the source
   before extraction; the proot/talloc sources are pinned tarballs with SHA256s in
   `linux/build.gradle.kts`; every package the install adds comes from the distribution's own
@@ -241,7 +292,7 @@ render as healthy. A stale "installed" flag can never present as a working insta
 | Card never appears | Health probe failing — the probe's field-by-field report is the Health check row of the Ubuntu on this device window (Settings → Ubuntu on this device → Verify) | Repair |
 | "proot: cannot execute" at shell start | `nativeLibraryDir` mismatch after an app update changed the ABI | Restart the app: the directory is read once, when the userspace graph is built, so a Stop and Start inside the same process reads the same stale path. Reinstall if it persists |
 | `apt-get` fails with hash/404 errors | Stale archive pin or interrupted update | Repair (re-runs `apt-get update`); check DNS in the probe report |
-| `whoami` says a number | `/etc/passwd` entry lost (rootfs edited by hand) | Repair |
+| `whoami` is not `root` (a number, or `ubuntu`) | `/etc/passwd`'s root entry lost, or the shell did not get proot's `-0` — without it `apt install` and `su` cannot work | Repair |
 | DNS does not resolve | Network changed since setup wrote `resolv.conf` | Repair rewrites it; the wiring layer passes the live resolvers |
 | Download dies mid-install | Network drop; the verified-tarball resume only covers completed downloads | Retry install; nothing half-extracted is left behind |
 | Sessions die when app is backgrounded | The foreground service was stopped by the user or the system | Settings → Ubuntu on this device → Start; sessions cannot be revived (their ptys died) but the workspace is untouched |

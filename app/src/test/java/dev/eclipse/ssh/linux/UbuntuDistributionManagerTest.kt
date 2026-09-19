@@ -254,8 +254,7 @@ class UbuntuDistributionManagerTest {
         // Four rungs ran scoped — the two primaries and the two built-ins — and rung two alone
         // forced IPv4.
         val scoped =
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .filter { it.startsWith("apt-get update") && isScopedRung(it) }
         assertThat(scoped).hasSize(4)
         assertThat(scoped[0]).doesNotContain("ForceIPv4")
@@ -264,8 +263,7 @@ class UbuntuDistributionManagerTest {
 
         // Exactly one unscoped update: the confirmation after the win.
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .count { it.startsWith("apt-get update") && !it.contains("Dir::Etc::sourcelist") },
         ).isEqualTo(1)
 
@@ -465,8 +463,7 @@ class UbuntuDistributionManagerTest {
         // One rung only: descending would burn every remaining rung against a broken runtime —
         // and the feed would never be fetched either.
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .count { it.startsWith("apt-get update") },
         ).isEqualTo(1)
         // The aborted rung's mirror is not left as the standing configuration: no rung ever won,
@@ -494,8 +491,7 @@ class UbuntuDistributionManagerTest {
         // The old pipeline's first proot execution was the apt rung itself, which is exactly how
         // a broken runtime read as "every mirror is down". Nothing apt-shaped ran.
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .none { it.startsWith("apt-get") || it.startsWith("dpkg") },
         ).isTrue()
     }
@@ -532,8 +528,7 @@ class UbuntuDistributionManagerTest {
         assertThat(resolv).doesNotContain("fe80::1")
         // Discovered here, not ten minutes later by an exhausted ladder: no apt command ran.
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .none { it.startsWith("apt-get") },
         ).isTrue()
     }
@@ -561,7 +556,7 @@ class UbuntuDistributionManagerTest {
         val thrown = runCatching { harness.distribution.setup() }.exceptionOrNull()
 
         assertThat(thrown).isInstanceOf(UserspaceFailure.Offline::class.java)
-        assertThat(harness.scripted.commandsWith).isEmpty()
+        assertThat(harness.scripted.commands).isEmpty()
     }
 
     @Test
@@ -579,8 +574,7 @@ class UbuntuDistributionManagerTest {
 
         assertThat(thrown).isInstanceOf(UserspaceFailure.Offline::class.java)
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .none { it.startsWith("apt-get update") },
         ).isTrue()
     }
@@ -604,8 +598,7 @@ class UbuntuDistributionManagerTest {
         assertThat(thrown!!.message).contains("only about 100 MB is free")
         // No rung ran: the refusal happened before the ladder, not inside it.
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .none { it.startsWith("apt-get update") },
         ).isTrue()
     }
@@ -769,8 +762,7 @@ class UbuntuDistributionManagerTest {
         assertThat(report.warnings).contains("the base packages needed a dpkg repair pass to install")
         // And the fallback never ran: the recovery rung answered first.
         assertThat(
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .none { it == "apt-get install -y --no-install-recommends git" },
         ).isTrue()
     }
@@ -781,7 +773,7 @@ class UbuntuDistributionManagerTest {
 
         harness.distribution.setup()
 
-        val commands = harness.scripted.commandsWith.map { it.second }
+        val commands = harness.scripted.commands
         val repairIndex = commands.indexOfFirst { it.startsWith("dpkg --configure -a") }
         val firstUpdateIndex = commands.indexOfFirst { it.startsWith("apt-get update") }
         assertThat(repairIndex).isAtLeast(0)
@@ -816,8 +808,7 @@ class UbuntuDistributionManagerTest {
         // The wedged rung did not end the install: the ladder descended to the IPv4 rung and won,
         // and the timeout is on the record.
         val scoped =
-            harness.scripted.commandsWith
-                .map { it.second }
+            harness.scripted.commands
                 .filter { it.startsWith("apt-get update") && isScopedRung(it) }
         assertThat(scoped).hasSize(2)
         assertThat(harness.distribution.diagnostics.export()).contains("rung timed out")
@@ -835,7 +826,7 @@ class UbuntuDistributionManagerTest {
         val harness = Harness(distro(arch = "arm64"))
         harness.distribution.setup()
 
-        val commands = harness.scripted.commandsWith.map { it.second }
+        val commands = harness.scripted.commands
         // The whole of what the install adds, in one command, all seven from the pinned archive.
         assertThat(commands).contains(
             "apt-get install -y --no-install-recommends " +
@@ -1057,7 +1048,7 @@ class UbuntuDistributionManagerTest {
         ): PtyProcess {
             val command = argv.lastOrNull() ?: ""
             if (wedgeOn(command)) {
-                delegate.commandsWith += (argv.contains("-0")) to command
+                delegate.commands += command
                 return WedgedPtyProcess()
             }
             return delegate.spawn(argv, envp, cwd, rows, columns)

@@ -17,7 +17,7 @@ class LocalLinuxHostTest {
     private val healthy =
         HealthReport(
             shellWorks = true,
-            account = "ubuntu",
+            account = "root",
             accountCorrect = true,
             networkUp = true,
             aptUsable = true,
