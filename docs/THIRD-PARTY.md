@@ -60,8 +60,9 @@ The module ships eight `.so` files per ABI: `libfreerdp-android.so` (the JNI
 bridge) plus the seven in the build's runtime list — `libfreerdp3`,
 `libfreerdp-client3`, `libwinpr3`, `libcrypto`, `libssl`, `libcjson`,
 `liburiparser`. `:app` depends on the module, so all of them are in the APKs.
-Three further libraries are compiled into those binaries, and their own terms
-therefore travel with them:
+Three further libraries ship as `.so` files of their own rather than being
+compiled into the FreeRDP ones — they are the last four of the eight above, not
+a fifth set alongside them — and their terms therefore travel with the APKs:
 
 - **OpenSSL 4.0.1** — Apache-2.0 — TLS and NLA for the RDP client
   (`libcrypto`, `libssl`)

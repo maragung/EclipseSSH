@@ -113,9 +113,11 @@ inside the runner and `chmod 600` them. Each has a step named "Shred signing
 material" (`if: always()`, so it runs on failure too) that removes both — `rm -f
 keystore.properties` and `rm -rf keystore`. It is `rm`, not `shred(1)`: the
 material lives on an ephemeral hosted runner's disk, which is discarded with the
-VM, and no workflow caches the workspace — the only caches anywhere in
-`.github/workflows/` are the two native build directories (`freerdp/build` and
-`linux/build`) and the Robolectric jar cache under `~/.m2/repository`.
+VM, and no workflow caches the workspace. The three caches in
+`.github/workflows/` — the Gradle user home (`gradle/actions/setup-gradle`), the
+two native build directories (`freerdp/build` and `linux/build`), and the
+Robolectric jar cache under `~/.m2/repository` — all live outside the checked-out
+tree; `docs/ci.md` counts them the same way.
 
 Rotate by:
 

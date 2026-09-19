@@ -62,7 +62,7 @@ key's signing identity, and resource shrinking.
 | `test_generate_report.py` | That parser's own tests, against the stdout shapes run 35338666049's artifacts contain. Run by `ci.yml`; needs no emulator. |
 | `auto-fix.sh` | The autonomous repair loop. See below. |
 | `universal/` | The `universal-apk-test.yml` pipeline's own scripts (`explore.py`, `adbutil.py`, `discover-app.py`, `generate-report.py`, `scan-issues.py`, `verify-apk.sh`, `auto-fix.sh`) and its README, which is the reference for that workflow's modes and budgets. |
-| `ubuntu-e2e/` | The `android-ubuntu-e2e.yml` driver (`driver.py`, `summary.py`) and its README. It drives a device directly and calls back into this directory's `auto-fix.sh` and `collect-diagnostics.sh`. |
+| `ubuntu-e2e/` | The `android-ubuntu-e2e.yml` driver (`driver.py`, `summary.py`), that driver's own matcher tests (`test_driver_matchers.py`, run by the workflow with no emulator), and its README. The driver drives a device directly; the workflow around it is what calls back into this directory's `collect-diagnostics.sh` and `auto-fix.sh`, not the driver. |
 
 ## Autonomous repair loop
 
@@ -89,10 +89,11 @@ never merges anything — a human (or the maintainer's session) reviews the PR.
 
 Honest limits, stated rather than hidden:
 
-- **Live SSH/SFTP/RDP/Linux-install journeys** need reachable servers and a
-  ~600 MB download; they are covered by the JVM suites against embedded
-  servers and by the maintainer's on-device loop. The manifest records this
-  per feature.
+- **Live SSH/SFTP/RDP/Linux-install journeys** need reachable servers and, for
+  the Ubuntu install, a ~30 MB rootfs download plus the apt packages the user
+  asks for; they are covered by the JVM suites against embedded servers and by
+  the maintainer's on-device loop. The manifest records this per feature. The
+  600 MB the installer script quotes is *disk headroom*, not a download.
 - **API 30 is the oldest leg** — two API levels above minSdk 28. Add levels via
   the `api_levels` dispatch input; each leg is a full emulator suite, so the
   default matrix is deliberately two.

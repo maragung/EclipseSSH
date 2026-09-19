@@ -177,12 +177,13 @@ and without one it is expected.
 
 Three caches, because they expire on different things:
 
-- `gradle/actions/setup-gradle@v4` handles the Gradle user home (dependencies, wrapper, build cache).
-  It is read-only off `main`, so a pull request cannot poison the cache the branch builds from.
-- `actions/cache@v4` for the two native build trees, `freerdp/build` and `linux/build`, keyed on the
-  module's own build file — and, for `:linux`, on `linux/proot-patches/*.patch` as well, since the
-  patches are part of what is compiled.
-- `actions/cache@v4` for `~/.m2/repository/org/robolectric`, keyed on `gradle/libs.versions.toml`
+- `gradle/actions/setup-gradle@v6.3.0` handles the Gradle user home (dependencies, wrapper, build
+  cache). It is read-only off `main`, so a pull request cannot poison the cache the branch builds
+  from.
+- `actions/cache@v6.1.0` for the two native build trees, `freerdp/build` and `linux/build`, keyed on
+  the module's own build file — and, for `:linux`, on `linux/proot-patches/*.patch` as well, since
+  the patches are part of what is compiled.
+- `actions/cache@v6.1.0` for `~/.m2/repository/org/robolectric`, keyed on `gradle/libs.versions.toml`
   and the `COMPILE_SDK` pin. Robolectric downloads its `android-all` jars (~100 MB per SDK level)
   from Maven Central at *test* time, not resolve time, so Gradle's own cache never contains them.
 

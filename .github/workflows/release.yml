@@ -83,7 +83,7 @@ jobs:
         # Same entry ci.yml restores: warm builds skip configure and Ninja
         # rebuilds nothing. The release build is a release of exactly what CI
         # verified, so sharing the cache keeps that literally true.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -94,7 +94,7 @@ jobs:
       - name: Cache the Linux userspace native build tree
         # Same entry ci.yml restores, for the same reason: the release APK
         # ships the userspace, built from exactly the tree CI verified.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: linux/build
           key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
@@ -105,7 +105,7 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
