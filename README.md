@@ -113,9 +113,11 @@ is 28).
 
 ## Tests
 
-The suite is 1,748 JVM/Robolectric test methods in 152 test files and runs offline: the SSH and SFTP
-integration tests start a real Apache MINA SSHD server on a loopback port inside the test JVM, so
-nothing external is contacted and no public or shared SSH account is involved. That figure is the
+The suite is 1,748 JVM/Robolectric test methods in 152 test files and contacts nothing off the
+machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
+inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
+loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot
+reproduce). No public or shared SSH account is involved either way. That figure is the
 count of `@Test` methods in `app/src/test` — a few of them sit behind `assumeTrue` and report as
 skipped wherever their precondition cannot hold, which is why a green CI run reports a slightly
 smaller number than this. A file count is not a class count: one Kotlin file may declare several test

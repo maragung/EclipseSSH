@@ -4964,3 +4964,75 @@ commits on the branch, squashed on merge into the single commit `v1.2.2` names, 
 holds the range, over the same 28 files and the same +1163/−201. That is the same lesson the
 paragraphs above keep arriving at in a different currency: a measurement anchored to something that
 moves tells you about the anchor, not about the thing. The tag does not move.
+
+---
+
+## 45. Every document against the tree
+
+§35 built a guard for the figures a build file owns. It says nothing about prose: a document can
+name a file that was renamed, a version that was bumped, a step that does what its title says it
+does, and read as perfectly consistent while being wrong in every one of those ways. This pass is the
+other half — each of the seven documents a reader actually meets, read against the tree by three
+readers with disjoint files, and edited only where a claim could be reproduced. Nine disagreements
+came back; eight were the document's and one was the code's.
+
+### 45.1 Eight claims the tree contradicted
+
+| Document | Said | The tree |
+|---|---|---|
+| `docs/ci.md` | `gradle/actions/setup-gradle@v4` | pinned at `# v6.3.0` in all ten workflows (`827fbac` bumped it 4.0.0 → 6.3.0) |
+| `docs/ci.md` | `actions/cache@v4`, twice | the pin is `v6.1.0` (`827fbac`); the workflows' own `# v4.2.0` comments were stale too |
+| `docs/branch-protection.md` | "the only caches … are the two native build directories and the Robolectric jar cache" | `setup-gradle` caches the Gradle user home as well — which `docs/ci.md` itself counts as the first of three |
+| `docs/linux-userspace.md` | the foreground service exists "when the state machine enters Running and stops … when the machine leaves" | `holdsProcess()` covers Running, Installing, Starting **and** Stopping (`657a5fd`), and both the binding rule and the service's self-stop read it |
+| `testing/README.md` | `ubuntu-e2e/` is "`driver.py`, `summary.py`", and "it … calls back into … `auto-fix.sh` and `collect-diagnostics.sh`" | the directory also holds `test_driver_matchers.py`, and neither call is the driver's: the workflow makes both |
+| `testing/README.md` | live journeys need "a ~600 MB download" | the rootfs is ~30 MB compressed; the 600 MB in the installer's own script is disk *headroom* |
+| `docs/THIRD-PARTY.md` | OpenSSL, cJSON and uriparser "are compiled into those binaries" | they are four `.so` files of their own — the last four of the eight the same section lists two paragraphs earlier |
+| `README.md` | the JVM suite "runs offline … nothing external is contacted" | `ci.yml` starts a real OpenSSH `sshd` on loopback first (`tools/local-sshd.sh`) — "because interop bugs live in the gap the in-JVM server cannot reproduce" |
+
+Two of these are worth more than the correction. The `actions/cache` comment was wrong in the *tree*
+as well as in the document, and it is the reason a reader would have believed `@v4`: a stale comment
+on a pinned action is exactly the kind of claim no guard reads, because it is not a figure the build
+owns. And `docs/linux-userspace.md`'s sentence had been byte-identical since before the predicate was
+widened — `git log -L` says every commit since, which is how a document that was right when it was
+written becomes wrong without anyone touching it.
+
+`linux/README.md` came back accurate line by line: every file, Gradle task, CMake target, variable,
+ABI set and version it names exists and is spelled as stated. So did the rest of the audited
+documents; the eight above are the whole of what disagreed.
+
+### 45.2 The ninth was the code's, and the fix was to the code
+
+`docs/ci.md` said the `assemble` job "asserts, before it compiles them, that the `androidTest`
+sources contain at least one **test**". It did not: the step counted *files* —
+
+```bash
+COUNT=$(find app/src/androidTest -name '*.kt' | wc -l)
+```
+
+— so a directory of sources declaring no test at all satisfied a step named "at least one test", and
+the document was describing an intent rather than the check. Either end could have been changed. The
+document was what the guard should have been, so the guard was changed:
+
+```bash
+COUNT=$(grep -rhaE '^[[:space:]]*@Test(\(|$)' app/src/androidTest --include='*.kt' | wc -l || true)
+```
+
+`-a` because `check-doc-figures.sh` reads its own tallies that way for a reason it records — a file
+carrying a NUL byte is binary to `grep`, which then reports one match for the whole file. `|| true`
+because the step runs under `set -euo pipefail` and a `grep` that matches nothing exits 1, which
+would abort the step before its own message. The count it prints on this tree is **47** — the same
+number the v1.2.2 gate printed as `OK (47 tests)` — which is the cross-check that the guard is now
+counting what the run counts.
+
+### 45.3 The system bar icons, closed rather than carried
+
+Task #22's code has been in place since `EclipseTheme`'s `SideEffect` began driving
+`isAppearanceLightStatusBars` from the app's own `darkTheme`, and it has been carried as *in progress*
+since on the honest ground that the value's effect is a thing an eye judges. The line between the two
+halves is now drawn where it belongs. `SystemBarAppearanceTest` ran on the **published** v1.2.2 APK
+in both legs of `35422315815`: logcat shows it starting at `05:10:56.075` and finishing at
+`05:10:58.977`, and the leg's stdout reports `OK (47 tests)`. The mapping from the app's flag to the
+window's appearance is therefore proven on the artifact a user installs, on API 30 and API 35, in
+both directions. What is *not* proven, and cannot be by any test, is that white-on-dark reads well —
+that stays with the maintainer's on-device loop, and it is the residue the test's own KDoc names
+rather than hides.

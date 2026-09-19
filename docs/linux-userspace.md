@@ -192,13 +192,17 @@ NeedsRepair ──install/repair──► …                   │  ▲
 The rule the whole design turns on: **Running means "held open", not "a process exists"**. Closing
 the last terminal does not stop the userspace, backgrounding the app does not stop it, and only an
 explicit Stop (or the app's process dying, which takes the pty masters — and with them every
-session — along) returns it to Stopped. While Running, the foreground service keeps the app's
-process alive so backgrounded sessions survive.
+session — along) returns it to Stopped. While the machine holds a process — Running, but also
+Installing, Starting and Stopping, so backgrounding the app cannot interrupt an install halfway —
+the foreground service keeps the app's process alive so backgrounded sessions survive.
 
 That service is `LinuxUserspaceService`, and its existence is derived: the userspace controller
-starts it when the state machine enters Running and stops it when the machine leaves, and the
-service itself watches the same state and stops itself if it is ever alive without a Running
-userspace. Its notification offers the two gestures that matter away from the app — Open (back to
+starts it when the state machine enters a state that holds a process and stops it when none does, and
+the service itself watches the same state and stops itself if it is ever alive without one. Both
+sides read one predicate for that — `LinuxUserspaceState.holdsProcess()` in
+`LinuxUserspaceController.kt` — so the binding and the service cannot disagree about what it covers;
+a Running-only rule would demote an install the binding deliberately promotes. Its notification
+offers the two gestures that matter away from the app — Open (back to
 the terminal) and Stop Ubuntu (the same lifecycle verb as Stop in the Ubuntu on this device
 window) — and its Android 15
 six-hour dataSync budget is shared with the SSH session service: when the budget runs out both post

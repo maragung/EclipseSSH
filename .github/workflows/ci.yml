@@ -144,7 +144,7 @@ jobs:
         # This job is the only writer of this cache. lint, test and assemble
         # restore the same key after needs:native, by which point this job's
         # post-step save is already visible to them in the same run.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -194,7 +194,7 @@ jobs:
         # carries the module's build script because that is where the
         # tarball, NDK and ABI pins live. A cold build is minutes (proot's
         # makefile is quick); a warm one is a download-free UP-TO-DATE.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: linux/build
           key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
@@ -292,7 +292,7 @@ jobs:
         # extract, never a rebuild. No restore-keys on purpose: a fuzzy restore
         # can pair stale cmake trees with fresh source (the PR #20/#22/#23
         # failure class the wipe guard exists for).
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -306,7 +306,7 @@ jobs:
         # so :linux's preBuild-wired fetch and build tasks find their declared
         # outputs and go UP-TO-DATE. Restored, never written, and no
         # restore-keys for the same reason the FreeRDP cache has none.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: linux/build
           key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
@@ -399,7 +399,7 @@ jobs:
         # extract, never a rebuild. No restore-keys on purpose: a fuzzy restore
         # can pair stale cmake trees with fresh source (the PR #20/#22/#23
         # failure class the wipe guard exists for).
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -413,7 +413,7 @@ jobs:
         # so :linux's preBuild-wired fetch and build tasks find their declared
         # outputs and go UP-TO-DATE. Restored, never written, and no
         # restore-keys for the same reason the FreeRDP cache has none.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: linux/build
           key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
@@ -426,7 +426,7 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.m2/repository/org/robolectric
           # Keyed on the version catalog only. The compile SDK is part of the
@@ -536,7 +536,7 @@ jobs:
         # extract, never a rebuild. No restore-keys on purpose: a fuzzy restore
         # can pair stale cmake trees with fresh source (the PR #20/#22/#23
         # failure class the wipe guard exists for).
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: freerdp/build
           key: freerdp-native-${{ runner.os }}-${{ hashFiles('freerdp/build.gradle.kts') }}
@@ -550,7 +550,7 @@ jobs:
         # so :linux's preBuild-wired fetch and build tasks find their declared
         # outputs and go UP-TO-DATE. Restored, never written, and no
         # restore-keys for the same reason the FreeRDP cache has none.
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: linux/build
           key: linux-native-${{ runner.os }}-${{ hashFiles('linux/build.gradle.kts', 'linux/proot-patches/*.patch') }}
@@ -584,14 +584,20 @@ jobs:
         # "instrumentation is being tested" in the run summary. Assert it
         # before running the build so a future contributor cannot silently
         # delete the suite and keep a green check.
+        #
+        # It counts @Test methods rather than files, which is what the step name
+        # and docs/ci.md both say it does: a file count passes for a directory of
+        # sources that declare no test at all, and `grep -c` on a file carrying a
+        # NUL byte would undercount -- hence `-a`, the same flag
+        # scripts/check-doc-figures.sh reads its tallies with.
         run: |
           set -euo pipefail
-          COUNT=$(find app/src/androidTest -name '*.kt' | wc -l)
+          COUNT=$(grep -rhaE '^[[:space:]]*@Test(\(|$)' app/src/androidTest --include='*.kt' | wc -l || true)
           if [ "$COUNT" -lt 1 ]; then
-            echo "No androidTest sources found in app/src/androidTest."
+            echo "No @Test methods found in app/src/androidTest."
             exit 1
           fi
-          echo "androidTest sources: $COUNT"
+          echo "androidTest @Test methods: $COUNT"
 
       - name: Check the instrumentation keep list against the test sources
         # The release-test suite failed both legs on run 35338666049 with
@@ -1057,7 +1063,7 @@ jobs:
           cache-read-only: true
 
       - name: Cache Robolectric runtime jars
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4.2.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.m2/repository/org/robolectric
           key: robolectric-${{ runner.os }}-${{ env.COMPILE_SDK }}-${{ hashFiles('gradle/libs.versions.toml') }}
