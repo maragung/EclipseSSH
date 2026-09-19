@@ -4748,13 +4748,15 @@ drift, because a report task exits 0 (#133). Publication state lives in the Rele
 
 ## 43. Releasing 1.2.2
 
-Seven commits, 26 files, +859/−187. Unlike 1.2.1, this range does change what a user installs, in two
+Nine commits against `v1.2.1` (`git rev-list --count v1.2.1..HEAD`), 28 files, +1163/−201. Unlike 1.2.1,
+this range does change what a user installs, in two
 places: the pty on the Linux side (`linux/src/main/cpp/linuxpty.c`, +236/−11) and the library line the
 app is built against, seven versions in `gradle/libs.versions.toml`. The four lines under
 `app/src/main` are the About screen catching up with three of those versions, and they are the whole of
 this release's change to the application's Kotlin: no composable, no screen, no repository, no
-ViewModel. `app/src/androidTest` does not change at all, so the suite that gates this release is the
-suite that gated 1.2.1.
+ViewModel. `app/src/androidTest` changes in two places, both of them §43.5: four helpers in
+`ReleaseChaosJourneyTest` — the file that turned this release's API 35 leg red twice, while its API 30
+leg stayed green both times — and the cross-reference to one of them in `MainActivityLifecycleTest`.
 
 The patch number is for that second half and not in spite of the first: nothing a user can do has been
 added, removed or renamed. What changed is what happens *after* something has already gone wrong — a
@@ -4841,3 +4843,96 @@ order of what they cost when they are missing:
 The visible one is in Settings → About: three library versions that now read as what the build pins.
 Everything else in this release is the shape 1.2.1 established — the artifact behaves as its
 predecessor does except where a failure was already in progress.
+
+### 43.5 The one test this release had to repair, and why it read as a flake
+
+The pre-release validation run `35415683279` came back red on API 35 with exactly one failing test —
+`rotatingThroughEveryDestinationKeepsTheScreenUsable`, on an `assertExists` for "Terminal theme" — while
+the API 30 leg of the *same* run was green, end to end, crash scan included. Issue #136. The run before
+it failed the same test on the same leg (#124, validation run `35343449935` attempt 1) — there on a
+`ComposeTimeoutException` in the row wait rather than on an assertion — and that issue was closed as
+superseded when 1.2.1's published asset cleared both legs, with "reopen if the same failure returns"
+written into it. It returned, in a different assertion, so this time the failed leg's logcat was read
+rather than the run re-run past a third time.
+
+**What it says, to the millisecond.** The test started at `02:50:46.781` and failed at `02:50:52.118`.
+The four configuration changes it asks for landed at `48.481` (landscape, `w914dp`), `49.630`
+(portrait, `w411dp`), `50.344` (landscape) and `51.086` (portrait). The activity was PAUSED at
+`50.917`, and the teardown that follows a failure had already started its `EmptyActivity` at `50.869`.
+So the assertion the test died on ran **before the rotation it had just requested had been applied**,
+against the previous orientation's window. `rotate()` set `requestedOrientation` and called
+`waitForIdle()`, and `waitForIdle` answers for Compose: Compose is idle for the whole 0.7–1.1 s the
+system spends rotating this emulator's display — its logcat is one long "Slow dispatch" while the
+taskbar is torn down and rebuilt. There was no recreation to wait for either: `MainActivity` declares
+`configChanges` for orientation, and the log holds exactly one instance and one `PRE_ON_CREATE` for
+the whole test.
+
+**First repair: two waits, both bounded at ten seconds and both loud when they expire.** That is what
+went to CI, and it turned the same leg red on a *second* test.
+
+- `rotate()` waits on the window's own `resources.configuration.orientation`, which is the only thing
+  that reports the change once recreation is off the table, and only then waits for idle.
+- Every tap in the journey waits for the destination it opened to render before the next rotation is
+  requested, so a tap that has not been acted on cannot carry the test into the next orientation
+  asserting against the screen it just left. This is the idiom the file already used after *its* own
+  rotation in `theAddHostFormSurvivesARotation`, and the lesson `MainActivityLifecycleTest` wrote down
+  when it measured the guest at `app_time_stats: avg=4235.73ms` per frame: a bare `waitForIdle()`
+  followed by an assertion is a race for anything the app derives asynchronously. A healthy emulator
+  hides it, which is why one leg was green.
+
+**Second repair: `theAddHostFormSurvivesARotation` had never rotated at all.** The instrumentation run
+`35417680596` reported 47 tests and 15 failures, of which 14 are `UbuntuE2eVerificationTest`'s
+`AssumptionViolatedException` rows, which AGP's XML counts as failures while the phase is healthy. The
+one real failure was that test, on `ComposeTimeoutException: Condition still not satisfied after 10000
+ms` at `rotate(ReleaseChaosJourneyTest.kt:83)` — the new wait, timing out because nothing had turned.
+
+The mechanism is the reason the test was vacuous, and it is in the manifest. That test opens
+`HostFormActivity` on top; `rotate()` asked `compose.activityRule.scenario`, which is only ever
+`MainActivity`, to change orientation. The display follows the activity *on top* — a request made on a
+covered, stopped activity rotates nothing, and that activity's `resources.configuration` is never
+updated either, so there was no wait to lose: the old `waitForIdle()` returned, the assertions after it
+ran against a display that had not moved, and the test passed by standing still. The claim in its own
+KDoc — that a rotation which recreated the window would empty the form — had never been exercised.
+
+`rotate()` now targets the foreground activity instead:
+
+```kotlin
+InstrumentationRegistry.getInstrumentation().runOnMainSync {
+    activity = ActivityLifecycleMonitorRegistry.getInstance()
+        .getActivitiesInStage(Stage.RESUMED).lastOrNull()
+}
+```
+
+and waits on *that* activity's configuration. RESUMED rather than visible, and the *last* resumed one,
+because both activities are briefly resumed while the form animates in and the one that just came up is
+the one that owns the display. No dependency was added for it: `espresso-core`'s POM declares
+`androidx.test:runner` at compile scope, so the registry is already on this source set's classpath —
+checked in the Gradle cache rather than assumed. With the rotation real, the form now has to survive
+one for the assertion to pass, which is what the test has always claimed to be about.
+
+**Third repair: the leg swapped, and the same class of mistake was one window over.** Validation run
+`35418754473` on `00aa2bc` came back with API 35 **green** and API 30 red — the reverse of both
+earlier runs, on the commit that fixed them. One test, `theAddHostFormSurvivesARotation`, on
+`assertIsDisplayed("Search hosts, tags, or usernames")` — and this time the rotation *had* happened:
+the API 30 log shows the form starting at `03:46:22.740`, resuming at `.934`, and the display
+reconfiguring to `ROTATION_90` (`w866dp h387dp`) at `24.233`. The form survived it, which is what that
+leg had never actually tested.
+
+The failure is at the last step. `MainActivity` went STOPPED at `23.764` and never resumed; the form
+was paused at `25.701` — after the run's teardown had already started, at `25.681` — and the test was
+reported failed at `25.923`. So Cancel did finish the window, and the assertion ran *while it was
+finishing*: `compose.waitForIdle()` answers for Compose, and the activity behind is a different window
+whose arrival is asynchronous, so the workspace node was there but not displayed. That is the same
+lesson as the first repair, one window over — a wait that answers for the wrong thing.
+
+`awaitForeground(MainActivity::class.java)` now waits for that window to be the resumed one before the
+assertion, bounded at ten seconds and loud when it expires, and it fails naming the window that did not
+come back rather than the text that was not on screen.
+
+**Not a product change.** Nothing under `app/src/main` is touched by any of the three repairs, and each
+leg builds its own APK from the commit under test: the two legs disagreed with each other on `00aa2bc`
+exactly as they had on `2303adf` and `64014ca`, one green and one red, over the same suite. What the
+release carries is a test file that no longer measures the emulator's rotation latency, or a window's
+arrival, as if either were the app's behaviour — and a test that had been passing without ever rotating
+anything now performs the rotation its name promises. The suite that gates this release is, for those
+reasons and no other, not quite the suite that gated 1.2.1.
