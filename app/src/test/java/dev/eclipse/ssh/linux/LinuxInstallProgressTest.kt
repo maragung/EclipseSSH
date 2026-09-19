@@ -46,14 +46,21 @@ class LinuxInstallProgressTest {
         val start = percent(LinuxInstallStep.SettingUp(SetupStep.INSTALL_BASE_PACKAGES))
         val half = percent(LinuxInstallStep.SettingUp(SetupStep.INSTALL_BASE_PACKAGES, fraction = 0.5f))
         val end = percent(LinuxInstallStep.SettingUp(SetupStep.INSTALL_BASE_PACKAGES, fraction = 1f))
-        val next = percent(LinuxInstallStep.SettingUp(SetupStep.VERIFY))
 
         assertThat(start).isLessThan(half)
         assertThat(half).isLessThan(end)
-        // The last package step's 100% is the *step's*, and the step after it still has its own
-        // share to spend: a measurement that ran the whole install to 100 would make the last
-        // stretch of work look like no work at all.
-        assertThat(end).isLessThan(next)
+        // The last package step's 100% is the *step's* own, and the schedule has to leave the two
+        // steps after it room to spend: a measurement that ran the whole install to 100 would make
+        // the last stretch of work look like no work at all.
+        //
+        // Not asserted as `end < percent(SettingUp(VERIFY))`, which is what this test said first and
+        // what CI refused: a step's `fraction = 1f` and the next step's `fraction = 0f` are the same
+        // point on the ladder *by construction* — both are the boundary the schedule places between
+        // them — so that comparison is 93 against 93 however the shares are chosen. The claim worth
+        // pinning is about the far end of the schedule, where the gap is real and would close if the
+        // measured fraction were ever allowed to run the whole way.
+        assertThat(end).isLessThan(100)
+        assertThat(percent(LinuxInstallStep.SettingUp(SetupStep.VERIFY, fraction = 1f))).isGreaterThan(end)
     }
 
     @Test

@@ -82,9 +82,12 @@ internal fun openTarStream(raw: InputStream, bufferSize: Int): TarArchiveInputSt
  * The file a progress-reporting extraction reads through: a [FileInputStream] that adds up what it
  * has handed out and reports the running total after each read.
  *
- * Both read entry points are overridden because the buffered stream above calls only one of them —
- * `read(byte[], int, int)` for its fills — while a caller reading byte by byte (a probe, a test)
- * uses the other; a count that saw only one of them would read as an extraction stuck at 0%.
+ * All three read entry points are overridden, and the third is the one that is easy to miss:
+ * `FileInputStream` overrides `read(byte[])` *and* `read(byte[], int, int)`, and both delegate to
+ * its own private native fill rather than to each other — so overriding the ranged form alone
+ * leaves the single-argument form uncounted, and a caller that fills a buffer with it would read as
+ * an extraction stuck at 0% while the tarball drained. The byte-at-a-time form is overridden for
+ * the same reason: a probe reads one byte at a time.
  */
 internal class CountingFileStream(file: File, private val onBytesRead: (Long) -> Unit) : FileInputStream(file) {
     private var total = 0L
@@ -94,6 +97,8 @@ internal class CountingFileStream(file: File, private val onBytesRead: (Long) ->
         if (value >= 0) report(1)
         return value
     }
+
+    override fun read(buffer: ByteArray): Int = read(buffer, 0, buffer.size)
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         val count = super.read(buffer, offset, length)
