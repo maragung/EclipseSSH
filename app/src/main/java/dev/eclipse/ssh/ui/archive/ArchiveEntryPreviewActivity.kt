@@ -10,6 +10,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import dagger.hilt.android.AndroidEntryPoint
+import dev.eclipse.ssh.archive.ArchiveEntry
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.ui.preview.ArchivePreviewRequest
 import dev.eclipse.ssh.ui.preview.PreviewRequests

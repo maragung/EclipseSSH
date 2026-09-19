@@ -1283,7 +1283,7 @@ private fun lineTops(text: String, layout: TextLayoutResult): FloatArray {
         val offset = starts[position].coerceIn(0, known)
         tops[position] = layout.getLineTop(layout.getLineForOffset(offset))
     }
-    tops[starts.size] = layout.size.height
+    tops[starts.size] = layout.size.height.toFloat()
     return tops
 }
 
