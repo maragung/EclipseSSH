@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 32 / versionName 1.3.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 33 / versionName 1.3.1 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §48, *The groups a session is really in*; the newest of them that releases a version is §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §49, *Releasing 1.3.1*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5374,3 +5374,55 @@ that is the on-device loop's verdict, and the terminal's own output is where it 
 
 The suite is now 1,858 JVM/Robolectric test methods in 164 test files — the README's figures, which
 `scripts/check-doc-figures.sh` re-derives on every run.
+
+---
+
+## 49. Releasing 1.3.1
+
+`v1.3.1` is the version of what `main` holds after #146, *Name the Android group IDs a session is
+really in*. §48 is the diagnosis and the change; this section is the release that carries them, and
+the one thing a reader of a release section wants from it is what the pipeline found that the
+author did not.
+
+Three commits make the range the tag names — #145, the dispatch example moved to the newest
+published release; #146, the group names; and this one. What `main` held before this commit is
+`git diff --shortstat v1.3.0..af58ede`: 11 files and +629/−6, of which #146 is 10 files and +601/−5
+on its own and #145 is the remaining 2 files and +29/−2. The suite is 1,858 JVM/Robolectric test
+methods in 164 test files, which is §48's count and README's.
+
+**What CI found that the branch did not, twice, in the same file.** The change as first pushed did
+not compile, and the job that said so was `Instrumentation` — whose `Pre-grant the notification
+permission` step runs `:app:installDebug` before the suite it is named for, so a Kotlin error lands
+there and the instrumentation step itself reports `skipped`. That is the shape of the second failure
+as well:
+
+- `Os.getgroups()` is `@hide`. `Unresolved reference 'getgroups'` at
+  `LinuxUserspaceGraphProvider.kt:177`, which is not a typo and not a missing import — android-37.0's
+  `android.jar` carries `getuid`, `geteuid`, `getgid` and `getegid` and no `getgroups` at all. §48
+  records the answer (`/proc/self/status`); the lesson the release keeps is that the SDK in the repo
+  can be asked before a push, and was not.
+- The follow-up fix then named `AndroidGroupNames` without importing it, across a package boundary:
+  `Unresolved reference 'AndroidGroupNames'` at line 179. One symbol, one import, and another
+  13-minute round trip through the emulator job to learn it.
+
+Both were caught before anything ran on a device, and the third push settled all seven required
+checks — including the crash-on-open gate, which boots the built APKs and is the check that would
+catch a rootfs write that broke startup. Nothing about the group naming was ever going to fail on
+the emulator: the emulator's app is in different groups than the phone that reported this, and no
+assertion in the suite can read a device's `groups` output. That is why §48 states what the tests
+pin and what they cannot, and why the terminal's own output is the verdict this section cannot give.
+
+**What this release deliberately does not carry.** The host-card menu has said *VNC Viewer* and *RDP
+Viewer* since `a56d417`, which renamed the labels and the comments and nothing else — the VNC side's
+identifiers still read as the umbrella (`RemoteDesktopConfigDialog`, `onRemoteDesktop`,
+`requestRemoteDesktop`, beside `RdpConfigDialog` and `onRdpDesktop`). Renaming them was proposed and
+declined on 2026-09-19, so the asymmetry is a decision here rather than a debt: the names are read
+at the call site, and the call site is where "the VNC one" is worth saying, but a rename is a diff
+over a working feature and this release is a bug fix.
+
+**What publication still owes.** The tag is created only after `app/build.gradle.kts` at `main`'s
+head answers `versionName = "1.3.1"` — the check §47 recorded, because no gate in the pipeline
+compares an artifact against what its tag promised. After the release is published,
+`testing/README.md`'s dispatch example moves from `v1.3.0` to `v1.3.1`, since §47's own rule is that
+the example names the newest release that is *published*: until then, `v1.3.1` is a tag with a draft
+beside it, and the command the example documents cannot fetch a draft.
