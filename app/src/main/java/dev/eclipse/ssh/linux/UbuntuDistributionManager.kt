@@ -28,11 +28,11 @@ import kotlinx.coroutines.withContext
  * which the app fetches itself because apt cannot run before its own sources are configured, and
  * because the feed only ever *reorders* candidates, never bypasses a pin.
  *
- * The account model: the app's Android uid is registered as user `ubuntu` in `/etc/passwd` (see
- * [ProotRuntime] for why sessions never fake root). The setup commands themselves run with
- * proot's `-0` — dpkg `chown`s what it unpacks to `root:root`, and a real EPERM there would abort
- * every package install; under `-0` proot swallows the ownership change while the kernel-level
- * owner stays the app uid.
+ * The account model: the app's Android uid is also registered as user `ubuntu` in `/etc/passwd`,
+ * but every proot run — sessions included — carries `-0`, proot's fake root, so the shell the user
+ * gets is `root` (see [ProotRuntime] for why that is the only thing that makes `apt install` and
+ * `su` work at all). The `ubuntu` entry is kept because it names the uid that really owns
+ * everything on disk, and because `su - ubuntu` is the way back to an unprivileged view.
  *
  * @param distro the pinned distribution being set up; its architecture selects the apt archive
  *   and its release names the apt suites
@@ -174,9 +174,10 @@ class UbuntuDistributionManager(
     }
 
     /**
-     * The post-install and on-demand health check: can the user-facing session path (a shell
-     * without fake root) actually run commands, is the account right, is DNS up, is the package
-     * database consistent. The host-list card is shown only while this passes.
+     * The post-install and on-demand health check: can the user-facing session path (the very argv
+     * a terminal tab gets) actually run commands, is the session root — the one identity under
+     * which `dpkg` will unpack and `su`/`sudo` can act — is DNS up, is the package database
+     * consistent. The host-list card is shown only while this passes.
      */
     suspend fun healthProbe(): HealthReport {
         val shell = runSessionCommand("echo $PROBE_MARKER", PROBE_TIMEOUT_MS)
@@ -187,7 +188,7 @@ class UbuntuDistributionManager(
         return HealthReport(
             shellWorks = shell != null && shell.exitCode == 0 && shell.outputText().contains(PROBE_MARKER),
             account = account,
-            accountCorrect = account == ACCOUNT_NAME,
+            accountCorrect = account == ROOT_ACCOUNT,
             networkUp = network?.exitCode == 0,
             aptUsable = apt?.exitCode == 0,
         )
@@ -198,6 +199,11 @@ class UbuntuDistributionManager(
     /**
      * Registers the app uid as the `ubuntu` user by editing `/etc/passwd`, `/etc/group` and
      * `/etc/shadow` directly — no `useradd`, which would want to be root for real.
+     *
+     * This is not the account a session runs as (that is proot's fake root, and `/etc/passwd`'s own
+     * `root` entry is where `whoami` reads it from); it is the name of the uid that really owns
+     * every file in the rootfs, and the account `su - ubuntu` drops to. Nothing is created for the
+     * root entry itself: the rootfs ships it.
      *
      * The shadow entry's password field is `*`: locked. The account is entered by process identity
      * (the app's uid *is* the account), never by password, so there is no password to attack.
@@ -292,7 +298,7 @@ class UbuntuDistributionManager(
      */
     private suspend fun verifyResolution() {
         val startedAt = System.currentTimeMillis()
-        val result = runRootCommand("getent hosts $networkHost", RESOLUTION_TIMEOUT_MS)
+        val result = runSetupCommand("getent hosts $networkHost", RESOLUTION_TIMEOUT_MS)
         val failure = UserspaceFailure.fromAptRun(
             networkHost,
             result?.exitCode,
@@ -388,7 +394,7 @@ class UbuntuDistributionManager(
             val attempt = rungs.removeFirst()
             writeSourcesList(attempt.baseUri)
             val startedAt = System.currentTimeMillis()
-            val result = runRootCommand(aptUpdateCommand(attempt), aptUpdateAttemptTimeoutMs, lineTracker(onProgress))
+            val result = runSetupCommand(aptUpdateCommand(attempt), aptUpdateAttemptTimeoutMs, lineTracker(onProgress))
             val durationMs = System.currentTimeMillis() - startedAt
             if (result != null && result.exitCode == 0) {
                 recordLastGoodMirror(attempt.baseUri)
@@ -402,7 +408,7 @@ class UbuntuDistributionManager(
                 // The scoped rung only refreshed the archive under test; one unscoped update
                 // confirms the whole sources tree. Best-effort: the lists the install needs are
                 // already on disk, and a third-party entry failing here must not undo a won rung.
-                val unscoped = runRootCommand(
+                val unscoped = runSetupCommand(
                     aptUpdateCommand(attempt, scoped = false),
                     aptUpdateAttemptTimeoutMs,
                     lineTracker(onProgress),
@@ -507,7 +513,7 @@ class UbuntuDistributionManager(
      */
     private suspend fun repairPackageState(warnings: MutableList<String>, onProgress: (String) -> Unit) {
         val startedAt = System.currentTimeMillis()
-        val result = runRootCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        val result = runSetupCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         val ok = result != null && result.exitCode == 0
         diagnostics.record(
             UserspaceDiagnosticCategory.APT,
@@ -573,7 +579,7 @@ class UbuntuDistributionManager(
      */
     private suspend fun verifyRuntime() {
         val startedAt = System.currentTimeMillis()
-        val result = runRootCommand("echo $RUNTIME_SMOKE_MARKER", RUNTIME_SMOKE_TIMEOUT_MS)
+        val result = runSetupCommand("echo $RUNTIME_SMOKE_MARKER", RUNTIME_SMOKE_TIMEOUT_MS)
         val ok = result != null && result.exitCode == 0 && result.outputText().contains(RUNTIME_SMOKE_MARKER)
         diagnostics.record(
             UserspaceDiagnosticCategory.PROOT,
@@ -632,7 +638,7 @@ class UbuntuDistributionManager(
                     "(the base system is already on disk), but only about ${free / MIB} MB is free. " +
                     "Free up storage and try again.",
             ).let { e ->
-                // The same "Ubuntu needs" → DiskFull mapping runRootCommand applies to the
+                // The same "Ubuntu needs" → DiskFull mapping runSetupCommand applies to the
                 // runtime's worded refusals, so both disk gates surface the same verdict.
                 UserspaceFailure.fromMessage(e.message ?: "", e) ?: e
             }
@@ -694,9 +700,9 @@ class UbuntuDistributionManager(
     private suspend fun installBasePackages(onProgress: (String) -> Unit, warnings: MutableList<String>) {
         requireOnline("installing the base packages")
         val command = basePackagesCommand()
-        val first = runRootCommand(command, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        val first = runSetupCommand(command, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         if (first != null && first.exitCode == 0) return
-        val retry = runRootCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        val retry = runSetupCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         if (retry != null && retry.exitCode == 0) {
             warnings += "base packages needed a --fix-missing retry to install"
             return
@@ -730,7 +736,7 @@ class UbuntuDistributionManager(
         // own attempt above was spent on the interrupted database — because one command that
         // installs the list is a better rung than 33 that each install one package.
         if (clearInterruptedDpkgState(onProgress)) {
-            val afterRepair = runRootCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+            val afterRepair = runSetupCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
             if (afterRepair != null && afterRepair.exitCode == 0) {
                 warnings += "the base packages needed a dpkg repair pass to install"
                 return
@@ -741,7 +747,7 @@ class UbuntuDistributionManager(
         // the ring rather than only in the warning sentence the UI shows one line of.
         val refusals = mutableListOf<Pair<String, ProotCommandResult?>>()
         for (pkg in BASE_PACKAGES) {
-            val result = runRootCommand("apt-get install -y --no-install-recommends $pkg", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+            val result = runSetupCommand("apt-get install -y --no-install-recommends $pkg", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
             if (result != null && result.exitCode == 0) {
                 installed++
             } else {
@@ -810,7 +816,7 @@ class UbuntuDistributionManager(
     private suspend fun clearInterruptedDpkgState(onProgress: (String) -> Unit): Boolean {
         val before = dpkgDatabaseSummary()
         val startedAt = System.currentTimeMillis()
-        val result = runRootCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        val result = runSetupCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         val ok = result != null && result.exitCode == 0
         diagnostics.record(
             UserspaceDiagnosticCategory.APT,
@@ -828,10 +834,10 @@ class UbuntuDistributionManager(
         "apt-get install -y --no-install-recommends ${BASE_PACKAGES.joinToString(" ")}"
 
     /**
-     * Gives `ubuntu` passwordless sudo. Every file in the rootfs is already owned by the app uid,
-     * so this changes little in practice — it exists because the spec asks for sudo "where
-     * possible", and because scripts written for a real Ubuntu box expect it. Best-effort: sudo
-     * refusing the file is a warning, not a failed install.
+     * Gives `ubuntu` passwordless sudo. Nothing needs it to become root — a session already is —
+     * but scripts written for a real Ubuntu box call `sudo` and would otherwise stop at a password
+     * prompt no one can answer, so the file is worth having. Best-effort: sudo refusing the file is
+     * a warning, not a failed install.
      */
     private fun configureSudo(warnings: MutableList<String>) {
         try {
@@ -862,7 +868,7 @@ class UbuntuDistributionManager(
      *    read. A locale-dependent "E:" line would classify as nothing; this pin makes the text a
      *    contract.
      */
-    private fun rootEnv(): List<String> =
+    private fun setupEnv(): List<String> =
         runtime.baseEnv()
             .map { entry ->
                 if (entry.startsWith("PATH=")) {
@@ -872,12 +878,20 @@ class UbuntuDistributionManager(
                 }
             } + listOf("LC_ALL=C", "DEBIAN_FRONTEND=noninteractive")
 
-    private suspend fun runRootCommand(
+    /**
+     * Runs one scripted pipeline command — a setup or repair step — through the runtime's argv
+     * (which carries `-0` like every other proot run) with [setupEnv]: apt's knobs, a pinned
+     * locale, and `$HOME/.local/bin` on PATH.
+     *
+     * The session-shaped counterpart is [runSessionCommand], which exists so the health probe
+     * answers for the path the user meets rather than the one this pipeline uses.
+     */
+    private suspend fun runSetupCommand(
         command: String,
         timeoutMs: Long,
         onOutput: ((ByteArray) -> Unit)? = null,
     ): ProotCommandResult? = try {
-        runtime.runCommand(runtime.commandArgv(command, asRoot = true), env = rootEnv(), timeoutMs = timeoutMs, onOutput = onOutput)
+        runtime.runCommand(runtime.commandArgv(command), env = setupEnv(), timeoutMs = timeoutMs, onOutput = onOutput)
     } catch (e: IOException) {
         // Cross-fork contract: the runtime layer refuses to spawn with its own worded message
         // ("runtime storage not ready: …"); the taxonomy maps it so the user reads one verdict.
@@ -885,8 +899,11 @@ class UbuntuDistributionManager(
     }
 
     /**
-     * Runs a command through the *session* argv — no fake root — because [healthProbe] must prove
-     * the user-facing path works, not the setup path.
+     * Runs a command through the *session* argv and environment — the exact pair a terminal tab is
+     * spawned with — because [healthProbe] must prove the path the user meets works, not the one
+     * the setup pipeline uses. Since sessions are fake root too (see [ProotRuntime]), the only
+     * difference left is the environment: this one is the clean [ProotRuntime.baseEnv], not the
+     * apt-tuned one [setupEnv] builds.
      */
     private suspend fun runSessionCommand(command: String, timeoutMs: Long): ProotCommandResult? =
         runtime.runCommand(runtime.sessionArgv(command), env = runtime.baseEnv(), timeoutMs = timeoutMs)
@@ -1091,6 +1108,12 @@ class UbuntuDistributionManager(
 
     companion object {
         private const val ACCOUNT_NAME = "ubuntu"
+        /**
+         * What `whoami` has to answer inside a session: the identity proot's `-0` gives it, and the
+         * one `dpkg` insists on before it will unpack anything. Anything else here means the
+         * session is not fake root, and `apt install` / `su` are broken for the user.
+         */
+        private const val ROOT_ACCOUNT = "root"
         private const val HOME_DIR = "/home/ubuntu"
         private const val PASSWD_PREFIX = "ubuntu:"
 
@@ -1493,7 +1516,7 @@ data class HealthReport(
     val shellWorks: Boolean,
     /** What `whoami` printed, for the settings screen's detail line. */
     val account: String?,
-    /** `whoami` printed `ubuntu` — the never-root-by-default contract holds. */
+    /** `whoami` printed `root` — the session is fake root, so dpkg and su will work. */
     val accountCorrect: Boolean,
     /** A hostname in the device's apt archive resolved. */
     val networkUp: Boolean,
@@ -1510,7 +1533,7 @@ data class HealthReport(
     fun describe(): String =
         buildList {
             if (!shellWorks) add("the shell does not run")
-            if (!accountCorrect) add("the account is '${account ?: "unknown"}' instead of 'ubuntu'")
+            if (!accountCorrect) add("the session runs as '${account ?: "unknown"}' instead of 'root'")
             if (!networkUp) add("DNS does not resolve")
             if (!aptUsable) add("the package database is inconsistent")
         }.joinToString(", ").ifEmpty { "healthy" }

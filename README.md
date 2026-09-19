@@ -36,10 +36,12 @@ and either opens in its own full-screen window riding the session's tunnel — s
 RFB or RDP is driven from the app that already holds its credentials.
 
 **On-device Linux.** A real Ubuntu userland — bash, apt, git, curl, wget, sudo and an SSH client
-— installed into the app's own sandbox and run under proot: no VM, no root, no ISO, and a local
-shell that is the same terminal channel an SSH one is. Anything past that base (Python, Node.js,
-an editor, a compiler) is one `apt-get install` away inside the terminal. Architecture and
-operating manual: [`docs/linux-userspace.md`](docs/linux-userspace.md).
+— installed into the app's own sandbox and run under proot: no VM, no rooted device, no ISO, and a
+local shell that is the same terminal channel an SSH one is. That shell is proot's fake root, which
+is what lets `apt install` unpack packages and `su` change identity without the device ever being
+rooted. Anything past the base (Python, Node.js, an editor, a compiler) is one `apt-get install`
+away inside the terminal. Architecture and operating manual:
+[`docs/linux-userspace.md`](docs/linux-userspace.md).
 
 **Files.** A text editor for the files the app browses — opened from the explorer, a preview window or
 the New File dialog — in its own opaque window rather than a panel over the workspace. An archive
@@ -134,7 +136,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,825 JVM/Robolectric test methods in 161 test files and contacts nothing off the
+The suite is 1,828 JVM/Robolectric test methods in 162 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot
@@ -152,7 +154,7 @@ file's methods.
 `encrypted_ed25519`) used only to exercise key parsing against that in-process server. They are test
 data, they authorise nothing anywhere, and they must never be reused as real credentials.
 
-`app/src/androidTest/` holds the instrumentation tests — 47 test methods in 7 files — which
+`app/src/androidTest/` holds the instrumentation tests — 49 test methods in 7 files — which
 need a device or emulator.
 
 ## Continuous integration

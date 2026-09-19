@@ -215,11 +215,73 @@ class UbuntuE2eVerificationTest {
         }
     }
 
+    /**
+     * A session is proot's fake root, and it says so.
+     *
+     * This is the identity `dpkg` demands before it will unpack anything, and the only one from
+     * which `su`/`sudo` have anywhere to go — proot's fake ids are all-or-nothing per process
+     * tree. It used to be the opposite: sessions ran as the app's own uid (registered as `ubuntu`)
+     * on the theory that a terminal account should never be root, and the result on a device was
+     * `apt install` refusing with "requested operation requires superuser privilege" and `su`
+     * dying with "System error". Both are one fact, and this asserts the fact.
+     *
+     * `id -u` is asked as well as `whoami`: the name comes from `/etc/passwd`, the number from the
+     * fake identity itself, and a rootfs whose passwd was edited by hand could disagree.
+     */
     @Test
-    fun sessionRunsAsTheUbuntuAccount() {
+    fun sessionRunsAsRoot() {
         assumeWritePhase()
         val whoami = sessionSucceeds("whoami").trim()
-        check(whoami == "ubuntu") { "ACCOUNT stage: whoami is '$whoami', expected 'ubuntu' (never root)" }
+        check(whoami == "root") {
+            "ACCOUNT stage: whoami is '$whoami', expected 'root' - without uid 0 the shell cannot " +
+                "install packages or su to anything"
+        }
+        val uid = sessionSucceeds("id -u").trim()
+        check(uid == "0") { "ACCOUNT stage: id -u is '$uid', expected 0" }
+    }
+
+    /**
+     * The user's own report, run end to end: install a package the userspace does not ship.
+     *
+     * Anything the base install already put on disk would prove nothing — the setup pipeline's
+     * `apt-get install` has always worked, because it was the only thing carrying `-0`. `zip` is
+     * deliberately a package the minimal base does not include, so this exercises the whole path a
+     * user's `apt install zip` takes: the lists, the dependency resolver, and dpkg unpacking as
+     * uid 0 and being told its `chown`s succeeded.
+     */
+    @Test
+    fun aNewPackageInstallsThroughApt() {
+        assumeWritePhase()
+        sessionSucceeds("apt-get install -y zip", APT_TIMEOUT_MS)
+        // Ran, not merely registered: dpkg only unpacks what its database records, and the
+        // binary is what the user asked for in the first place.
+        val version = sessionSucceeds("zip -v", APT_TIMEOUT_MS)
+        check("Zip" in version && "Info-ZIP" in version) {
+            "APT INSTALL stage: zip installed but does not run: ${version.take(500)}"
+        }
+    }
+
+    /**
+     * `su` changes identity instead of failing with a system error.
+     *
+     * The password prompt the user met is gone for a reason worth stating: `su`'s PAM stack lets a
+     * caller whose effective uid is already 0 through without one (`pam_rootok`), and proot
+     * answers `getuid`/`geteuid` from the fake identity, so no password is ever asked for or
+     * needed. What is asserted is the other side of the same syscall path — that `su`'s
+     * `setgid`/`setuid`/`setgroups` calls (trapped by the zygote's seccomp filter and answered by
+     * the fork's SIGSYS handler) leave the child believing it is root.
+     */
+    @Test
+    fun suReachesTheTargetAccount() {
+        assumeWritePhase()
+        val asRoot = sessionSucceeds("su root -c 'id -u'").trim()
+        check(asRoot == "0") { "SU stage: 'su root -c id -u' answered '$asRoot', expected 0" }
+        // And the way back down to the account that owns every file, which is the only other
+        // identity this rootfs has: the app's own uid, registered as `ubuntu`.
+        val asUbuntu = sessionSucceeds("su ubuntu -c 'whoami'").trim()
+        check(asUbuntu == "ubuntu") {
+            "SU stage: 'su ubuntu -c whoami' answered '$asUbuntu', expected 'ubuntu'"
+        }
     }
 
     @Test
