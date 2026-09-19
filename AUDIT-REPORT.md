@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 33 / versionName 1.3.1 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 34 / versionName 1.4.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §53, *The last two sheets, whose subject is half live*; the newest of them that releases a version is §49, *Releasing 1.3.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §54, *Releasing 1.4.0*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5800,3 +5800,72 @@ about which surface composes, what it reads, and what the workspace does with th
 The suite is now 1,896 JVM/Robolectric test methods in 169 test files — the README's figures, which
 `scripts/check-doc-figures.sh` re-derives on every run. §50's closing figures are left as that pass
 wrote them.
+
+---
+
+## 54. Releasing 1.4.0
+
+`v1.4.0` is the version of what `main` holds after the seven window promotions and the twelve-package
+userland are all in it — §50, §51, §52 and §53 are the four changes it carries, and this section is
+the release that publishes them. It is a minor bump rather than a patch because the user-facing
+surface changed shape: seven `ModalBottomSheet` surfaces are now Activities of their own, so the back
+arrow, the recents thumbnail and the window the system draws are all different from 1.3.1's.
+
+Five changes make the range the tag names — #149, the transfer and session why-window promotion,
+which landed as `c31d21b` and is what §50 wrote up; #148, which takes the userspace's base packages
+from seven to twelve; #151, the snippets, explorer-and-archive windows; #150, the port-forwarding
+manager and the host details window; and this one. What `main` held before this commit is `git diff
+--shortstat v1.3.1..4129d857381bf697d4424168b36c50fa4fe15752`: 32 files and +5717/−1158. The suite
+is 1,918 JVM/Robolectric test methods in 172 test files, which is README's count — and it is neither
+§52's 1,900 in 170 nor §53's 1,896 in 169 because each of those is the count of the tree its own
+pass produced: #150's branch took #151's three suites in, and the two branches' figures together are
+what this one counts.
+
+**What CI found that the authors did not, three times, in three different suites.** All three were
+compile-and-run failures that no local check could have reached, and all three are the same kind of
+thing: a test that reads correct and is wrong about the framework underneath it.
+
+- The three window suites of #151 never compiled. `node.config.getOrNull(SemanticsProperties.Text)`
+  is a call to `androidx.compose.ui.semantics.getOrNull`, a *top-level extension* rather than a member
+  of `SemanticsConfiguration`, and neither file imported it — so the compiler reported
+  `Unresolved reference 'getOrNull' on receiver of type 'SemanticsConfiguration'` at two lines and
+  then three cascading `Unresolved reference 'text'` errors that were inference fallout rather than
+  three further defects. The import had been in this tree before, in commit `5451751`, and the
+  promotion that produced these suites is the commit that dropped it along with the last caller — so
+  the fix was one line per file and the lesson is that a symbol which used to resolve is not evidence
+  that it still does.
+- #150's four were in the two suites that pass added, and three of the four were the *test*'s fault
+  rather than the window's. Two `HostDetailsActivityRobolectricTest` cases died on
+  `java.security.KeyStoreException: AndroidKeyStore not found`, because the vault rows reach the real
+  `HostCredentialStore` and its first write asks `SecureVault` for a hardware-backed key that
+  Robolectric does not implement at all; the suite now installs `StandInAndroidKeyStore`, which is
+  what the connection matrix and the forwarding suite already do. A third waited on a single
+  `Delete` row on a host that has two saved rules — `Delete` is one row per rule, so the wait was
+  ambiguous by construction. The fourth asserted that the capped "Add rule" row had no click action;
+  a disabled control is recorded as `SemanticsProperties.Disabled`, not as the absence of `OnClick`,
+  so the assertion was reading a property Compose does not promise and the row it found was the
+  settled, disabled row it was looking for.
+- The snippets window's delete test looked its button up by a content description that every row
+  carries. The test seeds two snippets on purpose, so that "the row I removed" and "the row I did not"
+  can be told apart — and with two rows drawn, that description matched two nodes, which `onNode`
+  refuses rather than resolves: `Failed to inject touch input ... found '2' nodes that satisfy
+  (ContentDescription = 'Delete snippet')`. The fix names the row instead of the description,
+  `hasAnyAncestor(hasText(label))` beside the content description, which is the same merge the
+  neighbouring test already relies on when it clicks a row by its label. This one surfaced on #150's
+  run rather than #151's, because #151's unit job had not yet reached the tests at all — the compile
+  error above was still failing it. That is the shape all three share: the window was right, and the
+  test's picture of the framework under it was wrong.
+
+**What this release deliberately does not carry.** The VNC side's identifiers still read as the
+umbrella — `RemoteDesktopConfigDialog`, `onRemoteDesktop`, `requestRemoteDesktop` beside
+`RdpConfigDialog` and `onRdpDesktop`. §49 recorded the rename as proposed and declined on
+2026-09-19, and it is declined here for the same reason: a rename is a diff over a working feature,
+and the names are read at the call site.
+
+**What publication still owes.** The tag is created only after `app/build.gradle.kts` at `main`'s head
+answers `versionName = "1.4.0"` and `AUDIT-REPORT.md`'s third line agrees with it — the check §47
+recorded, because no gate in the pipeline compares an artifact against what its tag promised. The
+release is published as a draft first and its assets verified before it is made public. Unlike §49,
+`testing/README.md`'s dispatch example moves to `v1.4.0` in the same pull request as the bump rather
+than in a follow-up: §47's rule is that the example names the newest release that is *published*, and
+folding the two together is one CI cycle instead of two for a line that would otherwise move twice.
