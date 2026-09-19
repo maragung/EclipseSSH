@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Process
 import androidx.annotation.VisibleForTesting
 import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.eclipse.ssh.linux.AndroidGroupNames
 import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxDistroCatalog
 import dev.eclipse.ssh.linux.LinuxPtySpawner

@@ -113,7 +113,7 @@ class AndroidGroupNamesTest {
     fun `the groups line of a status is what the session is in`() {
         // The line is tab-separated from its label and space-separated between IDs, which is the
         // shape the kernel writes and the shape this has to absorb.
-        assertThat(AndroidGroupNames.groupsIn(status)).asList()
+        assertThat(AndroidGroupNames.groupsIn(status).toList())
             .containsExactly(3003, 9997, 20504, 50504).inOrder()
     }
 
@@ -121,19 +121,19 @@ class AndroidGroupNamesTest {
     fun `a status with no groups line is no groups`() {
         // Total, not exception-throwing: an empty answer names nothing, which is what the userspace
         // did before any of this existed — never a reason to fail an install over a missing line.
-        assertThat(AndroidGroupNames.groupsIn("Name:\tdev.eclipse.ssh\nUid:\t10504\n")).isEmpty()
+        assertThat(AndroidGroupNames.groupsIn("Name:\tdev.eclipse.ssh\nUid:\t10504\n").toList()).isEmpty()
     }
 
     @Test
     fun `a groups line that is not all numbers answers with the numbers it has`() {
         // Nothing on this line is worth a crash. The IDs that parse are the IDs that get named.
-        assertThat(AndroidGroupNames.groupsIn("Groups:\t3003  bogus  9997\n")).asList()
+        assertThat(AndroidGroupNames.groupsIn("Groups:\t3003  bogus  9997\n").toList())
             .containsExactly(3003, 9997).inOrder()
     }
 
     @Test
     fun `a status that cannot be read is no groups`() {
-        assertThat(AndroidGroupNames.selfGroups(File("/proc/self/there-is-no-such-file")))
+        assertThat(AndroidGroupNames.selfGroups(File("/proc/self/there-is-no-such-file")).toList())
             .isEmpty()
     }
 }
