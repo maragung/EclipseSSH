@@ -83,6 +83,28 @@ windows, and what they show travels through `PreviewRequests` on the same one-sh
 because a live `FileSystemProvider` — and a closure over an open archive — cannot be parcelled into
 an intent.
 
+**Two surfaces that act, not just show, left the bottom of the screen** — the first of the remaining
+sheets, promoted one at a time:
+
+- **The transfers window** (`ui/transfers/TransferActionsActivity`). A long-press on a transfer card
+  used to raise a sheet over that same card, which is backwards when the card is a live progress row.
+  It is opened with the transfer's *id* rather than a snapshot, and reads the item from
+  `TransferRepository` itself, so a download keeps counting up in its header while its actions are on
+  screen.
+- **The session "why?" window** (`ui/sessions/SessionWhyActivity`). The reason a session is in the
+  state it is, and the diagnostic trace still being written for it. The tab travels as a token — a
+  `SessionTab` is assembled by the workspace's own view model and cannot be parcelled — but the trace
+  deliberately does not: the window collects the diagnostics ring itself, so a reconnect ladder that
+  climbs a rung while somebody is reading it appears as it happens.
+
+Both hand back what the user chose through `ActionRequests` and act on nothing themselves, because
+every one of those actions — pausing a transfer, resolving its local file, opening the editor — is the
+workspace's own code, and a second implementation in a second window is how the two drift.
+`MainActivity.onResume` is what takes the answer, the same way it takes a confirmed forward, and
+`takeAnswer` empties the slot as it reads it: a rotation, a re-delivered intent or a second resume
+cannot run the same action twice. The rest of the sheets follow the same route, one surface per
+change.
+
 The shared shell is `ui/settings/SettingsScaffold.kt` and the rows every screen draws are
 `ui/settings/SettingsComponents.kt`. The six screens that are just a list of choices — keep-alive,
 clipboard auto-clear, reconnect delay, auto-lock, terminal width and terminal height — are six
@@ -136,7 +158,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,858 JVM/Robolectric test methods in 164 test files and contacts nothing off the
+The suite is 1,878 JVM/Robolectric test methods in 167 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot

@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 32 / versionName 1.3.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 33 / versionName 1.3.1 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §48, *The groups a session is really in*; the newest of them that releases a version is §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §50, *Two sheets become windows*; the newest of them that releases a version is §49, *Releasing 1.3.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5373,4 +5373,174 @@ userspace starting, but is recorded). What no JVM test can prove is what a devic
 that is the on-device loop's verdict, and the terminal's own output is where it is read.
 
 The suite is now 1,858 JVM/Robolectric test methods in 164 test files — the README's figures, which
+`scripts/check-doc-figures.sh` re-derives on every run.
+
+---
+
+## 49. Releasing 1.3.1
+
+`v1.3.1` is the version of what `main` holds after #146, *Name the Android group IDs a session is
+really in*. §48 is the diagnosis and the change; this section is the release that carries them, and
+the one thing a reader of a release section wants from it is what the pipeline found that the
+author did not.
+
+Three commits make the range the tag names — #145, the dispatch example moved to the newest
+published release; #146, the group names; and this one. What `main` held before this commit is
+`git diff --shortstat v1.3.0..af58ede`: 11 files and +629/−6, of which #146 is 10 files and +601/−5
+on its own and #145 is the remaining 2 files and +29/−2. The suite is 1,858 JVM/Robolectric test
+methods in 164 test files, which is §48's count and README's.
+
+**What CI found that the branch did not, twice, in the same file.** The change as first pushed did
+not compile, and the job that said so was `Instrumentation` — whose `Pre-grant the notification
+permission` step runs `:app:installDebug` before the suite it is named for, so a Kotlin error lands
+there and the instrumentation step itself reports `skipped`. That is the shape of the second failure
+as well:
+
+- `Os.getgroups()` is `@hide`. `Unresolved reference 'getgroups'` at
+  `LinuxUserspaceGraphProvider.kt:177`, which is not a typo and not a missing import — android-37.0's
+  `android.jar` carries `getuid`, `geteuid`, `getgid` and `getegid` and no `getgroups` at all. §48
+  records the answer (`/proc/self/status`); the lesson the release keeps is that the SDK in the repo
+  can be asked before a push, and was not.
+- The follow-up fix then named `AndroidGroupNames` without importing it, across a package boundary:
+  `Unresolved reference 'AndroidGroupNames'` at line 179. One symbol, one import, and another
+  13-minute round trip through the emulator job to learn it.
+
+Both were caught before anything ran on a device, and the third push settled all seven required
+checks — including the crash-on-open gate, which boots the built APKs and is the check that would
+catch a rootfs write that broke startup. Nothing about the group naming was ever going to fail on
+the emulator: the emulator's app is in different groups than the phone that reported this, and no
+assertion in the suite can read a device's `groups` output. That is why §48 states what the tests
+pin and what they cannot, and why the terminal's own output is the verdict this section cannot give.
+
+**What this release deliberately does not carry.** The host-card menu has said *VNC Viewer* and *RDP
+Viewer* since `a56d417`, which renamed the labels and the comments and nothing else — the VNC side's
+identifiers still read as the umbrella (`RemoteDesktopConfigDialog`, `onRemoteDesktop`,
+`requestRemoteDesktop`, beside `RdpConfigDialog` and `onRdpDesktop`). Renaming them was proposed and
+declined on 2026-09-19, so the asymmetry is a decision here rather than a debt: the names are read
+at the call site, and the call site is where "the VNC one" is worth saying, but a rename is a diff
+over a working feature and this release is a bug fix.
+
+**What publication still owes.** The tag is created only after `app/build.gradle.kts` at `main`'s
+head answers `versionName = "1.3.1"` — the check §47 recorded, because no gate in the pipeline
+compares an artifact against what its tag promised. After the release is published,
+`testing/README.md`'s dispatch example moves from `v1.3.0` to `v1.3.1`, since §47's own rule is that
+the example names the newest release that is *published*: until then, `v1.3.1` is a tag with a draft
+beside it, and the command the example documents cannot fetch a draft.
+
+---
+
+## 50. Two sheets become windows
+
+**What this is.** Seven `ModalBottomSheet` surfaces were still in the app after the Settings, editor
+and preview promotions. This pass promotes the first two of the ones that **act** rather than merely
+show: the Transfers tab's per-item action sheet, and the session "why?" sheet that a `Why?` button
+raises from the tab strip or a session row. Each is now an Activity of its own —
+`ui/transfers/TransferActionsActivity` and `ui/sessions/SessionWhyActivity` — opened on top of the
+workspace and closed with the back arrow. The remaining five are the same change repeated and are not
+in this pass.
+
+**Why these two.** They are the two whose subject is *live*. A transfer's card is a progress row that
+keeps moving, and the why-sheet exists for a reconnect ladder that is still climbing; a sheet draws
+both inside a dialog window, over the very card it describes, through a slot at the bottom of the
+screen. The sheet also capped what the trace could show twice over — 45% of a panel that was itself
+capped at 85% of the display — which is a strange shape for the one surface a user opens precisely
+because they want to read something.
+
+**The handoff, and why it is two shapes.** There is no `@Parcelize` model in this app — not one:
+`grep -rn "@Parcelize\|: Parcelable\|: Serializable" app/src/main/java` returns nothing — so a
+window cannot be handed a transfer, a tab or a file entry in its intent. Two idioms already covered
+that (`PreviewRequests`, `EditorRequests`) and one covered answers (`ForwardRequests`); this pass
+generalises them into `ui/actions/ActionRequests.kt`, which carries both directions and states the
+rule for choosing between them: **pass an id when a singleton already holds the subject, a token
+when it does not.**
+
+- A transfer **is** held by a singleton — `TransferRepository` is Room-backed with a `Flow` — so
+  `TransferActionsActivity` takes a plain id and reads the item itself. That is not a workaround; it
+  is strictly better than the sheet was, and the difference is asserted: a download keeps counting up
+  in the window's header while its actions are on screen
+  (`TransferActionsActivityRobolectricTest.theHeaderFollowsTheTransferWhileTheWindowIsOpen`).
+- A `SessionTab` is **not**. It is assembled by `MainViewModel`, which is `@HiltViewModel` and
+  therefore activity-scoped — a second window resolving one would get a *different* instance with
+  different tabs — so the tab is snapshotted into `ActionSubject.SessionWhy` and read back by token.
+  The **trace** deliberately does not travel with it: `SessionWhyActivity` collects
+  `SessionDiagnostics` itself, because a frozen trace of a ladder mid-climb would be a window that
+  lies about the one thing it exists to show.
+
+**What the windows do not do is act.** Every row of the transfers window, including the ones that
+look self-contained, files an `ActionAnswer` and closes. View, Edit and Open are not self-contained:
+each resolves a `FileSystemProvider` from the transfer and opens a window with it, Open shells out to
+the platform's chooser, and Copy details writes to the vault-backed clipboard — all of them helpers
+that live in the workspace. Re-implementing them in a second window would be two implementations of
+the same act, which is how the two drift. `MainActivity.onResume` takes the answer — the same moment,
+and the same one-shot rule, as a confirmed port forward — hands it to the composition, and an
+exhaustive `when` over `ActionAnswer` acts on it. `takeAnswer` empties the slot as it reads it, so a
+rotation, a re-delivered intent or a second resume cannot run the same action twice; the test that
+says so from outside resumes the workspace twice and counts the editors that opened
+(`TransfersActionsRobolectricTest.theAnswerIsActedOnOnceEvenIfTheWorkspaceResumesTwice`).
+
+**What moved besides the two windows.** `statusColor` left `MainActivity` for `ui/SessionStatusColor.kt`,
+because the why-window is a third caller of the same five-branch `when` and a private copy in each is
+how one of them quietly starts disagreeing. The four-times-duplicated comment that described the
+Transfers sheet's close-then-act rule went with the sheet it described.
+
+**What the tests pin, and what they cannot.** Twenty new JVM methods in three files plus one existing
+suite: five in `ui/actions/ActionRequestsTest` (a token resolves to its own subject; a subject cannot
+be taken twice; an unknown or missing token resolves to nothing; an answer is delivered once and then
+gone; the later answer wins), seven in `TransferActionsActivityRobolectricTest` (the row matrix for a
+running, a paused and a completed transfer; the header following the item; a row filing its answer and
+closing; the window closing when its transfer leaves the list; an intent with no id opening nothing),
+seven in `SessionWhyActivityRobolectricTest` (the window opening on its own session; the heading
+worded from three states; no recorded reason said out loud; an event recorded *while the window is
+open* reaching it; a spent token closing the window; no token opening nothing; the copy row offered),
+and one in `TerminalScreenRobolectricTest` proving the strip's `Why?` starts the window and that the
+token its intent carries resolves back to the session that was on screen. `TransfersActionsRobolectricTest`
+was rewritten rather than extended: its row matrix moved to the window suite, and it now drives the two
+moments only the workspace can be seen at — the long-press that opens the window, and the answer
+acted on after a resume.
+
+**What CI found that the branch did not, on the first run.** Twenty-six Kotlin errors in the three new
+suites, none of them about the app: `ActivityScenario.launch(Intent)` returns `ActivityScenario<A>` with
+`A` inferred from the *target* type, so the three calls that fed it straight into `.use { }` — a spent
+token, no token, no id — had nothing to infer from and were rejected at the call site. The two suites
+that declare a return type (`launchWindow`) were accepted, which is why the same call compiled in one
+place and not another. The idiom the rest of the tree already uses is the fix: name the type argument,
+`ActivityScenario.launch<SessionWhyActivity>(intent)`. The other two are the same shape in a different
+place — `generateSequence { shadow.nextStartedActivity }` resolved its type parameter against a
+`DeepRecursiveFunction` overload (the lambda's `Intent?` has no other candidate to pin it), and one
+`performClick` was simply not imported. All three are test-side, and all three are the kind of thing
+only a compiler says.
+
+**What the second run found, and what each failure actually was.** Four failures out of 1,878 methods,
+and not one of them in the app. Three are worth naming because the *message* was wrong about the cause
+in each: a suite that timed out waiting for something that had already happened reads exactly like a
+suite waiting for something that never did.
+
+- `theHeaderFollowsTheTransferWhileTheWindowIsOpen` failed on its *second* assertion, not its first.
+  The header did catch up — the window's `Flow` re-emission works under Robolectric, which the earlier
+  reasoning had been doubting — and the row that never appeared was "View file", because a completed
+  download only offers its file when `localUri` is not null and the test's completion write kept the
+  fixture's `localUri = null`. The fixture's running transfer is deliberately file-less; finishing it
+  is what puts a file behind it, and the test now writes one as a real completion would.
+- `aRowFilesItsAnswerAndClosesTheWindow` failed on a `pumpUntil` whose condition *consumed* what it
+  tested: `ActionRequests.takeAnswer()` returns the answer once and null thereafter, and `pumpUntil`
+  asks twice — once to leave the loop, once to decide whether it timed out. The answer had arrived;
+  the helper threw it away and reported the timeout it had been handed. The condition caches what it
+  takes now, and the shape is worth remembering for any read-once slot.
+- The two waits for `scenario.state == DESTROYED` were the failure `ForwardFormActivityRobolectricTest`
+  already documents: the state the scenario reports falls one looper-hop after `finish()`, and waiting
+  for that is a test of Robolectric's looper rather than of the window. Both now assert
+  `activity.isFinishing`, which is the same fact at the moment it becomes true, and treat DESTROYED as
+  the same fact already reached.
+- `theAnswerIsActedOnOnceEvenIfTheWorkspaceResumesTwice` was the one failure that was about the *test's
+  own claim* rather than its driving: `awaitStartedActivity` **peeked** at the recorded intent, so the
+  first resume's editor was still in the queue when the test drained it after the second resume and
+  counted as one the second resume had opened. It takes now, which is what the test needs and what
+  nothing else in the suite loses — the returned intent is still the one the wait saw.
+
+What no JVM test here can prove is how the two windows *feel* on a device: a window that slides in
+over the workspace and returns to it is the platform's own animation, and no assertion in this suite
+looks at it. The claims above are about which surface composes, what it reads, and what the workspace
+does with the answer.
+
+The suite is now 1,878 JVM/Robolectric test methods in 167 test files — the README's figures, which
 `scripts/check-doc-figures.sh` re-derives on every run.

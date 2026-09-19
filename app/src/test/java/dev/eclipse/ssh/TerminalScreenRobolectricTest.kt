@@ -1,5 +1,6 @@
 package dev.eclipse.ssh
 
+import android.content.Intent
 import android.os.Looper
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.test.assertIsDisplayed
@@ -23,6 +24,8 @@ import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.TerminalTheme
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.ActionSubject
 import java.time.Duration
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
@@ -102,7 +105,11 @@ class TerminalScreenRobolectricTest {
      * layout crash. `sendApplyNotifications` publishes state written outside a frame — `connect`
      * writes the tab from a plain function call — which is what invalidates the recomposer at all.
      */
-    private fun pumpUntil(timeoutMs: Long = 10_000, describe: () -> String, condition: () -> Boolean) {
+    private fun pumpUntil(
+        timeoutMs: Long = 10_000,
+        describe: () -> String,
+        condition: () -> Boolean,
+    ): Intent? {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
         while (System.nanoTime() < deadline && !condition()) {
             Snapshot.sendApplyNotifications()
@@ -115,6 +122,7 @@ class TerminalScreenRobolectricTest {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(16))
         }
         check(condition()) { "timed out after ${timeoutMs}ms: ${describe()}" }
+        return peekStarted()
     }
 
     private fun waitForText(text: String) = pumpUntil(
@@ -628,4 +636,77 @@ class TerminalScreenRobolectricTest {
         // Nothing has been closed yet: the tab is still there behind the dialog.
         assertThat(viewModel().uiState.value.tabs).hasSize(1)
     }
+
+    /**
+     * Throws away every activity started so far, so a later peek reports only this test's doing.
+     *
+     * The setup - the connect, the tab that opens - records its own starts, and `peekNextStartedActivity`
+     * does not consume, so a stale intent would mask the one this test is waiting for.
+     */
+    private fun drainStartedActivities() {
+        val shadow = shadowOf(compose.activity.application)
+        while (runCatching { shadow.nextStartedActivity }.getOrNull() != null) Unit
+    }
+
+    /**
+     * The "Why?" on the strip opens the session's own window, on that session.
+     *
+     * The button is the only way into this surface, and what it has to get right is the pairing: the
+     * window is opened from a strip where several sessions are listed, and the tab cannot travel in
+     * the intent — it is assembled by the workspace's own view model. So the tab is snapshotted into a
+     * token handoff, and this test is the only place both halves are visible at once: the click
+     * starts [SessionWhyActivity], and the token its intent carries resolves back to the session the
+     * user was looking at.
+     *
+     * Aimed at a refused port rather than a live server because the button only exists on a state
+     * worth explaining, and a refusal is the cheapest one that is identical everywhere. See
+     * [aRefusedConnectionSettlesTheTabOnAnErrorStateWithoutCrashing] for why `127.0.0.1:1` and not a
+     * name that depends on the machine's DNS.
+     */
+    @Test
+    fun theWhyButtonOpensTheSessionWhyWindowOnThatSession() {
+        compose.waitForIdle()
+        val viewModel = viewModel()
+        val unreachable = HostProfile(
+            id = "why-host",
+            name = "Refused",
+            host = "127.0.0.1",
+            port = 1,
+            username = "nobody",
+        )
+        compose.runOnUiThread {
+            viewModel.saveHost(unreachable)
+            viewModel.connect(unreachable)
+        }
+        pumpUntil(
+            timeoutMs = 60_000,
+            describe = { "tab never settled: ${viewModel.uiState.value.tabs.firstOrNull()?.state}" },
+        ) {
+            viewModel.uiState.value.tabs.firstOrNull { it.hostId == unreachable.id }?.state ==
+                SessionConnectionState.ERROR
+        }
+        drainStartedActivities()
+
+        compose.onNodeWithContentDescription("Why this session is ERROR").performClick()
+
+        val started = pumpUntil(
+            describe = { "the session's why-window never opened (last start: ${peekStarted()})" },
+        ) {
+            peekStarted()?.component?.className == "dev.eclipse.ssh.ui.sessions.SessionWhyActivity"
+        }
+        // The condition above has already held, so this is the intent it read - not a second peek
+        // that could see a different one.
+        requireNotNull(started) { "the why-window's start was not recorded" }
+        // The intent carries a token and nothing else, and the token has to resolve to the session
+        // that was on screen. Reading it here spends it, which is also the claim that it was a
+        // single-use handoff and not a reference the window could keep.
+        val subject = ActionRequests.take(started.getStringExtra(ActionRequests.EXTRA_SUBJECT_TOKEN))
+        val tab = (subject as? ActionSubject.SessionWhy)?.tab
+        assertThat(tab?.hostId).isEqualTo(unreachable.id)
+        assertThat(tab?.state).isEqualTo(SessionConnectionState.ERROR)
+    }
+
+    /** The most recent start, without consuming it — see [drainStartedActivities]. */
+    private fun peekStarted(): Intent? =
+        runCatching { shadowOf(compose.activity.application).peekNextStartedActivity() }.getOrNull()
 }
