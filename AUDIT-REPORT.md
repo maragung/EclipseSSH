@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 31 / versionName 1.2.2 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 32 / versionName 1.3.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §41, *Releasing 1.2.1*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §46, *Releasing 1.3.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5036,3 +5036,231 @@ window's appearance is therefore proven on the artifact a user installs, on API 
 both directions. What is *not* proven, and cannot be by any test, is that white-on-dark reads well —
 that stays with the maintainer's on-device loop, and it is the residue the test's own KDoc names
 rather than hides.
+
+---
+
+## 46. Releasing 1.3.0
+
+Twelve commits on the branch against `main` `44fcd8e`, squashed on merge into the single commit
+`v1.3.0` names — so the range as `main` holds it is three commits (`git rev-list --count
+v1.2.2..v1.3.0`) over 71 files and +4768/−568. Two of the three are #141 and #142, the documentation
+passes that shipped between the two releases; a tag names a range, and those two are in it whether or
+not they are the release's subject. The twelve are the subject: 56 files, +4591/−508, of which 28
+files under `app/src/main`, 25 under `app/src/test` and one under `app/src/androidTest` — no
+workflow, no native source, no library line. Outside the app the release touches `README.md` (+38)
+and `docs/linux-userspace.md` (+68), both where the userspace's identity is described.
+
+The minor number is for §46.1 to §46.3 and not for the arithmetic. 1.2.2 was the same artifact with
+its failure paths repaired; this release has four things in it that 1.2.2 could not do at all: the
+left arrow moves the cursor, typing in a large file does no document-sized work, three surfaces that
+covered the thing they described are windows of their own, and the terminal has a height setting.
+§46.4 and §46.5 are the other kind of change — the installed userspace answers `apt install` and `su`,
+and an install says how far along it is — and they are the pair a userspace release turns on.
+
+### 46.1 The left arrow, and the class of bug it belonged to
+
+`readline` writes `^H` for cursor-left and `ESC [ C` for cursor-right, which makes left the only
+arrow that arrives as a bare control byte. The other three go through the CSI path or `index()`, and
+both of those advance `AnsiTerminalBuffer.revision` — the value `TerminalView` memoizes the layout
+it draws the cursor box from. Cursor-left moved the column and left the revision alone, so the frame
+compared equal to the one on screen, and the box sat where it had been until the next character was
+typed. It never showed in `vim` or `less` because their redraws are addressed and take the CSI path
+anyway, which is why the report was "the left arrow is broken" rather than "the terminal is".
+
+The fix is where the bug was, one level down: the increments move into the primitives —
+`setCursorColumn`, `setCursorRow`, `tabForward`, `tabBackward`, `saveCursor`, `restoreCursor`,
+`reset`, and the `CR`/`BS` branches — rather than sitting in each caller, which is where one of them
+had been forgotten. A second increment costs nothing, because `revision` is a monotonic token that is
+only ever compared for "did it change".
+
+Two holes of the same class are closed with it. CSI `C`/`D` now clear `wrapPending` the way `A`/`B`
+already did, so a move left at the right margin no longer breaks the following line early. And `ESC O`
+has a case in the ESC state at all: `ESC O D` (SS3, which is what a terminal in DECCKM mode sends for
+an arrow) used to fall out of that state and print a literal `D` instead of moving anything.
+
+### 46.2 The keystroke path, and what came off it
+
+Four jobs ran on the UI thread for every character in the editor, each proportional to the document
+rather than to the edit. The lexer was the worst of them: the whole file, up to
+`MAX_HIGHLIGHT_CHARS`, re-lexed and a fresh `AnnotatedString` built inside the composition. The
+gutter composed one `Text` per line. The status line walked the document twice — once for `Ln/Col`,
+once for the line count — and did it again on a theme flip. And the autosave effect was keyed on the
+document's own `String`.
+
+- The lex now runs in a `LaunchedEffect` on `Dispatchers.Default` once the text has been still for a
+  debounce (`debouncedSyntaxTransformationFor`). Until it lands, the field draws the previous spans
+  where they still fit the current text and plain text where they do not. The value the field holds
+  is untouched either way, so the caret, the selection and undo see exactly what they saw before, and
+  a span list that no longer fits is dropped rather than applied at an offset past the end —
+  `SyntaxHighlighterComposeTest` pins that case directly.
+- The gutter composes only the lines inside the viewport, standing in for the rest with one spacer
+  each of their exact combined height, derived from the field's own `TextLayoutResult`
+  (`lineTops`/`gutterWindow`, `EditorGutterWindowTest`). The names cannot lie about what is drawn:
+  `EditorGutterWindowingRobolectricTest` opens a two-hundred-line file in the real editor and asserts
+  line 1's number is on screen while lines 100 and 200 — which exist in the document — are not. The
+  old implementation composed all two hundred and fails it.
+- One walk answers all three status questions, keyed on the text and the caret.
+
+The autosave key is the one thing deliberately left alone, and the reason is worth recording because
+the first version of this commit changed it. `tab.textValue.text` is the whole document `String`, but
+so is the `tab.dirty` the same effect already keys on, and any recomposition reads both anyway — so
+re-keying it would move the comparison rather than remove it, and a hand-maintained revision counter
+is exactly the "one caller forgotten" trap §46.1 is about. The commit message says the opposite; the
+code is the record.
+
+CI pins the contracts and not the adjective: the transformation's behaviour with a span list that no
+longer fits, the windowing arithmetic, and the screen built on it. Whether the editor now *feels*
+smooth is a judgement made on a device, and the commit says so instead of dressing a seam test up as
+one.
+
+### 46.3 Three surfaces became windows, and the terminal got a height
+
+Same change seen from four sides: a surface that covered the thing it was describing becomes a window
+of its own.
+
+- **View text.** The file preview and the archive-entry preview were `ModalBottomSheet`s at the root
+  of `MainActivity` — a text body capped at 55% of a sheet that was itself capped at 85% of the
+  display, so a two-hundred-line log was read through a slot. Each is now an Activity drawing the same
+  body composable, reached through a one-shot token (`PreviewRequests`) because neither a live
+  `FileSystemProvider` nor a closure over an open archive can be parcelled. Both are `singleTop`: a
+  preview is a look at a file, not a place. Both carry the editor's `configChanges` list, and there it
+  is load-bearing rather than habit — a rotation that recreated one would find its token spent and
+  close itself. The files are renamed off "Sheet" (`FilePreviewContent`, `ArchiveEntryPreviewContent`)
+  so the names cannot lie.
+- **Add port forward.** The form was an `AlertDialog` over Settings that opened whenever the section
+  was drawn, accepted three fields with no host connected, and did nothing with them. It is now
+  `ui/forward/ForwardFormActivity`, and its validation — which had been `localPort.toIntOrNull() !=
+  null` and nothing else — moved out of the click handler into `ForwardFormState`, where it uses the
+  port and host rules the forward manager already had. The request returns to the workspace through
+  `ForwardRequests` on its next resume, and the host is captured at launch rather than resolved at
+  confirmation, which is how a forward used to end up on whichever server the user had switched to
+  with the form still open. The running-forwards list is untouched, and with no host at all the row's
+  Add button is switched off and says why.
+- **Terminal height.** Width has had an app-wide setting for a while; height had only a per-host one.
+  `terminalRows` is a ceiling rather than a floor, which is what the geometry already assumed — a row
+  past the bottom edge is nowhere — so a host's own height wins outright where it has one, the
+  app-wide value is the fallback, and `TerminalGrid.atMostRows` still cuts anything taller than the
+  screen down to what fits. It round-trips through the vault backup like every other setting, and a
+  backup written before it exists imports as the default rather than as a rejected file.
+
+### 46.4 The installed Ubuntu became fake root, which is what apt and su needed
+
+The seventh report of the batch came from a real session on a device:
+
+```
+ubuntu@localhost:~$ apt install zip
+dpkg: error: requested operation requires superuser privilege
+E: Sub-process /usr/bin/dpkg returned an error code (2)
+ubuntu@localhost:~$ /usr/bin/su - root
+su: System error
+```
+
+Both failures are one fact, and it is the same fact §46.1 is: a seam nothing asserted. Sessions were
+spawned **without** proot's `-0`, so the shell's `getuid()` was the app's own Android uid. `dpkg`
+refuses to unpack as anyone but uid 0, so `apt install` could never work from a session; and because
+proot's fake identity is all-or-nothing per process tree, a session that is not fake root has no way
+to ascend — `su`'s PAM stack saw a uid it could not elevate and gave up.
+
+The setup pipeline had carried `-0` from the day `dpkg` entered the picture, and the health probe
+asked `whoami` and *expected* `ubuntu`, because that is the name the app's uid is registered under.
+The suite agreed with the bug, which is the whole reason it shipped.
+
+The flag now lives at the source: `commandArgv` always passes `-0`, and `sessionArgv` is the same
+builder, so no caller may choose otherwise again. What a session presents is `root` — `whoami` says
+so, the prompt is `root@localhost` — while two things deliberately stay put: `HOME` is still
+`/home/ubuntu`, because that is where the workspace, the editor and SFTP live, and `/etc/passwd`
+keeps its `ubuntu` entry for the app's Android uid, because that is the account `su - ubuntu` drops
+back to. Neither account has a password (`*` in shadow for both) and `su`'s `pam_rootok` never asks
+for one. The health probe now requires the session to be root, so a rootfs that regresses is
+`NeedsRepair` rather than a card that opens onto a shell that cannot install anything.
+
+The oracle is the E2E pipeline, which installs the userspace for real on an emulator and then runs
+the user's own two commands: `apt-get install -y zip` — a package the minimal base deliberately does
+not ship — and `su` in both directions, `su root -c 'id -u'` answering `0` and `su ubuntu -c whoami`
+answering `ubuntu`. `ProotRuntimeExecModelTest` pins the flag on the session's own argv in the JVM
+suite, which is the assertion whose absence let this ship. `docs/linux-userspace.md` is rewritten
+where it described the old identity, including the reason the old design was wrong rather than only
+what replaced it.
+
+### 46.5 The install reports a percentage
+
+An install said which phase it was in and nothing about how far along it was: "updating package
+lists" was the same screen at one second and at ninety, and the settings row drew an indeterminate
+bar that swept back and forth whatever was happening.
+
+`LinuxInstallProgress` turns the current `LinuxInstallStep` into a whole percent, and the Ubuntu
+window, the host-list line and the foreground notification all read that one value, so the number and
+the bar beside it cannot disagree. What the number *is*, precisely, is a schedule refined by
+measurement: an install is not one measurable quantity, so each phase is given a share of the whole
+from how long it takes on a phone — setup the largest by a wide margin — and the phases that can
+measure themselves move inside their share rather than jumping to its end. The download moves on
+bytes received; extraction moves on the fraction of the tarball read, counted through a stream that
+reports as it is drained and ended with a literal `1f`, because a tar's end-of-archive padding is
+never read and the counter alone would stop just short; `apt-get install` moves on apt's own
+`Progress: [ 45%]` line, which counts completed package steps over the whole `dpkg` run — read from
+apt's source rather than assumed, which is what makes taking the maximum within a step correct
+instead of a value that locks at 100% early. A repair over an already-extracted rootfs renormalizes
+the shares and opens at zero rather than at the download's 36%. The health check reads 100%: the work
+is finished and what remains is the verdict, and a check that fails replaces the row with the failure
+rather than leaving a 100% standing.
+
+### 46.6 What CI found that the branch did not
+
+Every change in this release went through GitHub Actions; nothing was built or tested locally. What
+the runs found divides into the branch's own defects, its tests' own wrong assumptions, and one race
+that had been in the tree since the settings promotion:
+
+- **Two compile errors**, both in `:app`'s main source set and both from the window promotion: a
+  `TextLayoutResult.size.height` (an `Int`) written into a `FloatArray` of line tops, and
+  `ArchiveEntryPreviewActivity` naming `ArchiveEntry` without importing it — a name that reads as if
+  it were local because the file would live in that package if it were not under `ui.archive`.
+- **Five product failures and a whole class of them**: `SettingsBody` wrapped every window's content
+  in a `Column(Modifier.verticalScroll(...))`, which hands its children an unbounded maximum height.
+  Both preview bodies scroll themselves, as reading a long log requires, and they were written for a
+  sheet whose body does not scroll. Nested, the inner scroller was measured with an infinite
+  constraint and threw on the first measure, before anything was on screen — three archive-preview
+  tests, two file-preview tests, and every real open of either window. `SettingsDestinationWindow`
+  now takes `scrollable`, false for the two previews and true by default for the thirteen
+  destinations whose bodies do not scroll, so the window hands them the height and gets out of the
+  way, which is the contract the sheet had.
+- **Two test-harness bugs of the same shape as the one §43.5 records** — a wait that answers for the
+  wrong thing. `ForwardFormWiringRobolectricTest` deleted what `uiState` held before Room's first
+  emission, which is the empty initial value, so the `forEach` deleted nothing and the wait for an
+  empty list timed out with every host still present; it now writes a sentinel host and waits for it
+  to come back, which is the proof that the flow has been observed. And
+  `ForwardFormActivityRobolectricTest` asserted the window had closed through `scenario.state`, which
+  only falls once the destroy a `finish()` posts has been run — under Robolectric, nothing runs it.
+  The assertion is now on `isFinishing`, which is true then and there.
+- **Four more on the percentage commit itself**, which is the useful part of the record: the change
+  that introduced the measurement was the one CI caught measuring wrongly.
+  `stripEscapes` matched CSI only, and `ESC 7` / `ESC 8` (DECSC/DECRC) are exactly what `dpkg` wraps
+  each progress-bar redraw in — so the pattern whose whole purpose is to make the line readable left
+  their final byte behind as a literal digit in front of it, and two of the three tests asserting the
+  detail was empty failed with `expected: null but was : 7`. `CountingFileStream` overrode `read()`
+  and `read(byte[], int, int)`, and its own KDoc claimed both entry points were covered — but
+  `FileInputStream` overrides `read(byte[])` separately and neither form delegates to the other, so a
+  caller filling a buffer with the single-argument form was never counted: an extraction reading 0%
+  while the tarball drains. Both of those were defects the suite caught. The other two were the
+  other kind: `assertThat(end).isLessThan(next)` compared a step's `fraction = 1f` with the next
+  step's `fraction = 0f`, which the schedule makes the same point on the ladder by construction — 93
+  against 93, for any choice of shares — so the assertion could not hold as written and now pins the
+  far end of the schedule, where the gap is real; and the SS3 alternative in the widened pattern
+  carried a stray space, which the check below caught before CI did.
+- **One race that survived to the release run, and is worth naming as a class.** The clearing that
+  sentinel introduces is necessary but not sufficient, because the database is not the only writer:
+  `HostRepository.seedIfEmpty()` refills an emptied table with three demo hosts from the ViewModel's
+  `init`, and its upserts can still be queued behind the delete's own query when a single reading
+  reports the list empty. The run on `d517ead` failed exactly that way — the sentinel gone, all three
+  demo hosts back — and the clearing now re-deletes until the list has *stayed* empty across a settle
+  window. A test that tidies the shared database has two writers to lose to, not one.
+
+The escape pattern is the one change in this release that could be verified without a device or a
+compiler: it is a regular expression over strings, so the sequences it must remove were run through
+the same alternation outside the build, including the `ESC O D` that a CSI-only reading gets wrong in
+both directions. That is a narrow exception to the no-local-build rule and not a habit — everything
+else here is asserted by the Actions runs or not at all.
+
+The suite gains 93 JVM/Robolectric test methods across 11 new test files (1,748 in 152 files at
+`v1.2.2`, 1,841 in 163 here), and none of it is a claim that the editor is smooth or that a bar
+sweeps at the right speed — those are device judgements, and §46.2 and §46.5 say so rather than
+inventing a test for them.
