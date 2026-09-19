@@ -1,6 +1,6 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 30 / versionName 1.2.1 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 31 / versionName 1.2.2 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
@@ -4743,3 +4743,196 @@ there for is worse than no guard — the same lesson the lockfile check ran into
 removed the flag that rewrote the file it was meant to check, and the step still could not refuse
 drift, because a report task exits 0 (#133). Publication state lives in the Releases API, and the
 `docs` job has no network.
+
+---
+
+## 43. Releasing 1.2.2
+
+Nine commits against `v1.2.1` (`git rev-list --count v1.2.1..HEAD`), 28 files, +1163/−201. Unlike 1.2.1,
+this range does change what a user installs, in two
+places: the pty on the Linux side (`linux/src/main/cpp/linuxpty.c`, +236/−11) and the library line the
+app is built against, seven versions in `gradle/libs.versions.toml`. The four lines under
+`app/src/main` are the About screen catching up with three of those versions, and they are the whole of
+this release's change to the application's Kotlin: no composable, no screen, no repository, no
+ViewModel. `app/src/androidTest` changes in two places, both of them §43.5: four helpers in
+`ReleaseChaosJourneyTest` — the file that turned this release's API 35 leg red twice, while its API 30
+leg stayed green both times — and the cross-reference to one of them in `MainActivityLifecycleTest`.
+
+The patch number is for that second half and not in spite of the first: nothing a user can do has been
+added, removed or renamed. What changed is what happens *after* something has already gone wrong — a
+write to a pty whose reader has stopped, a child that outlives its `close()`, an `execve` that never
+happened, a fetch that meets a 5xx, a lockfile that has drifted, a report that cannot count the tests
+it just ran. The happy path is 1.2.1's, which is the whole of what a patch number claims.
+
+### 43.1 The write path, and the failures #129 could not fix by copy-paste
+
+`#86` and `#87` left residual work whose branch is `dirty` against a `main` that has since rewritten
+the same regions by other routes. Issue #129 listed each item with the reason it needs care rather
+than a copy-paste. Three of them are in this release, all three in `linuxpty.c`:
+
+- **The write JNI now polls.** It waits on `poll(POLLOUT)` with a timeout and re-checks the slot each
+  lap, which is what the read path already did. A bare blocking write on a pty whose reader has
+  stopped fills the buffer and parks forever, and `close()` on the fd cannot wake it.
+- **A child that outlives `close()` is no longer abandoned with its slot.** `close()` makes a single
+  non-blocking reap attempt; a child that misses it is kept in a deferred list that the next spawn or
+  teardown drains. That is how a child became a zombie the day it finally exited. The list holds as
+  many pids as the table has slots, and when it is full the pid is named in logcat rather than
+  dropped quietly.
+- **`report_child_progress` tells a real `execve` from a signal landing in the window between the
+  report byte and the call.** Both close the pipe, and only one of them means the program is running;
+  the other left the caller parked on the master for its whole timeout. The probe is
+  `waitid(WNOWAIT)` on purpose — the status must not be consumed, because that same child is reaped
+  through `awaitExit` for its exit code and a fast command can have exited inside the window. The
+  signal gets a stage of its own rather than reusing the execve one: the child reports an `errno` in
+  that slot and this reports a signal, and a message reading "failed at execve (errno 9)" for a
+  `SIGKILL` would send its reader to `EBADF`.
+
+The slave-to-master data path is probed at spawn and **logged, not gated**: the probe assumes a fresh
+pair echoes and nothing in that file sets termios, so failing a spawn on it would fail a healthy pty
+on any leg whose pair does not echo. It becomes a gate the day a red run names the data path, and the
+code says so where the probe is.
+
+Two `-keep` lines for `LinuxUserspaceState` come with it — the hierarchy `UbuntuE2eVerificationTest`
+resolves at runtime, which the keeps guard cannot see, because a name used from the test's own package
+needs no import and the scan reads imports. The guard's header now states that limit, and the second
+one beside it (the application's own namespace is excluded deliberately, or the list would fill with
+names that never needed keeping). The suite is green without the keeps; they are defensive, and the
+keep file says exactly that.
+
+### 43.2 The library line, and the lockfile that has to travel inside it
+
+Seven catalog versions move: AGP 9.4.0 → 9.4.1, KSP 2.3.11 → 2.3.12, Room 2.7.1 → 2.8.5, Compose BOM
+2025.04.01 → 2026.09.00, Navigation 2.8.9 → 2.10.1, BouncyCastle 1.79 → 1.86, Robolectric 4.16.1 →
+4.17. `app/gradle.lockfile` (65 insertions, 66 deletions) is the same bump seen from the resolver's
+side, and it has to be in the same commit rather than a later one: the lockfile pins resolution as a
+`strictly` constraint, so a catalog-only edit cannot resolve `releaseRuntimeClasspath` at all. That is
+what dependabot's #130 ran into, and why its bump reached `main` as #132 with the lockfile it resolves
+against.
+
+### 43.3 Most of the diff is the pipeline, and none of it rides in the artifact
+
+Nine workflow files change, plus the two guard scripts, the release reporter and its new tests. In
+order of what they cost when they are missing:
+
+- **#126** gives both native fetches one retry policy — seven attempts over roughly four minutes
+  (10s, 20s, 40s, 60s, 60s, 60s), logged attempt by attempt. `:freerdp`'s fetch had **no retry at
+  all**: one response, one red job, and that job is a release blocker. Same pinned URLs, same sha256
+  verification, which still decides what gets built.
+- **#128** makes the release gate report what it actually ran. `testing/generate-report.py` took its
+  test count from `^OK \((\d+) tests?\)` and nothing else, so a failing leg — which ends with
+  `FAILURES!!!` and `Tests run: 47,  Failures: 1` — reported `Ran: 0`. The evidence is the gate's own
+  output: v1.2.0's failed validation (run 35338666049, the one that pulled the release back to draft)
+  says "Ran: 0" for a suite of 47 tests on both legs. Three shapes are read now, and a run killed by
+  the workflow's `timeout` reports "unknown" instead of a 0 that claims it tested nothing.
+  `testing/test_generate_report.py` (181 lines) pins all of it against those artifacts.
+- **#133** makes the lockfile check able to refuse drift, which is two repairs in one step. The step
+  ran `:app:dependencies` — a report task, which resolves leniently, prints `FAILED` beside an
+  unresolvable coordinate and **exits 0** — and its `set -o pipefail` was not enough on its own: with
+  the Gradle command replaced by one that prints an error and exits 1, the pipeline still reached the
+  final echo and the step still exited 0, so a build script error, a daemon OOM or a lost network
+  would each have been reported as a satisfied lockfile. Measured, not assumed.
+- **#134** moves the dispatch example in `testing/README.md` to the newest release that is
+  *published*, which is the rule §40.6 stated and nothing checks — deliberately, and §42 says why.
+- **#100** bumps six GitHub Action versions.
+- `scripts/check-doc-figures.sh` gains a reader for the BouncyCastle line in `docs/THIRD-PARTY.md`
+  that `expect_section` cannot express, because that version sits after a code span rather than after
+  the name — a figure that had already gone stale the way the check exists to prevent.
+
+### 43.4 The change a user can see, and the change they cannot
+
+The visible one is in Settings → About: three library versions that now read as what the build pins.
+Everything else in this release is the shape 1.2.1 established — the artifact behaves as its
+predecessor does except where a failure was already in progress.
+
+### 43.5 The one test this release had to repair, and why it read as a flake
+
+The pre-release validation run `35415683279` came back red on API 35 with exactly one failing test —
+`rotatingThroughEveryDestinationKeepsTheScreenUsable`, on an `assertExists` for "Terminal theme" — while
+the API 30 leg of the *same* run was green, end to end, crash scan included. Issue #136. The run before
+it failed the same test on the same leg (#124, validation run `35343449935` attempt 1) — there on a
+`ComposeTimeoutException` in the row wait rather than on an assertion — and that issue was closed as
+superseded when 1.2.1's published asset cleared both legs, with "reopen if the same failure returns"
+written into it. It returned, in a different assertion, so this time the failed leg's logcat was read
+rather than the run re-run past a third time.
+
+**What it says, to the millisecond.** The test started at `02:50:46.781` and failed at `02:50:52.118`.
+The four configuration changes it asks for landed at `48.481` (landscape, `w914dp`), `49.630`
+(portrait, `w411dp`), `50.344` (landscape) and `51.086` (portrait). The activity was PAUSED at
+`50.917`, and the teardown that follows a failure had already started its `EmptyActivity` at `50.869`.
+So the assertion the test died on ran **before the rotation it had just requested had been applied**,
+against the previous orientation's window. `rotate()` set `requestedOrientation` and called
+`waitForIdle()`, and `waitForIdle` answers for Compose: Compose is idle for the whole 0.7–1.1 s the
+system spends rotating this emulator's display — its logcat is one long "Slow dispatch" while the
+taskbar is torn down and rebuilt. There was no recreation to wait for either: `MainActivity` declares
+`configChanges` for orientation, and the log holds exactly one instance and one `PRE_ON_CREATE` for
+the whole test.
+
+**First repair: two waits, both bounded at ten seconds and both loud when they expire.** That is what
+went to CI, and it turned the same leg red on a *second* test.
+
+- `rotate()` waits on the window's own `resources.configuration.orientation`, which is the only thing
+  that reports the change once recreation is off the table, and only then waits for idle.
+- Every tap in the journey waits for the destination it opened to render before the next rotation is
+  requested, so a tap that has not been acted on cannot carry the test into the next orientation
+  asserting against the screen it just left. This is the idiom the file already used after *its* own
+  rotation in `theAddHostFormSurvivesARotation`, and the lesson `MainActivityLifecycleTest` wrote down
+  when it measured the guest at `app_time_stats: avg=4235.73ms` per frame: a bare `waitForIdle()`
+  followed by an assertion is a race for anything the app derives asynchronously. A healthy emulator
+  hides it, which is why one leg was green.
+
+**Second repair: `theAddHostFormSurvivesARotation` had never rotated at all.** The instrumentation run
+`35417680596` reported 47 tests and 15 failures, of which 14 are `UbuntuE2eVerificationTest`'s
+`AssumptionViolatedException` rows, which AGP's XML counts as failures while the phase is healthy. The
+one real failure was that test, on `ComposeTimeoutException: Condition still not satisfied after 10000
+ms` at `rotate(ReleaseChaosJourneyTest.kt:83)` — the new wait, timing out because nothing had turned.
+
+The mechanism is the reason the test was vacuous, and it is in the manifest. That test opens
+`HostFormActivity` on top; `rotate()` asked `compose.activityRule.scenario`, which is only ever
+`MainActivity`, to change orientation. The display follows the activity *on top* — a request made on a
+covered, stopped activity rotates nothing, and that activity's `resources.configuration` is never
+updated either, so there was no wait to lose: the old `waitForIdle()` returned, the assertions after it
+ran against a display that had not moved, and the test passed by standing still. The claim in its own
+KDoc — that a rotation which recreated the window would empty the form — had never been exercised.
+
+`rotate()` now targets the foreground activity instead:
+
+```kotlin
+InstrumentationRegistry.getInstrumentation().runOnMainSync {
+    activity = ActivityLifecycleMonitorRegistry.getInstance()
+        .getActivitiesInStage(Stage.RESUMED).lastOrNull()
+}
+```
+
+and waits on *that* activity's configuration. RESUMED rather than visible, and the *last* resumed one,
+because both activities are briefly resumed while the form animates in and the one that just came up is
+the one that owns the display. No dependency was added for it: `espresso-core`'s POM declares
+`androidx.test:runner` at compile scope, so the registry is already on this source set's classpath —
+checked in the Gradle cache rather than assumed. With the rotation real, the form now has to survive
+one for the assertion to pass, which is what the test has always claimed to be about.
+
+**Third repair: the leg swapped, and the same class of mistake was one window over.** Validation run
+`35418754473` on `00aa2bc` came back with API 35 **green** and API 30 red — the reverse of both
+earlier runs, on the commit that fixed them. One test, `theAddHostFormSurvivesARotation`, on
+`assertIsDisplayed("Search hosts, tags, or usernames")` — and this time the rotation *had* happened:
+the API 30 log shows the form starting at `03:46:22.740`, resuming at `.934`, and the display
+reconfiguring to `ROTATION_90` (`w866dp h387dp`) at `24.233`. The form survived it, which is what that
+leg had never actually tested.
+
+The failure is at the last step. `MainActivity` went STOPPED at `23.764` and never resumed; the form
+was paused at `25.701` — after the run's teardown had already started, at `25.681` — and the test was
+reported failed at `25.923`. So Cancel did finish the window, and the assertion ran *while it was
+finishing*: `compose.waitForIdle()` answers for Compose, and the activity behind is a different window
+whose arrival is asynchronous, so the workspace node was there but not displayed. That is the same
+lesson as the first repair, one window over — a wait that answers for the wrong thing.
+
+`awaitForeground(MainActivity::class.java)` now waits for that window to be the resumed one before the
+assertion, bounded at ten seconds and loud when it expires, and it fails naming the window that did not
+come back rather than the text that was not on screen.
+
+**Not a product change.** Nothing under `app/src/main` is touched by any of the three repairs, and each
+leg builds its own APK from the commit under test: the two legs disagreed with each other on `00aa2bc`
+exactly as they had on `2303adf` and `64014ca`, one green and one red, over the same suite. What the
+release carries is a test file that no longer measures the emulator's rotation latency, or a window's
+arrival, as if either were the app's behaviour — and a test that had been passing without ever rotating
+anything now performs the rotation its name promises. The suite that gates this release is, for those
+reasons and no other, not quite the suite that gated 1.2.1.

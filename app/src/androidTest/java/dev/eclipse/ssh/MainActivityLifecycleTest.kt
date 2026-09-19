@@ -46,7 +46,7 @@ class MainActivityLifecycleTest {
     /**
      * Waits for [text] to appear, then asserts it is displayed.
      *
-     * Same shape as `ReleaseChaosJourneyTest.awaitSeededRow` and `AppNavigationTest.awaitSeededRow`,
+     * Same shape as `ReleaseChaosJourneyTest.awaitText` and `AppNavigationTest.awaitSeededRow`,
      * which is where this idiom already lives in this suite. A bare `waitForIdle()` followed by an
      * assertion is a race for anything the app derives from its intent: the link is handed to the
      * activity by the system's activity manager and reaches the main thread afterwards, so Compose
