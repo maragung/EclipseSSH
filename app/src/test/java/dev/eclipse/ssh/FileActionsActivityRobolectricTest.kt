@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Looper
 import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
