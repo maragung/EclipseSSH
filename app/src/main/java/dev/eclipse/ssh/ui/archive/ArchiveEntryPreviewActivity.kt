@@ -69,6 +69,9 @@ class ArchiveEntryPreviewActivity : ComponentActivity() {
                 settingsRepository = settingsRepository,
                 title = "Entry preview",
                 onClose = { finish() },
+                // As in the file preview: the content scrolls, so the window does not. See
+                // SettingsWindow.
+                scrollable = false,
             ) {
                 request?.let { current ->
                     ArchiveEntryPreviewContent(entry = current.entry, readEntry = current.readEntry)

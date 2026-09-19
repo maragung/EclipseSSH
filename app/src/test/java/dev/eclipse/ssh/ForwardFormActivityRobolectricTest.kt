@@ -239,8 +239,19 @@ class ForwardFormActivityRobolectricTest {
             )
             // The form closes itself once the answer is in the slot, so the workspace underneath is
             // what the user is left looking at rather than a window they also have to dismiss.
-            val settled = runCatching { scenario.state }.getOrNull()
-            assertThat(settled).isNotEqualTo(Lifecycle.State.RESUMED)
+            //
+            // Asserted on the activity rather than on `scenario.state`, which is the same fact one
+            // looper-hop later: `finish()` is called in the click handler and sets `isFinishing`
+            // there and then, while the state the scenario reports only falls once the destroy it
+            // posts has been run. Waiting for that would be a test of Robolectric's looper - it does
+            // not run on its own here, and the failure it produces is the confusing one, "expected
+            // not to be: RESUMED" about a window that has already been asked to close.
+            var closing = false
+            pumpUntil(describe = { "the form never closed after handing its request back" }) {
+                runCatching { scenario.onActivity { activity -> closing = activity.isFinishing } }
+                closing
+            }
+            assertThat(closing).isTrue()
         }
     }
 

@@ -63,6 +63,11 @@ class ForwardFormWiringRobolectricTest {
      * The shared Room file is the app's real one, so a host left behind here is a phantom card in
      * whatever runs next — and a leftover host is also the one thing that could make the no-host test
      * below pass for the wrong reason.
+     *
+     * The deletes are coroutines on the view model's scope, so they need frames to run: without the
+     * [pump] this method asks for the cleanup and leaves before it happens. What runs next is not
+     * relying on it either way — [seedHost] clears the list itself — but a class that tidies up after
+     * itself should mean it.
      */
     @After
     fun removeSeededHosts() {
@@ -72,6 +77,7 @@ class ForwardFormWiringRobolectricTest {
                 .filter { it.id.startsWith(ID_PREFIX) }
                 .forEach(viewModel::deleteHost)
         }
+        pump()
         ForwardRequests.takeConfirmed()
     }
 
@@ -102,14 +108,39 @@ class ForwardFormWiringRobolectricTest {
      * state is read from `MainUiState.hosts` — any host at all makes the workspace "pointed at" one —
      * so a stray profile from another class would arm a button this test is asserting is switched off.
      * Every class that seeds hosts deletes its own, so clearing here costs nobody anything.
+     *
+     * The sentinel is what makes that clearing real. `uiState` is a `StateFlow`, and its value before
+     * Room's first emission is the empty initial state: a delete that runs that early iterates an empty
+     * list, deletes nothing, and then waits twenty seconds for a list that only grows — which is how
+     * this test failed the first time it ran, with every host still in place and nothing having been
+     * asked to leave. Writing a host and waiting for it to come back proves the flow has been observed,
+     * so everything after it is a statement about the database rather than about how far the app got
+     * through starting up.
      */
     private fun seedHost(name: String?): HostProfile? {
         compose.waitForIdle()
         val viewModel = viewModel()
+
+        val sentinel = HostProfile(
+            id = ID_PREFIX + "sentinel",
+            name = "Sentinel",
+            host = "sentinel.example.test",
+            username = "tester",
+            port = 22,
+        )
+        compose.runOnUiThread { viewModel.saveHost(sentinel) }
+        pumpUntil(describe = { "the workspace never observed the host list" }) {
+            viewModel.uiState.value.hosts.any { it.id == sentinel.id }
+        }
+
         compose.runOnUiThread {
             viewModel.uiState.value.hosts.forEach(viewModel::deleteHost)
         }
-        pumpUntil(describe = { "the host list never emptied" }) { viewModel.uiState.value.hosts.isEmpty() }
+        pumpUntil(
+            describe = {
+                "the host list never emptied; left holding ${viewModel.uiState.value.hosts.map { it.id }}"
+            },
+        ) { viewModel.uiState.value.hosts.isEmpty() }
         if (name == null) return null
 
         val profile = HostProfile(id = ID_PREFIX + "1", name = name, host = "forward.example.test", username = "tester", port = 22)

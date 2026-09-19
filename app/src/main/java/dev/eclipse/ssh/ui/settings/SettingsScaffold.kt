@@ -137,16 +137,21 @@ fun SettingsDestination(
  * Separate from [SettingsDestination] rather than a defaulted parameter on it: a window that takes
  * no snapshot and one that takes a snapshot are two different contracts, and the one that takes none
  * should not have to name a type it does not use to get the theme.
+ *
+ * [scrollable] is false for the two callers whose body scrolls itself - the file preview and the
+ * archive entry preview - and true for the host form. See [SettingsWindow] for what a second
+ * scroller inside this one costs.
  */
 @Composable
 fun SettingsDestinationWindow(
     settingsRepository: SettingsRepository,
     title: String,
     onClose: () -> Unit,
+    scrollable: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val loaded = rememberSettings(settingsRepository)
-    SettingsWindowThemed(loaded?.darkTheme ?: isSystemInDarkTheme(), title, onClose, content)
+    SettingsWindowThemed(loaded?.darkTheme ?: isSystemInDarkTheme(), title, onClose, scrollable, content)
 }
 
 /**
@@ -180,6 +185,7 @@ private fun SettingsWindowThemed(
     darkTheme: Boolean,
     title: String,
     onClose: () -> Unit,
+    scrollable: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
@@ -195,7 +201,13 @@ private fun SettingsWindowThemed(
         },
     ) {
         EclipseTheme(darkTheme = darkTheme) {
-            SettingsWindow(title = title, onClose = onClose, snackbarHostState = snackbarHostState, content = content)
+            SettingsWindow(
+                title = title,
+                onClose = onClose,
+                snackbarHostState = snackbarHostState,
+                scrollable = scrollable,
+                content = content,
+            )
         }
     }
 }
@@ -207,6 +219,14 @@ private fun SettingsWindowThemed(
  * from Settings, and its subject is a host, not a preference. Everything about the window - the bar,
  * the back arrow, the inset padding, the width cap - should still be identical, and sharing the
  * chrome is what keeps it identical.
+ *
+ * [scrollable] is false for a body that scrolls itself, which is the two previews: a file's text and
+ * an archive entry's. A `Column(Modifier.verticalScroll(...))` hands its children an unbounded maximum
+ * height, so a body that scrolls *inside* this one is not a layout that looks slightly wrong - it is
+ * `IllegalStateException: Vertically scrollable component was measured with an infinity maximum height
+ * constraints`, thrown on the first measure, before anything is on screen. The previews were written
+ * for a sheet, and a sheet's body does not scroll; promoting them to a window means the window must
+ * not add a second scroll over theirs. Every other destination keeps the default.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -214,6 +234,7 @@ fun SettingsWindow(
     title: String,
     onClose: () -> Unit,
     snackbarHostState: SnackbarHostState = remember { SnackbarHostState() },
+    scrollable: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Scaffold(
@@ -236,26 +257,34 @@ fun SettingsWindow(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
-        SettingsBody(padding, content)
+        SettingsBody(padding, scrollable, content)
     }
 }
 
 /**
- * The scrolling body under the bar: the app's content column, in the same shape Settings uses.
+ * The body under the bar: the app's content column, in the same shape Settings uses.
  *
  * The horizontal padding goes *inside* the scroll rather than around it, which is the difference
  * between a list whose last row can be reached and one whose last row stops at the inset. The width
  * cap is the shell's own (`MainActivity` caps its content column at 1280dp), so a settings
  * destination reads as the same app on a tablet rather than as an edge-to-edge outlier.
+ *
+ * [scrollable] is false for the two previews, whose own content scrolls - see [SettingsWindow] for
+ * what a second scroller inside this Column costs.
  */
 @Composable
-private fun SettingsBody(padding: PaddingValues, content: @Composable ColumnScope.() -> Unit) {
+private fun SettingsBody(
+    padding: PaddingValues,
+    scrollable: Boolean,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val scroll = if (scrollable) Modifier.verticalScroll(rememberScrollState()) else Modifier
     Column(
         modifier = Modifier
             .padding(padding)
             .fillMaxSize()
             .widthIn(max = 1280.dp)
-            .verticalScroll(rememberScrollState())
+            .then(scroll)
             .padding(horizontal = 16.dp, vertical = 8.dp),
         content = content,
     )

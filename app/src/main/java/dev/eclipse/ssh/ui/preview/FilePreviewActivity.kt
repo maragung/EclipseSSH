@@ -85,6 +85,9 @@ class FilePreviewActivity : ComponentActivity() {
                 settingsRepository = settingsRepository,
                 title = "Preview",
                 onClose = { finish() },
+                // The body scrolls itself - a long log is read by scrolling it - so the window
+                // must not put a second scroller over it. See SettingsWindow.
+                scrollable = false,
             ) {
                 request?.let { current ->
                     FilePreviewContent(
