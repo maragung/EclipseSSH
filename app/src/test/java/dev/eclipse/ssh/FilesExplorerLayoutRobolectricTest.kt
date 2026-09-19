@@ -14,8 +14,7 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
-import androidx.compose.ui.semantics.SemanticsActions
-import androidx.compose.ui.semantics.getOrNull
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import com.google.common.truth.Truth.assertThat
 import com.google.common.truth.Truth.assertWithMessage
@@ -24,6 +23,10 @@ import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.presentation.MainViewModel
+import dev.eclipse.ssh.ui.actions.ActionAnswer
+import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.ActionSubject
+import dev.eclipse.ssh.ui.actions.FileActionKind
 import dev.eclipse.ssh.ui.preview.FilePreviewActivity
 import dev.eclipse.ssh.ui.preview.PreviewRequests
 import java.io.InputStream
@@ -195,29 +198,66 @@ class FilesExplorerLayoutRobolectricTest {
     }
 
     /**
-     * A long-press opens the per-entry action sheet; its Select row starts a selection; and the batch
-     * bar that follows offers the actions the session can serve.
+     * A long-press opens the per-entry actions window, on the row that was pressed.
      *
-     * The bar is what a touch file manager is judged by: it appears on the gesture, counts what the
-     * gesture caught, and offers Download and Schedule on a remote listing - the two a server's rows
-     * can do - alongside the ones both backends share. The gesture itself changed - long-press used
-     * to select directly - so this also pins the new half: the sheet is what the gesture opens, and
-     * selection is what its Select row starts.
+     * The gesture used to raise a `ModalBottomSheet` inside this composition; the menu is a window of
+     * its own now (see [dev.eclipse.ssh.ui.files.FileActionsActivity]), so the observable proof is an
+     * intent rather than a node - and the two halves are asserted separately because they fail
+     * separately. The intent must name the window, and the token in it must resolve to the row the
+     * user pressed: a window opened on whatever entry happened to be in the slot is a menu of actions
+     * for somebody else's file, and nothing on this screen would show it.
+     *
+     * The window itself never composes here, which is why this suite no longer pins its rows - that
+     * matrix is `FileActionsActivityRobolectricTest`'s, asserted against the window directly.
      */
     @Test
-    fun aSelectionBringsTheBatchBarAndItsActions() {
+    fun longPressingARowOpensThatEntriesWindow() {
         connect()
         openFiles()
         openTheHostsListing()
         pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
             names().contains(bulkName(0))
         }
+        drainStartedActivities()
 
-        compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
-        // The sheet, not the batch bar: the gesture's first consequence is the menu of everything
-        // this entry can do.
-        awaitDisplayed("Edit as text")
-        clickSheetRow("Select")
+        longPressRow(bulkName(0))
+
+        val started = awaitStartedActivity("dev.eclipse.ssh.ui.files.FileActionsActivity")
+        val subject = ActionRequests.take(started.getStringExtra(ActionRequests.EXTRA_SUBJECT_TOKEN))
+        assertWithMessage("the window was opened on an entry other than the one long-pressed")
+            .that((subject as? ActionSubject.FileActions)?.entry?.name).isEqualTo(bulkName(0))
+    }
+
+    /**
+     * The window's Select answer starts a selection when the workspace comes back, and the batch bar
+     * that follows offers the actions the session can serve.
+     *
+     * The bar is what a touch file manager is judged by: it appears on the gesture, counts what the
+     * gesture caught, and offers Download and Schedule on a remote listing - the two a server's rows
+     * can do - alongside the ones both backends share. The gesture itself changed - long-press used to
+     * select directly - so this pins the new middle: the window is what the gesture opens, and Select
+     * is the row that starts the selection.
+     *
+     * The answer is written and the workspace resumed here rather than the row being tapped, because
+     * that is what the real sequence is: the window closes, the workspace comes back to the
+     * foreground, and `MainActivity.onResume` is where its answer is taken. A window that opened
+     * perfectly and filed a perfect answer with nothing on the other end would pass every test the
+     * window's own suite has, so the drain is driven end to end.
+     */
+    @Test
+    fun theWindowsSelectAnswerBringsTheBatchBarAndItsActions() {
+        connect()
+        openFiles()
+        openTheHostsListing()
+        pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
+            names().contains(bulkName(0))
+        }
+        longPressRow(bulkName(0))
+        awaitStartedActivity("dev.eclipse.ssh.ui.files.FileActionsActivity")
+
+        ActionRequests.answer(ActionAnswer.FileAction(FileActionKind.SELECT))
+        resumeTheWorkspace()
+
         awaitDisplayed("1 selected")
         compose.onNode(hasText("Download") and hasClickAction()).assertIsDisplayed()
         compose.onNode(hasText("Schedule") and hasClickAction()).assertIsDisplayed()
@@ -225,98 +265,66 @@ class FilesExplorerLayoutRobolectricTest {
     }
 
     /**
-     * The sheet's Edit row opens the full-window editor for the file that was long-pressed.
+     * The window's Edit answer opens the full-window editor for the file that was long-pressed.
      *
-     * This is the reason the sheet exists: before it, the only way to edit a file was to open its
-     * preview and find the Edit button there - and only for the preview's text-ish kinds. The
-     * assertion is the editor activity starting, which is the whole of the promise; the editor's own
-     * behaviour has its own suites.
+     * This is why the answer comes back to the explorer at all rather than being carried out by the
+     * window: `onEditFile` resolves a [dev.eclipse.ssh.data.fs.FileSystemProvider] from the session on
+     * screen and opens the editor with it, and that resolution is this screen's. A second
+     * implementation in a second window would be two answers to the same question. The assertion is
+     * the editor activity starting, which is the whole of the promise; the editor has its own suites.
      */
     @Test
-    fun theActionsSheetsEditRowOpensTheEditor() {
+    fun theWindowsEditAnswerOpensTheEditor() {
         connect()
         openFiles()
         openTheHostsListing()
         pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
             names().contains(bulkName(0))
         }
-        val app = compose.activity.application
-        compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
-        // Drain whatever starts the setup made, so the peek below only ever reports this
-        // click's doing — peeking does not consume, so a stale intent would mask the editor's.
-        while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
-        clickSheetRow("Edit as text")
+        longPressRow(bulkName(0))
+        awaitStartedActivity("dev.eclipse.ssh.ui.files.FileActionsActivity")
+        // Drain whatever the long-press started, so the wait below only ever reports this answer's
+        // doing - a stale intent in the queue would mask the editor's.
+        drainStartedActivities()
 
-        // Stage 1: the row's own first act is closing the sheet it lives in, so the sheet
-        // leaving the tree is the observable proof that the click ran the app's code rather
-        // than stalling in the harness.
-        pumpUntil(describe = { "the sheet never closed after its Edit row was tapped: " + diagnose() }) {
-            compose.onAllNodes(hasText("Edit as text") and hasClickAction()).fetchSemanticsNodes().isEmpty()
-        }
-        // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it,
-        // which fires on a later frame. Robolectric records every startActivity
-        // unconditionally, so a timeout here means the request never reached the effect —
-        // and the peeked intent is the honest witness of what did start instead.
-        pumpUntil(describe = {
-            "the editor activity never started (last start: " +
-                runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull() + "). " + diagnose()
-        }) {
-            runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull()
-                ?.component?.className == "dev.eclipse.ssh.ui.editor.TextEditorActivity"
-        }
+        ActionRequests.answer(ActionAnswer.FileAction(FileActionKind.EDIT))
+        resumeTheWorkspace()
+
+        // The answer is consumed by a LaunchedEffect keyed on it, which fires on a later frame.
+        // Robolectric records every startActivity unconditionally, so a timeout here means the answer
+        // never reached the effect - and the peeked intent is the honest witness of what did start.
+        awaitStartedActivity("dev.eclipse.ssh.ui.editor.TextEditorActivity")
     }
 
     /**
-     * The sheet's Preview row opens the preview window for the file that was long-pressed, and the
-     * request behind it is that same file.
+     * The window's Preview answer opens the preview window on the file that was long-pressed.
      *
-     * The twin of the Edit-row test above, and the preview's half of the same change: the preview used
-     * to be a `ModalBottomSheet` at the root of MainActivity, so this row only raised a panel inside the
-     * same window, and "did it open" was a question about state no assertion could name. Now the row
-     * asks the platform for a window, and the intent it starts is the witness.
+     * The twin of the Edit answer above, and the preview's half of the same handoff: the preview used
+     * to be a `ModalBottomSheet` at the root of MainActivity, so this row only raised a panel inside
+     * the same window and "did it open" was a question about state no assertion could name.
      *
-     * Two halves are checked, because a preview has two: the intent names the window, and the token it
-     * carries resolves to the entry that was long-pressed. An intent started with the wrong request
-     * stored — or with none — would satisfy the first and fail the user, who would be looking at
-     * somebody else's file. The sheet leaving the tree is the third: it is the observable proof that
-     * the click ran this app's code rather than stalling in the harness.
+     * Two halves again, because a preview has two: the intent names the window, and the token it
+     * carries resolves to the row that was long-pressed. An intent started with the wrong request
+     * stored - or with none - satisfies the first and fails the user, who would be looking at somebody
+     * else's file. The window itself never composes here, so this is the only level that can check it.
      */
     @Test
-    fun theActionsSheetsPreviewRowOpensThePreviewWindow() {
+    fun theWindowsPreviewAnswerOpensThePreviewWindow() {
         connect()
         openFiles()
         openTheHostsListing()
         pumpUntil(describe = { "the listing never arrived: " + diagnose() }) {
             names().contains(bulkName(0))
         }
-        val app = compose.activity.application
-        compose.onNode(hasText(bulkName(0)) and hasClickAction()).performTouchInput { longClick() }
-        // Drain whatever starts the setup made, so the peek below only ever reports this click's
-        // doing — peeking does not consume, so a stale intent would mask the preview's.
-        while (runCatching { shadowOf(app).nextStartedActivity }.getOrNull() != null) Unit
-        clickSheetRow("Preview")
+        longPressRow(bulkName(0))
+        awaitStartedActivity("dev.eclipse.ssh.ui.files.FileActionsActivity")
+        drainStartedActivities()
 
-        pumpUntil(describe = { "the sheet never closed after its Preview row was tapped: " + diagnose() }) {
-            compose.onAllNodes(hasText("Preview") and hasClickAction()).fetchSemanticsNodes().isEmpty()
-        }
-        // Stage 2: the request the row filed is consumed by a LaunchedEffect keyed on it, which fires
-        // on a later frame. Robolectric records every startActivity unconditionally, so a timeout here
-        // means the request never reached the effect — and the peeked intent is the honest witness of
-        // what did start instead.
-        pumpUntil(describe = {
-            "the preview activity never started (last start: " +
-                runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull() + "). " + diagnose()
-        }) {
-            runCatching { shadowOf(app).peekNextStartedActivity() }.getOrNull()
-                ?.component?.className == "dev.eclipse.ssh.ui.preview.FilePreviewActivity"
-        }
+        ActionRequests.answer(ActionAnswer.FileAction(FileActionKind.PREVIEW))
+        resumeTheWorkspace()
 
-        // The other half of the handoff, and the one only this level can see: the token in the intent
-        // is the entry that was long-pressed. The window itself never composes here, so nothing else
-        // would ever read it — leaving the suite to assert a window opened on whatever file happened to
-        // be in the slot.
-        val started = shadowOf(app).peekNextStartedActivity()
-        val request = PreviewRequests.takeFile(started?.getStringExtra(FilePreviewActivity.EXTRA_REQUEST_TOKEN))
+        val started = awaitStartedActivity("dev.eclipse.ssh.ui.preview.FilePreviewActivity")
+        val request = PreviewRequests.takeFile(started.getStringExtra(FilePreviewActivity.EXTRA_REQUEST_TOKEN))
         assertWithMessage("the preview was opened on a file other than the one long-pressed")
             .that(request?.entry?.name).isEqualTo(bulkName(0))
     }
@@ -324,22 +332,47 @@ class FilesExplorerLayoutRobolectricTest {
     // ---------------------------------------------------------------- driving the app
     private fun viewModel(): MainViewModel = ViewModelProvider(compose.activity)[MainViewModel::class.java]
 
+    /** Long-presses one row of the listing, by the name the row shows. */
+    private fun longPressRow(name: String) {
+        compose.onNode(hasText(name) and hasClickAction()).performTouchInput { longClick() }
+    }
+
     /**
-     * Clicks a bottom-sheet row by invoking its own OnClick semantics action.
+     * Stops and resumes the workspace, which is what a window closing above it does.
      *
-     * A Material3 ModalBottomSheet lives in a Dialog window, and `performClick` delivers a real
-     * touch through the window's input dispatcher — which under Robolectric never reaches content
-     * inside a dialog window: the node is found, the call returns, and the row's lambda has not run.
-     * (The same gesture on the main window — a tab, a file row — arrives fine, which is why only
-     * the sheet-driven tests fail.) Invoking the action the touch would have dispatched runs the
-     * row's own code with nothing to deliver, so what the test asserts afterwards is about the app
-     * rather than about the harness.
+     * [MainActivity.onResume] is where an answer is taken, and it is deliberately the only place: the
+     * alternative is a result callback replayed into a fresh composition, which is the same action
+     * taken twice. Nothing else can drive it from here, because a window opened by `startActivity`
+     * under Robolectric is recorded rather than launched - so the resume is simulated at exactly the
+     * point the real one would happen.
      */
-    private fun clickSheetRow(label: String) {
-        val row = compose.onNode(hasText(label) and hasClickAction()).fetchSemanticsNode()
-        val click = row.config.getOrNull(SemanticsActions.OnClick)?.action
-        checkNotNull(click) { "the \"$label\" sheet row has no OnClick action" }
-        compose.runOnUiThread { click() }
+    private fun resumeTheWorkspace() {
+        compose.activityRule.scenario.moveToState(Lifecycle.State.STARTED)
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        compose.waitForIdle()
+    }
+
+    /** Throws away every activity started so far, so a later wait reports only this test's doing. */
+    private fun drainStartedActivities() {
+        val shadow = shadowOf(compose.activity.application)
+        while (runCatching { shadow.nextStartedActivity }.getOrNull() != null) Unit
+    }
+
+    /**
+     * Waits for an activity of [className] to have been started, and returns its intent.
+     *
+     * Peeked rather than taken, so the caller asserts on the same intent the wait saw instead of
+     * racing a second launch for it.
+     */
+    private fun awaitStartedActivity(className: String): android.content.Intent {
+        val shadow = shadowOf(compose.activity.application)
+        pumpUntil(describe = {
+            "$className never started (last start: " +
+                runCatching { shadow.peekNextStartedActivity() }.getOrNull() + "). " + diagnose()
+        }) {
+            runCatching { shadow.peekNextStartedActivity() }.getOrNull()?.component?.className == className
+        }
+        return checkNotNull(runCatching { shadow.peekNextStartedActivity() }.getOrNull())
     }
 
     private fun names(): List<String> = viewModel().filesExplorer.state.value.entries.map { it.name }

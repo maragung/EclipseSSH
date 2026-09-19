@@ -193,7 +193,6 @@ import dev.eclipse.ssh.data.model.decodeRemoteDesktop
 import dev.eclipse.ssh.data.model.SessionConnectionState
 import dev.eclipse.ssh.data.model.isEnded
 import dev.eclipse.ssh.data.model.isLive
-import dev.eclipse.ssh.data.model.Snippet
 import dev.eclipse.ssh.data.model.SessionTab
 import dev.eclipse.ssh.data.model.SftpSessionState
 import dev.eclipse.ssh.data.model.TransferDirection
@@ -234,7 +233,7 @@ import dev.eclipse.ssh.archive.ArchiveTarget
 import dev.eclipse.ssh.archive.ArchiveReader
 import dev.eclipse.ssh.archive.ArchiveUiState
 import dev.eclipse.ssh.ui.about.AboutActivity
-import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsSheet
+import dev.eclipse.ssh.ui.archive.ArchiveEntryActionsActivity
 import dev.eclipse.ssh.ui.archive.ArchiveEntryPreviewActivity
 import dev.eclipse.ssh.ui.archive.ArchiveEntryPropertiesDialog
 import dev.eclipse.ssh.ui.archive.ArchivePropertiesDialog
@@ -244,7 +243,7 @@ import dev.eclipse.ssh.ui.archive.SafArchiveDestination
 import dev.eclipse.ssh.ui.editor.EditorRequest
 import dev.eclipse.ssh.ui.editor.EditorRequests
 import dev.eclipse.ssh.ui.editor.TextEditorActivity
-import dev.eclipse.ssh.ui.files.ExplorerFileActionsSheet
+import dev.eclipse.ssh.ui.files.FileActionsActivity
 import dev.eclipse.ssh.ui.files.ExplorerList
 import dev.eclipse.ssh.ui.files.ExplorerPropertiesDialog
 import dev.eclipse.ssh.ui.files.ExplorerSelectionBar
@@ -286,10 +285,14 @@ import dev.eclipse.ssh.ui.SecretFieldKeyboard
 import dev.eclipse.ssh.ui.SecretPasteButton
 import dev.eclipse.ssh.ui.actions.ActionAnswer
 import dev.eclipse.ssh.ui.actions.ActionRequests
+import dev.eclipse.ssh.ui.actions.ArchiveEntryActionKind
+import dev.eclipse.ssh.ui.actions.FileActionKind
 import dev.eclipse.ssh.ui.actions.ForwardRuleKind
 import dev.eclipse.ssh.ui.actions.HostDetailsKind
+import dev.eclipse.ssh.ui.actions.SnippetActionKind
 import dev.eclipse.ssh.ui.actions.TransferActionKind
 import dev.eclipse.ssh.ui.sessions.SessionWhyActivity
+import dev.eclipse.ssh.ui.snippets.SnippetsActivity
 import dev.eclipse.ssh.ui.statusColor
 import dev.eclipse.ssh.ui.transfers.TransferActionsActivity
 import dev.eclipse.ssh.ssh.PERMISSION_PRESETS
@@ -1309,6 +1312,8 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     linuxUserspace = viewModel.linuxUserspace,
                     localLinuxCard = viewModel.localLinuxCard,
+                    pendingAction = pendingAction,
+                    onActionHandled = onActionHandled,
                     onPreviewFile = { entry, provider ->
                         context.startActivity(FilePreviewActivity.intent(context, entry, provider))
                     },
@@ -1368,7 +1373,6 @@ private fun EclipseWorkspace(
                     onCopyTerminalText = viewModel::copyToClipboard,
                     onPasteTerminal = viewModel::pasteFromClipboard,
                     onSaveSnippet = viewModel::saveSnippet,
-                    onDeleteSnippet = viewModel::deleteSnippet,
                     onSaveLogs = { hostId, text ->
                         pendingTextExport = ("Eclipse SSH session log\nHost: $hostId\nSaved: ${System.currentTimeMillis()}\n\n$text").toByteArray()
                         pickerActive = true
@@ -1491,6 +1495,8 @@ private fun EclipseWorkspace(
                     filesExplorer = viewModel.filesExplorer,
                     linuxUserspace = viewModel.linuxUserspace,
                     localLinuxCard = viewModel.localLinuxCard,
+                    pendingAction = pendingAction,
+                    onActionHandled = onActionHandled,
                     onPreviewFile = { entry, provider ->
                         context.startActivity(FilePreviewActivity.intent(context, entry, provider))
                     },
@@ -1550,7 +1556,6 @@ private fun EclipseWorkspace(
                     onCopyTerminalText = viewModel::copyToClipboard,
                     onPasteTerminal = viewModel::pasteFromClipboard,
                     onSaveSnippet = viewModel::saveSnippet,
-                    onDeleteSnippet = viewModel::deleteSnippet,
                     onSaveLogs = { hostId, text ->
                         pendingTextExport = ("Eclipse SSH session log\nHost: $hostId\nSaved: ${System.currentTimeMillis()}\n\n$text").toByteArray()
                         pickerActive = true
@@ -1861,9 +1866,12 @@ private fun EclipseWorkspace(
     // both fight the explorer's own bottom sheets and show one folder's worth of a 1M-entry tree in
     // a window measured for a file list. The layer reads the browser's state; dismissal is the
     // close above, which cancels the scan/watcher and releases the channel.
-    // The per-entry sheets live *here*, above the browser, not inside it: they act on this
-    // workspace's clipboard and extract destination, which the browser layer knows nothing about.
-    var archiveEntrySheet by remember { mutableStateOf<ArchiveEntry?>(null) }
+    // The per-entry window was a sheet held here, above the browser, because it acts on this
+    // workspace's clipboard and extract destination rather than on anything the browser knows. It
+    // is a window of its own now (see [ArchiveEntryActionsActivity]) and the window holds nothing;
+    // what stays is the *target* - which row it was opened on - because the answer carries no entry
+    // (see [ActionAnswer]) and this is the only place that knows which row the user pressed.
+    var archiveEntryAction by remember { mutableStateOf<ArchiveEntry?>(null) }
     var archiveEntryProperties by remember { mutableStateOf<ArchiveEntry?>(null) }
     var showArchiveProperties by remember { mutableStateOf(false) }
     // The extract that is waiting on the user to pick a destination folder. The entries are held
@@ -1926,16 +1934,30 @@ private fun EclipseWorkspace(
                 onRetry = browser::retry,
                 onUnlock = browser::unlock,
                 // Opening a file is the preview; only the ZIP format can fetch one entry's bytes
-                // by range, so a TAR entry falls to the action sheet's honest Extract verb rather
+                // by range, so a TAR entry falls to the action window's honest Extract verb rather
                 // than a preview that would secretly stream the whole archive.
                 onOpenEntry = { entry ->
                     if (ArchiveReader.supportsRandomAccess(browser.format)) {
                         openEntryPreview(entry)
                     } else {
-                        archiveEntrySheet = entry
+                        archiveEntryAction = entry
+                        context.startActivity(
+                            ArchiveEntryActionsActivity.intent(context, entry, canReadEntry = false),
+                        )
                     }
                 },
-                onEntryActions = { entry -> archiveEntrySheet = entry },
+                onEntryActions = { entry ->
+                    // The same verdict the sheet was given, and the same one the preview row above
+                    // was decided by: a range read exists only for ZIP, and only for a file.
+                    archiveEntryAction = entry
+                    context.startActivity(
+                        ArchiveEntryActionsActivity.intent(
+                            context = context,
+                            entry = entry,
+                            canReadEntry = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory,
+                        ),
+                    )
+                },
                 // The batch extract from the browser's selection bar: the same pendingExtract +
                 // picker the per-entry sheet's Extract row feeds, so there is one extract path,
                 // not two. The browser keeps its selection behind the picker; a cancelled pick
@@ -1949,31 +1971,40 @@ private fun EclipseWorkspace(
                 onShowProperties = { showArchiveProperties = true },
             ),
         )
-        // The entry preview's sheet stood here. It reads through the same ranged source the scan
-        // did - one entry's bytes, never the archive around it - but it is a window now, opened
-        // from the two rows that lead to it (the browser's own tap and the entry sheet's Preview).
-        archiveEntrySheet?.let { entry ->
-            val readable = ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory
-            ArchiveEntryActionsSheet(
-                entry = entry,
-                canReadEntry = readable,
-                onDismiss = { archiveEntrySheet = null },
-                onPreview = if (readable) ({ archiveEntrySheet = null; openEntryPreview(entry) }) else null,
-                // Extract (and single-entry Download, which is extract of one file by another
-                // name): hand the entries to the destination picker, and the extract itself runs
-                // when the picker answers. The archive stays remote throughout - what moves is
-                // each entry's own bytes.
-                onExtract = {
-                    archiveEntrySheet = null
+        // The entry preview's sheet stood here, and so did the action sheet's. Both are windows now:
+        // the preview reads through the same ranged source the scan did - one entry's bytes, never
+        // the archive around it - and the actions are answered back into this layer, below.
+        // What the entry action window answered, acted on here rather than at the workspace's own
+        // drain below, because everything it needs - the browser's format, this workspace's clipboard,
+        // the extract picker and the properties dialog - is in scope in this layer and nowhere else.
+        // Two effects keyed on the same answer is safe: this one consumes only its own kind, and the
+        // other ignores this kind, so exactly one of them acts and exactly one clears the slot.
+        LaunchedEffect(pendingAction) {
+            val answer = pendingAction as? ActionAnswer.ArchiveEntryAction ?: return@LaunchedEffect
+            val entry = archiveEntryAction ?: return@LaunchedEffect
+            when (answer.action) {
+                // Preview only where the range read exists - the same condition the window drew its
+                // Preview row by, resolved here because a TAR entry has no reader to hand it.
+                ArchiveEntryActionKind.PREVIEW ->
+                    if (ArchiveReader.supportsRandomAccess(browser.format) && !entry.isDirectory) {
+                        openEntryPreview(entry)
+                    } else {
+                        viewModel.reportUiMessage("${entry.path} cannot be previewed in this archive format")
+                    }
+                // Extract, and single-entry Download under its other name: hand the entry to the
+                // destination picker, and the extract itself runs when the picker answers. The
+                // archive stays remote throughout - what moves is the entry's own bytes.
+                ArchiveEntryActionKind.EXTRACT -> {
                     pendingExtract = target to listOf(entry)
                     archiveExtractPicker.launch(null)
-                },
-                onCopyPath = {
-                    archiveEntrySheet = null
-                    viewModel.copyToClipboard(entry.path)
-                },
-                onProperties = { archiveEntrySheet = null; archiveEntryProperties = entry },
-            )
+                }
+                // The path *inside* the archive, which is the archive's own coordinate system and
+                // what somebody pasting it beside the archive in a shell is addressing.
+                ArchiveEntryActionKind.COPY_PATH -> viewModel.copyToClipboard(entry.path)
+                ArchiveEntryActionKind.PROPERTIES -> archiveEntryProperties = entry
+            }
+            archiveEntryAction = null
+            onActionHandled()
         }
         archiveEntryProperties?.let { entry ->
             ArchiveEntryPropertiesDialog(
@@ -1995,6 +2026,14 @@ private fun EclipseWorkspace(
     // same reason the deep link above is: the answer needs something only this composition has. The
     // view-model calls are the easy half; View/Edit/Open resolve a provider from the transfer and then
     // open a window with it, and `editorRequest` and the preview launcher are this workspace's own.
+    //
+    // Two kinds of answer are deliberately *not* acted on here. `FileAction` and `SnippetAction` are
+    // handled by the screen that opened the window - the explorer and the terminal, each of which is
+    // the only place holding the row the answer is about - and they consume themselves, so this drain
+    // must leave the slot alone rather than clear it out from under them. That is safe rather than
+    // racy: the workspace is *stopped* while one of these windows is in front of it, so the screen
+    // that launched it is still composed when its answer arrives, and its own `LaunchedEffect` fires
+    // on the same recomposition this one does.
     //
     // Consumed at the end, exactly as the deep link is, so a recomposition cannot run one answer
     // twice. `takeAnswer` has already emptied the slot, so the worst a lost frame can do is drop an
@@ -2063,7 +2102,10 @@ private fun EclipseWorkspace(
                 HostDetailsKind.REFRESH_STATS -> viewModel.refreshStats(host)
             }
         }
-        onActionHandled()
+        // Cleared for every kind this drain owns, and for the archive's too, which is drained in its
+        // own layer above. Left alone for the two the explorer and the terminal consume themselves -
+        // clearing it here would race the screen whose answer it is.
+        if (answer !is ActionAnswer.FileAction && answer !is ActionAnswer.SnippetAction) onActionHandled()
     }
     }
     }
@@ -2163,6 +2205,17 @@ private fun WorkspaceScaffold(
      * scaffold for a card only the Hosts destination shows.
      */
     localLinuxCard: StateFlow<HostProfile?>,
+    /**
+     * The answer a window just handed back, and the way to say it has been acted on.
+     *
+     * Passed down rather than acted on here because the two screens below are the only places that
+     * hold the row their window was opened on: `FileAction` names a verb and nothing else, and only
+     * the explorer knows which entry was long-pressed, exactly as only the terminal knows which
+     * session a snippet is typed into. Both screens ignore an answer that is not theirs and consume
+     * the one that is - see the drain in [EclipseWorkspace] for why that is safe rather than racy.
+     */
+    pendingAction: ActionAnswer? = null,
+    onActionHandled: () -> Unit = {},
     /** Opens a file in the full-window preview - see the overlay state in [EclipseWorkspace]. */
     onPreviewFile: (FsEntry, FileSystemProvider) -> Unit = { _, _ -> },
     /** Opens a file in the full-window editor - see the overlay state in [EclipseWorkspace]. */
@@ -2241,7 +2294,6 @@ private fun WorkspaceScaffold(
     onCopyTerminalText: (String) -> Unit = {},
     onPasteTerminal: (String) -> Unit = {},
     onSaveSnippet: (String, String) -> Unit = { _, _ -> },
-    onDeleteSnippet: (String) -> Unit = {},
     onSaveLogs: (String, String) -> Unit = { _, _ -> },
     /** Saves a session's raw output log - session key and the host name to name the file after. */
     onSaveSessionLog: (String, String) -> Unit = { _, _ -> },
@@ -2322,6 +2374,8 @@ private fun WorkspaceScaffold(
         TerminalScreen(
             state = state,
             frames = frames,
+            pendingAction = pendingAction,
+            onActionHandled = onActionHandled,
             onCloseTab = onCloseTab,
             onDisconnectAll = onDisconnectAll,
             // The tab's own key, straight to the dial rather than through the host: a host with two
@@ -2340,7 +2394,6 @@ private fun WorkspaceScaffold(
             onCopyText = onCopyTerminalText,
             onPaste = onPasteTerminal,
             onSaveSnippet = onSaveSnippet,
-            onDeleteSnippet = onDeleteSnippet,
             onSaveLogs = onSaveLogs,
             onSaveSessionLog = onSaveSessionLog,
             onNotifyWhenDone = onNotifyWhenDone,
@@ -2471,6 +2524,10 @@ private fun WorkspaceScaffold(
                     onScheduleUpload,
                     onSync,
                     onSendToHost,
+                    // Last on purpose, and named: what came back from a window is not part of the
+                    // explorer's own vocabulary of actions, and it is the caller's to supply.
+                    pendingAction = pendingAction,
+                    onActionHandled = onActionHandled,
                 )
             }
             return@Scaffold
@@ -2775,7 +2832,6 @@ private fun TerminalScreen(
     onCopyText: (String) -> Unit,
     onPaste: (String) -> Unit,
     onSaveSnippet: (String, String) -> Unit,
-    onDeleteSnippet: (String) -> Unit,
     onSaveLogs: (String, String) -> Unit,
     /** Saves the raw session log - see MainViewModel.sessionLogText. */
     onSaveSessionLog: (String, String) -> Unit,
@@ -2798,6 +2854,16 @@ private fun TerminalScreen(
     onLeaveSession: () -> Unit,
     modifier: Modifier = Modifier,
     fontSize: Int = 13,
+    /**
+     * The answer a window just handed back, and the way to say it has been acted on.
+     *
+     * Only [ActionAnswer.SnippetAction] is this screen's, and it is this screen's because an insert
+     * is two things only the terminal has: the session on screen, which decides which shell the
+     * command is typed into, and the focus host the keyboard goes up over afterwards. Every other
+     * kind is ignored here and left for whoever owns it.
+     */
+    pendingAction: ActionAnswer? = null,
+    onActionHandled: () -> Unit = {},
     /** Persists a pinch-to-zoom result, so the size the user settled on survives leaving the screen. */
     onFontSize: (Int) -> Unit = {},
     /** Persists the shortcut bar's collapsed state, for the same reason. */
@@ -2807,6 +2873,8 @@ private fun TerminalScreen(
     var showSearch by rememberSaveable { mutableStateOf(false) }
     var showCommandBar by rememberSaveable { mutableStateOf(false) }
     var showHistory by rememberSaveable { mutableStateOf(false) }
+    // For the one thing this screen launches rather than draws: the snippets window.
+    val context = LocalContext.current
     /**
      * The half-typed command line.
      *
@@ -2823,7 +2891,6 @@ private fun TerminalScreen(
      * way, because the screen leaves composition with it.
      */
     var command by remember { mutableStateOf("") }
-    var showSnippets by remember { mutableStateOf(false) }
     var showSaveSnippet by remember { mutableStateOf(false) }
     var snippetLabel by remember { mutableStateOf("") }
     var selection by remember { mutableStateOf<TerminalSelection?>(null) }
@@ -2988,7 +3055,11 @@ private fun TerminalScreen(
             onToggleSearch = { showSearch = !showSearch },
             onToggleCommandBar = { showCommandBar = !showCommandBar },
             onToggleHistory = { showHistory = !showHistory },
-            onSnippets = { showSnippets = true },
+            // A window rather than a sheet over this grid: the saved commands are only worth offering
+            // while the command line they will land on is legible, and a sheet is a slot at the
+            // bottom of the screen - exactly where the grid's own last lines are. It carries nothing:
+            // the list is the snippet store, which that activity injects and watches directly.
+            onSnippets = { context.startActivity(SnippetsActivity.intent(context)) },
             onSaveLogs = { onSaveLogs(activeTab.hostId, terminalText) },
             // The session's own key, not the host: a host with two shells has two logs, and the
             // tab's title is the host name the file should be called after.
@@ -3165,17 +3236,33 @@ private fun TerminalScreen(
         )
     }
 
-    if (showSnippets) {
-        SnippetsSheet(
-            snippets = state.snippets,
-            onDismiss = { showSnippets = false },
-            // Typed into the remote shell rather than into a form, so the shell's own line editing
-            // applies: the snippet arrives on the command line where it can be corrected before Enter,
-            // which is what a snippet is for. Deliberately not sent with a newline.
-            onInsert = { snippet -> onSendText(activeTab.id, snippet.command); showSnippets = false; showKeyboard() },
-            onSaveCurrent = { showSnippets = false; showSaveSnippet = true },
-            onDelete = onDeleteSnippet,
-        )
+    // What the snippets window answered. Drained here rather than in the workspace because both of
+    // these rows need something only this screen has: an insert is typed into the session on screen
+    // and then has to raise the keyboard over this screen's own focus host, and the save row names
+    // the command this screen's command bar is holding. Delete is the one row that does *not* come
+    // through here - the window makes that write itself, which is what lets the row it removed go
+    // immediately rather than when the workspace comes back to the front.
+    LaunchedEffect(pendingAction) {
+        val answer = pendingAction as? ActionAnswer.SnippetAction ?: return@LaunchedEffect
+        // Read from the list this screen is showing - the same store the window drew its rows from -
+        // rather than from the answer, which carries an id and nothing more. The row cannot have gone
+        // between the tap and this line: the workspace is stopped while the window is in front of it.
+        val snippet = answer.snippetId?.let { id -> state.snippets.firstOrNull { it.id == id } }
+        when (answer.action) {
+            SnippetActionKind.INSERT -> snippet?.let {
+                // Typed into the remote shell rather than into a form, so the shell's own line
+                // editing applies: the snippet arrives on the command line where it can be
+                // corrected before Enter, which is what a snippet is for. Deliberately no newline.
+                onSendText(activeTab.id, it.command)
+                showKeyboard()
+            }
+            // The naming dialog stays here rather than moving into the window, and this is why the
+            // row is an answer at all: it names the command the user has typed, which is live text
+            // in this composition - a copy of it taken at launch would be a name for the wrong line
+            // if the user typed anything after opening the window.
+            SnippetActionKind.SAVE_CURRENT -> showSaveSnippet = true
+        }
+        onActionHandled()
     }
     if (showSaveSnippet) {
         SaveSnippetDialog(
@@ -4012,38 +4099,6 @@ private fun TerminalCommandBar(
 private val KEY_FILE_MIME_TYPES = arrayOf("application/octet-stream", "text/plain", "*/*")
 
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun SnippetsSheet(
-    snippets: List<Snippet>,
-    onDismiss: () -> Unit,
-    onInsert: (Snippet) -> Unit,
-    onSaveCurrent: () -> Unit,
-    onDelete: (String) -> Unit,
-) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.padding(horizontal = 22.dp).navigationBarsPadding().padding(bottom = 18.dp)) {
-            Text("Snippets", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(onClick = onSaveCurrent, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(8.dp)); Text("Save current command") }
-            Spacer(Modifier.height(12.dp))
-            if (snippets.isEmpty()) {
-                Text("No snippets yet. Save a command to reuse it later.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            } else {
-                snippets.forEach { snippet ->
-                    Row(Modifier.fillMaxWidth().clickable { onInsert(snippet) }.padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(snippet.label, fontWeight = FontWeight.SemiBold)
-                            Text(snippet.command, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, fontFamily = FontFamily.Monospace)
-                        }
-                        IconButton(onClick = { onDelete(snippet.id) }) { Icon(Icons.Default.Close, "Delete snippet", tint = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    }
-                }
-            }
-        }
-    }
-}
-
 @Composable
 private fun SaveSnippetDialog(initialCommand: String, label: String, onLabelChange: (String) -> Unit, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
     AlertDialog(
@@ -4089,9 +4144,21 @@ private fun ColumnScope.FilesScreen(
     onScheduleUpload: (List<LocalFile>, Long, Long?) -> Unit,
     onSync: (SyncDirection) -> Unit,
     onSendToHost: (RemoteFile, HostProfile, String) -> Unit,
+    /**
+     * The answer a window just handed back, and the way to say it has been acted on.
+     *
+     * Only [ActionAnswer.FileAction] is this screen's. The answer names a verb and carries no entry,
+     * because an entry is a row of the listing this screen holds and nothing an intent can carry -
+     * so `actionEntry`, which is what the window was opened on, is what the verb is applied to. Every
+     * other kind is ignored here and left for whoever owns it.
+     */
+    pendingAction: ActionAnswer? = null,
+    onActionHandled: () -> Unit = {},
 ) {
     val explorer by filesExplorer.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    // For the one thing this screen launches rather than draws: the per-entry actions window.
+    val context = LocalContext.current
     // The active session's provider, for the two actions that must hand one to a full-window
     // overlay. Rebuilt when the session changes, not on every recomposition.
     val provider = remember(explorer.activeSessionId) { filesExplorer.providerFor(explorer.activeSessionId) }
@@ -4188,7 +4255,27 @@ private fun ColumnScope.FilesScreen(
                 if (entry.isDirectory) filesExplorer.navigate(entry.path, entry.name) else provider?.let { onPreviewFile(entry, it) }
             },
             onToggleSelect = filesExplorer::toggleSelected,
-            onOpenActions = { actionEntry = it },
+            onOpenActions = { entry ->
+                // The row the window was opened on, kept here because the answer carries a verb and
+                // no subject - see [ActionAnswer]. Held across the launch for the same reason the
+                // extract target is: the window cannot be opened on one row and answer for another,
+                // because the workspace has to come back to the front for a second one to open.
+                actionEntry = entry
+                context.startActivity(
+                    FileActionsActivity.intent(
+                        context = context,
+                        entry = entry,
+                        isLocal = explorer.isLocal,
+                        supportsPermissions = explorer.supportsPermissions,
+                        // The row exists only when the session and the name can both be served: a
+                        // local document tree has no ranged reads to browse with, and an unknown
+                        // extension has no engine to browse with - hiding the verb beats offering
+                        // it and failing.
+                        canOpenArchive = onOpenArchive != null && !explorer.isLocal &&
+                            ArchiveReader.formatFor(entry.name) != null,
+                    ),
+                )
+            },
         )
     }
 
@@ -4212,34 +4299,34 @@ private fun ColumnScope.FilesScreen(
         )
     }
 
-    actionEntry?.let { entry ->
-        ExplorerFileActionsSheet(
-            entry = entry,
-            isLocal = explorer.isLocal,
-            supportsPermissions = explorer.supportsPermissions,
-            onDismiss = { actionEntry = null },
-            // The sheet closes so the batch bar it summons is visible; the entry joins whatever
+    // What the file actions window answered. The window itself is launched from
+    // `onOpenActions` above - see [FileActionsActivity] for why it carries a token and not the
+    // entry - and what comes back here is a verb with no subject, applied to the row this screen
+    // opened it on.
+    LaunchedEffect(pendingAction) {
+        val answer = pendingAction as? ActionAnswer.FileAction ?: return@LaunchedEffect
+        val entry = actionEntry
+        if (entry != null) when (answer.action) {
+            // The batch bar this summons is why the window closes first: the row joins whatever
             // selection is already active, which is the old long-press behaviour one tap deeper.
-            onSelect = { actionEntry = null; filesExplorer.toggleSelected(entry.path) },
-            onPreview = { actionEntry = null; provider?.let { onPreviewFile(entry, it) } },
-            onEdit = { actionEntry = null; provider?.let { onEditFile(entry, it) } },
-            onRename = { actionEntry = null; renameEntry = entry },
-            onCopy = { actionEntry = null; pendingRelocate = PendingRelocate(copy = true, entries = listOf(entry)) },
-            onMove = { actionEntry = null; pendingRelocate = PendingRelocate(copy = false, entries = listOf(entry)) },
-            onDelete = { actionEntry = null; deleteEntries = listOf(entry) },
-            onProperties = { actionEntry = null; propertiesEntry = entry },
-            onChmod = if (explorer.supportsPermissions) ({ actionEntry = null; chmodEntry = entry }) else null,
-            onTransfer = {
-                actionEntry = null
+            FileActionKind.SELECT -> filesExplorer.toggleSelected(entry.path)
+            FileActionKind.PREVIEW -> provider?.let { onPreviewFile(entry, it) }
+            FileActionKind.EDIT -> provider?.let { onEditFile(entry, it) }
+            FileActionKind.RENAME -> renameEntry = entry
+            FileActionKind.COPY -> pendingRelocate = PendingRelocate(copy = true, entries = listOf(entry))
+            FileActionKind.MOVE -> pendingRelocate = PendingRelocate(copy = false, entries = listOf(entry))
+            FileActionKind.DELETE -> deleteEntries = listOf(entry)
+            FileActionKind.PROPERTIES -> propertiesEntry = entry
+            FileActionKind.CHMOD -> chmodEntry = entry
+            FileActionKind.TRANSFER ->
                 if (explorer.isLocal) onUploadLocal(entry.toLocalFile()) else onDownloadFile(entry.toRemoteFile())
-            },
-            onSendToHost = if (!explorer.isLocal) ({ actionEntry = null; sendEntry = entry }) else null,
-            // The row exists only when the session and the name can both be served: a local
-            // document tree has no ranged reads to browse with, and an unknown extension has no
-            // engine to browse with - hiding the verb beats offering it and failing.
-            onOpenArchive = onOpenArchive?.takeIf { !explorer.isLocal && ArchiveReader.formatFor(entry.name) != null }
-                ?.let { open -> { actionEntry = null; provider?.let { open(entry, it) } } },
-        )
+            FileActionKind.SEND_TO_HOST -> sendEntry = entry
+            // The row is drawn only when the session and the name can both be served - see the
+            // window - so the only thing left to check is whether an opener was supplied at all.
+            FileActionKind.OPEN_ARCHIVE -> onOpenArchive?.let { open -> provider?.let { open(entry, it) } }
+        }
+        actionEntry = null
+        onActionHandled()
     }
 
     if (showNewFile) {

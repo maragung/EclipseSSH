@@ -83,7 +83,7 @@ windows, and what they show travels through `PreviewRequests` on the same one-sh
 because a live `FileSystemProvider` — and a closure over an open archive — cannot be parcelled into
 an intent.
 
-**Two surfaces that act, not just show, left the bottom of the screen** — the first of the remaining
+**Five surfaces that act, not just show, left the bottom of the screen** — the first of the remaining
 sheets, promoted one at a time:
 
 - **The transfers window** (`ui/transfers/TransferActionsActivity`). A long-press on a transfer card
@@ -96,8 +96,24 @@ sheets, promoted one at a time:
   `SessionTab` is assembled by the workspace's own view model and cannot be parcelled — but the trace
   deliberately does not: the window collects the diagnostics ring itself, so a reconnect ladder that
   climbs a rung while somebody is reading it appears as it happens.
+- **The snippets window** (`ui/snippets/SnippetsActivity`). The list of saved commands, which used to
+  be a sheet over the *shell* the commands were going to be typed into — the one surface where
+  covering the thing you are choosing for is plainly wrong. It is also the one window here that
+  carries no subject at all: a snippet list is not a row of anything the workspace holds, it is
+  `SnippetRepository`, a singleton with a `Flow`, so the window reads the store directly and a command
+  saved from the terminal appears in the open list. Two of its three rows still come back — an insert
+  is typed into the session on screen and the save row names the command bar's live text — while
+  delete is performed in the window, which is what lets a row go as it is tapped.
+- **The file actions window** (`ui/files/FileActionsActivity`). Everything one explorer row can do,
+  opened by long-pressing it. The entry travels as a token and the three session facts that decide
+  which rows exist — local or remote, mode bits, whether the name can be browsed as an archive —
+  travel as plain extras, because those are booleans an intent can carry and the entry is not.
+- **The archive entry window** (`ui/archive/ArchiveEntryActionsActivity`). The same shape one layer
+  down, inside an open archive: Preview and Download only where the entry's bytes can be fetched by
+  range, one Extract row where they cannot, and the archive's own vocabulary otherwise — no Rename,
+  Move or Delete, because the archive is read-only where it stands on the server.
 
-Both hand back what the user chose through `ActionRequests` and act on nothing themselves, because
+They hand back what the user chose through `ActionRequests` and act on nothing themselves, because
 every one of those actions — pausing a transfer, resolving its local file, opening the editor — is the
 workspace's own code, and a second implementation in a second window is how the two drift.
 `MainActivity.onResume` is what takes the answer, the same way it takes a confirmed forward, and
@@ -180,7 +196,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,896 JVM/Robolectric test methods in 169 test files and contacts nothing off the
+The suite is 1,918 JVM/Robolectric test methods in 172 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot
