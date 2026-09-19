@@ -160,7 +160,7 @@ class SessionWhyActivityRobolectricTest {
         val spent = ActionRequests.put(ActionSubject.SessionWhy(tab))
         ActionRequests.take(spent)
 
-        ActivityScenario.launch(spentTokenIntent(context, spent)).use { scenario ->
+        ActivityScenario.launch<SessionWhyActivity>(spentTokenIntent(context, spent)).use { scenario ->
             pumpUntil(describe = { "a spent token opened a window anyway" }) {
                 scenario.state == Lifecycle.State.DESTROYED
             }
@@ -171,7 +171,7 @@ class SessionWhyActivityRobolectricTest {
     @Test
     fun anIntentWithNoTokenOpensNothing() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        ActivityScenario.launch(Intent(context, SessionWhyActivity::class.java)).use { scenario ->
+        ActivityScenario.launch<SessionWhyActivity>(Intent(context, SessionWhyActivity::class.java)).use { scenario ->
             pumpUntil(describe = { "an intent with no subject token opened a window anyway" }) {
                 scenario.state == Lifecycle.State.DESTROYED
             }

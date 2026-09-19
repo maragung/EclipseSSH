@@ -7,6 +7,7 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.longClick
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
@@ -200,9 +201,12 @@ class TransfersActionsRobolectricTest {
 
         // Every start recorded after the first one, until there are none left. A second editor would
         // have to appear here.
-        val started = generateSequence { shadowOf(compose.activity.application).nextStartedActivity() }
-            .map { it.component?.className }
-            .toList()
+        val shadow = shadowOf(compose.activity.application)
+        val started = mutableListOf<String>()
+        while (true) {
+            val next = shadow.nextStartedActivity ?: break
+            next.component?.className?.let(started::add)
+        }
         assertThat(started).doesNotContain("dev.eclipse.ssh.ui.editor.TextEditorActivity")
     }
 

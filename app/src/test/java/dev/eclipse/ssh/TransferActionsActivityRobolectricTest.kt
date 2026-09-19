@@ -268,7 +268,7 @@ class TransferActionsActivityRobolectricTest {
     @Test
     fun anIntentWithNoIdOpensNothing() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        ActivityScenario.launch(Intent(context, TransferActionsActivity::class.java)).use { scenario ->
+        ActivityScenario.launch<TransferActionsActivity>(Intent(context, TransferActionsActivity::class.java)).use { scenario ->
             pumpUntil(describe = { "an intent with no transfer id opened a window anyway" }) {
                 scenario.state == Lifecycle.State.DESTROYED
             }

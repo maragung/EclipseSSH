@@ -5498,6 +5498,18 @@ was rewritten rather than extended: its row matrix moved to the window suite, an
 moments only the workspace can be seen at — the long-press that opens the window, and the answer
 acted on after a resume.
 
+**What CI found that the branch did not, on the first run.** Twenty-six Kotlin errors in the three new
+suites, none of them about the app: `ActivityScenario.launch(Intent)` returns `ActivityScenario<A>` with
+`A` inferred from the *target* type, so the three calls that fed it straight into `.use { }` — a spent
+token, no token, no id — had nothing to infer from and were rejected at the call site. The two suites
+that declare a return type (`launchWindow`) were accepted, which is why the same call compiled in one
+place and not another. The idiom the rest of the tree already uses is the fix: name the type argument,
+`ActivityScenario.launch<SessionWhyActivity>(intent)`. The other two are the same shape in a different
+place — `generateSequence { shadow.nextStartedActivity }` resolved its type parameter against a
+`DeepRecursiveFunction` overload (the lambda's `Intent?` has no other candidate to pin it), and one
+`performClick` was simply not imported. All three are test-side, and all three are the kind of thing
+only a compiler says.
+
 What no JVM test here can prove is how the two windows *feel* on a device: a window that slides in
 over the workspace and returns to it is the platform's own animation, and no assertion in this suite
 looks at it. The claims above are about which surface composes, what it reads, and what the workspace
