@@ -71,8 +71,16 @@ class RootfsInstaller(
          * Extracting; [entries] unpacked so far. [warnings] carries extraction events the rootfs
          * can live without but the setup report should name (a forward hardlink is the classic
          * one: a link whose target entry arrives later in the same tarball, skipped by design).
+         *
+         * [fraction] is how much of the tarball has been read, 0 to 1, or null when the file's
+         * length is unknown — the measure an extraction can actually take, since the size of the
+         * tree it unpacks to is exactly what the decompression-bomb budget refuses to assume.
          */
-        data class Extracting(val entries: Int, val warnings: List<String> = emptyList()) : Progress
+        data class Extracting(
+            val entries: Int,
+            val warnings: List<String> = emptyList(),
+            val fraction: Float? = null,
+        ) : Progress
     }
 
     /**
@@ -301,10 +309,16 @@ class RootfsInstaller(
         stagingDir.mkdirs()
         var entries = 0
         var written = 0L
+        // The tarball's own size is the denominator; a file whose length the platform will not
+        // report leaves every reading null, and the ladder above falls back to its schedule.
+        val tarballBytes = tarballFile.length()
+        var consumed = 0L
         val extractionWarnings = mutableListOf<String>()
         val budget = extractionBudgetBytes()
         val extractionStartedAt = System.currentTimeMillis()
-        openTarStream(tarballFile, DOWNLOAD_BUFFER).use { tar ->
+        fun fractionRead(): Float? =
+            if (tarballBytes > 0L) (consumed.toFloat() / tarballBytes).coerceIn(0f, 1f) else null
+        openTarStream(tarballFile, DOWNLOAD_BUFFER) { consumed = it }.use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
                 val target = resolveInside(stagingDir, entry.name)
@@ -365,11 +379,15 @@ class RootfsInstaller(
                 entries++
                 if (entries % PROGRESS_EVERY_ENTRIES == 0) {
                     coroutineContext.ensureActive()
-                    onProgress(Progress.Extracting(entries, extractionWarnings.toList()))
+                    onProgress(Progress.Extracting(entries, extractionWarnings.toList(), fractionRead()))
                 }
             }
         }
-        onProgress(Progress.Extracting(entries, extractionWarnings.toList()))
+        // The last reading is 1 by definition, not by the byte counter: the extraction is over, and
+        // a tar's own end-of-archive padding — which nothing reads — would otherwise leave the
+        // reading a little short of the end, so the bar would sit just below 100% through a phase
+        // that is finished.
+        onProgress(Progress.Extracting(entries, extractionWarnings.toList(), 1f))
         diagnostics.record(
             UserspaceDiagnosticCategory.ROOTFS,
             "rootfs extracted",

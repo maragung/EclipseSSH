@@ -60,6 +60,15 @@ class RootfsInstallerTest {
         assertThat(progress.first()).isInstanceOf(RootfsInstaller.Progress.Downloading::class.java)
         assertThat(progress.any { it is RootfsInstaller.Progress.Verifying }).isTrue()
         assertThat(progress.last()).isInstanceOf(RootfsInstaller.Progress.Extracting::class.java)
+
+        // And the extraction reports how much of the tarball it has read, ending at all of it: the
+        // one part of that phase anything here can measure, since the size of the tree it unpacks
+        // to is exactly what the decompression-bomb budget refuses to assume.
+        val extraction = progress.filterIsInstance<RootfsInstaller.Progress.Extracting>()
+        assertThat(extraction.mapNotNull { it.fraction }).isNotEmpty()
+        assertThat(extraction.mapNotNull { it.fraction }.zipWithNext().filter { (a, b) -> b < a })
+            .isEmpty()
+        assertThat(extraction.last().fraction).isEqualTo(1f)
     }
 
     @Test

@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
+import java.io.OutputStream
 import java.nio.file.Files
 import org.junit.Assume
 import org.junit.Test
@@ -181,5 +182,46 @@ class TarSafetyTest {
             locked.setReadable(true)
             locked.setExecutable(true)
         }
+    }
+
+    @Test
+    fun `a progress-reporting open counts the compressed bytes it hands over`() {
+        val fixture = TestTarballs.writeRootfsFixture(
+            newRoot().resolve("rootfs.tar.gz"),
+        )
+        val readings = mutableListOf<Long>()
+
+        // Drained in full, because the count is of what the *decompressor* read: a stream opened
+        // and abandoned would honestly report a partial reading, which is the property the install
+        // screen's extraction bar depends on.
+        openTarStream(fixture, 64 * 1024) { readings += it }.use { tar ->
+            while (tar.nextTarEntry != null) {
+                tar.copyTo(OutputStream.nullOutputStream())
+            }
+        }
+
+        assertThat(readings).isNotEmpty()
+        assertThat(readings.zipWithNext().filter { (before, after) -> after < before }).isEmpty()
+        assertThat(readings.last()).isEqualTo(fixture.length())
+    }
+
+    @Test
+    fun `the counter sees both ways of reading it`() {
+        // The buffered stream above the counter calls one read entry point for its fills and a
+        // direct caller may use the other; a count that saw only one of them reads as an extraction
+        // stuck at 0%, so both are exercised rather than assumed.
+        val file = newRoot().resolve("bytes.bin").apply { writeBytes(ByteArray(10) { it.toByte() }) }
+        val oneAtATime = mutableListOf<Long>()
+        CountingFileStream(file) { oneAtATime += it }.use { stream ->
+            while (stream.read() >= 0) Unit
+        }
+        val inBulk = mutableListOf<Long>()
+        CountingFileStream(file) { inBulk += it }.use { stream ->
+            stream.read(ByteArray(4))
+            stream.read(ByteArray(16))
+        }
+
+        assertThat(oneAtATime.last()).isEqualTo(10L)
+        assertThat(inBulk.last()).isEqualTo(10L)
     }
 }

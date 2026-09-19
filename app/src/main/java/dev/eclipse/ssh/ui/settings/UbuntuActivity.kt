@@ -60,6 +60,7 @@ import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
+import dev.eclipse.ssh.linux.percent
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceUiState
 import dev.eclipse.ssh.security.SecureClipboard
@@ -204,14 +205,23 @@ class UbuntuActivity : SettingsDestinationActivity() {
                 // compiler's proof of that invariant rather than a state any device can reach.
                 null -> Unit
                 is LinuxUserspaceState.Installing -> {
-                    val (label, fraction) = describeInstallStep(state.step)
-                    SettingRow(Icons.Default.CloudDownload, "Installing ${distro.displayName}", label) { }
-                    if (fraction != null) {
-                        LinearProgressIndicator(
-                            progress = { fraction },
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
-                        )
-                    }
+                    // The percentage trails the step rather than leading it: the line's first word
+                    // is the phase ("Downloading", "Installing the base packages"), and that is the
+                    // reading the E2E driver's STEP_SUBTITLES and every human scan of this row are
+                    // built on. The number is what the bar underneath draws.
+                    SettingRow(
+                        Icons.Default.CloudDownload,
+                        "Installing ${distro.displayName}",
+                        "${describeInstallStep(state.step)} · ${state.percent}%",
+                    ) { }
+                    // The bar and the number above it are the same fact, both read off the state's
+                    // one percentage: a bar drawn from a step's own fraction would sit at 90% while
+                    // the line beside it said 43%, which is the disagreement a progress display
+                    // exists to prevent.
+                    LinearProgressIndicator(
+                        progress = { state.percent / 100f },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
+                    )
                 }
                 is LinuxUserspaceState.NotInstalled -> SettingRow(
                     Icons.Default.Computer,
@@ -388,8 +398,9 @@ class UbuntuActivity : SettingsDestinationActivity() {
                             "base packages — bash, apt, git, curl, wget and an SSH client — are " +
                             "installed through apt itself, which needs a few hundred MB over your " +
                             "network. Anything else you want (Python, Node.js, an editor) is one " +
-                            "apt-get install away in the terminal. Nothing runs as root, and the " +
-                            "workspace at /home/ubuntu/workspace survives Stop and Restart." +
+                            "apt-get install away in the terminal. Inside it you are root over your " +
+                            "own files and nothing else, and the workspace at " +
+                            "/home/ubuntu/workspace survives Stop and Restart." +
                             if (ui.hasPendingWorkspaceBackup) {
                                 " Your saved workspace is restored after the install."
                             } else {
@@ -575,15 +586,18 @@ private fun distroTitle(ui: LinuxUserspaceUiState): String =
  * the phase has one (only the download does — verification, extraction and setup are steps whose
  * length the pipeline honestly cannot know, and a fake progress bar is worse than none).
  */
-private fun describeInstallStep(step: LinuxInstallStep): Pair<String, Float?> = when (step) {
-    is LinuxInstallStep.Downloading -> {
-        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}" to
-            (step.received.toFloat() / step.total.toFloat().coerceAtLeast(1f))
-    }
-    LinuxInstallStep.Verifying -> "Verifying the download" to null
-    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files" to null
-    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail) to null
-    LinuxInstallStep.VerifyingHealth -> "Running the health check" to null
+/**
+ * One install phase as the progress line renders it. The percentage that goes beside it is the
+ * state's, not the phase's: what a watcher wants is how far the install has got, and a phase-local
+ * number would read 0% again at each new step.
+ */
+private fun describeInstallStep(step: LinuxInstallStep): String = when (step) {
+    is LinuxInstallStep.Downloading ->
+        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}"
+    LinuxInstallStep.Verifying -> "Verifying the download"
+    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files"
+    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail)
+    LinuxInstallStep.VerifyingHealth -> "Running the health check"
 }
 
 private fun describeSetupStep(step: SetupStep, detail: String?): String {

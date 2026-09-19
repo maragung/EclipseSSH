@@ -222,6 +222,7 @@ import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.linux.SetupStep
+import dev.eclipse.ssh.linux.percent
 import dev.eclipse.ssh.presentation.files.LOCAL_SESSION_ID
 import dev.eclipse.ssh.presentation.files.ellipsizeCrumbs
 import dev.eclipse.ssh.presentation.sessionDiagnostics
@@ -5332,7 +5333,7 @@ private fun linuxUserspaceSummary(ui: LinuxUserspaceUiState): String {
         // compiler's proof of that invariant rather than a state any device can reach.
         null -> "Not installed"
         is LinuxUserspaceState.Installing ->
-            "Installing ${ui.distro?.displayName ?: "…"} · ${describeInstallStep(state.step).first}"
+            "Installing ${ui.distro?.displayName ?: "…"} · ${describeInstallStep(state.step)} · ${state.percent}%"
         is LinuxUserspaceState.NotInstalled ->
             if (ui.hasPendingWorkspaceBackup) {
                 "Not installed · a saved workspace will be restored"
@@ -5350,19 +5351,17 @@ private fun linuxUserspaceSummary(ui: LinuxUserspaceUiState): String {
 }
 
 /**
- * One install phase as the progress line renders it: the label, and the download's fraction when
- * the phase has one (only the download does — verification, extraction and setup are steps whose
- * length the pipeline honestly cannot know, and a fake progress bar is worse than none).
+ * One install phase as the progress line renders it. The percentage beside it is the state's own,
+ * so this is the phase alone — the install's overall figure is what the user is watching, and a
+ * phase-local one would start over at every step.
  */
-private fun describeInstallStep(step: LinuxInstallStep): Pair<String, Float?> = when (step) {
-    is LinuxInstallStep.Downloading -> {
-        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}" to
-            (step.received.toFloat() / step.total.toFloat().coerceAtLeast(1f))
-    }
-    LinuxInstallStep.Verifying -> "Verifying the download" to null
-    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files" to null
-    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail) to null
-    LinuxInstallStep.VerifyingHealth -> "Running the health check" to null
+private fun describeInstallStep(step: LinuxInstallStep): String = when (step) {
+    is LinuxInstallStep.Downloading ->
+        "Downloading · ${formatTransferBytes(step.received)} of ${formatTransferBytes(step.total)}"
+    LinuxInstallStep.Verifying -> "Verifying the download"
+    is LinuxInstallStep.Extracting -> "Extracting · ${step.entries} files"
+    is LinuxInstallStep.SettingUp -> describeSetupStep(step.step, step.detail)
+    LinuxInstallStep.VerifyingHealth -> "Running the health check"
 }
 
 private fun describeSetupStep(step: SetupStep, detail: String?): String {

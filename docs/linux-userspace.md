@@ -14,6 +14,7 @@ the app's sandbox, with no VM, no root and no ISO.
 1. [Architecture](#architecture)
 2. [The rootfs source](#the-rootfs-source)
 3. [The install process](#the-install-process)
+   - [The percentage](#the-percentage)
 4. [The runtime model](#the-runtime-model)
 5. [ABI support](#abi-support)
 6. [The filesystem contract](#the-filesystem-contract)
@@ -110,6 +111,30 @@ health check passes — "installed" and "works" are the same fact:
    `apt-get check` passes. Only then does the state machine reach Stopped.
 6. **Workspace restore** — if a previous keep-workspace uninstall parked a snapshot, it is
    restored into the fresh rootfs before the first shell opens.
+
+### The percentage
+
+The Ubuntu window, the host-list line and the foreground notification all show the same number, and
+it is one number rather than three because it is computed in one place: `LinuxInstallProgress`
+turns the current `LinuxInstallStep` into a whole percent, and every renderer reads that. The bar
+beside the label is drawn from the same value, so the two cannot disagree.
+
+What the number is, precisely, is a **schedule refined by measurement**. An install is not one
+measurable quantity: the download has a known byte total, extraction consumes a known tarball, the
+two apt steps draw a bar of their own, and the rest are steps whose length nothing can know in
+advance. So each phase is given a share of the whole from how long it actually takes on a phone —
+setup the largest by a wide margin — and the phases that can measure themselves move *inside* their
+share instead of jumping to its end. The download moves on bytes received, extraction on the
+fraction of the tarball read, and `apt-get install` on apt's own `Progress: [ 45%]` line, which
+counts completed package steps over the whole dpkg run. Reading it as a stopwatch would be wrong;
+what it does promise is that it starts at 0, never walks backwards, and reaches 100 when the work
+is done.
+
+A repair over a rootfs that is already extracted skips the download half entirely, and the shares
+are renormalized to match — otherwise a repair would open at 36% for work that is not happening. The
+health check is the last phase and is measured in seconds, so it reads 100%: the work is finished,
+and what remains is the verdict. A check that fails does not leave a 100% standing — the window
+replaces the row with the failure.
 
 ## The runtime model
 

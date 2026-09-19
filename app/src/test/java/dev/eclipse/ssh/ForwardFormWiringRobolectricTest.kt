@@ -116,6 +116,12 @@ class ForwardFormWiringRobolectricTest {
      * asked to leave. Writing a host and waiting for it to come back proves the flow has been observed,
      * so everything after it is a statement about the database rather than about how far the app got
      * through starting up.
+     *
+     * The sentinel is necessary but not sufficient, because the database is not the only writer:
+     * `HostRepository.seedIfEmpty()` runs from the view model's `init` and refills an emptied table
+     * with its three demo hosts. So the clearing below re-deletes until the list has *stayed* empty
+     * for a settle window rather than deleting once — the same race, one writer later, and the window
+     * is what covers the three upserts still in flight behind this delete's own query.
      */
     private fun seedHost(name: String?): HostProfile? {
         compose.waitForIdle()
@@ -136,11 +142,28 @@ class ForwardFormWiringRobolectricTest {
         compose.runOnUiThread {
             viewModel.uiState.value.hosts.forEach(viewModel::deleteHost)
         }
+        var emptySince = 0L
         pumpUntil(
             describe = {
                 "the host list never emptied; left holding ${viewModel.uiState.value.hosts.map { it.id }}"
             },
-        ) { viewModel.uiState.value.hosts.isEmpty() }
+        ) {
+            // Emptied by repetition, and then only believed once it has *stayed* empty for a settle
+            // window. `HostRepository.seedIfEmpty()` writes its three demo hosts whenever it finds the
+            // table empty, and `MainViewModel` calls it from `init` on the view model's own scope — so
+            // its three upserts can be sitting on the database's executor behind this delete's own
+            // query, committing an instant after a single reading reported the list empty. That is the
+            // shape CI reported: the sentinel gone, all three demo hosts back. Re-deleting handles the
+            // rows that have landed; the window is what makes "empty once" into "empty".
+            val hosts = viewModel.uiState.value.hosts
+            if (hosts.isNotEmpty()) {
+                compose.runOnUiThread { hosts.forEach(viewModel::deleteHost) }
+                emptySince = 0L
+            } else if (emptySince == 0L) {
+                emptySince = System.nanoTime()
+            }
+            hosts.isEmpty() && System.nanoTime() - emptySince >= EMPTY_SETTLE_NANOS
+        }
         if (name == null) return null
 
         val profile = HostProfile(id = ID_PREFIX + "1", name = name, host = "forward.example.test", username = "tester", port = 22)
@@ -255,5 +278,12 @@ class ForwardFormWiringRobolectricTest {
     private companion object {
         /** Marks the hosts this class seeds, so its cleanup cannot touch anybody else's. */
         const val ID_PREFIX = "forward-wiring-"
+
+        /**
+         * How long the host list has to *stay* empty before [seedHost] believes it, in nanoseconds of
+         * wall clock across pumped frames. Long enough for three queued upserts to commit and be
+         * delivered, short enough that it costs a passing run nothing.
+         */
+        const val EMPTY_SETTLE_NANOS = 2_000_000_000L
     }
 }
