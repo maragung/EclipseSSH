@@ -5968,7 +5968,37 @@ What was run, on the merged tree, at the commit this section is part of:
   which this section's own prose is what adds to the report.
 - `bundleRelease` then `assembleRelease`, `apksigner verify` (v2 and v3) on every APK, the AAB's JAR
   signature blocks, and `testing/verify-release-splits.sh` with `testing/verify-release-apk.sh` — the
-  same scripts, in the same order, that the workflow runs.
+  same scripts, in the same order, that the workflow runs. The build they ran on is JDK 17.0.20.1+1,
+  Gradle 9.7.1, SDK platform 37, build-tools 36.0.0, NDK 29.0.13113456 and CMake 4.1.2, run in stages
+  with one task graph at a time and a 1280m heap for the native ones, because this host has 7.9 GB and
+  another tenant holds half of it: the first attempt was a single `bundleRelease` at the 3g heap
+  `gradle.properties` asks for, and the kernel took it during the armeabi-v7a FreeRDP build with
+  nothing to show for it. One of the four native ABIs also needed its cJSON tarball fetched again after
+  GitHub answered HTTP 504, which was served from the pinned copy the other three ABIs already held,
+  after checking that copy's SHA-256 against the hash the ExternalProject names.
+
+### One gate reads a version of `file` this host does not have
+
+`testing/verify-release-splits.sh` reports the x86 split as failed when it is run here, and the artifact
+is not the reason. Its messages read *"lib/x86/libcjson.so is not a Intel 80386 ELF: ELF 32-bit LSB
+shared object, Intel i386, version 1 (SYSV), dynamically linked, for Android 28, built by NDK
+r29-beta1"*: the script greps `file`'s output for the literal `Intel 80386`, and `file` 5.46 — which is
+what this host has — spells e_machine 3 `Intel i386`. The runner image carries 5.45, which spells it
+`Intel 80386`, and that is why the same script passed on every release whose x86 split CI built. It is
+worth writing down because the failure text reads exactly like a split carrying the wrong
+architecture, which is the defect that check exists to catch.
+
+`readelf -h`, which prints the e_machine name from its own table, is not subject to the rewording, and
+it was what this release's x86 split was checked with: all ten libraries under `lib/x86` report
+`Class: ELF32` and `Machine: Intel 80386`, and `lib/x86` is the only directory the split has. Every
+other assertion the script makes about a split it passes was then made about this one by hand, with the
+same build-tools it uses: `aapt2 dump xmltree` reports `extractNativeLibs=true`, `aapt2 dump badging`
+reports `dev.eclipse.ssh`, versionCode 35, versionName 1.5.0, `native-code: 'x86'` and no debuggable
+flag, and `apksigner verify` reports v2 and v3 true for it as it does for the other four. So the x86
+split this release ships is checked as thoroughly as the three the script passed, and what remains
+unchecked is the script itself on a host whose `file` says `Intel i386` — which is what to fix before
+the next release is verified anywhere but the runner image, because the next person to run it will read
+the same eight messages and has no reason to doubt them.
 
 What that does **not** establish, and this release therefore claims nothing about: the instrumentation
 suite (`connectedAndroidTest`) and the Ubuntu end-to-end leg, which need an emulator this host cannot
