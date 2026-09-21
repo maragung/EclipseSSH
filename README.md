@@ -40,8 +40,10 @@ RFB or RDP is driven from the app that already holds its credentials.
 local shell that is the same terminal channel an SSH one is. That shell is proot's fake root, which
 is what lets `apt install` unpack packages and `su` change identity without the device ever being
 rooted. Anything past the base (Python, Node.js, an editor, a compiler) is one `apt-get install`
-away inside the terminal. Architecture and operating manual:
-[`docs/linux-userspace.md`](docs/linux-userspace.md).
+away inside the terminal. Its tree is browsable too: **Ubuntu on this device** appears in the Files
+tab as a session of its own, so the workspace is edited, renamed, copied in and out and searched the
+way a host's files are — with guest paths in every row, never the sandbox's. Architecture and
+operating manual: [`docs/linux-userspace.md`](docs/linux-userspace.md).
 
 **Files.** A text editor for the files the app browses — opened from the explorer, a preview window or
 the New File dialog — in its own opaque window rather than a panel over the workspace. An archive

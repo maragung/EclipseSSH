@@ -18,6 +18,7 @@ the app's sandbox, with no VM, no root and no ISO.
 4. [The runtime model](#the-runtime-model)
 5. [ABI support](#abi-support)
 6. [The filesystem contract](#the-filesystem-contract)
+   - [Browsing it from Files](#browsing-it-from-files)
 7. [Lifecycle](#lifecycle)
 8. [Security](#security)
 9. [Troubleshooting](#troubleshooting)
@@ -252,6 +253,24 @@ session reports: the shell's writes succeed by DAC — it is the owner — while
 because proot's fake identity says so and `/etc/passwd` has a `root` entry to put a name to it. Two
 different questions, and only the first is about the filesystem. Nothing in the rootfs needs a
 permission bit to be set for anyone, because the only process that ever opens them is the app.
+
+### Browsing it from Files
+
+The tree is also a Files-tab session of its own — the third backend beside SFTP and SAF, offered as an
+**Ubuntu on this device** chip whenever a rootfs is installed. What it shows is guest paths, not the
+sandbox's: `/home/ubuntu/workspace/main.kt`, never `filesDir/linux/rootfs/home/ubuntu/…`.
+
+That mapping is where the care is, because a rootfs is not a tree the host's own path semantics can
+walk. Ubuntu Base is usrmerged — `/bin` is a symlink to `usr/bin`, and `lib` and `sbin` join it — and
+every link in it is absolute and *guest*-rooted, so `File(rootfs, "/bin/sh")` resolves to the
+**device's** `/bin/sh` and would browse the phone while drawing Ubuntu's paths. So every path component
+is resolved inside the root and refused if it escapes: a link out of the root fails, `..` that climbs
+above `/` fails, a link that points at itself stops at Linux' own `MAXSYMLINKS` rather than recursing,
+and the device's `/dev`, `/proc` and `/sys` are hidden rather than offered as the guest's, because proot
+binds the host's over them and the Files tab has "This device" for the real ones. Writes carry the same
+guard, since one mapping decides both. The editor's `onlyIfUnmodifiedSince` check applies here as it
+does on SFTP: a file the guest changed underneath the editor is a question for the user, not a silent
+overwrite.
 
 ## Lifecycle
 
