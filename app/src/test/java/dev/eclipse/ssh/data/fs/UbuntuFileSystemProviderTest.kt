@@ -29,8 +29,11 @@ import org.junit.rules.TemporaryFolder
  */
 class UbuntuFileSystemProviderTest {
 
+    // `@get:Rule` alone, and not the `@get:Rule @JvmField` pair the Robolectric suites here use: a
+    // `@JvmField` property has no getter to carry the annotation, so Kotlin drops it and JUnit never
+    // creates the folder — every test in the class then dies on `newFolder` with "the temporary folder
+    // has not yet been created", which reads as fifteen broken tests rather than one broken rule.
     @get:Rule
-    @JvmField
     val temp = TemporaryFolder()
 
     private fun providerFor(root: File): UbuntuFileSystemProvider =
@@ -55,7 +58,7 @@ class UbuntuFileSystemProviderTest {
 
     private fun write(root: File, guestPath: String, text: String): File {
         val file = File(root, guestPath.removePrefix("/"))
-        file.parentFile.mkdirs()
+        file.parentFile?.mkdirs()
         file.writeText(text)
         return file
     }
@@ -88,7 +91,7 @@ class UbuntuFileSystemProviderTest {
     }
 
     @Test
-    fun `an absolute link resolves inside the root, so bin is usr bin to both paths`() = runBlocking {
+    fun `an absolute link resolves inside the root, so bin is usr bin to both paths`() = runBlocking<Unit> {
         val root = newRootfs()
         write(root, "usr/bin/hello", "#!/bin/sh\n")
 
@@ -236,7 +239,7 @@ class UbuntuFileSystemProviderTest {
         val root = newRootfs()
         val provider = providerFor(root)
 
-        for (name in listOf("..", ".", "", "a/b", " ")) {
+        for (name in listOf("..", ".", "", "a/b", "\u0000")) {
             assertThrows(IOException::class.java) {
                 runBlocking { provider.createFile("/home/ubuntu", name) }
             }

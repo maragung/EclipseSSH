@@ -690,14 +690,18 @@ class UbuntuDistributionManager(
                 (failure.message ?: failure.javaClass.simpleName)
             return
         }
-        // dpkg names the program it looked for and the PATH it looked in, so the answer is recorded
-        // by name at both ends: what was missing, and what the archive actually had.
+        // dpkg names the program it looked for, so the answer is recorded by name at both ends -
+        // and in one vocabulary: the guest path, which is how the user's own error names it. What
+        // the archive calls the member is an implementation detail of [tarSpellingsOf], and a line
+        // that answered in two spellings could not be read as a list of what did and did not come
+        // back.
+        val restoredGuests = missing.filter { guest -> tarSpellingsOf(guest).any { it in restored } }
         diagnostics.record(
             UserspaceDiagnosticCategory.ROOTFS,
             "essential programs restored",
-            detail = "$detail; restored=" + (restored.joinToString(",").ifEmpty { "none" }),
+            detail = "$detail; restored=" + restoredGuests.joinToString(",").ifEmpty { "none" },
         )
-        val unrepaired = missing.filter { guest -> tarSpellingsOf(guest).none { it in restored } }
+        val unrepaired = missing - restoredGuests.toSet()
         if (unrepaired.isNotEmpty()) {
             warnings += "the pinned archive does not carry ${unrepaired.joinToString(", ")}"
         }
@@ -1105,7 +1109,12 @@ class UbuntuDistributionManager(
     private fun rewriteLoginDefs(file: File) {
         val kept = if (file.isFile) {
             file.readLines().filterNot { line ->
-                val key = line.substringBefore('=').trim()
+                // The key is the first whitespace-delimited token, not what precedes an `=`: this
+                // file spells a setting `ENV_PATH PATH=/usr/bin`, with the value's own `=` inside
+                // it, so splitting on `=` reads the key as "ENV_PATH PATH" and keeps the old line -
+                // which is the setting this method exists to replace, left in place beside its
+                // replacement. Whatever login and su read first is then the distro's short PATH.
+                val key = line.trim().takeWhile { !it.isWhitespace() }
                 key == "ENV_PATH" || key == "ENV_SUPATH"
             }
         } else {

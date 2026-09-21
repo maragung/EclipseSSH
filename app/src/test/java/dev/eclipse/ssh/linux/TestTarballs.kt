@@ -39,10 +39,20 @@ internal object TestTarballs {
                 putDirectory(tar, "usr")
                 putDirectory(tar, "usr/bin")
                 putDirectory(tar, "var/lib")
+                putDirectory(tar, "usr/sbin")
                 putFile(tar, "bin/bash", "fake shell\n".toByteArray(), mode = 0b111_101_101)
                 putSymlink(tar, "bin/sh", "bash")
                 putSymlink(tar, "usr/bin/env", "../../bin/bash")
                 putFile(tar, "usr/bin/apt-get", "fake apt\n".toByteArray(), mode = 0b111_101_101)
+                // Every program the repair prologue stats before it asks dpkg anything, read off the
+                // same list the check uses so the two cannot drift. A real install put them there by
+                // unpacking; a fixture that says it is Ubuntu-Base-shaped and has no `rm` is not, and
+                // the check is right to say so on every test that runs setup.
+                val shipped = setOf("usr/bin/env", "usr/bin/apt-get")
+                UbuntuDistributionManager.ESSENTIAL_PROGRAMS
+                    .map { it.removePrefix("/") }
+                    .filterNot { it in shipped }
+                    .forEach { putFile(tar, it, "fake ${it.substringAfterLast('/')}\n".toByteArray(), mode = 0b111_101_101) }
                 putFile(tar, "lib/$linkerName", "fake linker\n".toByteArray(), mode = 0b111_101_101)
                 putFile(tar, "etc/passwd", "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n".toByteArray())
                 putFile(tar, "etc/group", "root:x:0:\ndaemon:x:1:\n".toByteArray())

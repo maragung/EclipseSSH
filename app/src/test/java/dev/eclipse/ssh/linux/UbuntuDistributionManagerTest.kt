@@ -1113,9 +1113,10 @@ class UbuntuDistributionManagerTest {
         assertThat(report.warnings.any { it.contains("restored 1 missing program") }).isTrue()
         val log = harness.distribution.diagnostics.export()
         assertThat(log).contains("essential programs restored")
-        // Both ends of the evidence: what was missing, and what the archive had.
-        assertThat(log).contains("missing=usr/bin/apt-get")
-        assertThat(log).contains("restored=usr/bin/apt-get")
+        // Both ends of the evidence: what was missing, and what came back — in the guest's own
+        // spelling, which is the one the user's dpkg error names the program in.
+        assertThat(log).contains("missing=/usr/bin/apt-get")
+        assertThat(log).contains("restored=/usr/bin/apt-get")
     }
 
     @Test
