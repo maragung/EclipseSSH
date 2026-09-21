@@ -1,0 +1,64 @@
+# One-off export of the signing material CI holds, so the canonical keystore can
+# exist locally again. The checkout's copy is a 2026-08-15 regeneration whose
+# certificate no installed app has - see AUDIT-REPORT.md section 56.
+#
+# DISPATCH ONLY WHILE THE REPOSITORY IS PRIVATE. The artifact this uploads is
+# readable by anyone who can read the repository, and it carries the release
+# signing key in the clear; on a public repository that hands every visitor the
+# ability to sign an APK that Android accepts as an update to `dev.eclipse.ssh`.
+#
+# Remove this workflow, and its run (and so its artifact), as soon as the
+# keystore has been downloaded and checked against
+# 0c69794b7934452bdf1b2f1f345314e13b86ef43f0d17bec9ff260dd30a443be.
+name: Export signing material
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Export the release keystore and its properties
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Set up JDK 17.0.13
+        # For `keytool`, so the certificate can be printed here and checked
+        # against the fingerprint the published APKs carry before the artifact
+        # is trusted.
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v4.1.0
+        with:
+          distribution: temurin
+          java-version: '17.0.13'
+          check-latest: false
+
+      - name: Write both secrets out, and say what the certificate is
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PROPERTIES: ${{ secrets.RELEASE_KEYSTORE_PROPERTIES }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_KEYSTORE_BASE64" || { echo "RELEASE_KEYSTORE_BASE64 is unset"; exit 1; }
+          test -n "$RELEASE_KEYSTORE_PROPERTIES" || { echo "RELEASE_KEYSTORE_PROPERTIES is unset"; exit 1; }
+          mkdir -p out
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > out/eclipse-release.jks
+          printf '%s\n' "$RELEASE_KEYSTORE_PROPERTIES" > out/keystore.properties
+          chmod 600 out/eclipse-release.jks out/keystore.properties
+          # The fingerprint is public - every published APK carries it. The
+          # secrets are not, and nothing here prints them.
+          STOREPASS="$(sed -n 's/^storePassword=//p' out/keystore.properties)"
+          ALIAS="$(sed -n 's/^keyAlias=//p' out/keystore.properties)"
+          keytool -list -v -keystore out/eclipse-release.jks -storepass "$STOREPASS" \
+            | grep -E 'Alias name|Owner|Valid from|SHA256:'
+          echo "== keyAlias in the properties: $ALIAS"
+          sha256sum out/eclipse-release.jks out/keystore.properties | tee out/SHA256SUMS.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signing-material
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
