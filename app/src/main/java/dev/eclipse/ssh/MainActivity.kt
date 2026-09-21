@@ -309,11 +309,11 @@ import androidx.compose.ui.focus.FocusRequester
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalSelection
+import dev.eclipse.ssh.terminal.TerminalViewport
 import dev.eclipse.ssh.ui.terminal.KeyBarPrefsCodec
 import dev.eclipse.ssh.ui.terminal.TerminalInputBridge
 import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
 import dev.eclipse.ssh.ui.terminal.TerminalView
-import dev.eclipse.ssh.ui.terminal.hostTerminalRows
 import dev.eclipse.ssh.ui.terminal.minTerminalColumns
 import dev.eclipse.ssh.ui.terminal.rememberTerminalCellMetrics
 import dev.eclipse.ssh.ui.terminal.TerminalMonoFontFamily
@@ -2364,7 +2364,7 @@ private fun WorkspaceScaffold(
     onSendText: (String, String) -> Unit = { _, _ -> },
     onSendKey: (String, TerminalKey, Boolean, Boolean, Boolean) -> Unit = { _, _, _, _, _ -> },
     onSendChar: (String, Char, Boolean, Boolean) -> Unit = { _, _, _, _ -> },
-    onResizeTerminal: (String, Int, Int) -> Unit = { _, _, _ -> },
+    onResizeTerminal: (String, TerminalViewport) -> Unit = { _, _ -> },
     onScrollTerminal: (String, Int) -> Unit = { _, _ -> },
     onScrollTerminalTo: (String, Int) -> Unit = { _, _ -> },
     onCopySelection: (String, TerminalSelection) -> Unit = { _, _ -> },
@@ -2912,7 +2912,7 @@ private fun TerminalScreen(
     onSendText: (String, String) -> Unit,
     onSendKey: (String, TerminalKey, Boolean, Boolean, Boolean) -> Unit,
     onSendChar: (String, Char, Boolean, Boolean) -> Unit,
-    onResize: (String, Int, Int) -> Unit,
+    onResize: (String, TerminalViewport) -> Unit,
     onScroll: (String, Int) -> Unit,
     onScrollTo: (String, Int) -> Unit,
     onCopySelection: (String, TerminalSelection) -> Unit,
@@ -3204,9 +3204,14 @@ private fun TerminalScreen(
                     // The host's own width is a floor here as well as an argument to the pty: a
                     // viewport report resizes the pty, and the first one arrives before any output does.
                     minColumns = minTerminalColumns(state.settings.terminalMinColumns, hostGeometry.first),
-                    // The host's height when it has one, the app-wide setting otherwise, and the
-                    // screen's own size over both — see [hostTerminalRows] and [atMostRows].
-                    hostRows = hostTerminalRows(state.settings.terminalRows, hostGeometry.second),
+                    // The app-wide height, which is a floor the view scrolls through — see [atLeastRows].
+                    // A taller terminal is a taller pty, not a taller screen: the shell prints without
+                    // paging and the window follows the cursor.
+                    minRows = state.settings.terminalRows,
+                    // The host's height over it, which can only shorten — see [atMostRows]. This is the
+                    // one place a per-host value beats the app-wide one, and the only way to tell a single
+                    // server that the window is short.
+                    hostRows = hostGeometry.second,
                     selection = selection,
                     onSelectionChange = { selection = it },
                     onSelectionFinished = { finished ->
@@ -3223,7 +3228,7 @@ private fun TerminalScreen(
                     onTap = {
                         if (selection != null) selection = null else showKeyboard()
                     },
-                    onViewportChange = { columns, rows -> onResize(activeTab.id, columns, rows) },
+                    onViewportChange = { viewport -> onResize(activeTab.id, viewport) },
                     onZoom = { scale, ended ->
                         // The gesture reports a factor against its own start, so the start size has to
                         // be captured once: reading the current size every step would compound the
@@ -5192,16 +5197,16 @@ private fun SettingsScreen(
             },
         ) { TextButton(onClick = { context.startActivity(Intent(context, TerminalWidthActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Terminal width" }) { Text("Change") } }
         // Directly under the width, because they are the two halves of one question - how big is the
-        // terminal - and the subtitles have to be read together to make sense: width is a floor the
-        // server may exceed, height is a request the screen may cut down. A row that said "Terminal
+        // terminal - and the subtitles have to be read together to make sense: both are floors the
+        // server is told, one reached by panning and the other by scrolling. A row that said "Terminal
         // height" with no explanation would read as the same kind of number as the one above it.
         SettingRow(
             Icons.Default.Terminal,
             "Terminal height",
             if (state.settings.terminalRows <= 0) {
-                "As many rows as the screen fits; fewer, and the pty is told so"
+                "As many rows as the screen fits; the window scrolls the rest"
             } else {
-                "Up to ${state.settings.terminalRows} rows, or the screen's own count if it fits fewer"
+                "At least ${state.settings.terminalRows} rows; the window scrolls the rest"
             },
         ) { TextButton(onClick = { context.startActivity(Intent(context, TerminalHeightActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Terminal height" }) { Text("Change") } }
         SettingRow(Icons.Default.Terminal, "Terminal theme", "Colours the grid and its background") {

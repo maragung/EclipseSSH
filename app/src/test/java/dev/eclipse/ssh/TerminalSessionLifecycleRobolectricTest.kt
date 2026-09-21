@@ -142,6 +142,15 @@ class TerminalSessionLifecycleRobolectricTest {
      */
     @After
     fun restoreChangedSettings() {
+        if (terminalRowsChanged) {
+            terminalRowsChanged = false
+            runCatching {
+                runBlocking {
+                    SettingsRepository(RuntimeEnvironment.getApplication())
+                        .setTerminalRows(SettingsRepository.DEFAULT_TERMINAL_ROWS)
+                }
+            }
+        }
         if (!reconnectBaseChanged) return
         reconnectBaseChanged = false
         runCatching {
@@ -154,6 +163,9 @@ class TerminalSessionLifecycleRobolectricTest {
 
     /** Set by the one test that writes a preference, so [restoreChangedSettings] knows to undo it. */
     private var reconnectBaseChanged = false
+
+    /** The same, for the one test that writes the terminal height. */
+    private var terminalRowsChanged = false
 
     // ---------------------------------------------------------------- the tests
 
@@ -347,7 +359,7 @@ class TerminalSessionLifecycleRobolectricTest {
         assertThat(measured.second).isIn(TERMINAL_ROWS_ALLOWED)
 
         val viewModel = viewModel()
-        compose.runOnUiThread { viewModel.resizeTerminal(hostId, 40, 12) }
+        compose.runOnUiThread { viewModel.resizeTerminal(hostId, screenViewport(40, 12)) }
 
         pumpUntil(describe = { "the remote pty was never told about 40x12, saw ${windowSize.get()}" }) {
             windowSize.get() == 40 to 12
@@ -670,6 +682,51 @@ class TerminalSessionLifecycleRobolectricTest {
     }
 
     /**
+     * A tall terminal is told its height and still draws the screen's, which is the whole of the setting.
+     *
+     * Two sessions in one test, and the first is the oracle: with the height left at "fit screen" all
+     * three numbers are the same one, so what the pty was asked for *is* the screen's row count. Raising
+     * the setting must then do exactly one thing to the second session - tell the pty a thousand - while
+     * the window stays the height the first session measured. That is what makes the extra height
+     * scrollback rather than a status line drawn below the last pixel, and it cannot be asserted from
+     * the pty alone: the pty agreeing with the grid is the easy half, and it is also what the bug this
+     * replaced looked like from the far end.
+     */
+    @Test
+    fun aTallTerminalIsToldItsHeightAndStillDrawsTheScreen() {
+        val fitted = connectAndOpenTerminal()
+        waitForFrameText(fitted, PROMPT)
+        val screenRows = ptyRequests.last().second
+        assertWithMessage("with the height at \"fit screen\" the window is the grid, not a window into it")
+            .that(frameFor(fitted).lines.size).isEqualTo(screenRows)
+        compose.runOnUiThread { viewModel().closeTab(checkNotNull(tabFor(fitted))) }
+
+        // Written the way the height screen writes it, then waited for so the second shell opens under
+        // the new setting rather than under whatever the first one was measured at.
+        runBlocking { SettingsRepository(RuntimeEnvironment.getApplication()).setTerminalRows(TALL_ROWS) }
+        terminalRowsChanged = true
+        pumpUntil(describe = { "the height setting never took: ${viewModel().uiState.value.settings}" }) {
+            viewModel().uiState.value.settings.terminalRows == TALL_ROWS
+        }
+
+        val tall = connectAndOpenTerminal()
+        waitForFrameText(tall, PROMPT)
+        pumpUntil(describe = { "the pty was never told about $TALL_ROWS rows, saw ${ptyRequests.lastOrNull()}" }) {
+            ptyRequests.last().second == TALL_ROWS
+        }
+
+        val frame = frameFor(tall)
+        // The grid is the tall one, and it is what the pty was given: the shell prints a thousand lines
+        // before it hands any of them to a pager, and the app's scrollback keeps all of them.
+        assertThat(frame.rows).isEqualTo(TALL_ROWS)
+        assertThat(ptyRequests.last()).isEqualTo(frame.columns to TALL_ROWS)
+        // The window is not. The screen is the same screen, so the same number of rows is on it - the
+        // rest are one scroll gesture away, which is the whole difference between a floor and a ceiling.
+        assertWithMessage("the tall grid was drawn as if the phone had a thousand rows")
+            .that(frame.lines.size).isEqualTo(screenRows)
+    }
+
+    /**
      * A reconnect brings the pty back at the size the user was working at, not at the default.
      *
      * The size lives in the view model rather than in the channel, because the channel that knew it is
@@ -686,7 +743,7 @@ class TerminalSessionLifecycleRobolectricTest {
         waitForFrameText(hostId, PROMPT)
 
         val viewModel = viewModel()
-        compose.runOnUiThread { viewModel.resizeTerminal(hostId, 47, 15) }
+        compose.runOnUiThread { viewModel.resizeTerminal(hostId, screenViewport(47, 15)) }
         pumpUntil(describe = { "the remote pty was never told about 47x15, saw ${windowSize.get()}" }) {
             windowSize.get() == 47 to 15
         }
@@ -1153,7 +1210,7 @@ class TerminalSessionLifecycleRobolectricTest {
         // A rotation, and the pair of resizes an IME produces as it opens and closes: the terminal
         // loses height to the keyboard and gets it back.
         listOf(40 to 12, 100 to 30, 100 to 14, 100 to 30).forEach { (columns, rows) ->
-            compose.runOnUiThread { viewModel.resizeTerminal(hostId, columns, rows) }
+            compose.runOnUiThread { viewModel.resizeTerminal(hostId, screenViewport(columns, rows)) }
             pumpUntil(describe = { "the pty never heard about ${columns}x$rows, saw ${windowSize.get()}" }) {
                 windowSize.get() == columns to rows
             }
@@ -1550,6 +1607,15 @@ class TerminalSessionLifecycleRobolectricTest {
         const val USER = "testuser"
         const val PASSWORD = "testpass123"
         const val HOST_NAME = "lifecycle"
+
+        /**
+         * The tallest height the settings screen offers, for the one test that asks for it.
+         *
+         * The top of `TERMINAL_ROW_CHOICES`, written out rather than derived from it: this is the number
+         * the pty has to be told, and a test that read it off the same list the setting writes could not
+         * notice the list changing.
+         */
+        const val TALL_ROWS = 1000
 
         /** What the shell prints on startup, before anything could have been typed at it. */
         const val BANNER = "eclipse-scripted-shell"

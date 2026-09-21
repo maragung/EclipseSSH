@@ -152,13 +152,22 @@ screens have a file each beside it: the nine heavier ones (key generation, PIN l
 saved credentials, shortcut bar, font size, backup export, diagnostics, Ubuntu) and the host form.
 About keeps its own home in `ui/about/`.
 
-**Terminal width and height are not the same kind of setting**, and the two screens say so. Width is
-a floor: the app-wide value and a host's own combine into the wider of the two, the pty is told at
-least that many columns, and the overflow is reachable by panning. Height is a ceiling — a row past
-the bottom edge is nowhere — so a host's own height wins outright where it has one, the app-wide
-value is the fallback for every host that has none, and the screen itself has the last word:
-`TerminalGrid.atMostRows` cuts a taller request down to what fits, while a shorter one is honoured
-exactly, because telling a server the window is short is a real thing to want.
+**Terminal width and height are both floors**, and each is bought differently. Width: the app-wide
+value and a host's own combine into the wider of the two, the pty is told at least that many columns,
+and the overflow is reachable by panning. Height: the app-wide value is what the pty is told, up to
+1000 rows, and the overflow is reachable by scrolling — the view anchors its window on the cursor
+(`AnsiTerminalBuffer.frame`) and the scroll gesture walks back through everything above it. A taller
+terminal is not a taller screen; it is a shell that prints a thousand lines of `ls` or `apt-get`
+before it pages any of them away, which is the difference between scrolling back through the output
+and re-running the command to see the part that went past.
+
+The one exception is a host's own height, which is a ceiling: `TerminalGrid.atMostRows` lets it
+shorten the app-wide floor and never raise it, because telling one server its window is short is a
+real thing to want and a per-host value that raised the height would silently override the app-wide
+one. A program that paints the screen positionally — `vim`, `htop`, `less`, `nano` — is told the
+height the *screen* has rather than the floor, since it draws its own borders and status line for
+the rows it was told about; the local grid keeps the taller height throughout, so entering and
+leaving such a program does not reflow the scrollback underneath it.
 
 ## Build
 
@@ -196,7 +205,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,942 JVM/Robolectric test methods in 173 test files and contacts nothing off the
+The suite is 1,947 JVM/Robolectric test methods in 173 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot

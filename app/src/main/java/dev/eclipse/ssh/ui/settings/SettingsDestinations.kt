@@ -273,17 +273,18 @@ class TerminalWidthActivity : ChoiceDestinationActivity() {
 /**
  * Terminal height: how many rows the server is told it has, up to what the screen can show.
  *
- * Deliberately worded as a limit rather than a size. The width screen above it promises a *minimum* -
- * whatever the user picks, the server is told at least that many columns and the grid pans for the
- * rest. This one cannot make that promise, because there is nowhere for a row past the bottom edge to
- * go: a pty told it has sixty rows on a screen that fits forty draws its prompt off the screen. So the
- * subtitle says what actually happens, and "Fit screen" is the default for that reason.
+ * Deliberately worded as a size rather than a limit. The width screen above it promises a *minimum*, and
+ * so does this one, now that height is a floor: the server is told at least this many rows, the shell
+ * prints that many lines before it pages, and the view scrolls the window through them. The choices
+ * above 60 are the ones that only make sense that way - no phone shows a thousand rows, and a thousand
+ * rows is not what is being asked for. The exception is a host's own height, which lowers this one and
+ * is what the per-host screen is for.
  */
 @AndroidEntryPoint
 class TerminalHeightActivity : ChoiceDestinationActivity() {
     override val screenTitle = "Terminal height"
     override val what = "the terminal height"
-    override val subtitle = "At most this many rows; a screen that fits fewer gets fewer"
+    override val subtitle = "At least this many rows; the screen shows what fits and scrolls the rest"
     override val icon = Icons.Default.Terminal
     override val options = SettingsRepository.TERMINAL_ROW_CHOICES
     override fun stored(settings: AppSettings) = settings.terminalRows

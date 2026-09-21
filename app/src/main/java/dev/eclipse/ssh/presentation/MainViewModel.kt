@@ -107,6 +107,7 @@ import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalKeys
 import dev.eclipse.ssh.terminal.TerminalModifiers
+import dev.eclipse.ssh.terminal.TerminalViewport
 import dev.eclipse.ssh.terminal.Utf8StreamDecoder
 import java.io.IOException
 import java.io.InputStream
@@ -516,12 +517,17 @@ class MainViewModel @Inject constructor(
     private val reconnectAttempts = ConcurrentHashMap<String, Int>()
 
     /**
-     * The viewport size each host's terminal was last measured at, carried into the next pty it opens.
+     * The viewport each host's terminal was last measured at, carried into the next pty it opens.
      *
      * Kept here rather than on the channel because the channel is the thing that gets replaced: the
      * size belongs to the user's screen, which a reconnect does not change. See [resizeTerminal].
+     *
+     * A [TerminalViewport] rather than a pair, because the terminal no longer has one size. The app-wide
+     * height setting is a floor the pty is told about, so the pty's height, the local grid's height and
+     * the height of the window the user reads are three different numbers - and every one of them has a
+     * place in this class that used to say "rows".
      */
-    private val ptySizes = ConcurrentHashMap<String, Pair<Int, Int>>()
+    private val viewportSizes = ConcurrentHashMap<String, TerminalViewport>()
 
     /**
      * When each live session's shell came up, on the monotonic clock, for the "up=" field in the
@@ -1018,7 +1024,7 @@ class MainViewModel @Inject constructor(
                             runCatching { session.close(false) }
                             return@dialing
                         }
-                        val size = ptySizes[key]
+                        val size = viewportSizes[key]
                         // Authenticated. Everything from here is the channel and the pty, and it is worth
                         // saying so: a server that accepts the password and then cannot give out a pty
                         // used to spend that whole time claiming to be connecting.
@@ -1036,7 +1042,7 @@ class MainViewModel @Inject constructor(
                         // makes the catch block's promise ("retries do not accumulate half-open
                         // sessions") true for the one phase it did not cover: after auth, before shell.
                         val terminal = try {
-                            sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
+                            sshConnectionManager.openTerminal(session, size?.columns, size?.ptyRows, host)
                         } catch (error: Throwable) {
                             runCatching { session.close(false) }
                             throw error
@@ -1174,10 +1180,10 @@ class MainViewModel @Inject constructor(
         // Recorded before the shell is asked for, so a pty that never opens is attributable to the
         // session it was asked of rather than looking like a fresh handshake that stalled.
         diagnostics.record(host.id, SessionEvent.ADOPTED, state = SessionConnectionState.CHANNEL_PTY_INITIALIZING)
-        val size = ptySizes[sessionKey]
+        val size = viewportSizes[sessionKey]
         markOpeningShell(sessionKey, dial, resuming)
         val terminal = try {
-            sshConnectionManager.openTerminal(session, size?.first, size?.second, host)
+            sshConnectionManager.openTerminal(session, size?.columns, size?.ptyRows, host)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -1270,9 +1276,12 @@ class MainViewModel @Inject constructor(
                         throw IOException(detail)
                     }
                 }
-                val size = ptySizes[key]
+                val size = viewportSizes[key]
                 val process = withContext(Dispatchers.IO) {
-                    graph.runtime.spawnSession(rows = size?.second ?: LOCAL_DEFAULT_ROWS, columns = size?.first ?: LOCAL_DEFAULT_COLUMNS)
+                    graph.runtime.spawnSession(
+                        rows = size?.ptyRows ?: LOCAL_DEFAULT_ROWS,
+                        columns = size?.columns ?: LOCAL_DEFAULT_COLUMNS,
+                    )
                 }
                 val terminal = LocalTerminalChannel(process)
                 graph.processes.register(key, terminal)
@@ -1289,7 +1298,7 @@ class MainViewModel @Inject constructor(
                     }
                 }
                 val buffer = terminalBuffers.getOrPut(key) { AnsiTerminalBuffer() }
-                ptySizes[key]?.let { (columns, rows) -> buffer.resize(columns, rows) }
+                viewportSizes[key]?.let { buffer.resize(it.columns, it.bufferRows) }
                 terminalJobs[key] = launchTerminalCollector(key, host.id, terminal, buffer)
                 publishTerminalFrame(key, buffer)
                 updateTab(key) { it?.copy(state = SessionConnectionState.CONNECTED, lastError = null) }
@@ -1376,11 +1385,16 @@ class MainViewModel @Inject constructor(
          * [TerminalChannel.open] respectively, so they land on the same numbers even at a size no
          * terminal may actually be.
          *
+         * The grid catches up with [TerminalViewport.bufferRows] and not with the pty's height, which is
+         * now allowed to differ: a pty in an alternate screen is told the height of the screen, while the
+         * local grid keeps the taller one the app-wide setting asked for, so leaving `vim` does not
+         * reflow a screenful of scrollback into the shape of a full-screen program.
+         *
          * No [SessionEvent.PTY_RESIZED] here: nothing is being asked of the far end. This is the local
          * grid catching up with what the far end was already told, and recording it as a resize would
          * put a window-change in the trace that never went out on the wire.
          */
-        ptySizes[sessionKey]?.let { (columns, rows) -> buffer.resize(columns, rows) }
+        viewportSizes[sessionKey]?.let { buffer.resize(it.columns, it.bufferRows) }
         terminalJobs[sessionKey] = launchTerminalCollector(sessionKey, host.id, terminal, buffer)
         // An adopted session may be sitting at a prompt with nothing to say, and the collector only
         // publishes when output arrives - so without this the scrollback the user already had would
@@ -2157,7 +2171,7 @@ class MainViewModel @Inject constructor(
         try {
             while (isActive) {
                 var chunk: ByteArray? = incoming.receiveCatching().getOrNull() ?: break
-                val before = buffer.lineCount()
+                val before = buffer.cursorLine
                 do {
                     // Decoded here rather than in the channel because the state that matters - the
                     // two or three bytes of a codepoint that straddled a network read - lives between
@@ -2400,24 +2414,51 @@ class MainViewModel @Inject constructor(
     }
 
     /**
+     * How many rows of [buffer] are actually on screen for [sessionKey].
+     *
+     * The height of the window, as opposed to the height of the terminal, and the two stopped being the
+     * same number when the app-wide setting became a floor: a 1000-row terminal on a 40-row phone holds
+     * a thousand rows of scrollback, and cutting a frame at the grid's height would hand the view all of
+     * them to draw forty of. [AnsiTerminalBuffer.frame] anchors its window on the cursor, so the rows the
+     * user reads are the ones around where the shell is writing, wherever that is in the buffer.
+     *
+     * Falls back to the buffer's own height before any view has reported one - which is the state every
+     * test that drives this class without a screen is in, and the state a session is in for the few
+     * milliseconds between its shell opening and its first measurement.
+     */
+    private fun visibleRowsOf(sessionKey: String, buffer: AnsiTerminalBuffer): Int =
+        viewportSizes[sessionKey]?.visibleRows ?: buffer.viewportRows
+
+    /**
      * Keeps scrolled-back text still while new output arrives underneath it.
      *
-     * The offset is measured from the bottom of the buffer, because that is the coordinate the live
-     * view needs - "zero" has to mean "following the output" no matter how long the scrollback is. The
-     * cost is that every line the shell prints moves the window the offset describes, so a user reading
-     * output halfway up a busy log would watch the text slide away under their eyes while they read.
-     * Adding the growth back cancels that exactly. Clamped by [AnsiTerminalBuffer.maxScrollOffset]
-     * because the buffer also shrinks from the top once the scrollback limit starts evicting lines, and
-     * an offset past the top would otherwise stick to a line that no longer exists.
+     * The offset is measured from the window's anchor - the cursor's line - because that is the
+     * coordinate the live view needs: "zero" has to mean "following the output" no matter how long the
+     * scrollback is. The cost is that every line the shell prints moves the window the offset describes,
+     * so a user reading output halfway up a busy log would watch the text slide away under their eyes
+     * while they read. Adding the anchor's own movement back cancels that exactly.
+     *
+     * The movement is measured from the cursor rather than from the line count, and the two are the same
+     * number in every session whose pty is exactly as tall as the buffer - the case [AnsiTerminalBuffer]
+     * was written for. They part company when the pty is taller, which is what the app-wide height
+     * setting asks for: on a 1000-row terminal with 200 lines written, a new line moves the cursor down
+     * without adding a line to the buffer at all, so a compensation keyed on the buffer's growth is zero
+     * and the view slides up by one row per line printed. One `ls` would walk a scrolled-back window off
+     * the screen. [AnsiTerminalBuffer.cursorLine] is the anchor the frame is really taken from, so it is
+     * the number that has to be given back.
+     *
+     * Clamped by [AnsiTerminalBuffer.maxScrollOffset] because the buffer also shrinks from the top once
+     * the scrollback limit starts evicting lines, and an offset past the top would otherwise stick to a
+     * line that no longer exists.
      *
      * A view that is already live is left alone - it is *supposed* to move.
      */
-    private fun pinScrollback(sessionKey: String, buffer: AnsiTerminalBuffer, linesBefore: Int) {
+    private fun pinScrollback(sessionKey: String, buffer: AnsiTerminalBuffer, anchorBefore: Int) {
         val offset = scrollOffsets[sessionKey] ?: return
         if (offset <= 0) return
-        val growth = buffer.lineCount() - linesBefore
+        val growth = buffer.cursorLine - anchorBefore
         if (growth <= 0) return
-        val ceiling = buffer.maxScrollOffset(buffer.viewportRows)
+        val ceiling = buffer.maxScrollOffset(visibleRowsOf(sessionKey, buffer))
         scrollOffsets[sessionKey] = (offset + growth).coerceIn(0, ceiling)
     }
 
@@ -2440,7 +2481,7 @@ class MainViewModel @Inject constructor(
     private fun publishTerminalFrame(sessionKey: String, buffer: AnsiTerminalBuffer) {
         if (!isDisplaying(sessionKey, buffer)) return
         if (terminalFrames.subscriptionCount.value == 0) return
-        val frame = buffer.frame(scrollOffsets[sessionKey] ?: 0)
+        val frame = buffer.frame(scrollOffsets[sessionKey] ?: 0, visibleRowsOf(sessionKey, buffer))
         // Asked a second time, from inside the update: the check above only decides whether the frame
         // is worth building. See [isDisplaying] for why the write is where the question has to be
         // settled. [newerTerminalFrame] settles the other question the write has to answer: whether
@@ -2469,7 +2510,10 @@ class MainViewModel @Inject constructor(
             current + terminalBuffers.entries.associate { (sessionKey, buffer) ->
                 // Same guard as the collector's publish, for the same reason: this builds one snapshot
                 // per open session and a session that is printing can publish a newer one in between.
-                sessionKey to newerTerminalFrame(current[sessionKey], buffer.frame(scrollOffsets[sessionKey] ?: 0))
+                sessionKey to newerTerminalFrame(
+                    current[sessionKey],
+                    buffer.frame(scrollOffsets[sessionKey] ?: 0, visibleRowsOf(sessionKey, buffer)),
+                )
             }
         }
     }
@@ -2723,7 +2767,7 @@ class MainViewModel @Inject constructor(
     /** Scrolls [sessionKey]'s terminal to [offset] lines above the live bottom; 0 follows the output again. */
     fun scrollTerminal(sessionKey: String, offset: Int) {
         val buffer = terminalBuffers[sessionKey] ?: return
-        val ceiling = buffer.maxScrollOffset(buffer.viewportRows)
+        val ceiling = buffer.maxScrollOffset(visibleRowsOf(sessionKey, buffer))
         val clamped = offset.coerceIn(0, ceiling)
         if (clamped == 0) scrollOffsets.remove(sessionKey) else scrollOffsets[sessionKey] = clamped
         publishTerminalFrame(sessionKey, buffer)
@@ -2844,23 +2888,27 @@ class MainViewModel @Inject constructor(
         commandHistory.value = commandHistory.value + (hostId to updated)
     }
     /**
-     * Applies a new viewport size to both halves of the terminal: the local grid and the remote pty.
+     * Applies a newly measured viewport to both halves of the terminal: the local grid and the remote pty.
      *
      * Both are required. Resizing only the buffer would leave the remote side drawing for the old
      * width, so a full-screen program would wrap its own status line; telling only the remote side
      * would leave the parser wrapping text the shell had already fitted. This runs on rotation, on a
-     * multi-window drag and when the software keyboard opens.
+     * multi-window drag, when the software keyboard opens, and when a program enters or leaves the
+     * alternate screen - the last of which changes the height the pty is given without changing the grid.
+     *
+     * The three heights in [viewport] go to three different places on purpose; see [TerminalViewport]
+     * for why the pty's is not always the grid's.
      */
-    fun resizeTerminal(sessionKey: String, columns: Int, rows: Int) {
+    fun resizeTerminal(sessionKey: String, viewport: TerminalViewport) {
         val buffer = terminalBuffers[sessionKey]
-        buffer?.resize(columns, rows)
+        buffer?.resize(viewport.columns, viewport.bufferRows)
         if (buffer != null) {
             // A taller viewport can leave the stored offset past the top of a short buffer.
             scrollOffsets[sessionKey]?.let { offset ->
-                // The buffer's own height, which is the requested one clamped to what a terminal may
-                // be; asking for 4 000 rows and then measuring the ceiling against 4 000 would clear
+                // Measured against the window the user is looking through, which is what the offset was
+                // recorded in. The grid's own height would now be the taller of the two and would clear
                 // an offset that is still perfectly valid.
-                val ceiling = buffer.maxScrollOffset(buffer.viewportRows)
+                val ceiling = buffer.maxScrollOffset(viewport.visibleRows)
                 if (offset > ceiling) {
                     if (ceiling <= 0) scrollOffsets.remove(sessionKey) else scrollOffsets[sessionKey] = ceiling
                 }
@@ -2872,24 +2920,28 @@ class MainViewModel @Inject constructor(
         // channel kept the 120x40 default while the UI, having already reported the real size once,
         // never mentioned it again. Every full-screen program on a reconnected session was drawn for a
         // terminal twice the width of the phone.
-        val previous = ptySizes.put(sessionKey, columns to rows)
+        val previous = viewportSizes.put(sessionKey, viewport)
         // Only when the geometry really moved. The composable reports on every measurement pass, and
         // an entry per pass would push the interesting history out of the ring within seconds of
         // scrolling. The trace is per *server*, so the host is resolved from the tab rather than
-        // assumed to be the key.
-        if (previous != columns to rows) {
+        // assumed to be the key. An alternate-screen flip counts as a move here, and should: the far end
+        // is about to be told a different height, and a window-change in the trace is what explains the
+        // reflow that follows.
+        if (previous != viewport) {
             tabs.value.firstOrNull { it.id == sessionKey }?.hostId?.let { hostId ->
                 diagnostics.record(
                     hostId,
                     SessionEvent.PTY_RESIZED,
-                    pty = "${columns}x$rows",
-                    detail = previous?.let { "was ${it.first}x${it.second}" },
+                    pty = "${viewport.columns}x${viewport.ptyRows}",
+                    detail = previous?.let { "was ${it.columns}x${it.ptyRows}" },
                 )
             }
         }
         // sendWindowChange writes an SSH packet, which blocks when the transport is
         // congested; keep it off the main thread so a stalled link cannot cause an ANR.
-        transportScope.launch { runCatching { channels[sessionKey]?.resize(columns, rows) } }
+        transportScope.launch {
+            runCatching { channels[sessionKey]?.resize(viewport.columns, viewport.ptyRows) }
+        }
     }
 
     /**
@@ -4160,7 +4212,7 @@ class MainViewModel @Inject constructor(
         scrollOffsets.remove(tab.id)
         textPublishedAt.remove(tab.id)
         typedLines.remove(tab.id)
-        ptySizes.remove(tab.id)
+        viewportSizes.remove(tab.id)
         connectedAt.remove(tab.id)
         // Asked *after* the store entry is gone, so the answer already reflects this session leaving.
         // Keys that have died but not been reaped still count - a sibling terminal may come back for

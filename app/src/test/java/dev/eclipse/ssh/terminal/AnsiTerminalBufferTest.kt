@@ -298,8 +298,87 @@ class AnsiTerminalBufferTest {
         buffer.resize(100_000, 100_000)
 
         val large = buffer.snapshot()
-        assertThat(large.columns).isAtMost(400)
-        assertThat(large.rows).isAtMost(200)
+        assertThat(large.columns).isEqualTo(TERMINAL_COLUMN_RANGE.last)
+        assertThat(large.rows).isEqualTo(TERMINAL_ROW_RANGE.last)
+    }
+
+    /**
+     * The window follows the cursor, which is the whole of what a tall pty needs from the buffer.
+     *
+     * With the pty taller than the output written so far the cursor sits somewhere in the middle of a
+     * buffer that is mostly blank rows, and a window measured from the *bottom* of it would be a screen
+     * of nothing with the prompt far above. The rows below the cursor are never drawn, so the window is
+     * taken from the cursor down instead - and at offset zero it ends on the cursor's own line, which is
+     * where a shell's newest output is.
+     */
+    @Test
+    fun `a window in a mostly blank buffer is taken from the cursor and not the bottom`() {
+        val buffer = AnsiTerminalBuffer(columns = 20, rows = 1000)
+        buffer.feed((1..6).joinToString("\r\n") { "line $it" })
+
+        val live = buffer.frame(scrollOffset = 0, viewportRows = 4)
+
+        assertThat(live.totalLines).isEqualTo(1000)
+        assertThat(live.lines.map { it.text() }).containsExactly("line 3", "line 4", "line 5", "line 6").inOrder()
+        assertThat(live.firstLine).isEqualTo(2)
+        // The cursor is on the last row of the window, not a thousand rows below it.
+        assertThat(live.cursorRow).isEqualTo(3)
+
+        // And the scrollback above the cursor is reachable: four rows back shows lines 1 and 2 with the
+        // blank rows above them, and no further, because there is nothing further to show.
+        val back = buffer.frame(scrollOffset = 2, viewportRows = 4)
+        assertThat(back.firstLine).isEqualTo(0)
+        assertThat(back.lines.last().text()).isEqualTo("line 4")
+        assertThat(back.cursorRow).isEqualTo(-1)
+
+        // The range of offsets is measured from the same anchor, so it is the distance to the first line
+        // the terminal ever wrote - two - and not the 996 blank rows below the cursor.
+        assertThat(buffer.maxScrollOffset(4)).isEqualTo(2)
+    }
+
+    /**
+     * A window taller than what has been written starts at the first line, not before the buffer.
+     *
+     * The lower bound on the anchor: a cursor on row 3 of a hundred-row screen pulled up by a window of
+     * four would otherwise ask for lines -1 to 3.
+     */
+    @Test
+    fun `a window taller than the output starts at the first line`() {
+        val buffer = AnsiTerminalBuffer(columns = 20, rows = 100)
+        buffer.feed("only line")
+
+        val frame = buffer.frame(scrollOffset = 0, viewportRows = 40)
+
+        assertThat(frame.firstLine).isEqualTo(0)
+        assertThat(frame.lines).hasSize(40)
+        assertThat(frame.lines.first().text()).isEqualTo("only line")
+        assertThat(frame.cursorRow).isEqualTo(0)
+        assertThat(buffer.maxScrollOffset(40)).isEqualTo(0)
+    }
+
+    /**
+     * [AnsiTerminalBuffer.cursorLine] is the anchor [AnsiTerminalBuffer.frame] is taken from.
+     *
+     * The caller that keeps a scrolled-back view still reads it before and after feeding output and adds
+     * the difference back to the offset. It has to be this number rather than the line count, because in
+     * a tall terminal output moves the cursor without adding a line at all - the buffer's growth is zero
+     * and the view would slide up by one row per line printed.
+     */
+    @Test
+    fun `cursorLine moves with the output in a tall terminal and stays put once it scrolls`() {
+        val buffer = AnsiTerminalBuffer(columns = 20, rows = 1000)
+
+        assertThat(buffer.cursorLine).isEqualTo(1)
+        buffer.feed("one\r\ntwo\r\nthree")
+        assertThat(buffer.cursorLine).isEqualTo(3)
+        // No line was added to a buffer that was already a thousand rows tall.
+        assertThat(buffer.lineCount()).isEqualTo(1000)
+
+        // Once the screen is full the cursor is pinned to the last row, and the line count is what
+        // grows instead - which is why the two agreed before there was such a thing as a tall terminal.
+        val full = AnsiTerminalBuffer(columns = 20, rows = 4)
+        full.feed((1..10).joinToString("\r\n") { "line $it" })
+        assertThat(full.cursorLine).isEqualTo(full.lineCount())
     }
 
     /**

@@ -43,6 +43,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
+import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import dev.eclipse.ssh.terminal.TerminalCell
 import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalLayout
@@ -50,6 +51,7 @@ import dev.eclipse.ssh.terminal.TerminalSelection
 import dev.eclipse.ssh.terminal.terminalLayout
 import dev.eclipse.ssh.terminal.TerminalColor
 import dev.eclipse.ssh.terminal.TerminalStyle
+import dev.eclipse.ssh.terminal.TerminalViewport
 import kotlinx.coroutines.delay
 import kotlin.math.floor
 import kotlin.math.roundToInt
@@ -109,9 +111,10 @@ data class TerminalGrid(val columns: Int, val rows: Int, val originX: Float, val
  * Asking for eighty instead - the width every command-line program on earth is written for - moves the
  * decision back to where it can be undone: the lines arrive whole, and the part that does not fit on
  * screen is wrapped at a word boundary by [dev.eclipse.ssh.terminal.terminalLayout], or panned to on the
- * alternate screen where wrapping would move a full-screen program's rows. [rows] is never touched,
- * because vertical space is not scarce in the same way: the view can always show every row it has, and a program that thinks it has
- * more rows than the screen would draw its status line where nobody can see it.
+ * alternate screen where wrapping would move a full-screen program's rows. Height is the other axis and
+ * has its own two functions, [atLeastRows] and [atMostRows], because a floor is not the only thing a
+ * height can be: the app-wide setting raises it, a host's own choice lowers it, and the screen decides
+ * nothing at all.
  *
  * Bounded by the same range the pty and the buffer accept, so a stored setting can never ask for a
  * grid that one of them would silently refuse.
@@ -119,6 +122,28 @@ data class TerminalGrid(val columns: Int, val rows: Int, val originX: Float, val
 fun TerminalGrid.atLeastColumns(minColumns: Int): TerminalGrid {
     val wanted = minColumns.coerceAtMost(TERMINAL_COLUMN_RANGE.last)
     return if (wanted <= columns) this else copy(columns = wanted)
+}
+
+/**
+ * The same grid, made at least [minRows] rows tall.
+ *
+ * This is what makes the taller choices mean anything, and it is the width rule applied to the other
+ * axis. A height used to be a ceiling - the screen cut it down to what fits, on the reasoning that a
+ * row past the bottom edge is nowhere while a column past the right edge can be panned to. The second
+ * half of that is still true, and is why a *host's* height stays a ceiling; what it got wrong was
+ * concluding that a taller terminal is therefore pointless. A pty told it has 1000 rows is one whose
+ * `ls` prints a thousand entries before it pages, whose `apt-get` output stays in the app's scrollback
+ * instead of being paged away by the program, and whose `less` pages a thousand lines at a time - and
+ * what the user reads is the window around the cursor, because `AnsiTerminalBuffer.frame` anchors
+ * there and the scroll gesture walks back through the rest. Nothing is drawn past the bottom edge:
+ * the view draws the height it has, and the pty is simply told a bigger number than that.
+ *
+ * Bounded by the same range the pty and the buffer accept, so a stored setting can never ask for a
+ * grid that one of them would silently refuse.
+ */
+fun TerminalGrid.atLeastRows(minRows: Int): TerminalGrid {
+    val wanted = minRows.coerceAtMost(TERMINAL_ROW_RANGE.last)
+    return if (wanted <= rows) this else copy(rows = wanted)
 }
 
 /**
@@ -137,32 +162,19 @@ internal fun minTerminalColumns(settingColumns: Int, hostColumns: Int): Int =
     maxOf(settingColumns.coerceAtLeast(0), hostColumns.coerceAtLeast(0))
 
 /**
- * The height to give a host's pty: the host's own choice when it has one, otherwise the app-wide one.
+ * The same grid, shortened to a host's chosen height when that is shorter than the app-wide one.
  *
- * The host wins here where it loses for columns, and the asymmetry is the point. Two floors combine by
- * taking the wider, because the screen can always show less than the server believes. Two ceilings have
- * no such arithmetic: the app-wide height is what the user wants a terminal to look like *by default*,
- * and a host that names a height is stating a fact about that server - the one place a per-host value
- * has ever carried information the global one cannot. A host with no opinion, which is every host until
- * someone edits it, takes the global value.
+ * A host's `Rows` field is the one place a per-host value is a ceiling rather than a floor, and it is
+ * the only way to tell a particular server that the window is short - which some programs want to know,
+ * and which no app-wide setting can express without shortening every host. So it only ever lowers: a
+ * host asking for fewer rows than the floor gets exactly what it asked for, and a host asking for more
+ * is left at the floor, because a value that raised the height here would be a per-host copy of the
+ * app-wide setting and would silently override it.
  *
- * Either way this is a request: what actually reaches the pty is this number passed through
- * [atMostRows], so a value taller than the screen is cut down to the screen rather than obeyed.
- */
-internal fun hostTerminalRows(settingRows: Int, hostRows: Int): Int =
-    if (hostRows > 0) hostRows else settingRows.coerceAtLeast(0)
-
-/**
- * The same grid, shortened to a host's chosen height when the screen can show that many rows.
+ * Only the grid is affected. What the *pty* is told is a separate decision made at the view, where an
+ * alternate screen asks for the on-screen height instead - see [TerminalViewport].
  *
- * A height is the one dimension that cannot be a floor. Columns past the right edge are reachable by
- * wrapping or panning, but a row past the bottom edge is nowhere: a pty told it has sixty rows on a
- * screen that fits forty puts the shell's prompt, and every full-screen program's status line, twenty
- * rows below the last pixel. So a host asking for more than fits is given what fits, and a host asking
- * for fewer - which is a real thing to want, and the only way to tell a server the window is short -
- * gets exactly what it asked for, drawn at the top with the rest of the screen left blank.
- *
- * Zero means "match the screen", the same sentinel the stored setting uses.
+ * Zero means "no opinion", the same sentinel the stored setting uses.
  */
 fun TerminalGrid.atMostRows(hostRows: Int): TerminalGrid =
     if (hostRows in 1 until rows) copy(rows = hostRows) else this
@@ -281,7 +293,11 @@ internal fun panForCursor(
  *
  * @param minColumns the narrowest grid to give the pty regardless of how many columns fit on screen;
  *   0 fits the screen exactly. See [atLeastColumns] and [minTerminalColumns].
- * @param hostRows the height this host asked for, capped by what the screen can show; 0 fits the screen.
+ * @param minRows the shortest grid to give the terminal regardless of how many rows fit on screen; 0
+ *   fits the screen exactly. See [atLeastRows]. The view draws the rows it has either way - a taller
+ *   grid is one the pty was told about, not one that is painted - so the extra height buys scrollback
+ *   the shell will not page away, not pixels.
+ * @param hostRows the height this host asked for, which can only shorten the grid; 0 has no opinion.
  *   See [atMostRows].
  * @param onScroll called with a line delta; positive scrolls back into the history.
  * @param onSelectionChange the live drag selection, in absolute buffer lines, or null when cleared.
@@ -295,13 +311,14 @@ fun TerminalView(
     metrics: TerminalCellMetrics,
     modifier: Modifier = Modifier,
     minColumns: Int = 0,
+    minRows: Int = 0,
     hostRows: Int = 0,
     selection: TerminalSelection? = null,
     onSelectionChange: (TerminalSelection?) -> Unit = {},
     onSelectionFinished: (TerminalSelection) -> Unit = {},
     onScroll: (Int) -> Unit = {},
     onTap: () -> Unit = {},
-    onViewportChange: (columns: Int, rows: Int) -> Unit = { _, _ -> },
+    onViewportChange: (TerminalViewport) -> Unit = {},
     onLongPressCell: (line: Int, column: Int) -> Unit = { _, _ -> },
     /**
      * Reports a pinch as a font-size scale factor relative to the size in force when the gesture
@@ -340,16 +357,37 @@ fun TerminalView(
         val widthPx = with(density) { maxWidth.toPx() }
         val heightPx = with(density) { maxHeight.toPx() }
         // Two grids, and the difference between them is the whole feature. `visible` is what fits on
-        // screen; `grid` is what the pty is told it has, which is at least as wide. They are the same
-        // object whenever the setting is "fit screen".
+        // screen; `grid` is what the pty is told it has, which is at least as wide and usually as tall.
+        // They are the same object whenever both settings are "fit screen".
         val visible = remember(metrics, widthPx, heightPx) { metrics.gridIn(widthPx, heightPx) }
-        val grid = remember(visible, minColumns, hostRows) {
-            visible.atLeastColumns(minColumns).atMostRows(hostRows)
+        val grid = remember(visible, minColumns, minRows, hostRows) {
+            visible.atLeastColumns(minColumns).atLeastRows(minRows).atMostRows(hostRows)
         }
+        // What the pty is told it has, which is the grid except while a program is painting the screen.
+        //
+        // `vim`, `htop`, `less` and `nano` address every cell positionally and draw their own borders
+        // and status lines for the height they were told; a thousand-row `vim` on a forty-row screen is
+        // a status line nobody can see and a body of text whose bottom half does not exist. The primary
+        // screen has no such problem, because a shell's output flows and the window around the cursor is
+        // what the reader looks at - so the two cases get different numbers, which is the same
+        // distinction [dev.eclipse.ssh.terminal.terminalLayout] already draws for wrapping.
+        //
+        // Bounded by the grid as well as by the screen, so a host that asked for a short window keeps
+        // it: capping only at the screen would let a full-screen program be told forty rows on a host
+        // explicitly configured for thirty.
+        val ptyRows = if (frame.alternateScreen) minOf(visible.rows, grid.rows) else grid.rows
         val origin = remember(visible) { Offset(visible.originX, visible.originY) }
+        val viewport = TerminalViewport(
+            columns = grid.columns,
+            ptyRows = ptyRows,
+            bufferRows = grid.rows,
+            visibleRows = visible.rows,
+        )
         // Reported on every size change, including the one the software keyboard causes: the pty has
         // to know the window it is drawing into or a full-screen program wraps its own status line.
-        LaunchedEffect(grid.columns, grid.rows) { viewportChange(grid.columns, grid.rows) }
+        // Keyed on the whole value, so entering and leaving an alternate screen reports the changed
+        // height too - that flip is a resize as far as the far end is concerned.
+        LaunchedEffect(viewport) { viewportChange(viewport) }
 
         // How far the grid is panned to the left, in pixels. A float rather than a column index so a
         // drag moves smoothly instead of snapping a character at a time, and a `MutableFloatState`
@@ -360,8 +398,12 @@ fun TerminalView(
         // word boundary. Keyed on what the answer depends on rather than on the frame, whose equality is
         // a comparison of several thousand cells: the revision covers every mutation of the buffer and
         // `firstLine` covers a scroll, which moves the window without mutating anything.
-        val layout = remember(frame.revision, frame.firstLine, frame.lines.size, visible.columns, grid.rows) {
-            terminalLayout(frame, visible.columns, grid.rows)
+        //
+        // The height here is the *visible* one. A tall grid is a taller pty, not a taller screen, and the
+        // frame the buffer hands over is already the window around the cursor - laying it out for a
+        // thousand rows would wrap and bottom-anchor against space that is not on the phone.
+        val layout = remember(frame.revision, frame.firstLine, frame.lines.size, visible.columns, visible.rows) {
+            terminalLayout(frame, visible.columns, visible.rows)
         }
         // Read from the long-lived gesture handlers, which are keyed on the metrics and would otherwise
         // map a touch through the layout of whichever frame was on screen when they were installed.
@@ -510,7 +552,10 @@ fun TerminalView(
                             foreground = foreground,
                             background = background,
                             metrics = metrics,
-                            maxRows = grid.rows,
+                            // The rows there is room for, not the rows the pty was told about: a tall
+                            // grid is a taller pty, and a row below the bottom edge is a row of cells
+                            // painted where nobody can see them.
+                            maxRows = visible.rows,
                             selection = selection,
                             selectionColour = selectionColour,
                             cursorColour = cursorColour,
