@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 34 / versionName 1.4.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 35 / versionName 1.5.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §54, *Releasing 1.4.0*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §55, *Releasing 1.5.0*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -5869,3 +5869,117 @@ release is published as a draft first and its assets verified before it is made 
 `testing/README.md`'s dispatch example moves to `v1.4.0` in the same pull request as the bump rather
 than in a follow-up: §47's rule is that the example names the newest release that is *published*, and
 folding the two together is one CI cycle instead of two for a line that would otherwise move twice.
+
+---
+
+## 55. Releasing 1.5.0
+
+`v1.5.0` is what `main` holds after the four things a user asked for in one message — Files browsing the
+on-device Ubuntu, a confirmation before the session list's X closes a shell, terminal height options of
+100/200/500/1000 rows, and the `dpkg: warning: 'rm' not found in PATH or not executable` that made
+`apt-get` unusable. It is a minor bump rather than a patch because three of the four add surface: a new
+backend in the Files tab, a new dialog, and a range of heights that changes what a terminal *is* on this
+app rather than how it is drawn.
+
+Three changes make the range the tag names, and this bump is the fourth commit in it. `189b3bc` is
+Files and the list's X, `df13f57` is the dpkg failure, and `f78a0fb` is the terminal height; `dcdf812`
+is the six test and fixture repairs that running the first two commits' suites found. What `main` held
+before this commit is `git diff --shortstat v1.4.0..6fb8553`: 30 files and +2945/−235. The suite is
+1,947 JVM/Robolectric test methods in 173 test files, which is README's count — and it is neither the
+Files branch's 1,942 in 173 nor the height branch's 1,923 in 172, because each of those is the count of
+the tree its own pass produced and the two branches' tests are additive. Both branches edited that one
+README line and it was the merge's only conflict.
+
+### What the four changes are
+
+- **Files, over the userspace.** `UbuntuFileSystemProvider` (`providerId = "ubuntu"`) is a third
+  implementation of the `FileSystemProvider` seam SFTP and SAF already implement, so the explorer's
+  session chips, listing, editor, permissions and search all work on the guest tree with nothing in the
+  UI learning a new backend. `RootfsPaths` is the guest↔host mapping, and it is the part with teeth:
+  Ubuntu Base is usrmerged, so `/bin` is an absolute link to `usr/bin`, and a naive `File(rootfs, path)`
+  walk would follow it to the *device's* `/usr/bin` — reading, and writing, the phone while claiming to
+  browse Ubuntu. Every component is resolved inside the root and anything that escapes it is refused,
+  `..` above `/` included; the device's own `/dev`, `/proc` and `/sys` are hidden, since proot binds the
+  host's over them and the Files tab has "This device" for the real ones.
+- **The list's X asks.** It did not, and the strip's did, so the two buttons that kill the same shell
+  behaved differently — and the list is where a session that dropped while the app was elsewhere gets
+  discovered, which is also where a close tap is most likely to be aimed at the wrong row. The strip's
+  dialog became `ConfirmCloseSessionDialog` and both call it, so they cannot drift in wording or
+  behaviour.
+- **Height is a floor the view scrolls through.** This is the change with the most rework in it, and
+  README's terminal-setting paragraph says why: height used to be a ceiling, so 100, 200, 500 and 1000
+  would each have been cut down to the screen on every phone — four choices that could never do
+  anything. The window now anchors on the cursor rather than on the bottom of the buffer (in a 1000-row
+  pty with 200 lines printed, the old rule showed the blank rows 960-1000), the existing scroll gesture
+  walks back through the rest, and a program that paints the screen positionally is told the *screen's*
+  height instead, because `vim` and `htop` draw their own status line for the rows they were told
+  about. A host's own `Rows` stays a ceiling — deliberately, and its range stays 5..200 — because
+  telling one server its window is short is a real thing to want, and a per-host value that raised the
+  height would silently override the setting it sits under.
+- **dpkg gets its programs back, and the guest a PATH that finds them.** The two causes of that warning
+  are indistinguishable from the outside, and the fix is one of each. Repair previously ran only
+  `apt-get update`, `dpkg --configure -a` and `apt-get -y -f install` — every one of which needs a
+  working dpkg — so a rootfs genuinely missing `rm`, `tar` or `sh` had no in-app route out at all:
+  `restoreMissingEssentials` now extracts named members from the pinned, SHA-256-verified tarball the
+  install already trusts, *before* dpkg is asked anything, and names any program the archive does not
+  carry instead of reporting a clean repair. The other half is that the guest's own `sudo`, `su -` and
+  login shells each rebuild `PATH` from files the app was not writing, which is why it kept coming
+  back: `configureGuestPath` writes all four entry points. The plan named `env_keep += "PATH"` for the
+  sudoers drop-in and `secure_path` was written instead — keeping the caller's `PATH` preserves a good
+  one and a short one equally, and the point is that the answer stops depending on what the caller
+  happened to inherit.
+
+Two of the four also answer the question this report could previously only guess at: `HealthReport`
+gains `loginUid`, `loginPath` and `missingPrograms`, so "is it absent or just unfindable" reads off
+Settings → Ubuntu on this device → Verify rather than off a stack trace, and `healthy` is false while
+any program is missing.
+
+### This release has no CI behind it, for the first time in this file
+
+Every release from v1.1.19 through v1.4.0 has a successful `tagged-release.yml` run behind it — runs 26
+to 33, `v1.1.19` on 2026-09-17 through `v1.4.0` on 2026-09-19T22:37Z. **v1.5.0 does not.** On
+2026-09-21 every job of every workflow dispatched against this repository stopped starting: the runs
+report `failure` after about four seconds with no steps executed at all and an empty `runner_name`, and
+the check-run annotation says why in one sentence —
+
+> The job was not started because recent account payments have failed or your spending limit needs to
+> be increased. Please check the 'Billing & plans' section in your settings
+
+That is a billing state and not a workflow, a diff or a caching problem, which is worth stating because
+the symptom reads like all three: a green-looking run whose every job failed in seconds with nothing in
+its log. Nothing here fixes it, and no workflow can build, test or publish anything for this repository
+until the account's billing is settled. The last run that did work is Android release test on
+2026-09-19T23:02Z.
+
+So the gates `tagged-release.yml` and `ci.yml` perform were run by hand on the maintainer's host, and
+the honest summary is that they are most of the gate and not all of it.
+
+What was run, on the merged tree, at the commit this section is part of:
+
+- `./gradlew :app:testDebugUnitTest` — 1,947 methods, 0 failures, 0 errors, 17 skipped, 181 class result
+  files — with `-x :freerdp:buildFreerdpNative -x :linux:buildLinuxNative`, because NDK 29 is not
+  installed on that host and neither native task can run there. The app and both test source sets
+  compile against the real, already-built native libraries.
+- `scripts/check-doc-figures.sh` — all 141 claims, which is what re-derives this header and README's
+  counts from the tree.
+- `bundleRelease` then `assembleRelease`, `apksigner verify` (v2 and v3) on every APK, the AAB's JAR
+  signature blocks, and `testing/verify-release-splits.sh` with `testing/verify-release-apk.sh` — the
+  same scripts, in the same order, that the workflow runs.
+
+What that does **not** establish, and this release therefore claims nothing about: the instrumentation
+suite (`connectedAndroidTest`) and the Ubuntu end-to-end leg, which need an emulator this host cannot
+run — the guest kills `system_server` for want of KVM — and the on-device loop, which needs a phone.
+The JVM suite is the whole of the evidence for the four changes above, and the userspace's own behaviour
+under proot on a real device is verified by neither. A reader comparing this release with its neighbours
+should read it as the one whose artifact is signed and split correctly and whose *runtime* claims rest
+on a single host's run.
+
+### What publication still owes
+
+Unchanged from §54 and §47, and now checked by hand rather than by the workflow: the tag is created only
+after `app/build.gradle.kts` answers `versionName = "1.5.0"` and this file's third line agrees with it,
+because no gate in the pipeline compares an artifact against what its tag promised. The release is
+created as a draft and its seven assets — the four per-ABI APKs, the universal APK, the AAB and
+`SHA256SUMS.txt` — verified before it is made public. `testing/README.md`'s dispatch example moves to
+`v1.5.0` in the same commit as the bump, per §47's rule that the example names the newest release that
+is *published*.
