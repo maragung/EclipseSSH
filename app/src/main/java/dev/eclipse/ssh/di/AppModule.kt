@@ -21,6 +21,7 @@ import dev.eclipse.ssh.data.RoomTransferRepository
 import dev.eclipse.ssh.data.local.EclipseDatabase
 import dev.eclipse.ssh.data.local.HostDao
 import dev.eclipse.ssh.data.local.Migrations
+import dev.eclipse.ssh.data.fs.UbuntuRootfsLocator
 import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.security.SecretCipher
 import dev.eclipse.ssh.security.SecureVault
@@ -122,4 +123,24 @@ object AppModule {
             corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
             produceFile = { context.preferencesDataStoreFile("host_credentials") },
         )
+
+    /**
+     * Where the Files tab finds the installed Ubuntu userspace, if there is one.
+     *
+     * A lambda over the graph provider rather than the directory itself, because the filesystem it
+     * names is not fixed for the life of the process: an install, an uninstall and a repair all
+     * replace the tree, and a provider holding the `File` it saw at construction would keep browsing
+     * the old one — or, worse, a half-deleted one. Reading through the flow on every call costs a
+     * property read and cannot go stale.
+     *
+     * The manager's own state is deliberately not consulted. The question here is the one the Files
+     * tab can act on — "are there files to show" — and a rootfs the manager has flagged NeedsRepair
+     * is still a tree the user should be able to look inside and empty out. A device whose ABI maps
+     * to no Ubuntu architecture has no graph at all, and this answers null for it, which is what
+     * keeps the chip off a screen where it could never open.
+     */
+    @Provides
+    @Singleton
+    fun provideUbuntuRootfsLocator(graphProvider: LinuxUserspaceGraphProvider): UbuntuRootfsLocator =
+        UbuntuRootfsLocator { graphProvider.graph?.installer?.rootfsDir }
 }

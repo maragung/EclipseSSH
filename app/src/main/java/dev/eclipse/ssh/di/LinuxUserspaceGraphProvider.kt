@@ -182,6 +182,10 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             // /etc/resolv.conf, so a network change between install and repair lands in the file
             // instead of pinning the DNS of the moment the graph was built.
             dnsServers = { liveDnsServers(context) },
+            // The same installer instance the graph built above, so the manager's missing-program
+            // restore reads the same pinned tarball this device installed from — and files into
+            // the same diagnostics ring, which is why both take the one `diagnostics` object.
+            installer = installer,
             diagnostics = diagnostics,
         )
         val processes = LinuxProcessManager()

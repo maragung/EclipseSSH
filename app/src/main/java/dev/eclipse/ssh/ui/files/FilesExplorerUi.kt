@@ -45,6 +45,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -64,6 +65,7 @@ import androidx.compose.ui.unit.dp
 import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.presentation.files.Crumb
 import dev.eclipse.ssh.presentation.files.CrumbOrEllipsis
+import dev.eclipse.ssh.presentation.files.ExplorerCopy
 import dev.eclipse.ssh.presentation.files.ExplorerSession
 import dev.eclipse.ssh.presentation.files.ExplorerSort
 import dev.eclipse.ssh.presentation.files.ExplorerState
@@ -106,6 +108,14 @@ fun ExplorerTopBar(
             state.sessions.forEach { session ->
                 SessionChip(session, selected = session.id == state.activeSessionId, onClick = { onSession(session.id) })
             }
+        }
+        // The copy in hand, when one is running. Here rather than in a dialog: it is the one progress
+        // this session has - a copy between two folders of the same device is not a transfer, so it
+        // has no row in the Transfers tab to look at instead - and it belongs above the path bar,
+        // where the eye already is after tapping the row that started it.
+        state.copy?.let { copy ->
+            Spacer(Modifier.height(10.dp))
+            CopyProgressRow(copy)
         }
         Spacer(Modifier.height(10.dp))
 
@@ -466,6 +476,10 @@ fun ExplorerSelectionBar(
             Spacer(Modifier.width(16.dp))
             TextButton(onClick = onClear) { Text("Clear") }
             if (onDownload != null) {
+                // "Download" names the device as the destination, which is what it is for a server
+                // and for the userspace alike — both ends of an Ubuntu copy are this device, and the
+                // rows being copied out are the userspace's. The label is deliberately the same in
+                // both: what changes is the mechanism behind it, not what the user is asking for.
                 Button(onClick = onDownload) { Text("Download") }
             }
             if (onUpload != null) {
@@ -518,6 +532,35 @@ private fun PropertyRow(label: String, value: String) {
 @OptIn(ExperimentalFoundationApi::class)
 private fun Modifier.combinedClickableCompat(onClick: () -> Unit): Modifier =
     this.combinedClickable(onClick = onClick)
+
+/**
+ * One line of "Copying …", with a bar under it once there is a fraction to draw.
+ *
+ * A zero fraction means *no measurement*, not *nothing done*: the copy reports 0 while the source's
+ * size is unknown — a document provider that will not answer, a pipe — so a bar at zero would sit
+ * motionless through a copy that is in fact moving, which is the one reading a progress bar must never
+ * give. Indeterminate says "running, unmeasured", which is true in both of those cases and in the
+ * instant before the first buffer lands.
+ */
+@Composable
+private fun CopyProgressRow(copy: ExplorerCopy) {
+    Column(Modifier.fillMaxWidth()) {
+        Text(
+            copy.label,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(6.dp))
+        val fraction = copy.progress?.takeIf { it > 0f }
+        if (fraction == null) {
+            LinearProgressIndicator(Modifier.fillMaxWidth())
+        } else {
+            LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
 
 fun describeSize(bytes: Long): String = when {
     bytes < 1024 -> "$bytes B"

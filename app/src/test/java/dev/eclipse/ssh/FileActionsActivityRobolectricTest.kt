@@ -190,7 +190,14 @@ class FileActionsActivityRobolectricTest {
         ActionRequests.take(spent)
 
         ActivityScenario.launch<FileActionsActivity>(
-            FileActionsActivity.intent(context, remoteFile(), isLocal = false, supportsPermissions = true, canOpenArchive = true)
+            FileActionsActivity.intent(
+                context,
+                remoteFile(),
+                isLocal = false,
+                isUbuntu = false,
+                supportsPermissions = true,
+                canOpenArchive = true,
+            )
                 .putExtra(ActionRequests.EXTRA_SUBJECT_TOKEN, spent),
         ).use { scenario ->
             pumpUntil(describe = { "a spent subject token opened a window anyway" }) {
@@ -218,10 +225,21 @@ class FileActionsActivityRobolectricTest {
         isLocal: Boolean,
         supportsPermissions: Boolean,
         canOpenArchive: Boolean,
+        // The default is the SFTP shape every caller above wants. Named rather than positional at the
+        // call below, because the two booleans that follow it are both about the *backend* and a
+        // positional call would put `supportsPermissions` in the Ubuntu slot the moment one is added.
+        isUbuntu: Boolean = false,
     ): ActivityScenario<FileActionsActivity> {
         val context = ApplicationProvider.getApplicationContext<Context>()
         return ActivityScenario.launch<FileActionsActivity>(
-            FileActionsActivity.intent(context, entry, isLocal, supportsPermissions, canOpenArchive),
+            FileActionsActivity.intent(
+                context,
+                entry,
+                isLocal = isLocal,
+                isUbuntu = isUbuntu,
+                supportsPermissions = supportsPermissions,
+                canOpenArchive = canOpenArchive,
+            ),
         )
     }
 

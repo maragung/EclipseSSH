@@ -462,6 +462,88 @@ class RootfsInstaller(
         target.setWritable(true, true)
     }
 
+    /**
+     * Puts named members of the pinned archive back into the installed rootfs, and answers which
+     * ones it restored.
+     *
+     * The one repair that cannot go through the package manager, written for the failure where the
+     * package manager is the thing that broke. `dpkg` needs a handful of programs to exist before it
+     * will run at all — `sh` to execute its maintainer scripts, `rm` and `tar` to unpack and clear
+     * away — and when one of them is gone from the rootfs, every `dpkg --configure -a` and every
+     * `apt-get -f install` fails with the same `1 expected program not found in PATH or not
+     * executable`, so the app's own Repair could never clear the state it exists to clear. There is
+     * no way back through apt by definition, and no way at all through a shell that has no `rm`.
+     *
+     * So the bytes come from where the install got them: the same tarball, the same pin, the same
+     * SHA256. The archive is downloaded again when a successful install has deleted it (the install
+     * path removes it deliberately — see [moveIntoPlace]) and *kept* afterwards, because unlike on
+     * the install path it is not spare bytes here: it is the only copy of the files a repair can
+     * reach for, and re-downloading 30 MB on every pass of the repair ladder is worse than pinning it.
+     *
+     * Members are restored into the live rootfs rather than into staging, because this runs on a
+     * rootfs that is otherwise complete and in use: a staging swap would replace a user's whole
+     * installed system to put back four binaries. Only the named members are touched — no directory
+     * is cleared, nothing is overwritten that the archive does not name — so a file the user has
+     * edited outside those names survives untouched.
+     *
+     * @param memberNames archive-relative names, exactly as the tarball spells them (`usr/bin/rm`,
+     *   not `/usr/bin/rm`). A name the archive does not carry is reported by its absence from the
+     *   result rather than as a failure: a rootfs that is missing four things is not made worse by
+     *   restoring three.
+     */
+    suspend fun restoreFromPinnedTarball(
+        memberNames: Set<String>,
+        onProgress: (Progress) -> Unit = {},
+    ): List<String> {
+        if (memberNames.isEmpty()) return emptyList()
+        if (!tarballFile.isFile || !verifyFileSha256(tarballFile, distro.rootfsSha256)) {
+            download(onProgress)
+        }
+        val restored = sortedSetOf<String>()
+        val startedAt = System.currentTimeMillis()
+        openTarStream(tarballFile, DOWNLOAD_BUFFER) {}.use { tar ->
+            while (true) {
+                val entry = tar.nextTarEntry ?: break
+                val name = entry.name.removePrefix("./")
+                if (name !in memberNames) continue
+                val target = resolveInside(rootfsDir, name)
+                when (entry.linkFlag) {
+                    TarArchiveEntry.LF_DIR -> target.mkdirs()
+                    TarArchiveEntry.LF_SYMLINK -> {
+                        target.parentFile?.mkdirs()
+                        // The link target is checked by the same guard extraction uses: a tarball
+                        // whose symlink points out of the root is not made acceptable by arriving
+                        // through a repair instead of an install.
+                        resolveLinkInsideRoot(rootfsDir, name, entry.linkName)
+                        target.delete()
+                        deleteTreeNoFollow(target)
+                        java.nio.file.Files.createSymbolicLink(target.toPath(), java.nio.file.Path.of(entry.linkName))
+                    }
+                    TarArchiveEntry.LF_LINK -> {
+                        target.parentFile?.mkdirs()
+                        val source = resolveInside(rootfsDir, entry.linkName)
+                        if (source.isFile) source.copyTo(target, overwrite = true)
+                    }
+                    TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
+                        target.parentFile?.mkdirs()
+                        target.outputStream().use { output -> tar.copyTo(output) }
+                        applyMode(target, entry.mode)
+                    }
+                    else -> continue
+                }
+                restored += name
+            }
+        }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "restored from the pinned archive",
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = "${restored.size} of ${memberNames.size} member(s): " +
+                (restored.take(6).joinToString(", ").ifEmpty { "none" }),
+        )
+        return restored.toList()
+    }
+
     private fun verifyFileSha256(file: File, expected: String): Boolean {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->

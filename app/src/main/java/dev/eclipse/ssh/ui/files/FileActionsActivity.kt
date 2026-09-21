@@ -72,6 +72,7 @@ class FileActionsActivity : ComponentActivity() {
         // when the row was long-pressed, and the workspace cannot change underneath a window that is
         // in front of it.
         val isLocal = intent?.getBooleanExtra(EXTRA_IS_LOCAL, false) == true
+        val isUbuntu = intent?.getBooleanExtra(EXTRA_IS_UBUNTU, false) == true
         val supportsPermissions = intent?.getBooleanExtra(EXTRA_SUPPORTS_PERMISSIONS, false) == true
         val canOpenArchive = intent?.getBooleanExtra(EXTRA_CAN_OPEN_ARCHIVE, false) == true
         setContent {
@@ -83,6 +84,7 @@ class FileActionsActivity : ComponentActivity() {
                 FileActions(
                     entry = entry,
                     isLocal = isLocal,
+                    isUbuntu = isUbuntu,
                     supportsPermissions = supportsPermissions,
                     canOpenArchive = canOpenArchive,
                 ) { kind ->
@@ -97,6 +99,19 @@ class FileActionsActivity : ComponentActivity() {
 
         /** Whether the explorer was showing the local session's own storage. */
         const val EXTRA_IS_LOCAL = "dev.eclipse.ssh.files.IS_LOCAL"
+
+        /**
+         * Whether the explorer was showing the on-device Ubuntu userspace.
+         *
+         * A second boolean beside [EXTRA_IS_LOCAL] rather than one three-valued extra, because the
+         * window asks exactly two independent questions and neither is "which of three": *is the
+         * other end this device's own shared storage* (which decides the Transfer row's wording and
+         * whether Send to another server exists at all, both of which need a remote source), and *is
+         * the other end the userspace* (which decides whether the Transfer row copies into the
+         * userspace or downloads from a server). The pair is total — false/false is an SFTP host —
+         * and each reads on its own at the one row that asks it.
+         */
+        const val EXTRA_IS_UBUNTU = "dev.eclipse.ssh.files.IS_UBUNTU"
 
         /**
          * Whether the active backend has a permission model at all.
@@ -117,7 +132,7 @@ class FileActionsActivity : ComponentActivity() {
         /**
          * The intent that opens this window on [entry].
          *
-         * The four booleans are not part of the subject because they are not unparcelable - see the
+         * The five booleans are not part of the subject because they are not unparcelable - see the
          * class doc. [canOpenArchive] is the only one that is not a property of the session alone, and
          * it is still a boolean the caller already worked out.
          */
@@ -125,11 +140,13 @@ class FileActionsActivity : ComponentActivity() {
             context: Context,
             entry: FsEntry,
             isLocal: Boolean,
+            isUbuntu: Boolean,
             supportsPermissions: Boolean,
             canOpenArchive: Boolean,
         ): Intent = Intent(context, FileActionsActivity::class.java)
             .putExtra(ActionRequests.EXTRA_SUBJECT_TOKEN, ActionRequests.put(ActionSubject.FileActions(entry)))
             .putExtra(EXTRA_IS_LOCAL, isLocal)
+            .putExtra(EXTRA_IS_UBUNTU, isUbuntu)
             .putExtra(EXTRA_SUPPORTS_PERMISSIONS, supportsPermissions)
             .putExtra(EXTRA_CAN_OPEN_ARCHIVE, canOpenArchive)
     }
@@ -150,6 +167,7 @@ class FileActionsActivity : ComponentActivity() {
 private fun FileActions(
     entry: FsEntry,
     isLocal: Boolean,
+    isUbuntu: Boolean,
     supportsPermissions: Boolean,
     canOpenArchive: Boolean,
     onAction: (FileActionKind) -> Unit,
@@ -178,12 +196,22 @@ private fun FileActions(
         FileActionRow("Rename") { onAction(FileActionKind.RENAME) }
         FileActionRow("Copy to…") { onAction(FileActionKind.COPY) }
         FileActionRow("Move to…") { onAction(FileActionKind.MOVE) }
-        // One verb under two names, exactly as the sheet had it: the direction is the session's, not
-        // the file's, and naming it "Transfer" would make the user work out which way it goes.
-        FileActionRow(if (isLocal) "Upload to server" else "Download to device") { onAction(FileActionKind.TRANSFER) }
-        if (!isLocal) {
+        // One verb under three names, exactly as the sheet had it: the direction is the session's, not
+        // the file's, and naming it "Transfer" would make the user work out which way it goes. The
+        // userspace is the device, so it does not read as "server" - and it is not the *shared*
+        // storage either, so it cannot borrow the local session's own wording: "Upload to server"
+        // under a breadcrumb reading /home/ubuntu would be a plain lie about where the file goes.
+        FileActionRow(
+            when {
+                isLocal -> "Upload to server"
+                isUbuntu -> "Copy to this device"
+                else -> "Download to device"
+            },
+        ) { onAction(FileActionKind.TRANSFER) }
+        if (!isLocal && !isUbuntu) {
             // Sending is remote-to-remote only. From the local session there is no source path a
-            // second server could be told to fetch.
+            // second server could be told to fetch, and the userspace is not a server at all: it has
+            // no SFTP endpoint for the send path to open a channel to.
             FileActionRow("Send to another server") { onAction(FileActionKind.SEND_TO_HOST) }
         }
         if (supportsPermissions) {
