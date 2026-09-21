@@ -5957,11 +5957,15 @@ the honest summary is that they are most of the gate and not all of it.
 What was run, on the merged tree, at the commit this section is part of:
 
 - `./gradlew :app:testDebugUnitTest` — 1,947 methods, 0 failures, 0 errors, 17 skipped, 181 class result
-  files — with `-x :freerdp:buildFreerdpNative -x :linux:buildLinuxNative`, because NDK 29 is not
-  installed on that host and neither native task can run there. The app and both test source sets
-  compile against the real, already-built native libraries.
-- `scripts/check-doc-figures.sh` — all 141 claims, which is what re-derives this header and README's
-  counts from the tree.
+  files — run with `-x :freerdp:buildFreerdpNative -x :linux:buildLinuxNative`, because NDK 29 was not
+  installed on that host when the suite ran. Both test source sets compile against the real native
+  libraries regardless, and the release build below then built them for real: NDK 29.0.13113456 and
+  CMake 4.1.2 were installed for it, so neither native module was skipped in the artifacts this
+  section is about.
+- `scripts/check-doc-figures.sh` — all 143 claims, which is what re-derives this header and README's
+  counts from the tree. It is not the 141 this section first quoted: two of the 143 are the
+  `testing/verify-release-apk.sh` and `testing/verify-release-splits.sh` citations in the bullet below,
+  which this section's own prose is what adds to the report.
 - `bundleRelease` then `assembleRelease`, `apksigner verify` (v2 and v3) on every APK, the AAB's JAR
   signature blocks, and `testing/verify-release-splits.sh` with `testing/verify-release-apk.sh` — the
   same scripts, in the same order, that the workflow runs.
