@@ -69,6 +69,17 @@ class UbuntuDistributionManager(
     private val networkOnline: () -> Boolean = { true },
     private val aptUpdateAttemptTimeoutMs: Long = APT_UPDATE_ATTEMPT_TIMEOUT_MS,
     /**
+     * The installer that owns the pinned tarball, read by [restoreMissingEssentials] when the guest
+     * has lost a program `dpkg` cannot run without.
+     *
+     * The one place this class reaches past apt, and it has to: the failure it exists for is apt's
+     * own foundation being gone (`'rm' not found in PATH`), which no package-manager command can
+     * repair, because running one needs the missing program. Nullable, and null by default, so a
+     * test that builds this class alone still constructs — the restore step then reports the
+     * missing programs as a warning it cannot act on instead of doing nothing silently.
+     */
+    private val installer: RootfsInstaller? = null,
+    /**
      * The ring every event of an install is filed into, and the one the "Install log" row reads.
      * A constructor parameter rather than a property this class makes for itself, because the
      * install is more than this class: [RootfsInstaller] downloads, verifies and extracts the rootfs
@@ -169,6 +180,11 @@ class UbuntuDistributionManager(
         onStep(SetupStep.INSTALL_BASE_PACKAGES)
         installBasePackages(onProgress, warnings)
         configureSudo(warnings)
+        // The other half of the same subject, and directly after it: sudo decides the PATH of the
+        // commands it elevates, and the four files below decide it for every other way into the
+        // guest. Both are soft for the same reason — a userspace with a short PATH is one where
+        // `apt` and `dpkg` complain about the sbin directories, not one that failed to install.
+        configureGuestPath(warnings)
         onStep(SetupStep.VERIFY)
         return SetupReport(warnings.toList())
     }
@@ -201,13 +217,31 @@ class UbuntuDistributionManager(
         val whoami = runSessionCommand("whoami", PROBE_TIMEOUT_MS)
         val network = runSessionCommand("getent hosts $networkHost", NETWORK_TIMEOUT_MS)
         val apt = runSessionCommand("apt-get check", APT_TIMEOUT_MS)
+        // One more command, and the one that answers the failure this probe could not name before:
+        // `whoami` proves the session is fake root, but says nothing about the PATH the login shell
+        // built or whether dpkg's own programs are still on it. Both are read here rather than
+        // inferred, because "'rm' not found in PATH" has two causes — a short PATH and an absent
+        // file — and the repair for each is different.
+        val login = runSessionCommand(LOGIN_PROBE_COMMAND, PROBE_TIMEOUT_MS)
+        val loginLines = login?.outputText()?.lines()?.map { stripEscapes(it).trim() }.orEmpty()
         val account = whoami?.outputText()?.trim()
+        fun marked(prefix: String): String? = loginLines
+            .firstOrNull { it.startsWith(prefix) }
+            ?.removePrefix(prefix)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
         return HealthReport(
             shellWorks = shell != null && shell.exitCode == 0 && shell.outputText().contains(PROBE_MARKER),
             account = account,
             accountCorrect = account == ROOT_ACCOUNT,
             networkUp = network?.exitCode == 0,
             aptUsable = apt?.exitCode == 0,
+            loginUid = marked(PROBE_UID_PREFIX)?.toIntOrNull(),
+            loginPath = marked(PROBE_PATH_PREFIX),
+            missingPrograms = loginLines
+                .filter { it.startsWith(PROBE_MISSING_PREFIX) }
+                .map { it.removePrefix(PROBE_MISSING_PREFIX).trim() }
+                .filter { it.isNotEmpty() },
         )
     }
 
@@ -558,6 +592,12 @@ class UbuntuDistributionManager(
      * the sentence the user can act on.
      */
     private suspend fun repairPackageState(warnings: MutableList<String>, onProgress: (String) -> Unit) {
+        // Before dpkg is asked anything, because dpkg cannot answer if it is the broken thing. An
+        // install whose `rm` or `tar` has gone is one where every command below fails with the same
+        // "'<program>' not found in PATH or not executable", so a pass that did not check first
+        // would report "the dpkg repair pass did not fully succeed" forever while the actual cause —
+        // a program that is not there — went unnamed and unrepaired.
+        restoreMissingEssentials(warnings, onProgress)
         val startedAt = System.currentTimeMillis()
         val result = runSetupCommand(DPKG_REPAIR_COMMAND, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         val ok = result != null && result.exitCode == 0
@@ -587,6 +627,106 @@ class UbuntuDistributionManager(
                     (failureTail(result?.outputText(), lines = 1)
                         ?.let { ": $it" } ?: ": the pass did not answer in time")
         }
+    }
+
+    /**
+     * Puts back any of [ESSENTIAL_PROGRAMS] the rootfs has lost, out of the pinned archive.
+     *
+     * The one repair that cannot go through the package manager, because the package manager is what
+     * it is repairing: `dpkg` looks up `sh`, `rm` and `tar` in `PATH` before it will do anything at
+     * all, so when one of them is gone, `dpkg --configure -a` and `apt-get -f install` — the two
+     * commands every other recovery in this class is built on — fail identically, and Repair can
+     * never clear the state it exists to clear. The bytes therefore come from where the install got
+     * them: the same tarball at the same pin and SHA256, through
+     * [RootfsInstaller.restoreFromPinnedTarball], which touches only the members it is given.
+     *
+     * Runs on every repair pass and costs one `stat` per program when nothing is missing, which is
+     * the case it is built for.
+     *
+     * Two honest refusals rather than silence: with no installer wired, the missing programs are
+     * recorded and warned about but not restored (a test-built manager, and the report should say so
+     * rather than pretend the check passed); and a program the archive itself does not carry comes
+     * back absent from the restore's answer, which is named as such — that is a different fault from
+     * a file that was deleted, and no amount of re-downloading will change it.
+     */
+    private suspend fun restoreMissingEssentials(
+        warnings: MutableList<String>,
+        onProgress: (String) -> Unit,
+    ) {
+        val paths = runCatching { RootfsPaths(rootfs) }.getOrNull() ?: return
+        // An unresolvable path counts as missing: `hostPath` throws for a link that loops or climbs
+        // out of the root, and an essential program that cannot be resolved is not one dpkg can run
+        // either. The failure is recorded rather than thrown — this runs inside the repair prologue,
+        // where a check that could throw would replace the evidence with itself.
+        val missing = ESSENTIAL_PROGRAMS.filter { guest ->
+            runCatching { !paths.hostPath(guest).exists() }.getOrDefault(true)
+        }
+        if (missing.isEmpty()) return
+        val detail = "missing=" + missing.joinToString(",")
+        val restorer = installer
+        if (restorer == null) {
+            diagnostics.record(UserspaceDiagnosticCategory.ROOTFS, "essential programs missing", detail = detail)
+            warnings += "the userspace is missing ${missing.joinToString(", ")} and this build cannot restore them"
+            return
+        }
+        onProgress("restoring ${missing.size} missing program(s)")
+        val members = missing.flatMap { guest -> tarSpellingsOf(guest) }.toSet()
+        val restored = runCatching {
+            restorer.restoreFromPinnedTarball(members, onProgress = { progress ->
+                // The download is the only part of this that is slow enough to be worth reporting,
+                // and it is exactly the part a user would otherwise see as a repair that has hung.
+                if (progress is RootfsInstaller.Progress.Downloading && progress.total > 0) {
+                    onProgress("restoring: ${progress.received * 100 / progress.total}%")
+                }
+            })
+        }.getOrElse { failure ->
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "essential restore failed",
+                detail = detail + "; " + (failure.message ?: failure.javaClass.simpleName),
+            )
+            recordSigsysTail("essential restore failed")
+            warnings += "could not restore ${missing.joinToString(", ")}: " +
+                (failure.message ?: failure.javaClass.simpleName)
+            return
+        }
+        // dpkg names the program it looked for and the PATH it looked in, so the answer is recorded
+        // by name at both ends: what was missing, and what the archive actually had.
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "essential programs restored",
+            detail = "$detail; restored=" + (restored.joinToString(",").ifEmpty { "none" }),
+        )
+        val unrepaired = missing.filter { guest -> tarSpellingsOf(guest).none { it in restored } }
+        if (unrepaired.isNotEmpty()) {
+            warnings += "the pinned archive does not carry ${unrepaired.joinToString(", ")}"
+        }
+        if (restored.isNotEmpty()) {
+            // Named even on success, because a repair that silently replaced binaries in a rootfs
+            // the user is working in is a fact the install log has to hold.
+            warnings += "restored ${restored.size} missing program(s) from the pinned archive"
+        }
+    }
+
+    /**
+     * The archive-relative names a guest path can be spelled by, for
+     * [RootfsInstaller.restoreFromPinnedTarball]'s member set.
+     *
+     * Both spellings of a usrmerged path, because the two are the same file seen from two sides:
+     * the guest reaches `ldconfig` as `/sbin/ldconfig` (through the `/sbin -> usr/sbin` link), while
+     * the archive holds it at `usr/sbin/ldconfig` and holds `/sbin` itself as a symlink entry. A name
+     * the archive does not carry is inert — the restore scans the tar and keeps only what it finds —
+     * so passing both costs one string and removes the need to know which side of the link the
+     * problem is on.
+     */
+    private fun tarSpellingsOf(guestPath: String): List<String> {
+        val trimmed = guestPath.trim('/')
+        val usrmerged = when {
+            trimmed.startsWith("bin/") -> "usr/$trimmed"
+            trimmed.startsWith("sbin/") -> "usr/$trimmed"
+            else -> null
+        }
+        return listOfNotNull(trimmed, usrmerged).distinct()
     }
 
     /**
@@ -884,6 +1024,17 @@ class UbuntuDistributionManager(
      * but scripts written for a real Ubuntu box call `sudo` and would otherwise stop at a password
      * prompt no one can answer, so the file is worth having. Best-effort: sudo refusing the file is
      * a warning, not a failed install.
+     *
+     * Also pins sudo's own PATH. `sudo` does not pass the caller's PATH through: it resets the
+     * environment and builds a new PATH from `secure_path` (or, without it, from a compiled-in
+     * default that can be as short as `/bin:/usr/bin`). That is precisely how a maintainer script
+     * invoked through `sudo` ends up unable to find `/sbin/ldconfig` or the programs in
+     * `/usr/sbin`, which `dpkg`
+     * reports as `'<program>' not found in PATH or not executable` followed by the note about the
+     * sbin directories. Setting it here — rather than `env_keep += "PATH"`, which the plan's first
+     * draft proposed — is the deliberate choice: keeping the caller's PATH would preserve a *good*
+     * one, but it would equally preserve a short one, and the point of this file is that the answer
+     * no longer depends on what the caller happened to inherit.
      */
     private fun configureSudo(warnings: MutableList<String>) {
         try {
@@ -892,13 +1043,78 @@ class UbuntuDistributionManager(
             // 0440, owner-only: sudo ignores a sudoers file it considers writable by others —
             // and refuses to parse a torn one, so the write is atomic like the other config files.
             val file = File(dir, "90-eclipse-ubuntu")
-            writeAtomically(file, "$ACCOUNT_NAME ALL=(ALL) NOPASSWD: ALL\n")
+            writeAtomically(
+                file,
+                "$ACCOUNT_NAME ALL=(ALL) NOPASSWD: ALL\n" +
+                    "Defaults\tenv_reset\n" +
+                    "Defaults\tsecure_path=\"$LINUX_PATH\"\n",
+            )
             file.setExecutable(false, false)
             file.setWritable(false, false)
             file.setReadable(true, false)
         } catch (t: Throwable) {
             warnings += "sudo configuration skipped: ${t.message ?: t.javaClass.simpleName}"
         }
+    }
+
+    /**
+     * Writes the guest's own PATH into every file a login shell, `su -` or PAM session reads it
+     * from, so that no route into the userspace can hand a program a PATH without the sbin
+     * directories.
+     *
+     * The app replaces the environment of the commands it runs itself ([setupEnv] and
+     * [ProotRuntime.baseEnv] both carry the full path), so this is not about the app's own commands:
+     * it is about the ones the *guest* starts. `sudo` rebuilds PATH from sudoers, `su -` from
+     * `/etc/login.defs`, a PAM session from `/etc/environment`, and an interactive login shell from
+     * the scripts in `/etc/profile.d` — four separate re-derivations of the same variable, none of
+     * which the app was writing. Fixing fewer than all four leaves a way in that still produces the reported
+     * failure, which is why this is one step and not four conditionals.
+     *
+     * Best-effort in the same sense as [configureSudo]: an unwritable `/etc` is a warning on the
+     * report, not a failed install.
+     */
+    private fun configureGuestPath(warnings: MutableList<String>) {
+        try {
+            val etc = File(rootfs, "etc")
+            // Read by pam_env on every session, including the non-interactive ones that never
+            // source a profile — the strongest of the four, because nothing has to run for it.
+            writeAtomically(File(etc, "environment"), "PATH=\"$LINUX_PATH\"\n")
+            val profileDir = File(etc, "profile.d")
+            profileDir.mkdirs()
+            // Sourced by /etc/profile for login shells. The loop adds only the directories that are
+            // actually absent, so a user who has arranged their own PATH keeps its order and its
+            // extras — this file guarantees the required ones are present, it does not impose one.
+            writeAtomically(File(profileDir, "00-eclipse-path.sh"), PROFILE_PATH_SCRIPT)
+            rewriteLoginDefs(File(etc, "login.defs"))
+        } catch (t: Throwable) {
+            warnings += "PATH configuration skipped: ${t.message ?: t.javaClass.simpleName}"
+        }
+    }
+
+    /**
+     * Sets `ENV_PATH` and `ENV_SUPATH` in `/etc/login.defs`, which is what util-linux' `su -` reads
+     * its shell's PATH from — the one entry point that does not consult `/etc/environment` at all,
+     * since a login shell resets the environment it was handed.
+     *
+     * The rest of the file is preserved line for line: login.defs is a settings file the
+     * distribution ships and the user may have edited, and this rewrites exactly the two keys it
+     * owns. A rootfs with no login.defs gets one carrying only these two — the file is parsed as a
+     * set of overrides, so a document that names two settings leaves every other at its
+     * compiled-in default.
+     */
+    private fun rewriteLoginDefs(file: File) {
+        val kept = if (file.isFile) {
+            file.readLines().filterNot { line ->
+                val key = line.substringBefore('=').trim()
+                key == "ENV_PATH" || key == "ENV_SUPATH"
+            }
+        } else {
+            emptyList()
+        }
+        writeAtomically(
+            file,
+            (kept + "ENV_PATH PATH=$LINUX_PATH" + "ENV_SUPATH PATH=$LINUX_PATH").joinToString("\n") + "\n",
+        )
     }
 
     // ------------------------------------------------------------------ command helpers
@@ -1162,6 +1378,113 @@ class UbuntuDistributionManager(
         private const val ROOT_ACCOUNT = "root"
         private const val HOME_DIR = "/home/ubuntu"
         private const val PASSWD_PREFIX = "ubuntu:"
+
+        /**
+         * The PATH the guest is given everywhere the app can arrange it: the same value
+         * [ProotRuntime.baseEnv] hands proot, written into the files the *guest's* own entry points
+         * read it from.
+         *
+         * It is not a taste in directories: `/sbin` and `/usr/sbin` are where `ldconfig` and the
+         * init-script helpers live, and a PATH without them is what makes `dpkg` stop with
+         * `'rm' not found in PATH or not executable` and the note that follows it. `/usr/local/sbin`
+         * is first for the same reason a real Ubuntu box puts it there — locally installed
+         * administrative tools win over the distribution's.
+         *
+         * Internal rather than private because it is a contract two places have to agree on: what
+         * the app hands proot ([ProotRuntime.baseEnv]) and what it writes into the guest's own
+         * files. A test names it to assert both halves say the same thing.
+         */
+        internal const val LINUX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        /**
+         * The login-shell fragment [configureGuestPath] installs as `/etc/profile.d/00-eclipse-path.sh`.
+         *
+         * A loop rather than an assignment, and that is the whole point of the file: a user who has
+         * built their own PATH keeps its order, its extras and its `~/.local/bin`, and this only
+         * appends the directories that are missing. An outright `PATH=…` here would silently undo
+         * their profile every time they opened a terminal, which is a worse bug than the one it
+         * fixes. The `case` guard makes re-sourcing idempotent, so nested login shells do not
+         * accumulate duplicates.
+         */
+        private val PROFILE_PATH_SCRIPT = listOf(
+            "# Written by Eclipse: keep the directories dpkg and apt require on PATH.",
+            "#",
+            "# A login shell rebuilds PATH from files the app never wrote, and a PATH without",
+            "# /usr/sbin or /sbin is what makes dpkg stop with \"'rm' not found in PATH or not",
+            "# executable\" the moment a maintainer script runs. Only the missing directories are",
+            "# appended, so a PATH arranged by hand keeps its order.",
+            "for dir in " + LINUX_PATH.split(":").joinToString(" ") + "; do",
+            "  case \":\$PATH:\" in",
+            "    *\":\$dir:\"*) ;;",
+            "    *) PATH=\"\$PATH:\$dir\" ;;",
+            "  esac",
+            "done",
+            "export PATH",
+        ).joinToString("\n") + "\n"
+
+        /**
+         * The programs `dpkg` and the repair path need to exist *before* either can run: the shell
+         * a maintainer script is executed with, the four coreutils `dpkg` itself shells out to
+         * (`rm`, `tar`, `env`, and the findutils trio), the package manager and its database, and
+         * `ldconfig`, whose home is `/sbin` — the directory the reported note is about.
+         *
+         * Every entry is a canonical usrmerge path, because that is the spelling the pinned archive
+         * carries: `/bin` and `/sbin` are symlinks into `usr/`, so the file a repair has to put back
+         * for `/bin/sh` really lives at `usr/bin/sh`. Checking the canonical path therefore checks
+         * the same file while naming the entry that can actually restore it.
+         *
+         * Deliberately short. A program this list does not name is one no repair will try to
+         * restore, so an entry that the pinned image does not carry would be a re-download on every
+         * pass for a file that was never going to appear — the list is the floor both `dpkg` and the
+         * probe stand on, not an inventory of a base system.
+         *
+         * Internal so the tests can build a rootfs that has them: the check is a *check*, and a
+         * fixture that does not carry the programs a real install put there would raise its warning
+         * on every test that runs setup.
+         */
+        internal val ESSENTIAL_PROGRAMS = listOf(
+            "/usr/bin/sh",
+            "/usr/bin/dash",
+            "/usr/bin/bash",
+            "/usr/bin/rm",
+            "/usr/bin/tar",
+            "/usr/bin/env",
+            "/usr/bin/find",
+            "/usr/bin/sed",
+            "/usr/bin/grep",
+            "/usr/bin/xargs",
+            "/usr/bin/dpkg",
+            "/usr/bin/apt-get",
+            "/usr/bin/apt",
+            "/usr/sbin/ldconfig",
+        )
+
+        /**
+         * The markers [LOGIN_PROBE_COMMAND] prints, one line each, so the probe's answer is read
+         * back field by field rather than by position in the output.
+         */
+        private const val PROBE_UID_PREFIX = "eclipse-uid="
+        private const val PROBE_PATH_PREFIX = "eclipse-path="
+        private const val PROBE_MISSING_PREFIX = "eclipse-missing="
+
+        /** The programs [healthProbe] asks a login shell to find, by name: `command -v`. */
+        private val LOGIN_PROBE_PROGRAMS = listOf("sh", "rm", "tar", "dpkg", "apt-get", "ldconfig")
+
+        /**
+         * What [healthProbe] runs to answer for the *login* path rather than for the app's own.
+         *
+         * No nested shell: the session argv is already `bash --login -c <command>`
+         * ([ProotRuntime.commandArgv]), so this text executes *inside* a login shell and `$PATH` here
+         * is the one `/etc/profile` and `/etc/environment` produced — which is exactly the value
+         * [configureGuestPath] exists to fix, and the one a user's own terminal shows them.
+         *
+         * A missing program is echoed rather than allowed to fail the command, so one probe reports
+         * every absence at once instead of stopping at the first.
+         */
+        private val LOGIN_PROBE_COMMAND =
+            "echo $PROBE_UID_PREFIX\$(id -u); echo $PROBE_PATH_PREFIX\$PATH; " +
+                "for p in ${LOGIN_PROBE_PROGRAMS.joinToString(" ")}; do " +
+                "command -v \$p >/dev/null 2>&1 || echo $PROBE_MISSING_PREFIX\$p; done"
 
         /**
          * Fallback resolvers, used when the wiring layer does not supply the device's live ones.
@@ -1583,9 +1906,37 @@ data class HealthReport(
     val networkUp: Boolean,
     /** `apt-get check` passed: the package database is consistent and usable. */
     val aptUsable: Boolean,
+    /**
+     * What `id -u` answers inside a *login* shell, or null when that shell would not run. Reported,
+     * never gating: the session's identity is already [accountCorrect]'s subject, and this is the
+     * same fact read through the other entry point — the pair disagreeing is the finding, not either
+     * value on its own.
+     */
+    val loginUid: Int? = null,
+    /**
+     * The PATH a login shell actually ended up with — `/etc/profile`, `/etc/profile.d` and
+     * `/etc/environment`, as the user's own terminal would see it, rather than the environment the
+     * app hands its commands. Reported rather than judged: a PATH without `/sbin` is a fault only
+     * when the programs in it are then unfindable, which is [missingPrograms]' question.
+     */
+    val loginPath: String? = null,
+    /**
+     * The programs `dpkg` needs that a login shell cannot find — `command -v` answered nothing for
+     * them. Empty is the healthy answer, and also what a probe that could not run reports, which is
+     * why [shellWorks] is checked separately rather than inferred from this.
+     */
+    val missingPrograms: List<String> = emptyList(),
 ) {
-    /** Healthy — and therefore card-worthy — only when every field passes. */
-    val healthy: Boolean get() = shellWorks && accountCorrect && networkUp && aptUsable
+    /**
+     * Healthy — and therefore card-worthy — only when every field passes.
+     *
+     * [missingPrograms] gates because it is the exact state that makes the package manager
+     * unusable: `dpkg` searches `PATH` for `sh`, `rm` and `tar` before it will unpack anything, so
+     * a userspace missing one of them cannot install, remove or repair a package at all. A missing
+     * program is therefore not a detail of a working install; it is the install not working.
+     */
+    val healthy: Boolean
+        get() = shellWorks && accountCorrect && networkUp && aptUsable && missingPrograms.isEmpty()
 
     /**
      * The failing fields as one sentence, for NeedsRepair's detail and the settings screen. Names
@@ -1597,5 +1948,11 @@ data class HealthReport(
             if (!accountCorrect) add("the session runs as '${account ?: "unknown"}' instead of 'root'")
             if (!networkUp) add("DNS does not resolve")
             if (!aptUsable) add("the package database is inconsistent")
+            if (missingPrograms.isNotEmpty()) {
+                // dpkg's own words for this are "not found in PATH or not executable", which reads
+                // as a PATH problem; naming the programs says which of the two causes it actually is
+                // as soon as the PATH below is read next to it.
+                add("the package manager cannot find ${missingPrograms.joinToString(", ")}")
+            }
         }.joinToString(", ").ifEmpty { "healthy" }
 }

@@ -1028,6 +1028,162 @@ class UbuntuDistributionManagerTest {
             .contains("ubuntu:x:10150:10150:Ubuntu:/home/ubuntu:/bin/bash")
     }
 
+    // ------------------------------------------------------------------ the guest's PATH
+
+    @Test
+    fun `setup writes the app's PATH into every file a login shell reads it from`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+
+        harness.distribution.setup()
+
+        val rootfs = harness.runtime.rootfsDir
+        val path = UbuntuDistributionManager.LINUX_PATH
+        // Four files, because a session's PATH is re-derived four times and the app was writing
+        // none of them: fixing fewer leaves a way in that still produces the reported failure.
+        //
+        // PAM sessions: read by pam_env, and nothing has to run for it to apply.
+        assertThat(File(rootfs, "etc/environment").readText()).isEqualTo("PATH=\"$path\"\n")
+        // Login shells: sourced by /etc/profile, and it appends only what is missing.
+        val profile = File(rootfs, "etc/profile.d/00-eclipse-path.sh").readText()
+        assertThat(profile).contains("for dir in ${path.split(":").joinToString(" ")}; do")
+        assertThat(profile).contains("export PATH")
+        // `su -`, which reads login.defs and not /etc/environment, because a login shell resets the
+        // environment it was handed.
+        val loginDefs = File(rootfs, "etc/login.defs").readText()
+        assertThat(loginDefs).contains("ENV_PATH PATH=$path")
+        assertThat(loginDefs).contains("ENV_SUPATH PATH=$path")
+        // And sudo, which builds its own PATH from secure_path rather than passing the caller's.
+        val sudoers = File(rootfs, "etc/sudoers.d/90-eclipse-ubuntu").readText()
+        assertThat(sudoers).contains("secure_path=\"$path\"")
+        assertThat(sudoers).contains("ubuntu ALL=(ALL) NOPASSWD: ALL")
+    }
+
+    @Test
+    fun `rewriting login defs keeps the settings it does not own`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        val loginDefs = File(harness.runtime.rootfsDir, "etc/login.defs")
+        // A rootfs whose login.defs is the distribution's, with one of the two keys already set to
+        // something short — the state the reported failure comes from.
+        loginDefs.writeText("# distro defaults\nUMASK\t\t022\nENV_PATH PATH=/usr/bin:/bin\n")
+
+        harness.distribution.setup()
+
+        val lines = loginDefs.readLines()
+        // Everything the file said that this does not own survives, comment included: login.defs is
+        // a settings file the user may have edited, and the write is not a rewrite of the file.
+        assertThat(lines).contains("# distro defaults")
+        assertThat(lines).contains("UMASK\t\t022")
+        // And the key it does own is set once, to the app's value — not appended to the old one.
+        assertThat(lines.count { it.startsWith("ENV_PATH") }).isEqualTo(1)
+        assertThat(lines).contains("ENV_PATH PATH=${UbuntuDistributionManager.LINUX_PATH}")
+    }
+
+    // ------------------------------------------------------------------ the programs dpkg needs
+
+    @Test
+    fun `a rootfs missing one of dpkg's programs names it, and says it cannot restore it`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        File(harness.runtime.rootfsDir, "usr/bin/rm").delete()
+
+        val report = harness.distribution.setup()
+
+        // Named, not swallowed: "'rm' not found in PATH or not executable" has two causes — a short
+        // PATH and an absent file — and this is the second, which no PATH fix reaches.
+        assertThat(report.warnings.any { it.contains("usr/bin/rm") }).isTrue()
+        // And the check took no repair action it cannot take: no installer is wired here, and the
+        // report says so rather than looking like a check that passed.
+        assertThat(harness.distribution.diagnostics.export()).contains("essential programs missing")
+    }
+
+    @Test
+    fun `a missing program comes back out of the pinned archive`() = runTest {
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        val harness = Harness(distro(arch = "arm64"), pinnedTarball = fixture)
+        val aptGet = File(harness.runtime.rootfsDir, "usr/bin/apt-get")
+        aptGet.delete()
+
+        val report = harness.distribution.setup()
+
+        // The bytes came from where the install got them: the same tarball at the same pin. Nothing
+        // in the guest could have done this — asking apt to reinstall a package needs the package
+        // manager, and the package manager is the thing that cannot run.
+        assertThat(aptGet.readText()).isEqualTo("fake apt\n")
+        assertThat(report.warnings.any { it.contains("restored 1 missing program") }).isTrue()
+        val log = harness.distribution.diagnostics.export()
+        assertThat(log).contains("essential programs restored")
+        // Both ends of the evidence: what was missing, and what the archive had.
+        assertThat(log).contains("missing=usr/bin/apt-get")
+        assertThat(log).contains("restored=usr/bin/apt-get")
+    }
+
+    @Test
+    fun `a rootfs with every program present downloads nothing`() = runTest {
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        val harness = Harness(distro(arch = "arm64"), pinnedTarball = fixture)
+
+        val report = harness.distribution.setup()
+
+        // The check is one stat per program when nothing is missing — which is the case it is built
+        // for, since it runs on every setup and every repair pass. A check that fetched 30 MB to
+        // answer "everything is here" would be a worse fault than the one it repairs.
+        assertThat(File(harness.rootDir, "downloads/rootfs-arm64.tar.gz").exists()).isFalse()
+        assertThat(report.warnings.none { it.contains("restored") }).isTrue()
+        assertThat(harness.distribution.diagnostics.export()).doesNotContain("essential programs")
+    }
+
+    // ------------------------------------------------------------------ the login probe
+
+    @Test
+    fun `the probe reports the login shell's PATH and the programs it cannot find`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("eclipse-uid=") ->
+                    0 to "eclipse-uid=0\neclipse-path=/usr/bin:/bin\neclipse-missing=rm\neclipse-missing=tar\n"
+                command == "echo eclipse-probe-ok" -> 0 to "eclipse-probe-ok\n"
+                command == "whoami" -> 0 to "root\n"
+                command.startsWith("getent hosts ") -> 0 to "1.2.3.4 archive.ubuntu.com\n"
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.healthProbe()
+
+        assertThat(report.loginUid).isEqualTo(0)
+        assertThat(report.loginPath).isEqualTo("/usr/bin:/bin")
+        assertThat(report.missingPrograms).containsExactly("rm", "tar")
+        // Everything else passed and the install is still not healthy: a userspace whose dpkg
+        // cannot find `rm` is one that cannot install, remove or repair a package at all.
+        assertThat(report.aptUsable).isTrue()
+        assertThat(report.healthy).isFalse()
+        assertThat(report.describe()).contains("the package manager cannot find rm, tar")
+    }
+
+    @Test
+    fun `a login shell that finds everything leaves the install healthy`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("eclipse-uid=") ->
+                    0 to "eclipse-uid=0\neclipse-path=${UbuntuDistributionManager.LINUX_PATH}\n"
+                command == "echo eclipse-probe-ok" -> 0 to "eclipse-probe-ok\n"
+                command == "whoami" -> 0 to "root\n"
+                command.startsWith("getent hosts ") -> 0 to "1.2.3.4 archive.ubuntu.com\n"
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.healthProbe()
+
+        assertThat(report.missingPrograms).isEmpty()
+        assertThat(report.healthy).isTrue()
+        assertThat(report.describe()).isEqualTo("healthy")
+    }
+
     // ------------------------------------------------------------------ fixtures
 
     /**
@@ -1047,6 +1203,16 @@ class UbuntuDistributionManagerTest {
         aptUpdateAttemptTimeoutMs: Long = 10 * 60_000L,
         freeBytes: () -> Long = { 0L },
         supplementaryGids: () -> IntArray = { IntArray(0) },
+        /**
+         * A tarball to hand the manager's installer, for the one repair that goes around apt: a
+         * rootfs whose `dpkg` cannot run because a program it needs has gone comes back through the
+         * pinned archive, and a test of that needs a pinned archive to come back through.
+         *
+         * Null everywhere else, and null is not a gap: it is the state the manager has to handle
+         * honestly — no installer wired, so a missing program is reported rather than ignored — and
+         * the tests below hold it to that.
+         */
+        pinnedTarball: File? = null,
     ) {
         /** The scripted fake every non-wedged spawn lands in, even when [wedgeOn] wraps it. */
         val scripted: ScriptedPtySpawner = scripted.apply { respond = { baseline(it) } }
@@ -1069,6 +1235,19 @@ class UbuntuDistributionManagerTest {
                 mirrorListUrl = mirrorListUrl,
                 networkOnline = networkOnline,
                 aptUpdateAttemptTimeoutMs = aptUpdateAttemptTimeoutMs,
+                // Its own distro record, because the installer verifies what it downloads against
+                // the pin — and the pin has to be the fixture's, not the catalog's.
+                installer = pinnedTarball?.let { tarball ->
+                    RootfsInstaller(
+                        rootDir,
+                        TestTarballs.fixtureDistro(
+                            url = "https://fixtures.invalid/rootfs.tar.gz",
+                            sha256 = TestTarballs.sha256(tarball),
+                            ubuntuArch = distro.ubuntuArch,
+                        ),
+                        TestTarballs.serving(tarball),
+                    )
+                },
             )
 
         init {
@@ -1079,6 +1258,13 @@ class UbuntuDistributionManagerTest {
             File(rootfs, "etc/passwd").writeText("root:x:0:0:root:/root:/bin/bash\n")
             File(rootfs, "etc/group").writeText("root:x:0:\n")
             File(rootfs, "etc/shadow").writeText("root:*:19850:0:99999:7:::\n")
+            // The programs the repair prologue checks for before it asks dpkg anything. A real
+            // rootfs has them because a real install unpacked them; this one has to say so, or the
+            // check would raise its "missing" warning on every test in this file — which is the
+            // warning working, not a fixture quirk.
+            UbuntuDistributionManager.ESSENTIAL_PROGRAMS.forEach { guest ->
+                File(rootfs, guest.removePrefix("/")).apply { parentFile?.mkdirs() }.writeText("")
+            }
         }
     }
 
