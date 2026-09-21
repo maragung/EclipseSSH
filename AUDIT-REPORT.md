@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 35 / versionName 1.5.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 36 / versionName 1.5.1 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §55, *Releasing 1.5.0*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §56, *Releasing 1.5.1*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6017,3 +6017,71 @@ created as a draft and its seven assets — the four per-ABI APKs, the universal
 `SHA256SUMS.txt` — verified before it is made public. `testing/README.md`'s dispatch example moves to
 `v1.5.0` in the same commit as the bump, per §47's rule that the example names the newest release that
 is *published*.
+
+## 56. Releasing 1.5.1
+
+`v1.5.1` is `v1.5.0`'s code with a different signature on it, and that is the whole of the difference:
+this section, and the two version lines it moves. It exists because 1.5.0 was signed with a key no
+release before it used, and an APK signed with a key no installed app was signed with cannot be
+installed over one — Android answers `INSTALL_FAILED_UPDATE_INCOMPATIBLE` and offers uninstall as the
+only way forward.
+
+### Two keystores, and the one in the checkout is the wrong one
+
+The comparison is one command over the published artifacts, and it is the same command for all of them:
+
+```
+apksigner verify --print-certs app-arm64-v8a-release.apk | grep 'certificate SHA-256'
+```
+
+| Release | Signer certificate |
+|---|---|
+| v1.1.20, v1.2.1, v1.3.1, v1.4.0 — and the CI artifact zips under `eclipse-artifacts/` | `0c69794b…` · `CN=EclipseSSH, O=Eclipse, C=ID` |
+| v1.5.0 | `a75a6fc4…` · `CN=Eclipse SSH, OU=Mobile, O=Eclipse SSH, L=Jakarta, C=ID` |
+
+`keystore/eclipse-release.jks` in this checkout — and the copy in the `eclipse-p3` worktree, byte for
+byte — holds the second of those, and its certificate is valid **from 2026-08-15**. That date is the
+finding: the file is a *regeneration* that replaced the original at some point after every release that
+matters had been cut, so the keystore sitting in the tree is not the keystore the release line is
+signed with, and building a release from this host signs it with an identity the app has never had.
+
+The original is not on this host. A sweep of every `*.jks`, `*.keystore`, `*.b64` and `*.p12` under
+`/home/dev`, the thirty-odd agent worktrees under `.claude/worktrees/`, the shell history, and
+`git log --all --diff-filter=A` — no keystore has ever been committed, which is the point of the
+`.gitignore` entry and the reason this was not caught sooner — turns up only the `a75a6fc4…` file. The
+key that signed v1.1.19 through v1.4.0 is the one CI holds, in the write-only secret
+`RELEASE_KEYSTORE_BASE64`, and GitHub returns secret *names* and never values, so it cannot be read
+back out of Actions either.
+
+### The fix is the path §55's billing block had closed
+
+Nothing here repairs the wrong file, because the correct key is not available to repair it with. What
+makes 1.5.1 correct is that it is not built here: `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64`
+into `keystore/eclipse-release.jks` on the runner before it signs anything, so the release carries the
+canonical identity by construction. §55 recorded that this workflow could not run at all — every job
+failing in four seconds with an empty `runner_name` — and the account's billing was settled on
+2026-09-21, which is what makes this the first release in this file's narrative with CI behind it since
+v1.4.0.
+
+The cost falls on whoever already installed the broken 1.5.0, and it is one uninstall: an install of
+1.1.20 through 1.4.0 upgrades to 1.5.1 normally, and an install of 1.5.0 does not, because that app
+carries the key this release is deliberately abandoning. `android:allowBackup="false"` and
+`fullBackupContent="false"` (`app/src/main/AndroidManifest.xml:27-30`) mean that uninstall takes the
+hosts, the keys, the vault and the userspace under `filesDir/linux/rootfs` with it, so it is a real
+cost and not a formality — the release notes say so rather than leaving it to be discovered.
+
+The two files that would do this again are still in the tree, and the durable fix is not in this
+commit. `keystore/eclipse-release.jks` should not exist in a checkout that cannot know whether it is
+the canonical one, and the release workflow's `steps.signing.outputs.signed` is `true` whenever a
+`keystore.properties` and a keystore are present — it asks whether *a* key signed the build, never
+whether it was *the* key. So "Signed with the release key" in a release body is a weaker claim than it
+reads as: it is exactly the claim that was true of v1.5.0. A gate that compares the signing
+certificate's SHA-256 against the recorded canonical fingerprint, and fails the release when it
+differs, is the fix this section owes; it is deliberately not written here, because a gate added in the
+same commit as the release it is certifying certifies nothing, and it must first be run against a build
+whose answer is already known.
+
+`scripts/check-doc-figures.sh` counts one more claim than §55 records — 144 against 143 — and the
+difference is in this file's own edits rather than in the tree: the version lines at the top, the
+sentence that names this section as the last one, and the paragraph above. Reverting the dispatch
+example in `testing/README.md` leaves the figure at 144, so the example is not what moved it.
