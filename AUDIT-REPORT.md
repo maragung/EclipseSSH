@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §56, *Releasing 1.5.1*, which is also the newest of them that releases a version and the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §57, *The gate that checks the key, and the bill that stops the runner*; the newest of them that releases a version is §56, *Releasing 1.5.1*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6085,3 +6085,68 @@ whose answer is already known.
 difference is in this file's own edits rather than in the tree: the version lines at the top, the
 sentence that names this section as the last one, and the paragraph above. Reverting the dispatch
 example in `testing/README.md` leaves the figure at 144, so the example is not what moved it.
+
+## 57. The gate that checks the key, and the bill that stops the runner
+
+§56 published `v1.5.1` — built by CI, signed `0c69794b…`, and verified with `apksigner --print-certs`
+over all five APKs before the draft was published — and left one thing owed: a gate that compares the
+signing certificate against the canonical one, rather than trusting that *a* keystore was present.
+That gate is `testing/verify-release-signer.sh` as of this commit.
+
+### The gate, and the case it does not cover
+
+The script holds the canonical fingerprint as a constant and fails when any certificate `apksigner`
+reports differs from it — including the past signers a v3 rotation lineage would add — and when no v2
+signature is present at all. `tagged-release.yml` runs it after its AAB check: a mismatch fails the
+release when the signing secrets were present, and is reported as a warning when they were not,
+because the debug-key fallback is deliberate and exists so a fork can build the app.
+
+Its self-test is the part worth recording, because §56's artifact is what makes it possible. Run
+against `v1.4.0`, `v1.3.1` and the `v1.1.20` CI artifact it prints `ok` for each; run against v1.5.0:
+
+```
+FAIL v150.apk: signed by a75a6fc4f72b4d738b59c97fbaea48f9cdbf85cb5bf5d10f112ff6f73142921e
+            expected  0c69794b7934452bdf1b2f1f345314e13b86ef43f0d17bec9ff260dd30a443be
+```
+
+The gate rejects exactly the artifact that caused §56. What it would **not** have caught is that
+artifact's publication: v1.5.0 was built on the maintainer's host and uploaded by hand, and no step in
+a workflow that never ran can fail. The recurrence it closes is the one inside CI — a secret replaced
+with a differently-generated keystore, or a key rotated without the release notes saying so — and the
+hand-built case is closed by the script being runnable over any APK, which is how it was tested here
+and what §56's release did with the same commands before publishing. The step this commit adds to the
+workflow has not itself been run by CI, because the repository has no minutes for that either; its
+first execution will be the next release's.
+
+### The export that could not run, because the repository is private now
+
+The one thing §56 left undone, and the one thing this host cannot do for itself, is hold the canonical
+keystore: `RELEASE_KEYSTORE_BASE64` is write-only, and every keystore on this host is the 2026-08-15
+regeneration. `.github/workflows/export-signing-material.yml` was written to close that — dispatch
+only, printing the certificate's public fingerprint, uploading the keystore and the properties as an
+artifact, meant to be deleted with its run as soon as they have been downloaded. Making the repository
+private is what makes running it safe, and that happened the same afternoon.
+
+It cannot run. The dispatch was accepted — HTTP 204 — and the job failed before its first step, with
+an empty log and one annotation:
+
+> The job was not started because recent account payments have failed or your spending limit needs to
+> be increased. Please check the 'Billing & plans' section in your settings
+
+That is the sentence §55 recorded, with a different cause. Actions minutes are not billed on a public
+repository and are on a private one: the tagged release of `v1.5.1` spent about twenty minutes of
+runner time while the repository was public and free, the repository was private by the time the
+export was dispatched, and the account has no private-repo minutes. The export is not broken, it is
+unaffordable — and so is every future release build, which is the larger of the two facts here.
+
+### What is still owed
+
+Three things, all of them consequences of that. The canonical keystore exists only inside the secret,
+so a release built on this host still signs with an identity no installed app has. The wrong keystore
+is still the file `keystore/eclipse-release.jks` here and in the `eclipse-p3` worktree, which is a trap
+for whoever builds locally next. And the pipeline that produced every release through v1.4.0, this one
+included, needs runner minutes it does not currently have. The first two are what the export workflow
+fixes the moment it can run; the third is not a code change at all.
+
+`scripts/check-doc-figures.sh` counts 147 claims as of this commit, against §56's 144, and the three
+came with this one.

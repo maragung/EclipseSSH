@@ -212,6 +212,29 @@ jobs:
             echo "AAB is signed with the debug key (no release secrets in CI)."
           fi
 
+      - name: Verify which key signed the release
+        # `steps.signing.outputs.signed` is true whenever a keystore and a
+        # keystore.properties existed on the runner. That is a check that *a*
+        # key signed the build, never that *the* key did - and an APK signed
+        # with the wrong key installs fine on a fresh device while refusing to
+        # install over anything, which no build step here would have noticed.
+        # So this asserts the certificate itself. See AUDIT-REPORT.md section 57.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          APKS=(app/build/outputs/apk/release/*.apk)
+          test "${#APKS[@]}" -gt 0 || { echo "no APKs in app/build/outputs/apk/release"; exit 1; }
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            testing/verify-release-signer.sh "${APKS[@]}"
+          else
+            # A debug-signed release is a deliberate fallback so a fork can
+            # build the app, so it warns rather than fails - but the
+            # fingerprints are printed either way, so a published release says
+            # which key it actually carries.
+            echo "::warning::No signing secrets: these APKs are debug-signed and cannot upgrade an existing install."
+            testing/verify-release-signer.sh "${APKS[@]}" || true
+          fi
+
       - name: Compute APK and AAB checksums
         # The simplest reliable form: append a section header, then
         # a `sha256sum` line that shows the basename rather than the

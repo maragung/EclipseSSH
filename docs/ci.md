@@ -203,6 +203,15 @@ and the signature check then only asserts the APK is signed at all. That fallbac
 fork should be able to build the app — but a debug-signed APK is not publishable and cannot upgrade
 an existing install.
 
+`testing/verify-release-signer.sh` is what turns "signed with the release key" from a description of
+the step above into a checkable claim. It asserts that every certificate `apksigner` reports for each
+APK is `0c69794b…`, the one v1.1.20 through v1.4.0 carry, and that a v2 signature is present;
+`tagged-release.yml` runs it over the five APKs before the release is created. When the secrets were
+present a mismatch fails the release; when they were not, the same output is reported as a warning, so
+a fork's deliberate debug-signed build is still allowed to be built while a published release says
+which key it carries. Rotating the release key therefore means editing that constant in its own
+commit, with the reinstall the rotation costs stated in the release notes. See AUDIT-REPORT.md §57.
+
 ## Reproducing a CI failure locally
 
 The documentation check needs nothing but `bash` and the checkout, so it is the one gate that is
