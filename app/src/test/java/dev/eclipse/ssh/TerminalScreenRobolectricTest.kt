@@ -638,6 +638,43 @@ class TerminalScreenRobolectricTest {
     }
 
     /**
+     * The X in the session list asks too, and asks the same question the strip's does.
+     *
+     * Both X buttons kill the same shell, so both have to confirm — and the list's was the worse of the
+     * two to leave unguarded, because the list is where a session that dropped while the app was
+     * elsewhere gets discovered, which is also where a close tap is most likely to be aimed at the
+     * wrong row. It is also the only X that asks with nothing else on screen: the list replaces the
+     * shell, so there is no grid to read past the confirmation.
+     *
+     * Asserted at window level for the reason [closingATabAsksBeforeItClosesTheSession] gives — a
+     * Compose dialog never goes idle under Robolectric — with the second half being that the
+     * confirmation, once given, really does close it. A dialog that asked and then did nothing would
+     * pass the first assertion alone.
+     */
+    @Test
+    fun closingASessionFromTheListAsksBeforeItClosesIt() {
+        val hostName = openTerminalWithSession()
+
+        // Out of the shell and into the list, the same route the sessions button takes.
+        compose.onNodeWithContentDescription("Show sessions").performClick()
+        waitForText("1 active session")
+
+        val before = ShadowDialog.getShownDialogs().size
+        compose.onNodeWithContentDescription("Close $hostName session").performScrollTo().performClick()
+        pumpUntil(describe = { "the list's X closed the session without asking" }) {
+            ShadowDialog.getShownDialogs().size > before
+        }
+        assertThat(ShadowDialog.getLatestDialog()?.isShowing).isTrue()
+        // The X asked; it did not close. This is the half that was missing before the dialog landed.
+        assertThat(viewModel().uiState.value.tabs).hasSize(1)
+
+        compose.onNodeWithText("Close session").performClick()
+        pumpUntil(describe = { "confirming left ${viewModel().uiState.value.tabs.size} sessions open" }) {
+            viewModel().uiState.value.tabs.isEmpty()
+        }
+    }
+
+    /**
      * Throws away every activity started so far, so a later peek reports only this test's doing.
      *
      * The setup - the connect, the tab that opens - records its own starts, and `peekNextStartedActivity`

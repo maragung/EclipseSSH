@@ -6,6 +6,8 @@ import dev.eclipse.ssh.data.fs.FsEntry
 import dev.eclipse.ssh.data.fs.FileSystemProvider
 import dev.eclipse.ssh.data.fs.LocalFileSystemProvider
 import dev.eclipse.ssh.data.fs.SftpProviderFactory
+import dev.eclipse.ssh.data.fs.UbuntuFileSystemProvider
+import dev.eclipse.ssh.data.fs.UbuntuTransfers
 import dev.eclipse.ssh.data.model.HostProfile
 import dev.eclipse.ssh.ssh.SshSessionStore
 import javax.inject.Inject
@@ -25,6 +27,61 @@ import kotlinx.coroutines.withContext
 /** The id of the one session that is always present: the device's own storage. */
 const val LOCAL_SESSION_ID = "local"
 
+/**
+ * The id of the on-device Ubuntu userspace, when one is installed.
+ *
+ * One id rather than one per distro, because a device holds exactly one rootfs at a time: installing
+ * a different LTS replaces the tree rather than sitting beside it (see `LinuxUserspaceGraphProvider`),
+ * so a second chip would be a second door into the same room. The id carries no distro because the
+ * provider resolves the live rootfs on every call — which is also what makes the chip survive a
+ * reinstall without the session list being rebuilt.
+ */
+const val UBUNTU_SESSION_ID = "ubuntu"
+
+/**
+ * What a browsing session actually is, which is not a two-way question.
+ *
+ * This replaced an `isLocal: Boolean` that had grown three meanings. The distinction the explorer
+ * really draws is between the *device's own storage behind SAF* — where a path is a `content://`
+ * document URI that cannot be split, parented or crumbed by arithmetic, so the trail is navigation
+ * history — and the two POSIX backends, where a path is an ordinary absolute string. Ubuntu is the
+ * second kind while being the *device's* filesystem, which is exactly the fact a boolean cannot hold:
+ * it browses like SFTP (POSIX paths, real mode bits, crumbs segmented from the path) and transfers
+ * like a local copy (both ends are the same disk, so there is no transfer pipeline to schedule).
+ */
+enum class ExplorerSessionKind {
+    /** The device's own storage, behind the Storage Access Framework. */
+    DEVICE,
+
+    /** One saved host's SFTP tree. */
+    SFTP,
+
+    /** The installed Ubuntu userspace, a directory tree in the app's own sandbox. */
+    UBUNTU,
+}
+
+/** List or grid. The grid earns its place for images and media; everything else reads better as rows. */
+enum class ExplorerViewMode { LIST, GRID }
+
+/**
+ * A copy running between the device and the Ubuntu userspace, for the explorer to report as it goes.
+ *
+ * A one-slot value rather than a queue like the Transfers tab's, because this is not a queue: both
+ * ends are the same disk, so a copy of anything a person would move finishes while they are still
+ * looking at the screen, and there is nothing to pause, resume or schedule. What it exists for is the
+ * honest *interim*: a 400 MB copy takes long enough that a menu that closed silently would read as a
+ * tap that did nothing.
+ *
+ * [progress] is null while the size of the source is unknown, which the UI draws as a moving row
+ * rather than a bar stuck at zero — the same distinction [FsEntry.size] makes, and for the same
+ * reason: unknown is not zero.
+ */
+data class ExplorerCopy(
+    val label: String,
+    val intoUbuntu: Boolean,
+    val progress: Float?,
+)
+
 /** How a directory is sorted in the explorer. The UI offers each of these both ways. */
 enum class ExplorerSort(val label: String) {
     NAME_ASC("Name A→Z"),
@@ -34,17 +91,18 @@ enum class ExplorerSort(val label: String) {
     LARGEST_FIRST("Largest first"),
 }
 
-/** List or grid. The grid earns its place for images and media; everything else reads better as rows. */
-enum class ExplorerViewMode { LIST, GRID }
-
-/** One place the explorer can browse: the device's own storage, or one host's SFTP tree. */
+/** One place the explorer can browse: the device's own storage, the userspace, or one host's SFTP tree. */
 data class ExplorerSession(
     val id: String,
     val label: String,
-    val isLocal: Boolean,
+    val kind: ExplorerSessionKind,
     /** Whether the host currently holds a live session — drives the dot and the "reconnect first" hint. */
     val live: Boolean,
-)
+) {
+    /** The device's own storage: the one session whose paths are SAF documents. */
+    val isLocal: Boolean get() = kind == ExplorerSessionKind.DEVICE
+}
+
 
 /** What the Files tab is looking at, in one snapshot. */
 data class ExplorerState(
@@ -76,9 +134,20 @@ data class ExplorerState(
     val selection: Set<String> = emptySet(),
     /** Whether the active provider can set POSIX permissions; hides the action when it cannot. */
     val supportsPermissions: Boolean = false,
-    /** Whether the active session is the device's own storage. */
-    val isLocal: Boolean = true,
-)
+    /** What the active session is — see [ExplorerSessionKind] for why this is not a boolean. */
+    val kind: ExplorerSessionKind = ExplorerSessionKind.DEVICE,
+    /** The device-to-userspace copy in flight, or null. See [ExplorerCopy]. */
+    val copy: ExplorerCopy? = null,
+) {
+    /** The device's own storage, behind SAF: the one session whose paths are document URIs. */
+    val isLocal: Boolean get() = kind == ExplorerSessionKind.DEVICE
+
+    /** The installed Ubuntu userspace: POSIX paths, but both ends of a transfer are this one device. */
+    val isUbuntu: Boolean get() = kind == ExplorerSessionKind.UBUNTU
+
+    /** One host's SFTP tree: the only session the transfer pipeline and the archive browser serve. */
+    val isSftp: Boolean get() = kind == ExplorerSessionKind.SFTP
+}
 
 /**
  * The Files Explorer's state and its every action, over [FileSystemProvider]s.
@@ -95,6 +164,8 @@ data class ExplorerState(
 @Singleton
 class FilesExplorerController @Inject constructor(
     private val localProvider: LocalFileSystemProvider,
+    private val ubuntuProvider: UbuntuFileSystemProvider,
+    private val ubuntuTransfers: UbuntuTransfers,
     private val sftpFactory: SftpProviderFactory,
     private val sessionStore: SshSessionStore,
     private val hostRepository: HostRepository,
@@ -130,12 +201,20 @@ class FilesExplorerController @Inject constructor(
     /** The provider for a session id, or null when the session is not one this controller made. */
     fun providerFor(sessionId: String): FileSystemProvider? = when {
         sessionId == LOCAL_SESSION_ID -> localProvider
+        sessionId == UBUNTU_SESSION_ID -> ubuntuProvider
         sessionId.startsWith("sftp:") -> {
             val hostId = sessionId.removePrefix("sftp:")
             lastHosts.firstOrNull { it.id == hostId }?.let(sftpFactory::forHost)
         }
 
         else -> null
+    }
+
+    /** What [sessionId] is, for the state a session opens into. */
+    private fun kindOf(sessionId: String): ExplorerSessionKind = when {
+        sessionId == LOCAL_SESSION_ID -> ExplorerSessionKind.DEVICE
+        sessionId == UBUNTU_SESSION_ID -> ExplorerSessionKind.UBUNTU
+        else -> ExplorerSessionKind.SFTP
     }
 
     /** The hosts whose sessions were last built from, so [providerFor] can find usernames. */
@@ -160,24 +239,38 @@ class FilesExplorerController @Inject constructor(
         return sftpFactory.archiveSource(host, remotePath, size)
     }
 
-    /** Rebuilds the session list — local first, then every saved host, live or not. */
+    /**
+     * Rebuilds the session list — the device first, then Ubuntu when it is installed, then every
+     * saved host, live or not.
+     *
+     * The Ubuntu chip is offered only when there is a rootfs to open. A device whose ABI maps to no
+     * Ubuntu architecture can never install one, and a chip that opens onto "no userspace is
+     * installed" is worse than no chip: it advertises a place that does not exist. The check is the
+     * same one the provider makes on every call, so a rootfs uninstalled while the app is running
+     * loses its chip on the next refresh rather than on the next launch.
+     */
     fun refreshSessions() {
         scope.launch {
             val hosts = runCatching { hostRepository.hosts.first() }.getOrDefault(emptyList())
             lastHosts = hosts
             val live = withContext(Dispatchers.IO) { sessionStore.liveHostIds() }
-            val local = ExplorerSession(LOCAL_SESSION_ID, "This device", isLocal = true, live = true)
+            val local = ExplorerSession(LOCAL_SESSION_ID, "This device", ExplorerSessionKind.DEVICE, live = true)
+            val ubuntu = ubuntuProvider.isAvailable().let { available ->
+                // Ubuntu is "live" when it is installed, which is the only liveness it has: there is
+                // no session to hold open, because the files are simply there.
+                if (available) listOf(ExplorerSession(UBUNTU_SESSION_ID, "Ubuntu on this device", ExplorerSessionKind.UBUNTU, live = true)) else emptyList()
+            }
             val remote = hosts
                 .filter { it.id != LOCAL_SESSION_ID }
                 .map { host ->
                     ExplorerSession(
                         id = "sftp:${host.id}",
                         label = host.name,
-                        isLocal = false,
+                        kind = ExplorerSessionKind.SFTP,
                         live = host.id in live,
                     )
                 }
-            _state.update { it.copy(sessions = listOf(local) + remote) }
+            _state.update { it.copy(sessions = listOf(local) + ubuntu + remote) }
         }
     }
 
@@ -192,7 +285,7 @@ class FilesExplorerController @Inject constructor(
             _state.update {
                 it.copy(
                     activeSessionId = sessionId,
-                    isLocal = sessionId == LOCAL_SESSION_ID,
+                    kind = kindOf(sessionId),
                     selection = emptySet(),
                     searchQuery = null,
                     error = null,
@@ -205,6 +298,9 @@ class FilesExplorerController @Inject constructor(
             }
             val start = try {
                 when {
+                    // One call for both: the Ubuntu provider answers with its own home, and the local
+                    // one with the folder the user picked. The branch is kept because a future
+                    // provider that needs no special start should not have to be added here.
                     sessionId == LOCAL_SESSION_ID -> localProvider.homePath()
                     else -> provider.homePath()
                 }
@@ -492,6 +588,156 @@ class FilesExplorerController @Inject constructor(
             updateIfCurrent(sessionId) { it.copy(error = "New file failed: ${error.message ?: "unknown error"}") }
             null
         }
+    }
+
+    /**
+     * Copies the documents the user picked on the device into the folder the Ubuntu session is in.
+     *
+     * A copy, not a move: the file the user picked stays where it was, which is what the SFTP upload
+     * does too and what "Upload" means everywhere else in this app. Each picked document is copied in
+     * turn, and the whole batch shares one [ExplorerCopy] row whose label names the file in hand — a
+     * per-file queue would be the Transfers tab's job, and this is not that.
+     *
+     * Refuses when the session on screen is not the userspace, because the destination is the folder
+     * that session is showing: an upload that arrived after the user switched to a server would
+     * otherwise be filed into the server's path, which is a guest path only Ubuntu can read.
+     */
+    fun copyIntoUbuntu(sources: List<android.net.Uri>) {
+        if (sources.isEmpty()) return
+        scope.launch {
+            val current = _state.value
+            val sessionId = current.activeSessionId
+            if (current.kind != ExplorerSessionKind.UBUNTU) {
+                _state.update { it.copy(error = "Switch to Ubuntu on this device before copying into it") }
+                return@launch
+            }
+            val directory = current.path
+            if (directory == null) {
+                _state.update { it.copy(error = "Open a folder in the userspace first") }
+                return@launch
+            }
+            var failures = 0
+            for ((index, source) in sources.withIndex()) {
+                val name = ubuntuTransfers.displayName(source)
+                updateIfCurrent(sessionId) {
+                    it.copy(
+                        error = null,
+                        copy = ExplorerCopy(
+                            label = copyLabel(name, intoUbuntu = true, index = index, total = sources.size),
+                            intoUbuntu = true,
+                            progress = null,
+                        ),
+                    )
+                }
+                try {
+                    ubuntuTransfers.copyIn(source, name, directory) { fraction ->
+                        updateIfCurrent(sessionId) { state ->
+                            state.copy(copy = state.copy?.copy(progress = fraction.takeIf { it < 1f }))
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    failures++
+                    updateIfCurrent(sessionId) {
+                        it.copy(error = "Copying $name failed: ${failure.message ?: "unknown error"}")
+                    }
+                }
+            }
+            updateIfCurrent(sessionId) { it.copy(copy = null) }
+            if (_state.value.activeSessionId == sessionId) list(directory)
+            report(if (failures == 0) "Copied ${sources.size} file(s) into the userspace" else "$failures of ${sources.size} copies failed")
+        }
+    }
+
+    /**
+     * Copies one guest file out to a document the platform picker has already created on the device.
+     *
+     * The destination arrives rather than being asked for here because that is the direction the
+     * picker runs: `CreateDocument` makes the file first and answers with it, so by the time this is
+     * called the user has named and placed it, and a second file made inside it would be one file too
+     * many.
+     */
+    fun copyOutOfUbuntu(entry: FsEntry, destination: android.net.Uri) {
+        scope.launch {
+            val sessionId = _state.value.activeSessionId
+            if (_state.value.kind != ExplorerSessionKind.UBUNTU) return@launch
+            updateIfCurrent(sessionId) {
+                it.copy(
+                    error = null,
+                    copy = ExplorerCopy("Copying ${entry.name} to this device", intoUbuntu = false, progress = null),
+                )
+            }
+            try {
+                ubuntuTransfers.copyOut(entry.path, entry.name, destination) { fraction ->
+                    updateIfCurrent(sessionId) { state ->
+                        state.copy(copy = state.copy?.copy(progress = fraction.takeIf { it < 1f }))
+                    }
+                }
+                report("Copied ${entry.name} to this device")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                updateIfCurrent(sessionId) {
+                    it.copy(error = "Copying ${entry.name} failed: ${failure.message ?: "unknown error"}")
+                }
+            } finally {
+                updateIfCurrent(sessionId) { it.copy(copy = null) }
+            }
+        }
+    }
+
+    /**
+     * Copies several selected guest files out into the Storage Access Framework folder [tree].
+     *
+     * The batch form of [copyOutOfUbuntu], and it needs its own destination shape: `CreateDocument`
+     * can only answer with one document, so a selection of any size is served by a folder instead.
+     * One [ExplorerCopy] row covers the batch, naming the file in hand.
+     */
+    fun copySelectionOutOfUbuntu(entries: List<FsEntry>, tree: android.net.Uri) {
+        if (entries.isEmpty()) return
+        scope.launch {
+            val sessionId = _state.value.activeSessionId
+            if (_state.value.kind != ExplorerSessionKind.UBUNTU) return@launch
+            var failures = 0
+            for ((index, entry) in entries.withIndex()) {
+                updateIfCurrent(sessionId) {
+                    it.copy(
+                        error = null,
+                        copy = ExplorerCopy(
+                            label = copyLabel(entry.name, intoUbuntu = false, index = index, total = entries.size),
+                            intoUbuntu = false,
+                            progress = null,
+                        ),
+                    )
+                }
+                try {
+                    ubuntuTransfers.copyOutToTree(entry.path, entry.name, tree) { fraction ->
+                        updateIfCurrent(sessionId) { state ->
+                            state.copy(copy = state.copy?.copy(progress = fraction.takeIf { it < 1f }))
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    failures++
+                    updateIfCurrent(sessionId) {
+                        it.copy(error = "Copying ${entry.name} failed: ${failure.message ?: "unknown error"}")
+                    }
+                }
+            }
+            updateIfCurrent(sessionId) { it.copy(copy = null) }
+            report(
+                if (failures == 0) "Copied ${entries.size} file(s) to this device"
+                else "$failures of ${entries.size} copies failed",
+            )
+        }
+    }
+
+    /** "Copying notes.md into Ubuntu" for one file, "… (2 of 5)" when a batch was picked. */
+    private fun copyLabel(name: String, intoUbuntu: Boolean, index: Int, total: Int): String {
+        val where = if (intoUbuntu) "into the userspace" else "to this device"
+        return if (total <= 1) "Copying $name $where" else "Copying $name $where (${index + 1} of $total)"
     }
 
     /** The folder the user just picked in the SAF picker becomes Local's root, and is remembered. */

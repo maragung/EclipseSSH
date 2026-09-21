@@ -597,7 +597,9 @@ private fun EclipseWorkspace(
      */
     val transferHost: () -> HostProfile? = {
         val explorer = viewModel.filesExplorer.state.value
-        val hostId = explorer.activeSessionId.takeIf { !explorer.isLocal }?.removePrefix("sftp:")
+        // Only an SFTP session has a host to address. The Ubuntu session is *this* device, so a
+        // transfer there is a local copy and never reaches this lambda's answer.
+        val hostId = explorer.activeSessionId.takeIf { explorer.isSftp }?.removePrefix("sftp:")
         state.hosts.firstOrNull { it.id == hostId } ?: activeHost
     }
     /**
@@ -607,7 +609,7 @@ private fun EclipseWorkspace(
      */
     val explorerRemoteDirectory: () -> String? = {
         val explorer = viewModel.filesExplorer.state.value
-        explorer.path.takeIf { !explorer.isLocal }
+        explorer.path.takeIf { explorer.isSftp }
     }
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     // Ask once, and only when the permission is actually missing: launching the request
@@ -712,14 +714,41 @@ private fun EclipseWorkspace(
         }
     }
     var pendingDownload by remember { mutableStateOf<RemoteFile?>(null) }
+    /**
+     * The userspace rows a "Copy to this device" is copying, held while its picker is up.
+     *
+     * A different slot from [pendingDownload] rather than a reuse of it, because the two carry
+     * different subjects: that one is a `RemoteFile` for the transfer pipeline, and these are the guest
+     * entries a direct copy streams — carrying an entry as a `RemoteFile` and converting it back would
+     * be lossy in exactly the field this copy needs, its guest path. A list because both entry points
+     * land here: one row offered a name, a selection offered a folder.
+     */
+    var pendingUbuntuCopyOut by remember { mutableStateOf<List<FsEntry>>(emptyList()) }
     val downloadPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri: Uri? ->
         pickerActive = false
+        // Read and cleared before anything else can look at them: a second resume must not re-run
+        // this copy, and the explorer may have moved on by the time the picker answered.
+        val ubuntuEntry = pendingUbuntuCopyOut.firstOrNull()
+        val remote = pendingDownload
+        pendingUbuntuCopyOut = emptyList()
+        pendingDownload = null
+        if (uri == null) return@rememberLauncherForActivityResult
         // The explorer's session, not the app's selected host: the file being downloaded was
         // picked in whichever server the Files tab was browsing - see [transferHost].
         val host = transferHost()
-        val remote = pendingDownload
-        pendingDownload = null
-        if (uri != null && host != null && remote != null) {
+        if (ubuntuEntry != null && viewModel.filesExplorer.state.value.isUbuntu) {
+            // The userspace is this device, so the document the picker just made *is* the copy: a
+            // direct stream from the rootfs into it, with no host and no queue to file it under.
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
+            viewModel.filesExplorer.copyOutOfUbuntu(ubuntuEntry, uri)
+            return@rememberLauncherForActivityResult
+        }
+        if (host != null && remote != null) {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(
                     uri,
@@ -729,10 +758,36 @@ private fun EclipseWorkspace(
             viewModel.startDownload(host, remote, uri)
         }
     }
+    val ubuntuCopyOutPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
+        pickerActive = false
+        val entries = pendingUbuntuCopyOut
+        pendingUbuntuCopyOut = emptyList()
+        if (uri != null && entries.isNotEmpty()) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
+            viewModel.filesExplorer.copySelectionOutOfUbuntu(entries, uri)
+        }
+    }
     val uploadPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
         pickerActive = false
         val host = transferHost()
-        if (uris.isNotEmpty() && host != null) {
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        if (viewModel.filesExplorer.state.value.isUbuntu) {
+            // Uploading *into* the userspace: the destination is the guest folder on screen, and the
+            // copy is a local stream rather than a queued transfer - see [UbuntuTransfers].
+            uris.forEach { uri ->
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+            viewModel.filesExplorer.copyIntoUbuntu(uris)
+            return@rememberLauncherForActivityResult
+        }
+        if (host != null) {
             uris.forEach { uri ->
                 runCatching {
                     context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -1422,6 +1477,17 @@ private fun EclipseWorkspace(
                             else { pendingDownload = remote; pickerActive = true; downloadPicker.launch(remote.name) }
                         }
                     },
+                    onCopyToDevice = { entries ->
+                        // The explorer's session again, because a copy out of the userspace is only a
+                        // copy while the userspace is what is on screen. One file is offered a name -
+                        // the same `CreateDocument` answer a server's download gets - and a selection
+                        // is offered a folder, the one destination that serves any number of them,
+                        // since `CreateDocument` can only answer with a single document.
+                        pendingUbuntuCopyOut = entries
+                        pickerActive = true
+                        if (entries.size == 1) downloadPicker.launch(entries.first().name)
+                        else ubuntuCopyOutPicker.launch(null)
+                    },
                     onPickLocalFolder = { pickerActive = true; localFolderPicker.launch(null) },
                     onUploadLocal = { file -> transferHost()?.let { viewModel.uploadLocal(it, file) } },
                     onScheduleDownload = { files, scheduledAt, repeatMinutes -> transferHost()?.let { host -> files.forEach { viewModel.scheduleDownload(host, it, scheduledAt, repeatMinutes) } } },
@@ -1604,6 +1670,17 @@ private fun EclipseWorkspace(
                             if (state.localDirUri != null) viewModel.downloadToLocal(host, remote)
                             else { pendingDownload = remote; pickerActive = true; downloadPicker.launch(remote.name) }
                         }
+                    },
+                    onCopyToDevice = { entries ->
+                        // The explorer's session again, because a copy out of the userspace is only a
+                        // copy while the userspace is what is on screen. One file is offered a name -
+                        // the same `CreateDocument` answer a server's download gets - and a selection
+                        // is offered a folder, the one destination that serves any number of them,
+                        // since `CreateDocument` can only answer with a single document.
+                        pendingUbuntuCopyOut = entries
+                        pickerActive = true
+                        if (entries.size == 1) downloadPicker.launch(entries.first().name)
+                        else ubuntuCopyOutPicker.launch(null)
                     },
                     onPickLocalFolder = { pickerActive = true; localFolderPicker.launch(null) },
                     onUploadLocal = { file -> transferHost()?.let { viewModel.uploadLocal(it, file) } },
@@ -2304,6 +2381,15 @@ private fun WorkspaceScaffold(
     onClearCompleted: () -> Unit = {},
     onUpload: () -> Unit = {},
     onDownloadFile: (RemoteFile) -> Unit = {},
+    /**
+     * Copies userspace rows out to the device's own storage.
+     *
+     * A list rather than one entry, because the two entry points into it disagree about how many rows
+     * they are moving — the selection bar's Download carries the whole selection, and a row's own
+     * Transfer carries exactly one. Which picker answers is a list's question, not this screen's: see
+     * the call site, where one file is offered a name and several are offered a folder.
+     */
+    onCopyToDevice: (List<FsEntry>) -> Unit = {},
     onPickLocalFolder: () -> Unit = {},
     onUploadLocal: (LocalFile) -> Unit = {},
     onScheduleDownload: (List<RemoteFile>, Long, Long?) -> Unit = { _, _, _ -> },
@@ -2518,6 +2604,7 @@ private fun WorkspaceScaffold(
                     onOpenArchive,
                     onUpload,
                     onDownloadFile,
+                    onCopyToDevice,
                     onPickLocalFolder,
                     onUploadLocal,
                     onScheduleDownload,
@@ -3472,6 +3559,10 @@ private fun SessionRow(
     // The "why?" window is an Activity now, so this row needs a context and nothing else: the trace it
     // used to be handed, and the copy callback it used to forward, both belong to that window.
     val context = LocalContext.current
+    // This row's X kills a session exactly as the tab strip's does, so it asks exactly as the strip's
+    // does. The list is where a session that dropped while the app was elsewhere gets discovered, which
+    // is also where a close tap is most likely to be aimed at the wrong row.
+    var confirmClose by remember { mutableStateOf(false) }
     val preview = remember(lastOutput) {
         lastOutput?.takeLast(SESSION_PREVIEW_SCAN_CHARS)
             ?.lineSequence()?.lastOrNull { it.isNotBlank() }?.trim()?.take(120)
@@ -3610,11 +3701,58 @@ private fun SessionRow(
                     Text("Why?", style = MaterialTheme.typography.labelMedium)
                 }
             }
-            IconButton(onClick = onClose) {
+            IconButton(onClick = { confirmClose = true }) {
                 Icon(Icons.Default.Close, "Close ${tab.title} session", modifier = Modifier.size(18.dp))
             }
         }
     }
+    if (confirmClose) {
+        ConfirmCloseSessionDialog(
+            tab = tab,
+            onConfirm = { confirmClose = false; onClose() },
+            onDismiss = { confirmClose = false },
+        )
+    }
+}
+
+/**
+ * The confirmation both close buttons in the Terminal tab ask.
+ *
+ * Shared rather than written twice, because the tab strip's X and the session row's X are one decision
+ * made in two places: each kills a live shell, each sits a thumb-width from the control the user was
+ * aiming for, and the session list — where a session that dropped while the app was elsewhere gets
+ * discovered — is where a close tap is most likely to land on the wrong row. Two copies of that
+ * wording would drift the moment either was reworded.
+ *
+ * App-themed on purpose, unlike the strip's own controls: an `AlertDialog` is a modal surface with its
+ * own scrim, not a control drawn on the terminal's background, so it follows the palette every other
+ * dialog in the app follows.
+ */
+@Composable
+private fun ConfirmCloseSessionDialog(
+    tab: SessionTab,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Close \"${tab.title}\"?") },
+        text = {
+            Text(
+                if (tab.state.isLive) {
+                    "The session is still running. Closing it ends the shell on the server; nothing is saved on the way out."
+                } else {
+                    "Close this session's tab?"
+                }
+            )
+        },
+        confirmButton = {
+            Button(onClick = onConfirm) { Text("Close session") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 /**
@@ -3985,27 +4123,10 @@ private fun TerminalTabStrip(
         }
     }
     confirmClose?.let { tab ->
-        // App-themed on purpose, unlike everything else on the strip: an AlertDialog is a modal
-        // surface with its own scrim, not a control drawn on the terminal's background, so it
-        // follows the palette every other dialog in the app follows.
-        AlertDialog(
-            onDismissRequest = { confirmClose = null },
-            title = { Text("Close \"${tab.title}\"?") },
-            text = {
-                Text(
-                    if (tab.state.isLive) {
-                        "The session is still running. Closing it ends the shell on the server; nothing is saved on the way out."
-                    } else {
-                        "Close this session's tab?"
-                    }
-                )
-            },
-            confirmButton = {
-                Button(onClick = { confirmClose = null; onCloseTab(tab) }) { Text("Close session") }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmClose = null }) { Text("Cancel") }
-            },
+        ConfirmCloseSessionDialog(
+            tab = tab,
+            onConfirm = { confirmClose = null; onCloseTab(tab) },
+            onDismiss = { confirmClose = null },
         )
     }
 }
@@ -4138,6 +4259,8 @@ private fun ColumnScope.FilesScreen(
     onOpenArchive: ((FsEntry, FileSystemProvider) -> Unit)?,
     onUpload: () -> Unit,
     onDownloadFile: (RemoteFile) -> Unit,
+    /** Rows of the on-device userspace to copy out to this device; never a server's. */
+    onCopyToDevice: (List<FsEntry>) -> Unit,
     onPickLocalFolder: () -> Unit,
     onUploadLocal: (LocalFile) -> Unit,
     onScheduleDownload: (List<RemoteFile>, Long, Long?) -> Unit,
@@ -4209,8 +4332,12 @@ private fun ColumnScope.FilesScreen(
         onSort = filesExplorer::setSort,
         onViewMode = filesExplorer::setViewMode,
         onPickFolder = onPickLocalFolder,
+        // Upload is offered wherever the "other side" is somewhere a picked device file can land —
+        // a server's SFTP tree or the userspace. Sync is not: it is a two-way reconciliation between
+        // the device's shared storage and one host's tree, and the userspace has no host to
+        // reconcile against.
         onUpload = onUpload.takeIf { !explorer.isLocal },
-        onSync = { showSync = true }.takeIf { !explorer.isLocal },
+        onSync = { showSync = true }.takeIf { explorer.isSftp },
     )
     Spacer(Modifier.height(12.dp))
 
@@ -4266,12 +4393,13 @@ private fun ColumnScope.FilesScreen(
                         context = context,
                         entry = entry,
                         isLocal = explorer.isLocal,
+                        isUbuntu = explorer.isUbuntu,
                         supportsPermissions = explorer.supportsPermissions,
                         // The row exists only when the session and the name can both be served: a
-                        // local document tree has no ranged reads to browse with, and an unknown
-                        // extension has no engine to browse with - hiding the verb beats offering
-                        // it and failing.
-                        canOpenArchive = onOpenArchive != null && !explorer.isLocal &&
+                        // local document tree has no ranged reads to browse with, the userspace has
+                        // no SFTP channel to range-read over, and an unknown extension has no engine
+                        // to browse with - hiding the verb beats offering it and failing.
+                        canOpenArchive = onOpenArchive != null && explorer.isSftp &&
                             ArchiveReader.formatFor(entry.name) != null,
                     ),
                 )
@@ -4284,15 +4412,33 @@ private fun ColumnScope.FilesScreen(
         ExplorerSelectionBar(
             count = explorer.selection.size,
             onClear = filesExplorer::clearSelection,
-            onDownload = if (!explorer.isLocal) {
-                // The bar works on the explorer's FsEntry rows; the transfer queue wants the
-                // backend-shaped RemoteFile those rows stand for.
-                { selectedEntries.map { it.toRemoteFile() }.forEach(onDownloadFile); filesExplorer.clearSelection() }
-            } else null,
+            // Three destinations, three mechanisms, and the bar has to know which it is showing:
+            // the userspace copies to a folder the user picks (both ends are this device, so there
+            // is no transfer to queue), a server goes through the SFTP pipeline one row at a time,
+            // and the device's own storage has nothing to download *to* — its rows are already here.
+            onDownload = when {
+                explorer.isSftp -> {
+                    // The bar works on the explorer's FsEntry rows; the transfer queue wants the
+                    // backend-shaped RemoteFile those rows stand for.
+                    { selectedEntries.map { it.toRemoteFile() }.forEach(onDownloadFile); filesExplorer.clearSelection() }
+                }
+
+                explorer.isUbuntu -> {
+                    { onCopyToDevice(selectedEntries); filesExplorer.clearSelection() }
+                }
+
+                else -> null
+            },
             onUpload = if (explorer.isLocal) {
                 { selectedEntries.map { it.toLocalFile() }.forEach(onUploadLocal); filesExplorer.clearSelection() }
             } else null,
-            onSchedule = if (explorer.isLocal) ({ scheduleLocal = true }) else ({ scheduleRemote = true }),
+            // Scheduled transfers are a WorkManager queue keyed on a host. The userspace has no host
+            // and both ends of its copy are the same disk, so there is nothing to schedule.
+            onSchedule = when {
+                explorer.isUbuntu -> null
+                explorer.isLocal -> ({ scheduleLocal = true })
+                else -> ({ scheduleRemote = true })
+            },
             onCopy = { pendingRelocate = PendingRelocate(copy = true, entries = selectedEntries); filesExplorer.clearSelection() },
             onMove = { pendingRelocate = PendingRelocate(copy = false, entries = selectedEntries); filesExplorer.clearSelection() },
             onDelete = { deleteEntries = selectedEntries },
@@ -4318,8 +4464,13 @@ private fun ColumnScope.FilesScreen(
             FileActionKind.DELETE -> deleteEntries = listOf(entry)
             FileActionKind.PROPERTIES -> propertiesEntry = entry
             FileActionKind.CHMOD -> chmodEntry = entry
-            FileActionKind.TRANSFER ->
-                if (explorer.isLocal) onUploadLocal(entry.toLocalFile()) else onDownloadFile(entry.toRemoteFile())
+            FileActionKind.TRANSFER -> when {
+                explorer.isLocal -> onUploadLocal(entry.toLocalFile())
+                // The userspace's Transfer copies out, like a server's downloads, but it is this
+                // device on both ends: the list goes to the copy, not to the transfer queue.
+                explorer.isUbuntu -> onCopyToDevice(listOf(entry))
+                else -> onDownloadFile(entry.toRemoteFile())
+            }
             FileActionKind.SEND_TO_HOST -> sendEntry = entry
             // The row is drawn only when the session and the name can both be served - see the
             // window - so the only thing left to check is whether an opener was supplied at all.
