@@ -273,12 +273,18 @@ class SettingsRepository(private val context: Context) {
     /**
      * How many rows the pty is told it has, or 0 for "as many as fit the screen".
      *
-     * The mirror of [setTerminalMinColumns], and the opposite kind of number. A width is a floor: the
-     * screen can always show fewer columns than the server believes, because the rest is reachable by
-     * wrapping or by panning. A height is a ceiling, because a row past the bottom edge is nowhere -
-     * a shell told it has sixty rows on a screen that fits forty puts its prompt twenty rows below the
-     * last pixel. So this value is agreed with the screen (see `TerminalGrid.atMostRows`) rather than
-     * demanded of it, and the clamp here is only the range the pty and the buffer share.
+     * The mirror of [setTerminalMinColumns], and the same kind of number: a floor. A width is a floor
+     * because the screen can show fewer columns than the server believes and the rest is reachable by
+     * wrapping or by panning; a height is a floor because a row past the bottom edge is not lost, it is
+     * one flick of the scrollback away - the view anchors its window on the cursor and the scroll gesture
+     * walks back through everything above it. What the extra height buys is output that never got paged
+     * away in the first place: a shell told it has a thousand rows prints a thousand lines before it
+     * hands anything to a pager.
+     *
+     * The screen's own height is therefore no longer an input. The pty is told this value, the local grid
+     * is given it, and the window the user reads is [TerminalViewport.visibleRows] - three numbers that
+     * coincide exactly when this is 0. A *host's* `terminalRows` is still the ceiling that can lower it,
+     * which is how a single server is told the window is short.
      *
      * Normalized rather than trusted for the same reason as every other stored number: only
      * [setTerminalRows] and a restored backup write it, and a backup is a file the user can hand-edit.
@@ -369,10 +375,20 @@ class SettingsRepository(private val context: Context) {
          *
          * Short by convention rather than by ratio: 24 rows is the classic terminal, 30 and 40 are a
          * phone held against a desktop's shape, and 50 is the point past which a "short" screen is
-         * mostly blank. Nothing here is above 60 because a phone screen fits fewer than that anyway,
-         * and a choice the screen overrules on every device is a choice that never does anything.
+         * mostly blank.
+         *
+         * The values above 60 are the ones that only mean something as a floor, and that is what they
+         * are: 100, 200, 500 and 1000 are heights no phone can show, chosen because the height a pty is
+         * told is not the height of the screen. A shell told it has a thousand rows prints a thousand
+         * lines of `ls`, `git log` or `apt-get` before it pages, and keeps them in the app's own
+         * scrollback rather than handing them to `less` a screenful at a time - which is the difference
+         * between scrolling back through the output and re-running the command to see the part that got
+         * paged away. The view draws the rows it has and follows the cursor through the rest.
+         *
+         * A screen that overrules a choice is no longer a reason to withhold it; the top of this list is
+         * bounded by the range the pty and the buffer share, not by any device.
          */
-        val TERMINAL_ROW_CHOICES = listOf(0, 24, 30, 40, 50, 60)
+        val TERMINAL_ROW_CHOICES = listOf(0, 24, 30, 40, 50, 60, 100, 200, 500, 1000)
 
         /** 0 stays 0; anything else is pulled inside the range the pty and the buffer share. */
         fun normalizeRows(rows: Int): Int =

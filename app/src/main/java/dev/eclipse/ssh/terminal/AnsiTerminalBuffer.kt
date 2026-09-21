@@ -51,9 +51,16 @@ private const val C0_ESC = 0x1B
  * The display is the tighter constraint, because a grid of cells is real memory and the pty is only
  * two integers, so the display's limits are the shared ones. That way the server is never told about
  * a window that cannot be drawn.
+ *
+ * The rows reach 1000 because an app-wide height is a *floor* the view scrolls through rather than a
+ * ceiling the screen cuts down - a value the screen overruled on every device would be a setting that
+ * never did anything, which is why the choices used to stop at 60. What that costs is bounded here
+ * and nowhere else: at this range's corner (1000 rows by 400 columns) the grid is the largest thing
+ * this class will ever hold, some tens of megabytes of cells for a terminal the user asked to be that
+ * tall. Every other height is proportional to it, and the default is still "fit the screen".
  */
 val TERMINAL_COLUMN_RANGE = 20..400
-val TERMINAL_ROW_RANGE = 5..200
+val TERMINAL_ROW_RANGE = 5..1000
 
 data class TerminalColor(val value: Int = COLOR_DEFAULT) {
     val isDefault: Boolean get() = value == COLOR_DEFAULT
@@ -356,18 +363,33 @@ class AnsiTerminalBuffer(
     )
 
     /**
-     * The window the view can actually draw: [viewportRows] lines ending [scrollOffset] lines above
-     * the bottom of the buffer.
+     * The window the view can actually draw: [viewportRows] lines ending at the cursor, [scrollOffset]
+     * lines above it.
+     *
+     * The cursor is the anchor rather than the bottom of the buffer, and the two are the same thing
+     * whenever the cursor is on the last line - which it is in every session whose pty is exactly as
+     * tall as the buffer. They part company precisely when the pty is *taller*, which is the setting
+     * this exists for: with a 1000-row pty and 200 lines of output the cursor sits on row 200 while
+     * the last line of the buffer is row 999, so a window measured from the bottom is 800 rows of
+     * blank screen with the prompt somewhere far above it. Anchoring on the cursor keeps what the
+     * shell is writing on the screen, and the blank rows below the cursor are never drawn at all.
      *
      * An offset of zero is "following the output", which is the state a terminal is in unless the
-     * user has deliberately scrolled back. Offsets past the top are clamped rather than rejected,
-     * because the buffer shrinks under the view whenever the scrollback limit evicts a line.
+     * user has deliberately scrolled back. The offset walks *up* from that anchor, and it is measured
+     * the same way by [maxScrollOffset] so a scrolled-back view holds the text it was showing while
+     * output arrives below: the caller adds the growth back, which cancels the anchor's own movement
+     * exactly as it used to cancel the buffer's. Offsets past the top are clamped rather than
+     * rejected, because the buffer shrinks under the view whenever the scrollback limit evicts a line.
      */
     @Synchronized
     fun frame(scrollOffset: Int = 0, viewportRows: Int = rows): TerminalFrame {
         val take = viewportRows.coerceIn(1, lines.size)
-        val offset = scrollOffset.coerceIn(0, (lines.size - take).coerceAtLeast(0))
-        val first = (lines.size - take - offset).coerceAtLeast(0)
+        // Never above the cursor, and never so near the start that the window would begin before the
+        // buffer does - the lower bound is what stops a cursor on row 3 of a tall screen from pulling
+        // the window up past the first line the terminal ever wrote.
+        val anchor = (cursorRow + 1).coerceIn(take, lines.size)
+        val offset = scrollOffset.coerceIn(0, anchor - take)
+        val first = anchor - take - offset
         val window = ArrayList<List<TerminalCell>>(take)
         var content = 0
         for (index in first until first + take) {
@@ -436,13 +458,39 @@ class AnsiTerminalBuffer(
     val viewportRows: Int
         @Synchronized get() = rows
 
-    /** How far back the view may scroll while showing [viewportRows] lines. */
+    /**
+     * How far back the view may scroll while showing [viewportRows] lines.
+     *
+     * Measured to the cursor rather than to the end of the buffer, because [frame] anchors there: the
+     * distance that matters is from the cursor up to the first line of scrollback, and measuring to
+     * the buffer's last line instead would hand the view a range of offsets whose upper half draws
+     * exactly the same screen. A tall pty with a little output is where that shows - 960 offsets that
+     * all clamp to the top of the buffer is a scroll gesture that stops responding.
+     */
     @Synchronized
-    fun maxScrollOffset(viewportRows: Int): Int =
-        (lines.size - viewportRows.coerceIn(1, lines.size)).coerceAtLeast(0)
+    fun maxScrollOffset(viewportRows: Int): Int {
+        val take = viewportRows.coerceIn(1, lines.size)
+        return (cursorRow + 1).coerceIn(take, lines.size) - take
+    }
 
     @Synchronized
     fun lineCount(): Int = lines.size
+
+    /**
+     * The line [frame] anchors its window at: the cursor's own line, or the last line there is.
+     *
+     * The frame's window is `[cursorLine - viewportRows - offset, cursorLine - offset)`, so this is the
+     * single number that decides where the window sits, and moving it by one moves the window by one.
+     * That is why the caller that keeps a scrolled-back view still ([MainViewModel.pinScrollback]) reads
+     * it before and after feeding output and gives the difference back: the line count is the same
+     * number in a session whose pty is exactly as tall as the buffer, and a different one in a session
+     * whose pty is taller - where output moves this down the screen without adding a line at all.
+     *
+     * Synchronized and allocation-free for the same reason [viewportRows] is: it is read twice per
+     * collector iteration, on the terminal's hot path.
+     */
+    val cursorLine: Int
+        @Synchronized get() = (cursorRow + 1).coerceIn(1, lines.size)
 
     /** Whether a paste has to be wrapped in `ESC [ 200 ~` and `ESC [ 201 ~`. */
     @Synchronized

@@ -214,7 +214,7 @@ class RealOpenSshInteropRobolectricTest {
         assertNothingLookedLikeADrop(saved.id)
 
         // What the on-screen keyboard does to a session a second after it connects.
-        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, PHONE_COLUMNS, PHONE_ROWS) }
+        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, screenViewport(PHONE_COLUMNS, PHONE_ROWS)) }
         compose.runOnUiThread { viewModel.sendText(saved.id, "echo $MARKER") }
         compose.runOnUiThread { viewModel.sendKey(saved.id, TerminalKey.ENTER) }
         pumpUntil(describe = { "the shell never answered the command. " + diagnose(saved.id) }) {
@@ -479,7 +479,7 @@ class RealOpenSshInteropRobolectricTest {
         // The pty the app asks for on a phone: 80 columns whatever the screen fits, which is
         // `AppSettings.terminalMinColumns` and the reason a full-screen program's rows are wider than
         // the view they are drawn into.
-        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, PHONE_COLUMNS, PHONE_ROWS) }
+        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, screenViewport(PHONE_COLUMNS, PHONE_ROWS)) }
 
         // Text of this test's own, wide enough that a phone-width view has to do something about it,
         // rather than whatever this machine happens to keep in /etc.
@@ -602,7 +602,7 @@ class RealOpenSshInteropRobolectricTest {
 
         val viewModel = viewModel()
         val saved = logInWithAShell("real-openssh-wrapping", sandbox!!, port)
-        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, PHONE_COLUMNS, PHONE_ROWS) }
+        compose.runOnUiThread { viewModel.resizeTerminal(saved.id, screenViewport(PHONE_COLUMNS, PHONE_ROWS)) }
 
         // A URL and a path, which is what the complaint that started this was about: reachable only by
         // dragging the text sideways, and unreadable if broken at column 46.

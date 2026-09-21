@@ -3,6 +3,7 @@ package dev.eclipse.ssh.ui.terminal
 import androidx.compose.ui.unit.dp
 import com.google.common.truth.Truth.assertThat
 import dev.eclipse.ssh.terminal.TERMINAL_COLUMN_RANGE
+import dev.eclipse.ssh.terminal.TERMINAL_ROW_RANGE
 import org.junit.Test
 
 /**
@@ -122,8 +123,9 @@ class TerminalGeometryTest {
 
         assertThat(visible.columns).isEqualTo(46)
         assertThat(wide.columns).isEqualTo(80)
-        // Rows are never widened - vertical space is not scarce in the same way, and a program that
-        // thought it had more rows than the screen would draw its status line where nobody can see it.
+        // Rows are a separate axis with its own two rules, and a width never touches them: the app-wide
+        // height is a floor ([atLeastRows]) and a host's own is a ceiling ([atMostRows]), neither of
+        // which has anything to do with how many columns fit.
         assertThat(wide.rows).isEqualTo(visible.rows)
         // And the centring is unchanged: the pan window is still the visible one.
         assertThat(wide.originX).isEqualTo(visible.originX)
@@ -159,15 +161,17 @@ class TerminalGeometryTest {
     }
 
     @Test
-    fun `a host's height is honoured up to what the screen can show`() {
+    fun `a host's height can only shorten the grid`() {
         val visible = cell.gridIn(widthPx = 500f, heightPx = 400f)
 
         assertThat(visible.rows).isEqualTo(20)
-        // Shorter than the screen is a real thing to want and is given exactly: the server is told the
-        // window is short, and the rows it does not use are left blank.
+        // Shorter than the floor is a real thing to want and is given exactly, drawn at the top: a host
+        // that names a height is telling one server its window is short, and that is the only per-host
+        // value in the app that lowers anything.
         assertThat(visible.atMostRows(12).rows).isEqualTo(12)
-        // Taller is not, and quietly is not: a pty told it has 60 rows on a screen that fits 20 puts
-        // the prompt, and every full-screen program's status line, forty rows below the last pixel.
+        // Taller is not, and now for a different reason than it used to be: a host's value is a ceiling
+        // over the app-wide floor, so raising the height is the app-wide setting's job and a per-host
+        // copy of it would silently override that setting for one server.
         assertThat(visible.atMostRows(60)).isEqualTo(visible)
         assertThat(visible.atMostRows(0)).isEqualTo(visible)
         // Width is never touched by a height, and the centring is the visible window's either way.
@@ -176,34 +180,52 @@ class TerminalGeometryTest {
     }
 
     /**
-     * The app-wide height and a host's own, which combine the other way round from the widths.
+     * The app-wide height, which is a floor - and the whole of what the taller choices mean.
      *
-     * Two floors take the wider of the two, because the screen can always show less than the server
-     * believes and the overflow is reachable. Two ceilings have no such arithmetic, so the host's own
-     * height wins outright where it has one: the app-wide value is a default for every host, and a host
-     * that names a height is saying something about that server that the global setting cannot know.
+     * A pty told it has a thousand rows on a phone that fits twenty is not a mistake to be corrected: it
+     * is the setting. The shell prints a thousand lines of `ls` or `apt-get` before it hands anything to
+     * a pager, the app's scrollback keeps all of them, and the view draws the twenty rows around the
+     * cursor and scrolls through the rest.
      */
     @Test
-    fun `a host's height wins over the app-wide one, and the app-wide one is the fallback`() {
-        assertThat(hostTerminalRows(settingRows = 30, hostRows = 0)).isEqualTo(30)
-        assertThat(hostTerminalRows(settingRows = 30, hostRows = 50)).isEqualTo(50)
-        // Not the smaller of the two, which is what a ceiling-versus-ceiling reading would give: an
-        // explicit per-host height is a statement about that host, not a competing limit.
-        assertThat(hostTerminalRows(settingRows = 30, hostRows = 12)).isEqualTo(12)
-        // Neither side configured: "match the screen", the same sentinel the settings screen stores.
-        assertThat(hostTerminalRows(settingRows = 0, hostRows = 0)).isEqualTo(0)
+    fun `the app-wide height is a floor the grid is raised to`() {
+        val visible = cell.gridIn(widthPx = 500f, heightPx = 400f)
+
+        assertThat(visible.rows).isEqualTo(20)
+        // "Fit screen" is the floor at its no-op value, and so is anything shorter than what fits.
+        assertThat(visible.atLeastRows(0)).isEqualTo(visible)
+        assertThat(visible.atLeastRows(12)).isEqualTo(visible)
+        assertThat(visible.atLeastRows(1000).rows).isEqualTo(1000)
+        // Grown downwards, not sideways: the width and the centring stay the visible window's.
+        assertThat(visible.atLeastRows(1000).columns).isEqualTo(visible.columns)
+        assertThat(visible.atLeastRows(1000).originY).isEqualTo(visible.originY)
     }
 
     @Test
-    fun `the app-wide height is still only a request the screen can refuse`() {
-        // The two helpers composed the way MainActivity composes them, which is the only place the
-        // guarantee matters: whatever a user picks, a pty is never told it has more rows than the
-        // screen it is drawn on.
+    fun `the app-wide height is a floor a host's own height can lower`() {
+        // Composed the way MainActivity composes them, which is the only place the rule matters.
+        val visible = cell.gridIn(widthPx = 500f, heightPx = 400f)
+        val tall = visible.atLeastRows(1000)
+
+        assertThat(tall.rows).isEqualTo(1000)
+        // A host that names a height gets it, whatever the app-wide floor was.
+        assertThat(tall.atMostRows(200).rows).isEqualTo(200)
+        assertThat(tall.atMostRows(12).rows).isEqualTo(12)
+        // A host with no opinion leaves the floor alone.
+        assertThat(tall.atMostRows(0).rows).isEqualTo(1000)
+        // With the floor at "fit screen" this is exactly the behaviour the setting had before it became
+        // one: a host's height is honoured when it is shorter than the screen and ignored when taller.
+        assertThat(visible.atLeastRows(0).atMostRows(12).rows).isEqualTo(12)
+        assertThat(visible.atLeastRows(0).atMostRows(60)).isEqualTo(visible)
+    }
+
+    @Test
+    fun `a stored height beyond what the pty accepts is bounded rather than obeyed`() {
+        // A vault file is editable text; 4 000 rows in one would otherwise be sent to a server that
+        // clamps it, leaving the buffer and the pty disagreeing about the height of the terminal.
         val visible = cell.gridIn(widthPx = 500f, heightPx = 400f)
 
-        assertThat(visible.atMostRows(hostTerminalRows(settingRows = 60, hostRows = 0)).rows).isEqualTo(20)
-        assertThat(visible.atMostRows(hostTerminalRows(settingRows = 0, hostRows = 60)).rows).isEqualTo(20)
-        assertThat(visible.atMostRows(hostTerminalRows(settingRows = 12, hostRows = 0)).rows).isEqualTo(12)
+        assertThat(visible.atLeastRows(100_000).rows).isEqualTo(TERMINAL_ROW_RANGE.last)
     }
 
     @Test

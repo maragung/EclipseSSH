@@ -393,6 +393,14 @@ val TERMINAL_TYPE_CHOICES = listOf(
  *
  * The lower bounds are the smallest sizes a shell is usable at rather than protocol limits: a pty 4
  * columns wide is accepted by every server and by nothing a user would want to read.
+ *
+ * The two upper bounds differ, and now for a reason that is not symmetry. A host's width is a floor
+ * competing with the app-wide floor, so 500 columns is a real thing to ask for. A host's *height* is a
+ * ceiling over the app-wide floor - the one per-host value that lowers instead of raising, because it
+ * is how a single server is told its window is short - and a ceiling taller than any phone screen can
+ * never do anything. 200 is already past the tallest screen this app will run on, so the top of the
+ * range is where a value stops being able to lower anything rather than where a terminal stops being
+ * useful; the app-wide height, which *is* a floor, runs to 1000.
  */
 val TERMINAL_COLUMNS_RANGE = 20..500
 val TERMINAL_ROWS_RANGE = 5..200
@@ -860,14 +868,19 @@ data class AppSettings(
     /**
      * How many rows the pty is told it has, or 0 to use as many as the screen fits.
      *
-     * The counterpart of [terminalMinColumns] and deliberately not its mirror image. A width is a
-     * floor - the screen can always show fewer columns than the server believes, because the rest is
-     * reachable by wrapping or panning - so the app-wide number and a host's own are combined by
-     * taking the wider, and nothing is ever cut off. A height is a *ceiling*: a row past the bottom
-     * edge is nowhere, so a shell told it has sixty rows on a screen that fits forty draws its prompt
-     * twenty rows below the last pixel. This value is therefore a request that the screen has the
-     * final word on (see `TerminalGrid.atMostRows`), and 0 - the default, and what every install
-     * predating the setting already had - means "exactly what fits".
+     * The counterpart of [terminalMinColumns] and now its mirror image as well: a floor. A width is a
+     * floor because the screen can show fewer columns than the server believes and the rest is reachable
+     * by wrapping or panning; a height is a floor because a row past the bottom edge is not lost either,
+     * it is one flick of the scrollback away - the view anchors its window on the cursor and the scroll
+     * gesture walks back through everything above it. What the extra height buys is output that never got
+     * paged away in the first place: a shell told it has a thousand rows prints a thousand lines of `ls`
+     * or `apt-get` before it hands anything to a pager, and the app's own scrollback keeps all of them.
+     *
+     * The screen's height is therefore no longer consulted. This value *is* the pty's height, and the
+     * window the user reads is as tall as the phone; the two coincide exactly when this is 0 - the
+     * default, and what every install predating the setting already had. A host's own `terminalRows`
+     * is the exception that lowers rather than raises (see `TerminalGrid.atMostRows`), and is the only
+     * way to tell one server that its window is short.
      */
     val terminalRows: Int = 0,
     val pinEnabled: Boolean = false,

@@ -260,13 +260,15 @@ class TerminalWidthScreenRobolectricTest {
 }
 
 /**
- * Terminal height: how many rows the server is told it has, up to what the screen can show.
+ * Terminal height: how many rows the server is told it has, which the view scrolls through.
  *
- * The mirror of the width screen above, and deliberately not worded like it. That one promises a
- * minimum - pick 132 and the server is told at least 132 columns, with the grid panning for the
- * overflow. This one cannot promise a size at all: there is nowhere for a row past the bottom edge to
- * go, so what the user picks is a limit and the screen has the last word. The subtitle asserted here
- * is that difference made visible, which is why it is pinned rather than left to the row's own text.
+ * The mirror of the width screen above, and worded as one: pick 132 and the server is told at least
+ * 132 columns with the grid panning for the overflow; pick 1000 and it is told at least 1000 rows,
+ * with the window following the cursor and the scroll gesture reaching the rest. The values above 60
+ * are the ones only a floor can offer - no phone shows a hundred rows, let alone a thousand, and that
+ * is the point: the shell prints that many lines before it pages, so the output stays in the app's
+ * scrollback instead of going through `less` a screenful at a time. The subtitle asserted here is that
+ * promise made visible, which is why it is pinned rather than left to the row's own text.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(application = EclipseApp::class, sdk = [35], qualifiers = "w411dp-h891dp-xhdpi")
@@ -280,11 +282,14 @@ class TerminalHeightScreenRobolectricTest {
         compose.waitForIdle()
 
         compose.assertTitled("Terminal height")
-        compose.onNodeWithText("At most this many rows; a screen that fits fewer gets fewer")
+        compose.onNodeWithText("At least this many rows; the screen shows what fits and scrolls the rest")
             .assertIsDisplayed()
         compose.assertSectionHeader("Terminal height")
 
-        val labels = listOf("Fit screen", "24 rows", "30 rows", "40 rows", "50 rows", "60 rows")
+        val labels = listOf(
+            "Fit screen", "24 rows", "30 rows", "40 rows", "50 rows", "60 rows",
+            "100 rows", "200 rows", "500 rows", "1000 rows",
+        )
         assertWithMessage("the offered heights and the labels asserted here have drifted apart")
             .that(labels.size).isEqualTo(SettingsRepository.TERMINAL_ROW_CHOICES.size)
         labels.forEach { compose.assertChoiceOffered(it) }
