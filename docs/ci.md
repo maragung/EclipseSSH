@@ -239,13 +239,26 @@ scripts/ci-window.sh close                        # close it now
 **The three closers, and what each one covers.** The opener installs its close as an `EXIT` trap, so
 an interrupt or a failure in the script does not leave the door open. That covers the script; it does
 not cover the machine the script runs on. `close-ci-window.yml` covers a run that outlives its opener
-— it is a job in `ci.yml` and `release.yml`, guarded on the repository actually being public, so it
-is `skipped` and costs nothing on every ordinary run, and it closes the window in seconds rather than
-at the next tick. `scripts/ci-window-watchdog.sh` covers the rest: the opener died before it
-dispatched anything, so there is no run to close the window and no trap left to fire. It runs from
-cron, every five minutes, and it acts only when the repository is public *and* carries a deadline
-that has passed. A repository someone made public by hand has no deadline, and the watchdog leaves it
-alone — that is a decision, and the script does not overrule decisions.
+— it is a job in `ci.yml` and `release.yml`, guarded so that it is `skipped` and costs nothing on
+every ordinary run, and it closes the window in seconds rather than at the next tick. `scripts/ci-window-watchdog.sh`
+covers the rest: the opener died before it dispatched anything, so there is no run to close the
+window and no trap left to fire. It runs from cron, every five minutes, and it acts only when the
+repository is public *and* carries a deadline that has passed. A repository someone made public by
+hand has no deadline, and the watchdog leaves it alone — that is a decision, and the script does not
+overrule decisions.
+
+**The closer's guard reads the trigger event, not the repository.** The job is conditioned on
+`github.event.repository.private == false`, and that is the visibility recorded in the event payload
+when the run was created — not a live read at job time. Two consequences, both observed. A run
+created while the repository was private keeps `private: true` in its payload after a window opens,
+so its closer is `skipped` even though the repository is public by then: `release.yml` run
+`35699061371`, a re-run of a push from 07:19:53Z, reported `Close the CI window / Close the CI
+window: completed/skipped` while the window opened at 07:25:48Z was still open. And a window that
+spans more than one run is closed by whichever of them settles first — which is why the opener's trap
+and the deadline exist as well, and why a release, which is a branch push, a merge and a tag, is
+opened by hand with a long deadline and closed with `close` rather than by `open`'s dispatch-and-wait.
+A job that has already started keeps its runner when the window closes underneath it; what a close
+does affect is any job that had not started yet, which is billed from that moment on.
 
 **The deadline is the honest part of the design.** The opener records `CI_WINDOW_DEADLINE` as a
 repository variable *before* it flips anything, so a crash between the two leaves a public repository
