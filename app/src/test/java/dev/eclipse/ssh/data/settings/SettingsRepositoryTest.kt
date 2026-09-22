@@ -72,6 +72,11 @@ class SettingsRepositoryTest {
             repo.setReconnectBaseSeconds(SettingsRepository.DEFAULT_RECONNECT_BASE_SECONDS)
             repo.setTerminalFontSize(SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE)
             repo.setTerminalKeyRowVisible(true)
+            repo.setTerminalScrollbackCountVisible(false)
+            // Missing until now, and the omission was the leak this method exists to prevent: `02`
+            // sets it true and nothing put it back, so a sibling class reading the defaults saw the
+            // whole terminal keeping its system bars for reasons it could not see written.
+            repo.setTerminalKeepSystemBars(false)
             repo.setTerminalKeyBarJson("{}")
             repo.setTerminalMinColumns(SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS)
             repo.setTerminalRows(SettingsRepository.DEFAULT_TERMINAL_ROWS)
@@ -100,6 +105,11 @@ class SettingsRepositoryTest {
         // Shown by default: the row carries ESC, TAB and CTRL, which a phone keyboard does not, so a
         // first-run terminal that hid it would have no way to interrupt a command.
         assertThat(settings.terminalKeyRowVisible).isTrue()
+        // Hidden by default, unlike the row above, and the difference is what each one leaves on
+        // screen: the key row is the only way to send ESC from a phone keyboard, while the badge it
+        // accompanies stays either way - only its number is behind the setting. So the quiet default
+        // costs no install its way back to the live output, and the count has to be asked for.
+        assertThat(settings.terminalScrollbackCountVisible).isFalse()
         assertThat(settings.pinEnabled).isFalse()
         // 5 minutes: long enough that a glance away and back does not ask again, short enough that
         // a phone left on a desk is not an open vault.
@@ -128,6 +138,9 @@ class SettingsRepositoryTest {
         repo.setTerminalFontSize(18)
         repo.setTerminalRows(42)
         repo.setTerminalKeyRowVisible(false)
+        // Written opposite to its default, which is what makes the assertion below a test of the
+        // write rather than a second reading of the default.
+        repo.setTerminalScrollbackCountVisible(true)
         repo.setLegacyAlgorithms(true)
         repo.setTerminalTheme(TerminalTheme.entries.last().name)
         repo.setBlockScreenshots(true)
@@ -151,6 +164,7 @@ class SettingsRepositoryTest {
         // "unset" sentinel and would round-trip even if the key were never written at all.
         assertThat(settings.terminalRows).isEqualTo(42)
         assertThat(settings.terminalKeyRowVisible).isFalse()
+        assertThat(settings.terminalScrollbackCountVisible).isTrue()
         assertThat(settings.legacyAlgorithms).isTrue()
         assertThat(settings.terminalTheme).isEqualTo(TerminalTheme.entries.last().name)
         assertThat(settings.blockScreenshots).isTrue()
@@ -407,5 +421,31 @@ class SettingsRepositoryTest {
 
         repo.setTerminalKeyRowVisible(true)
         assertThat(repo.settings.first().terminalKeyRowVisible).isTrue()
+    }
+
+    /**
+     * The scrolled-back badge's count survives a restart, and an install that never touches it gets a
+     * badge with no number on it.
+     *
+     * The default is the half that matters, and it is the half that moved. `false` is safe to default
+     * to *only* because of what is not behind the switch: the arrow, its tap target and its "Jump to
+     * live output" description are drawn either way, so the quiet default cannot strand anyone - it
+     * withholds a number, not the way back to the live output. What it must not be is a value that
+     * cannot be told apart from a stored one, which is why the write is `true`, against the default,
+     * and the read side is checked separately below.
+     */
+    @Test
+    fun `11 the scrolled-back count round-trips and is off where it was never set`() = runTest {
+        val repo = repository
+
+        repo.setTerminalScrollbackCountVisible(true)
+        assertThat(repo.settings.first().terminalScrollbackCountVisible).isTrue()
+
+        repo.setTerminalScrollbackCountVisible(false)
+        assertThat(repo.settings.first().terminalScrollbackCountVisible).isFalse()
+
+        // The read side, against a preference set no setter produces: an older build's store, with
+        // the key simply absent. `settingsFrom` is pure, so this needs no store of its own.
+        assertThat(settingsFrom(mutablePreferencesOf()).terminalScrollbackCountVisible).isFalse()
     }
 }

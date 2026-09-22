@@ -4722,6 +4722,7 @@ class MainViewModel @Inject constructor(
     fun setTerminalFontSize(size: Int) = writeSetting("the terminal font size") { settingsRepository.setTerminalFontSize(size) }
     fun setTerminalMinColumns(columns: Int) = writeSetting("the terminal width") { settingsRepository.setTerminalMinColumns(columns) }
     fun setTerminalKeyRowVisible(visible: Boolean) = writeSetting("the shortcut bar") { settingsRepository.setTerminalKeyRowVisible(visible) }
+    fun setTerminalScrollbackCountVisible(visible: Boolean) = writeSetting("the scrollback badge count") { settingsRepository.setTerminalScrollbackCountVisible(visible) }
     fun setLegacyAlgorithms(enabled: Boolean) = writeSetting("the legacy algorithm setting") { settingsRepository.setLegacyAlgorithms(enabled) }
     fun setTerminalTheme(name: String) = writeSetting("the terminal theme") { settingsRepository.setTerminalTheme(name) }
     fun setEditorPrefsJson(json: String) = writeSetting("the editor preferences") { settingsRepository.setEditorPrefsJson(json) }

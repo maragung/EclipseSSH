@@ -190,6 +190,9 @@ class VaultBackupTest {
             // objects, so a field left at its default would match even if the backup dropped it.
             blockScreenshots = true,
             reconnectAskFirst = true,
+            // Opposite of its default as well, for the same reason: the whole-object comparison
+            // below is the only thing that would notice the backup dropping this one.
+            terminalScrollbackCountVisible = true,
             vaultAutoLockMinutes = 60,
             // Every field opposite its default for the same reason as blockScreenshots above.
             editorPrefsJson = "{\"wordWrap\":true,\"showLineNumbers\":false,\"tabSize\":2," +
@@ -280,6 +283,9 @@ class VaultBackupTest {
         // Absent from a v1 backup, so it resolves to the default (immersive full screen) rather
         // than to true-by-accident.
         assertThat(settings.terminalKeepSystemBars).isEqualTo(defaults.terminalKeepSystemBars)
+        // Absent from a v1 backup too, and here the default is what those installs already drew: the
+        // badge spelled out its count, so a v1 file must not turn the text off on import.
+        assertThat(settings.terminalScrollbackCountVisible).isEqualTo(defaults.terminalScrollbackCountVisible)
         // Absent from a v1 backup, so it resolves to the default (re-lock after 5 minutes) rather
         // than to zero (never re-lock) by accident.
         assertThat(settings.vaultAutoLockMinutes).isEqualTo(defaults.vaultAutoLockMinutes)

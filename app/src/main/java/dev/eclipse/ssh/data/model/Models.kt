@@ -836,6 +836,27 @@ data class AppSettings(
      */
     val terminalKeyRowVisible: Boolean = true,
     /**
+     * Whether the scrolled-back indicator says how many lines behind the live output the view is.
+     *
+     * The badge itself is not optional and this does not make it so: it is the only thing on screen
+     * that says a *still* screen is a scrolled-back one rather than a hung session, and the only way
+     * back to the live output. What is optional is the count, which is the part that costs width:
+     * "137 lines below" is fifteen characters of pill sitting over the top-right of the grid, which
+     * is where a `tail -f`, a `top` header or a wrapped command line has its busiest text, spent to
+     * say a number the reader is usually about to leave anyway - the tap that dismisses the badge is
+     * the same tap that makes the number irrelevant. Hidden, the arrow that remains still jumps and
+     * still announces itself ("Jump to live output"), so nothing becomes unreachable.
+     *
+     * Off by default, which is the direction a switch nobody has read should point: the default is the
+     * state every install that never opens Settings lives in, and the count is the part that costs the
+     * busiest corner of the grid, so it is the part that has to be asked for. Defaulting to the quiet
+     * state is safe here for one reason and not as a general principle - what this withholds is a
+     * number, never the badge - and where that reasoning does not hold the defaults in this app go the
+     * other way: the key row above is on by default, because off would take away the only way a phone
+     * keyboard can send ESC.
+     */
+    val terminalScrollbackCountVisible: Boolean = false,
+    /**
      * The shortcut bar's whole configuration as one JSON blob — which caps exist, which show, their
      * row and order, the layout mode and the cap size.
      *
