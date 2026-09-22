@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 37 / versionName 1.6.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 38 / versionName 1.7.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §58, *Releasing 1.6.0*; the newest of them that releases a version is §58, *Releasing 1.6.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §59, *Releasing 1.7.0*; the newest of them that releases a version is §59, *Releasing 1.7.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6224,3 +6224,131 @@ The two version lines in this file's header moved, `app/build.gradle.kts` moved 
 `scripts/check-doc-figures.sh` counts 150 claims as of this commit, against §57's 147 — the three
 came with the userspace documentation the merged work added, not with this section, which moves two
 re-derived values without adding a claim to re-derive.
+
+
+## 59. Releasing 1.7.0
+
+The first release since §54's 1.4.0 whose suites a GitHub-hosted runner ran. §55's 1.5.0 was built on
+this host and uploaded by hand, §56's 1.5.1 was built by CI and checked by hand, and §58's 1.6.0 was
+verified here in package-sized chunks because §57's block was in force for every commit that went into
+it. What is different this time is not the account — §56 and §58 both had a settled account — but the
+repository's visibility while the runs happen: minutes are free on a public repository and billed on a
+private one, and 1.7.0 carries the machinery that opens that window deliberately and closes it again.
+It is two changes: the Repair work §57 and §58 kept circling, and the window.
+
+### What it carries
+
+**Repair can now fix the failures it could not see, and refuse the ones it cannot.** §58 left a
+ladder whose every rung began with `dpkg --configure -a` and whose deepest rung was a reinstall, and
+two failures that made every rung fail identically — one of them unfixable *by construction*. Two
+rungs now sit above every rung that touches the network, because both answer failures that make
+every network rung fail the same way and at once:
+
+- **Rung L, restore local state.** A killed `apt` leaves lock files the kernel has already released;
+  every later `dpkg` and `apt-get` refuses in about a second with a sentence about a process that
+  does not exist, so the ladder used to end by rebuilding a userspace that was never broken. The
+  rung proves a lock is unheld by *taking* the fcntl lock rather than by reading a file's name, gives
+  up apt's regenerable state whether or not the disk looked short, and puts back the guest's `tmp`,
+  `run` and workspace — replacing a link rather than writing through it.
+- **Rung D, restore the package database.** `var/lib/dpkg` is a preserved member, so no rung may
+  write it, while every rung reads it. A truncated `/var/lib/dpkg/status` was therefore unfixable by
+  the ladder *and* untouched by the reinstall, which is a deadlock rather than a gap. It now comes
+  back from dpkg's own `status-old` — costing nothing and keeping every package the user installed —
+  or from the pinned archive, and with no source at all the rung stops the ladder with
+  `PackageDatabaseUnreadable` and names the honest exit: uninstall with files kept, then install.
+
+Four failures stopped being reported as something else. `StepTimedOut` was declared and never
+constructed, so a merely-slow connection spent a reinstall that timed out identically; exits above
+128 were read as "the Linux runtime (proot) failed to start", which for 137 is the low-memory killer
+taking the largest process on the phone, and no rung creates memory; the app's own loader is checked
+before the first fork instead of surfacing as a shell's exit 127 that the ladder reads as a rootfs
+worth rebuilding; and a full pty table is reported as a fact about this app. A session that dies
+mid-flight is visible to Repair at last — it used to leave the manager `Running`, so the card offered
+nothing to press.
+
+**The CI window.** §57 recorded that every job on this repository died in two to four seconds with
+zero steps and an empty `runner_name`, and that the reason is only ever in the check-run annotation:
+Actions minutes are free on a public repository and billed on a private one. The obvious automation
+cannot work, and that is the whole design — a GitHub-hosted runner is exactly what the account cannot
+afford while private, so no workflow in this repository can run the command that would make the
+minutes free. `scripts/ci-window.sh` is that command, run from a machine that is not GitHub: `open`
+records a deadline in the repository variable `CI_WINDOW_DEADLINE`, flips the repository public,
+dispatches, waits, and closes the window from an `EXIT` trap, so an interrupt is not one of the ways
+a window stays open. `.github/workflows/close-ci-window.yml` is the same close as a job, called by
+`ci.yml` and `release.yml`; `scripts/ci-window-watchdog.sh` is the backstop for the one failure a
+trap cannot cover — the machine dying — on a five-minute cron. It is deliberately not a scheduled
+workflow, because while the repository is private the schedule is exactly as absent as the runner
+budget is.
+
+What it does not guard against is the decision itself. Making this repository public publishes its
+entire history to everyone, permanently, and flipping it back does not recall the forks and archives
+that copy it within minutes. So the audit ran before the flip, over every ref, the issues and pull
+requests, and the secret names: no credential is in the history, no workflow echoes one, and no
+key-named artifact was ever uploaded. What is exposed is the source code, which is the point — and it
+is a decision taken out loud rather than a side effect of wanting a free runner, which is why `open`
+refuses without `--yes`.
+
+Using it turned up one thing the design did not anticipate, and it is recorded in `docs/ci.md` beside
+the mechanism rather than here alone: the closer job's guard reads the visibility recorded in the
+trigger event's payload, not the repository's state when the job runs. A run created while the
+repository was private therefore keeps `private: true` and skips its closer even once the window is
+open — `release.yml` run `35699061371`, a re-run of a push from six minutes before the flip, reported
+`Close the CI window: completed/skipped` with the window open underneath it. And a window that spans
+more than one run is closed by whichever of them settles first, so a release — a branch push, a merge
+and a tag — is opened by hand with a long deadline and closed with `close`, rather than by `open`'s
+dispatch-and-wait, which is shaped for a single run.
+
+### The verification
+
+The tree this release carries — `main` at `11be972`, which is #155 and #156 and nothing else — ran on
+GitHub-hosted runners on 2026-09-22 between 07:25:51Z and 08:01:08Z, as `ci.yml` run `35699555007`.
+It is the first run of this repository's CI to reach a runner since §57 recorded the block, and every
+job that executes was green:
+
+| Job | Result |
+| --- | --- |
+| Documentation figures | success, 5s |
+| FreeRDP native (4 ABIs) | success, 11m39s |
+| APKs, AAB and signatures | success, 16m50s |
+| Lint (release variant) | success, 19m19s |
+| Unit and integration tests | success, 23m24s |
+| Boot the built APKs (crash-on-open gate) | success, 3m12s |
+| Long idle stress test | skipped — the dispatch did not ask for it |
+
+The eighth job of that run is the window's own closer, and it is the run's only red. It refuses when
+the repository is public and `REPO_ADMIN_TOKEN` is unset, which is the case here: the token that
+would close a window from inside a run needs rotating and was deliberately not installed as a secret.
+Its annotation says exactly that — *"This run started while the repository was public, and
+REPO_ADMIN_TOKEN is not set, so nothing here can close the window"* — and the opener's `EXIT` trap
+closed the window instead, four seconds later. A job that goes red, names its own cause, and leaves
+the repository in the state it was asked for is the outcome that design was for; the alternative it
+replaced is a green run that leaves a public repository behind and says nothing.
+
+`release.yml` came with it. Run `35699061371`, the same commit, green in twenty-four minutes on a
+runner: a complete signed release build, AAB included. §57 ended with "so is every future release
+build" unaffordable, and this is the release build that answers it — not because the account changed,
+but because the repository was public while it ran.
+
+**What has not run.** The instrumented suite. `instrumentation.yml` runs on every push and pull
+request and its `connectedAndroidTest` is a required check, but every run of it against this tree so
+far was created while the repository was private and died before its first step with §55's annotation.
+The release's own pull request is the first that starts with a window open, so its result is recorded
+there — and this file's §58, which had to verify a whole release from this host, is the measure of
+what that is worth.
+
+### Why this one can be installed over an existing app
+
+The signature is not built here. `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the
+runner before it signs, so this release carries `0c69794b…` — the identity every release through
+v1.4.0, v1.5.1 and v1.6.0 was signed with — and an install of any of them upgrades to 1.7.0 normally.
+An install of v1.5.0 still cannot, for the reason §56 gives.
+
+The two version lines in this file's header moved, `app/build.gradle.kts` moved with them
+(`versionCode 38`, `versionName "1.7.0"`), and this section is the only other change.
+`scripts/check-doc-figures.sh` counts 157 claims as of this commit, against §58's 150. Three of the
+seven came with the CI window's own documentation, which #156 merged; the other four are this
+section's, since it names the two scripts, the workflow and the build file it is about. The same
+commit also settled a debt the two hours between the merges left: §58's README figures, 1,982 JVM
+test methods in 176 files, were still standing when #155's own tests made them 2,005 in 177, so the
+documentation gate disagreed with the tree from #155's merge until the CI window's commit corrected
+it.
