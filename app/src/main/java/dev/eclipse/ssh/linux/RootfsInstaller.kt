@@ -265,63 +265,206 @@ class RootfsInstaller(
         // How much each kind of thing gave back, for the log line: which tree was holding the bytes
         // is the question a report asks, and the total alone cannot answer it.
         val freed = linkedMapOf<String, Long>()
-
-        /** Deletes [target] whole — for a cache apt owns as a unit, and for single files. */
-        fun reclaim(label: String, target: File) {
-            if (!target.exists() && !java.nio.file.Files.isSymbolicLink(target.toPath())) return
-            val bytes = sizeNoFollow(target)
-            deleteTreeNoFollow(target)
-            if (target.exists()) return
-            freed[label] = (freed[label] ?: 0L) + bytes
-        }
-
-        /** Empties [dir] of its contents, keeping the directory itself. */
-        fun empty(label: String, dir: File) {
-            if (!isRealDirectory(dir)) return
-            dir.listFiles()?.forEach { reclaim(label, it) }
-        }
-
-        /**
-         * Deletes the rotated logs directly under [dir] and under its immediate subdirectories —
-         * `/var/log/apt` is where a long install's transcripts live. Two levels, not a walk, for the
-         * reason the function's own doc gives.
-         */
-        fun reclaimRotatedLogs(dir: File) {
-            if (!isRealDirectory(dir)) return
-            val entries = dir.listFiles().orEmpty().toList()
-            val rotated = { file: File -> isRealFile(file) && isRotatedLog(file.name) }
-            entries.filter(rotated).forEach { reclaim("rotated logs", it) }
-            entries.filter { isRealDirectory(it) }
-                .flatMap { it.listFiles().orEmpty().filter(rotated).toList() }
-                .forEach { reclaim("rotated logs", it) }
-        }
-
         val startedAt = System.currentTimeMillis()
-        empty("apt package cache", File(rootfsDir, "var/cache/apt/archives"))
-        empty("apt package lists", File(rootfsDir, "var/lib/apt/lists"))
-        reclaim("apt index caches", File(rootfsDir, "var/cache/apt/pkgcache.bin"))
-        reclaim("apt index caches", File(rootfsDir, "var/cache/apt/srcpkgcache.bin"))
-        empty("temporary files", File(rootfsDir, "tmp"))
-        empty("temporary files", File(rootfsDir, "var/tmp"))
-        reclaimRotatedLogs(File(rootfsDir, "var/log"))
-        reclaim("download fragments", File(storage.downloadsDir, "${tarballFile.name}.part"))
+        reclaimAptState(freed)
+        emptyDirectory("temporary files", File(rootfsDir, "tmp"), freed)
+        emptyDirectory("temporary files", File(rootfsDir, "var/tmp"), freed)
+        reclaimRotatedLogs(File(rootfsDir, "var/log"), freed)
+        reclaim("download fragments", File(storage.downloadsDir, "${tarballFile.name}.part"), freed)
         if (rootfsInPlace()) {
             // The condition is the whole safety of this line: a parked rootfs with nothing in place
             // is the user's system, mid-swap, and not this function's to delete.
-            reclaim("a previous rootfs", File(storage.rootDir, "rootfs.old"))
+            reclaim("a previous rootfs", File(storage.rootDir, "rootfs.old"), freed)
         }
+        val total = recordReclaimed(freed, startedAt, "reclaimed space in the userspace")
+        total
+    }
 
+    /**
+     * Gives up the apt-owned trees alone — the package cache, the index lists, apt's binary index
+     * caches — and answers how many bytes that freed.
+     *
+     * The same work [reclaimSpace] does, for a different reason, and the split is deliberate: that
+     * one is the answer to a *disk* that is short, this one is the answer to a *download* that is
+     * wrong. `Hash Sum mismatch` and an index apt cannot parse are both regenerable state and
+     * nothing else — the next `apt-get update` rewrites every byte of them — so clearing them is a
+     * repair no user file pays for, and the repair ladder runs it before it spends a single byte of
+     * a metered connection on the fetch that replaces them.
+     *
+     * It is deliberately *not* part of [reclaimSpace]'s callers' disk gate: the failure it answers
+     * happens on a device with all the space in the world, which is exactly why the gate never fired
+     * for it. Nothing here descends a symlink, for the reason [reclaimSpace]'s own doc gives at
+     * length — the helper functions it shares with that one are where that rule is enforced.
+     */
+    suspend fun clearRegenerableState(): Long = withContext(Dispatchers.IO) {
+        val freed = linkedMapOf<String, Long>()
+        val startedAt = System.currentTimeMillis()
+        reclaimAptState(freed)
+        recordReclaimed(freed, startedAt, "cleared apt's regenerable state")
+    }
+
+    /**
+     * The apt-owned trees, shared by the two reclaim paths above: the package cache and the index
+     * lists are *emptied* rather than deleted — the directories are the archive's structure and apt
+     * expects them to exist, which is also why nothing here needs to know whether a rootfs is in
+     * place. The two `pkgcache.bin` files beside them are apt's own binary indexes, which it rewrites
+     * on the next run by definition.
+     */
+    private fun reclaimAptState(freed: MutableMap<String, Long>) {
+        emptyDirectory("apt package cache", File(rootfsDir, "var/cache/apt/archives"), freed)
+        emptyDirectory("apt package lists", File(rootfsDir, "var/lib/apt/lists"), freed)
+        reclaim("apt index caches", File(rootfsDir, "var/cache/apt/pkgcache.bin"), freed)
+        reclaim("apt index caches", File(rootfsDir, "var/cache/apt/srcpkgcache.bin"), freed)
+    }
+
+    /** Deletes [target] whole — for a cache apt owns as a unit, and for single files. */
+    private fun reclaim(label: String, target: File, freed: MutableMap<String, Long>) {
+        if (!target.exists() && !java.nio.file.Files.isSymbolicLink(target.toPath())) return
+        val bytes = sizeNoFollow(target)
+        deleteTreeNoFollow(target)
+        if (target.exists()) return
+        freed[label] = (freed[label] ?: 0L) + bytes
+    }
+
+    /** Empties [dir] of its contents, keeping the directory itself. */
+    private fun emptyDirectory(label: String, dir: File, freed: MutableMap<String, Long>) {
+        if (!isRealDirectory(dir)) return
+        dir.listFiles()?.forEach { reclaim(label, it, freed) }
+    }
+
+    /**
+     * Deletes the rotated logs directly under [dir] and under its immediate subdirectories —
+     * `/var/log/apt` is where a long install's transcripts live. Two levels, not a walk, for the
+     * reason [reclaimSpace]'s own doc gives.
+     */
+    private fun reclaimRotatedLogs(dir: File, freed: MutableMap<String, Long>) {
+        if (!isRealDirectory(dir)) return
+        val entries = dir.listFiles().orEmpty().toList()
+        val rotated = { file: File -> isRealFile(file) && isRotatedLog(file.name) }
+        entries.filter(rotated).forEach { reclaim("rotated logs", it, freed) }
+        entries.filter { isRealDirectory(it) }
+            .flatMap { it.listFiles().orEmpty().filter(rotated).toList() }
+            .forEach { reclaim("rotated logs", it, freed) }
+    }
+
+    /**
+     * Records what a reclaim pass took and answers the total. One line per pass, and only when
+     * something was taken: a repair that freed nothing is not an event, and the ring it would be
+     * written to is read by a person.
+     */
+    private fun recordReclaimed(freed: Map<String, Long>, startedAt: Long, event: String): Long {
         val total = freed.values.sum()
         if (total > 0L) {
             diagnostics.record(
                 UserspaceDiagnosticCategory.STORAGE,
-                "reclaimed space in the userspace",
+                event,
                 durationMs = System.currentTimeMillis() - startedAt,
                 detail = "${total / MIB}MB: " +
                     freed.entries.joinToString(", ") { "${it.key} ${it.value / MIB}MB" },
             )
         }
-        total
+        return total
+    }
+
+    /**
+     * Removes the package-manager locks an interrupted or killed run left behind, and answers which
+     * it could remove and which it could not — the two halves the caller needs to tell a cleared
+     * problem from a live one.
+     *
+     * A killed apt never deletes its own lock file: the file is not the lock (the lock is an fcntl
+     * record lock the kernel drops when the process dies), so what is left on disk is a *stale
+     * marker* that the next dpkg or apt refuses to work past — "Could not get lock ... is another
+     * process using it?" — in about a second, without contacting anything. Every step of every
+     * repair that goes through the package manager then fails identically, which is how one OOM kill
+     * during an install turns into a userspace that no rung of the ladder can touch.
+     *
+     * So the question is not "does a lock file exist" — one nearly always does after a killed run —
+     * but "is anything actually holding it", and that is asked of the kernel rather than inferred
+     * from a pid: [java.nio.channels.FileChannel.tryLock] takes the same POSIX record lock dpkg
+     * takes, so a lock it can take is a lock nothing holds. A lock it cannot take is left exactly
+     * where it is, and reported: deleting a live lock would let two package tools run at once over
+     * one database, and the rootfs under a running dpkg is the one thing in this feature that must
+     * never be touched.
+     *
+     * The invariant that makes this safe is the kernel's answer above, and it is worth stating
+     * precisely, because the tempting version of it is false. It is *not* that nothing else can be
+     * running: Repair does not close the user's terminals, and the install lock this holds serializes
+     * repairs and installs against each other rather than against a shell. What it is, instead, is
+     * that no process can be *waiting* on a lock this function unlinks — a waiter is the one thing
+     * that would make removal dangerous, because it would take the record lock on a file that no
+     * longer has a name, and two package tools would then work on one database. Neither apt nor dpkg
+     * can be that waiter: both take these locks with a non-blocking `F_SETLK` and *refuse* when they
+     * cannot have it ("Could not get lock ... is another process using it?"), which is why a package
+     * command's failure here arrives in about a second rather than after a wait. A shell genuinely
+     * running apt is therefore not a race to lose but a holder — and a lock something holds is never
+     * removed by this function, only reported.
+     *
+     * @return the lock files removed, and the ones something still holds or that could not be
+     *   examined at all. A file that cannot be opened is not evidence of staleness, so it is reported
+     *   as held rather than deleted.
+     */
+    suspend fun clearStalePackageLocks(): PackageLockSweep = withContext(Dispatchers.IO) {
+        val removed = mutableListOf<String>()
+        val held = mutableListOf<String>()
+        for (name in PACKAGE_LOCK_FILES) {
+            val lock = runCatching { resolveInside(rootfsDir, name) }.getOrNull() ?: continue
+            if (!lock.isFile) continue
+            when (lockIsFree(lock)) {
+                true -> if (lock.delete()) removed += name else held += name
+                false -> held += name
+                null -> held += name
+            }
+        }
+        if (removed.isNotEmpty() || held.isNotEmpty()) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.APT,
+                "package locks swept before the repair",
+                detail = "removed=[${removed.joinToString(", ")}] held=[${held.joinToString(", ")}]",
+            )
+        }
+        PackageLockSweep(removed = removed, held = held)
+    }
+
+    /**
+     * The package-manager locks that are present and that nothing holds — the ones [clearStalePackageLocks]
+     * would remove, answered without removing anything.
+     *
+     * For the health probe, which has to *report* rather than repair: the same proof ([lockIsFree]),
+     * the same list of files, and no write. A lock something really holds is deliberately not
+     * reported, because a package operation that is running is not a fault — the app cannot tell the
+     * user's own `apt` from its own, and a probe that called a working install broken would be worse
+     * than one that stayed quiet.
+     */
+    suspend fun stalePackageLocks(): List<String> = withContext(Dispatchers.IO) {
+        PACKAGE_LOCK_FILES.filter { name ->
+            val lock = runCatching { resolveInside(rootfsDir, name) }.getOrNull() ?: return@filter false
+            lock.isFile && lockIsFree(lock) == true
+        }
+    }
+
+    /**
+     * Whether nothing holds [lock] — true, false, or null for "could not tell".
+     *
+     * The lock is taken and released rather than merely tested, because that is the only way the
+     * question can be asked: POSIX record locks have no "is it locked" query, and a successful
+     * [java.nio.channels.FileChannel.tryLock] answers it by construction. The channel is closed on
+     * every path, so the release is the close — one syscall, and no window in which this process
+     * holds a lock it is about to delete.
+     *
+     * `OverlappingFileLockException` is "held" and not "free": the JVM raises it when *this* process
+     * already holds a lock on the file, which means a repair or an install in this process is using
+     * it — the one case where deleting would be catastrophic rather than merely wrong.
+     */
+    private fun lockIsFree(lock: File): Boolean? = runCatching {
+        java.io.RandomAccessFile(lock, "rw").use { file ->
+            file.channel.use { channel ->
+                val acquired = channel.tryLock() ?: return@runCatching false
+                acquired.release()
+                true
+            }
+        }
+    }.getOrElse { error ->
+        if (error is java.nio.channels.OverlappingFileLockException) false else null
     }
 
     /**
@@ -695,6 +838,253 @@ class RootfsInstaller(
     }
 
     /**
+     * Puts a readable package database back into the installed rootfs, and answers where it came
+     * from — or null when there was nothing to do.
+     *
+     * The deadlock this exists for: `var/lib/dpkg` is a preserved member, so no repair writes it —
+     * and every repair of anything else begins with `dpkg --configure -a`, which reads exactly that
+     * file and refuses to run when it is absent, truncated or unparseable. A userspace in that state
+     * fails every rung identically, and a ladder that cannot see why would burn a full rebuild on it.
+     *
+     * Three sources, cheapest and least destructive first:
+     *
+     *  1. the file is fine — nothing to do, and the failure being repaired is somewhere else;
+     *  2. **dpkg's own previous generation**, `status-old`, which dpkg rewrites on every successful
+     *     run. It is the file's own last-known-good state, so restoring it keeps the record of every
+     *     package the user installed;
+     *  3. **the pinned archive's copy**, the same SHA256-verified tarball the install trusts. This is
+     *     the last resort and it costs something real: the archive's database describes a system with
+     *     nothing but the base packages, so packages installed on top of it read as not installed,
+     *     while their files stay on disk — `apt-get install` puts the record back. That is still far
+     *     cheaper than the rebuild the ladder falls back to, which deletes those files too.
+     *
+     * Whatever was there is parked as `status.broken` before anything is written: it is the only
+     * remaining evidence of what the user had installed, and a repair that overwrites it has thrown
+     * that away to fix a file. `var/lib/dpkg` is written *in place* and never wholesale — this is the
+     * one deliberate exception to the preserved-member rule, it is one named file, and the reason is
+     * in the caller: without a package database there is no repair path at all, only a rebuild.
+     *
+     * "Readable" is judged by shape and never by parsing, for the reason [memberIsPresent] gives about
+     * contents: a repair that cannot start dpkg cannot ask dpkg whether its database is readable, so
+     * the question asked is the one that can be answered — non-empty, contains at least one record,
+     * and ends where a record ends.
+     *
+     * @throws UserspaceFailure.PackageDatabaseUnreadable when no source could be put back, which the
+     *   ladder reads as "the rebuild is the only answer left" rather than as a dead end
+     */
+    suspend fun restorePackageDatabase(
+        onProgress: (Progress) -> Unit = {},
+    ): PackageDatabaseSource? = withContext(Dispatchers.IO) {
+        val status = resolveInside(rootfsDir, DPKG_STATUS)
+        if (isReadablePackageDatabase(status)) return@withContext null
+        val startedAt = System.currentTimeMillis()
+        parkUnreadablePackageDatabase(status)
+
+        val previous = resolveInside(rootfsDir, DPKG_STATUS_PREVIOUS)
+        if (isReadablePackageDatabase(previous)) {
+            writePackageDatabaseFrom(previous, status)
+            if (isReadablePackageDatabase(status)) {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "restored the package database from dpkg's own previous copy",
+                    durationMs = System.currentTimeMillis() - startedAt,
+                    detail = "the unreadable file was kept as $DPKG_STATUS.broken",
+                )
+                return@withContext PackageDatabaseSource.PREVIOUS
+            }
+        }
+
+        // Last resort, and the only one that needs anything outside the rootfs: one pass over the
+        // pinned archive for the one member, exactly as the file-level restore makes one.
+        val restored = runCatching {
+            ensurePinnedArchive(onProgress)
+            var written = false
+            val warnings = mutableListOf<String>()
+            openTarStream(tarballFile, DOWNLOAD_BUFFER) {}.use { tar ->
+                while (true) {
+                    val entry = tar.nextTarEntry ?: break
+                    if (entry.name.removePrefix("./") != DPKG_STATUS) continue
+                    // Deliberately not [restoreFromPinnedTarball]: that one refuses every preserved
+                    // member, and this member is the exception its own doc describes. The traversal
+                    // guard is not bypassed with it — [resolveInside] above already ran, and the
+                    // member name is a constant, not anything the archive supplies.
+                    written = writeMember(DPKG_STATUS, status, entry, tar, warnings)
+                    break
+                }
+            }
+            written
+        }.getOrDefault(false)
+        if (restored && isReadablePackageDatabase(status)) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.APT,
+                "restored the package database from the pinned archive",
+                durationMs = System.currentTimeMillis() - startedAt,
+                detail = "base-system records only; packages installed on top of the base system are no longer tracked",
+            )
+            return@withContext PackageDatabaseSource.ARCHIVE
+        }
+        throw UserspaceFailure.PackageDatabaseUnreadable(
+            detail = "($DPKG_STATUS could not be restored from $DPKG_STATUS_PREVIOUS or from the archive)",
+        )
+    }
+
+    /**
+     * Moves an unreadable package database aside as `status.broken`, if anything is there at all.
+     * Best-effort and non-fatal: a file that cannot be moved is a file that cannot be replaced
+     * either, and the write that follows will say so with its own error rather than this one.
+     *
+     * The parked name is derived from [status]'s own name rather than from [DPKG_STATUS]: the
+     * constant is rootfs-relative and this file's parent is already the directory it resolves into,
+     * so `File(status.parentFile, "$DPKG_STATUS.broken")` names `var/lib/dpkg/var/lib/dpkg/...` — a
+     * path whose parent does not exist, whose move fails, and which the caller's diagnostics went on
+     * to describe as kept. The test that reads the parked file back is what found that.
+     */
+    private fun parkUnreadablePackageDatabase(status: File) {
+        val path = status.toPath()
+        if (!status.exists() && !java.nio.file.Files.isSymbolicLink(path)) return
+        val parked = File(status.parentFile, status.name + ".broken")
+        parked.delete()
+        runCatching { java.nio.file.Files.move(path, parked.toPath()) }
+            .onFailure {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "could not keep a copy of the unreadable package database",
+                    detail = it.message ?: it.javaClass.simpleName,
+                )
+            }
+    }
+
+    /** Replaces [status] with a copy of [source], creating the directory it lives in. */
+    private fun writePackageDatabaseFrom(source: File, status: File) {
+        status.parentFile?.mkdirs()
+        status.delete()
+        runCatching {
+            java.nio.file.Files.copy(
+                source.toPath(),
+                status.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
+        }
+    }
+
+    /**
+     * Whether [file] is shaped like a dpkg database: a real file, long enough to hold a record,
+     * carrying at least one `Package:` field, and ending on a newline — where a record ends.
+     *
+     * The newline check is the one that catches the failure this is written for: dpkg writes the
+     * database whole, so a file cut short by a full disk or a killed process stops mid-line, and a
+     * truncated database is one dpkg refuses to read while looking perfectly present to everything
+     * that only asks whether the file is there.
+     */
+    private fun isReadablePackageDatabase(file: File): Boolean {
+        if (!isRealFile(file) || file.length() < MIN_DPKG_STATUS_BYTES) return false
+        val bytes = runCatching { file.readBytes() }.getOrNull() ?: return false
+        if (bytes.isEmpty() || bytes.last() != '\n'.code.toByte()) return false
+        return bytes.decodeToString()
+            .lineSequence()
+            .take(DPKG_STATUS_SCAN_LINES)
+            .any { it.startsWith("Package: ") }
+    }
+
+    /**
+     * Makes sure the guest's own temporary directories are real directories that can be written
+     * through, and answers which it had to put right — empty when there was nothing to do.
+     *
+     * `tmp` and `run` are preserved members (see [isPreservedMember]), so no rung and no rebuild-style
+     * overlay ever writes them: a `tmp` the user deleted, replaced with a file, or left with modes
+     * nothing can write through stays exactly that way while every session and every package install
+     * that needs it fails in some other tool's words — "could not create temporary file", a shell that
+     * will not start, an apt that dies without a reason. The trees' *contents* are nobody's: temp files
+     * are regenerated by definition, and a repair that clears them is doing what a reboot does.
+     *
+     * Writability is proved rather than assumed, because the modes are not the whole question on a
+     * filesystem the app does not own exclusively: a probe file is created and removed. The modes are
+     * still set afterwards — `rwxrwxrwt`, the archive's own for these two — since a directory that
+     * works by accident is a directory the next failure will be blamed on.
+     *
+     * @throws UserspaceFailure.GuestTmpUnwritable when a directory cannot be made writable even after
+     *   being recreated, which is the caller's signal that this userspace cannot be repaired in place
+     */
+    suspend fun ensureGuestTemp(): List<String> = withContext(Dispatchers.IO) {
+        val repaired = mutableListOf<String>()
+        for (name in GUEST_TEMP_DIRS) {
+            // The unresolved path, deliberately: everything below deletes and recreates, and a name
+            // that resolves out of the rootfs is a name to act on where it stands rather than where
+            // it points. See [unusableGuestTemp] for why the link is checked before the resolution.
+            val path = File(rootfsDir, name)
+            val linked = java.nio.file.Files.isSymbolicLink(path.toPath())
+            val dir = runCatching { resolveInside(rootfsDir, name) }.getOrNull()
+            if (!linked && dir != null && isRealDirectory(dir) && isWritableDirectory(dir)) continue
+            // Recreated rather than adjusted: the archive's modes are the state to return to, and a
+            // directory that is a symlink is exactly the case where writing through would mean
+            // writing somewhere the guest never named.
+            deleteTreeNoFollow(path)
+            path.mkdirs()
+            setStickyWorldWritable(path)
+            if (!isWritableDirectory(path)) throw UserspaceFailure.GuestTmpUnwritable("/$name")
+            repaired += name
+        }
+        if (repaired.isNotEmpty()) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "recreated the guest's temporary directories",
+                detail = repaired.joinToString(", "),
+            )
+        }
+        repaired
+    }
+
+    /**
+     * The guest's temporary directories that are not usable as they stand, in [GUEST_TEMP_DIRS]
+     * order — the ones [ensureGuestTemp] would put right, answered without putting anything right.
+     *
+     * For the health probe, which reports rather than repairs, and which has to be able to say this
+     * for the same reason the rung has to be able to fix it: nothing else in the userspace notices.
+     * A shell starts, `apt-get check` passes, and the fault surfaces only when some tool needs a
+     * temporary file — in that tool's words, which name nothing about `/tmp`.
+     *
+     * The same two questions the rung asks, and the same answers: a directory that is not a real
+     * directory (missing, a file, or a link, which is not the directory the guest named), or one that
+     * cannot be written through.
+     */
+    suspend fun unusableGuestTemp(): List<String> = withContext(Dispatchers.IO) {
+        GUEST_TEMP_DIRS.filter { name ->
+            val path = File(rootfsDir, name)
+            // The link is asked about before the path is resolved, and this is the whole reason the
+            // question is asked on the host: canonicalising a directory that is a link to somewhere
+            // else makes it *escape* the rootfs, [resolveInside] refuses it, and an implementation
+            // that treated that refusal as "nothing to report" called a `run` pointing at the
+            // device's own `/data` perfectly healthy — reported, fixed and probed by nothing, while
+            // every write the guest made through it landed outside its userspace.
+            if (java.nio.file.Files.isSymbolicLink(path.toPath())) return@filter true
+            // A path that cannot be resolved inside the rootfs at all is not the directory the guest
+            // named either, so it is reported rather than skipped. Recreating is the cheap direction
+            // to be wrong in: these trees' contents are nobody's (see [ensureGuestTemp]).
+            val dir = runCatching { resolveInside(rootfsDir, name) }.getOrNull() ?: return@filter true
+            !isRealDirectory(dir) || !isWritableDirectory(dir)
+        }
+    }
+
+    /** Whether a file can be created and removed inside [dir] — the only honest test of writability. */
+    private fun isWritableDirectory(dir: File): Boolean = runCatching {
+        val probe = File(dir, WRITE_PROBE_NAME)
+        probe.delete()
+        if (!probe.createNewFile()) return@runCatching false
+        probe.delete()
+        true
+    }.getOrDefault(false)
+
+    /** The archive's own modes for `/tmp` and `/run`: world-writable, with the sticky bit. */
+    private fun setStickyWorldWritable(dir: File) {
+        runCatching {
+            java.nio.file.Files.setPosixFilePermissions(
+                dir.toPath(),
+                java.nio.file.attribute.PosixFilePermissions.fromString("rwxrwxrwt"),
+            )
+        }
+    }
+
+    /**
      * Puts named members of the pinned archive back into the installed rootfs, and answers which
      * ones it restored.
      *
@@ -1063,6 +1453,41 @@ class RootfsInstaller(
             "etc/ssh",
         )
 
+        /**
+         * The package database, and dpkg's own previous generation of it. Archive-relative, like
+         * every other path this class names, so they go through the same traversal guard.
+         */
+        private const val DPKG_STATUS = "var/lib/dpkg/status"
+        private const val DPKG_STATUS_PREVIOUS = "var/lib/dpkg/status-old"
+
+        /**
+         * The floor under a database that could still be read: the base image's own is a few hundred
+         * kilobytes, and anything under this is a file that was truncated to nothing rather than a
+         * small system.
+         */
+        private const val MIN_DPKG_STATUS_BYTES = 512L
+
+        /** How far into a database the `Package:` check looks before giving up on finding one. */
+        private const val DPKG_STATUS_SCAN_LINES = 2000
+
+        /**
+         * Every lock file dpkg and apt take: the two dpkg takes around a run, and the two the index
+         * and archive directories carry. Named explicitly rather than discovered by a walk — a walk
+         * would find a lock file inside a package's own data and delete it.
+         */
+        private val PACKAGE_LOCK_FILES = listOf(
+            "var/lib/dpkg/lock",
+            "var/lib/dpkg/lock-frontend",
+            "var/lib/apt/lists/lock",
+            "var/cache/apt/archives/lock",
+        )
+
+        /** The guest's own temporary trees, which the archive ships and no repair writes. */
+        private val GUEST_TEMP_DIRS = listOf("tmp", "run")
+
+        /** The file [isWritableDirectory] creates and removes; never left behind. */
+        private const val WRITE_PROBE_NAME = ".eclipse-write-probe"
+
         /** The tarball plus this many multiples of it: the extracted rootfs and apt's working space. */
         private const val NEEDED_TARBALL_MULTIPLE = 5L
 
@@ -1111,6 +1536,37 @@ data class RootfsIntegrity(
         return "$examined member(s) examined, ${damaged.size} missing or wrong: $named" +
             (if (rest > 0) " and $rest more" else "")
     }
+}
+
+/**
+ * What a package-lock sweep found, split by what it could prove: [removed] are the lock files
+ * nothing was holding, [held] the ones something still holds — or that could not be examined at all,
+ * which is reported as held because a file that cannot be opened is not evidence of staleness.
+ *
+ * Two lists rather than a count, because the caller says different things about them: a sweep that
+ * removed something repaired the userspace, and a sweep that found a live holder has to tell the user
+ * to wait rather than send them into a repair that will fail the same way.
+ */
+data class PackageLockSweep(
+    val removed: List<String>,
+    val held: List<String>,
+)
+
+/**
+ * Where [RootfsInstaller.restorePackageDatabase] found the package database it put back.
+ *
+ * An enum rather than the path it came from, because the two are not comparable to the user: the
+ * first costs nothing (dpkg's own previous generation, which knows every package they installed) and
+ * the second costs the record of everything installed on top of the base system. The caller has to
+ * say which happened, and a path string would have made that a comparison against a constant that
+ * leaks out of the installer's companion.
+ */
+enum class PackageDatabaseSource {
+    /** dpkg's own `status-old`: the database's last-known-good state, package records intact. */
+    PREVIOUS,
+
+    /** The pinned archive's copy: base-system records only, as [RootfsInstaller]'s doc describes. */
+    ARCHIVE,
 }
 
 /**

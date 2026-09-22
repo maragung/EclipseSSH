@@ -202,7 +202,7 @@ class UbuntuDistributionManager(
         val sources = File(rootfs, "etc/apt/sources.list")
         if (!passwd.isFile || !sources.isFile) return false
         return passwd.readLines().any { it.startsWith(PASSWD_PREFIX) } &&
-            File(rootfs, "home/ubuntu/workspace").isDirectory &&
+            File(rootfs, WORKSPACE_DIR).isDirectory &&
             sources.readText().contains(APT_MARKER)
     }
 
@@ -211,6 +211,13 @@ class UbuntuDistributionManager(
      * a terminal tab gets) actually run commands, is the session root — the one identity under
      * which `dpkg` will unpack and `su`/`sudo` can act — is DNS up, is the package database
      * consistent. The host-list card is shown only while this passes.
+     *
+     * Two of [HealthReport]'s fields are not answers from a shell at all: the guest's temporary
+     * directories and the package locks are asked of the [installer], on the host, because both are
+     * states in which the guest's own tooling reports something else entirely (see the fields' own
+     * docs). A probe built without an installer — a test that constructs this class alone — reports
+     * both as healthy, which is what "not examined" has to mean for a report whose other fields are
+     * all measured.
      */
     suspend fun healthProbe(): HealthReport {
         val shell = runSessionCommand("echo $PROBE_MARKER", PROBE_TIMEOUT_MS)
@@ -223,6 +230,14 @@ class UbuntuDistributionManager(
         // inferred, because "'rm' not found in PATH" has two causes — a short PATH and an absent
         // file — and the repair for each is different.
         val login = runSessionCommand(LOGIN_PROBE_COMMAND, PROBE_TIMEOUT_MS)
+        // The two faults no command from inside the guest would ever report as themselves, asked on
+        // the host instead: the installer owns both proofs (a probe file for writability, a kernel
+        // record lock for staleness) and neither question needs a proot child to answer. They are
+        // here because they are the two states that silently disable package management while every
+        // other field of this report passes — and because the ladder's local rung repairs exactly
+        // them, which is what makes a failed probe here mean something the user can act on.
+        val unusableTemp = installer?.unusableGuestTemp().orEmpty()
+        val staleLocks = installer?.stalePackageLocks().orEmpty()
         val loginLines = login?.outputText()?.lines()?.map { stripEscapes(it).trim() }.orEmpty()
         val account = whoami?.outputText()?.trim()
         fun marked(prefix: String): String? = loginLines
@@ -242,6 +257,8 @@ class UbuntuDistributionManager(
                 .filter { it.startsWith(PROBE_MISSING_PREFIX) }
                 .map { it.removePrefix(PROBE_MISSING_PREFIX).trim() }
                 .filter { it.isNotEmpty() },
+            unusableTempDirs = unusableTemp,
+            staleLocks = staleLocks,
         )
     }
 
@@ -338,12 +355,53 @@ class UbuntuDistributionManager(
         }
     }
 
-    private fun prepareWorkspace() {
-        // The workspace is the user's persisted project directory; its lifecycle (sizes, clearing,
-        // surviving an uninstall) is LinuxWorkspaceManager's, but its creation belongs to setup so
-        // the first shell lands in a home that already has it.
-        File(rootfs, "$HOME_DIR/workspace").mkdirs()
-        File(rootfs, "tmp").mkdirs()
+    /**
+     * The two directories setup promises exist before the first shell opens: the user's workspace,
+     * and the guest's own temporary trees.
+     *
+     * The temporary trees are the installer's job ([RootfsInstaller.ensureGuestTemp]) and are called
+     * rather than reimplemented, because the repair ladder's local rung puts the same two
+     * directories right and a second implementation here is the one that drifts. It already had: this
+     * method once created `tmp` with a bare `mkdirs` whose answer nobody read, so a `tmp` that was a
+     * *file*, or a `run` that could not be written through, let setup report success and the failure
+     * surface later in whatever tool happened to need a temporary file first — with that tool's
+     * words for it. The installer's version deletes NOFOLLOW, recreates, sets the archive's modes,
+     * and proves writability with a probe rather than assuming it. The `?:` arm is a test that built
+     * this class without an installer; production always has one.
+     *
+     * The workspace is created here because its lifecycle (sizes, clearing, surviving an uninstall)
+     * belongs to [LinuxWorkspaceManager], while its *creation* belongs to setup, so the first shell
+     * lands in a home that already has it. A symlink is not accepted as one: [LinuxWorkspaceManager.clear]
+     * deletes inside this directory, and a link would have it empty whatever it points at — possibly
+     * something outside the rootfs — so creating the link state here would be creating exactly what
+     * the repair path then has to undo.
+     *
+     * Failure is named rather than swallowed. `mkdirs` returning false used to be nothing at all: the
+     * install completed, [isConfigured] reported false from then on, and the userspace read as
+     * "the installed files are incomplete" — a sentence about the rootfs, for a home directory that
+     * was not there.
+     */
+    private suspend fun prepareWorkspace() {
+        val rootfsInstaller = installer
+        if (rootfsInstaller == null) {
+            // A class built by a test, which is the only way this can be null; production always has
+            // one, and it is the checked implementation above.
+            File(rootfs, "tmp").mkdirs()
+            File(rootfs, "run").mkdirs()
+        } else {
+            rootfsInstaller.ensureGuestTemp()
+        }
+        val workspace = File(rootfs, WORKSPACE_DIR)
+        val linked = java.nio.file.Files.isSymbolicLink(workspace.toPath())
+        if (workspace.isDirectory && !linked) return
+        deleteTreeNoFollow(workspace)
+        workspace.mkdirs()
+        if (!workspace.isDirectory) {
+            throw IOException(
+                "could not create the workspace at ${workspace.path} - Ubuntu's home directory " +
+                    "is missing or not writable",
+            )
+        }
     }
 
     private fun configureDns() {
@@ -569,6 +627,16 @@ class UbuntuDistributionManager(
         val summary =
             "every archive tried: ${failures.joinToString("; ")}$feedNote" +
                 (lastTail.takeIf { it.isNotBlank() }?.let { " - last output: $it" } ?: "")
+        // Every rung ran out of time without a word: no exit code and no output anywhere in the
+        // evidence. Nothing can be classified from that — an empty output matches no pattern in the
+        // taxonomy — and the generic sentence below is the one verdict that misleads, because
+        // "failed on every archive tried" reads as the archives' doing while the archives were never
+        // heard from. A step slower than its budget is a fact about the connection, and the one
+        // thing the user can act on, so it is named as itself. The ladder's verdict arm has a place
+        // for it (nothing about it is a rebuild's to fix), which is why the type exists at all.
+        if (evidence.isNotEmpty() && evidence.all { it.second == null && it.third.isBlank() }) {
+            throw UserspaceFailure.StepTimedOut(UPDATE_PACKAGES_STEP, detail = summary)
+        }
         // First rung whose evidence the taxonomy recognizes decides the type; the summary rides
         // along as the detail so no rung stops being named.
         throw evidence.firstNotNullOfOrNull { (uri, exitCode, output) ->
@@ -892,11 +960,17 @@ class UbuntuDistributionManager(
         val command = basePackagesCommand()
         val first = runSetupCommand(command, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         if (first != null && first.exitCode == 0) return
+        // Whether every bulk attempt so far went *unanswered*, which is a different fact from every
+        // bulk attempt failing: a null result carries no exit code and no output at all, so nothing
+        // about it can be classified, and the verdict at the bottom of this method has to be able to
+        // tell the two apart rather than reading silence as apt's refusal.
+        var bulkUnanswered = first == null
         val retry = runSetupCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
         if (retry != null && retry.exitCode == 0) {
             warnings += "base packages needed a --fix-missing retry to install"
             return
         }
+        bulkUnanswered = bulkUnanswered && retry == null
         // Both bulk attempts are down, and this is the moment to read the three things the failure
         // itself cannot report: why dpkg refused, the disk it was writing to, and the dpkg database
         // it left behind. The fallback below overwrites the last two — every apt run it starts
@@ -931,6 +1005,7 @@ class UbuntuDistributionManager(
                 warnings += "the base packages needed a dpkg repair pass to install"
                 return
             }
+            bulkUnanswered = bulkUnanswered && afterRepair == null
         }
         var installed = 0
         // The refusals, not just their count: what each one said is the evidence, and it belongs in
@@ -978,8 +1053,19 @@ class UbuntuDistributionManager(
                 exitCode = first?.exitCode ?: retry?.exitCode,
             )
             recordSigsysTail("base packages failed")
+            // Silence, all the way down: the bulk attempt, its `--fix-missing` retry, the retry after
+            // the dpkg repair pass and every one of the per-package fallbacks ran out of their budget
+            // without producing an exit code. No output means no pattern to match, so the classifier
+            // below is being asked a question it cannot answer, and the sentence it falls back to
+            // ("Installing base packages failed (exit null)") names a fact the user cannot act on.
+            // Thirty-three commands each timing out in turn is a connection slower than this step's
+            // budget, and saying so is the only honest verdict — and the only one that tells the user
+            // their packages are not the problem.
+            if (bulkUnanswered && refusals.all { it.second == null }) {
+                throw UserspaceFailure.StepTimedOut(INSTALL_BASE_PACKAGES_STEP, detail = dpkgState)
+            }
             throw UserspaceFailure.fromCommandOutput(
-                "Installing base packages",
+                INSTALL_BASE_PACKAGES_STEP,
                 first?.exitCode ?: retry?.exitCode,
                 first?.outputText() ?: retry?.outputText() ?: "",
                 dnsServers = writtenDnsServers,
@@ -1386,7 +1472,24 @@ class UbuntuDistributionManager(
          */
         private const val ROOT_ACCOUNT = "root"
         private const val HOME_DIR = "/home/ubuntu"
+        /**
+         * The user's persisted projects, inside their home, as a path *relative to the rootfs* — the
+         * form every other path in this file takes. Named once because two places ask about it for
+         * different reasons: [prepareWorkspace] creates it and [isConfigured] reads it as one of the
+         * three marks that setup finished.
+         */
+        private const val WORKSPACE_DIR = "home/ubuntu/workspace"
         private const val PASSWD_PREFIX = "ubuntu:"
+
+        /**
+         * The two step names a [UserspaceFailure.StepTimedOut] can carry, worded exactly as the
+         * other sentences about these steps word them — the generic failure below names the same
+         * "Installing base packages", and the offline gate and the diagnostics both say "updating
+         * package lists". One spelling per step, so a user comparing two reports of the same failure
+         * is not left wondering whether they are the same failure.
+         */
+        private const val UPDATE_PACKAGES_STEP = "Updating package lists"
+        private const val INSTALL_BASE_PACKAGES_STEP = "Installing base packages"
 
         /**
          * The PATH the guest is given everywhere the app can arrange it: the same value
@@ -1935,6 +2038,30 @@ data class HealthReport(
      * why [shellWorks] is checked separately rather than inferred from this.
      */
     val missingPrograms: List<String> = emptyList(),
+    /**
+     * The guest's own temporary directories that cannot be written through — a directory that is
+     * missing, is a file, is a link, or refuses a write. Empty is the healthy answer.
+     *
+     * Asked on the host rather than from inside a shell, and by writing a file and removing it
+     * rather than by reading modes: it is the same directory either way (proot does not virtualize
+     * `/tmp`), and only a real write answers the question on a filesystem this app shares with the
+     * device. It gates because every tool in the guest needs one of these two directories, and what
+     * they say when it is gone names anything but the cause — "could not create temporary file" from
+     * a compiler, a shell that will not start, an apt that dies without a word.
+     */
+    val unusableTempDirs: List<String> = emptyList(),
+    /**
+     * The package-manager lock files that are present while *nothing holds them* — what an
+     * interrupted or killed apt leaves on disk. Empty is the healthy answer.
+     *
+     * A lock something holds is deliberately not here: a package operation that is really running is
+     * not a fault, and this probe cannot tell the user's own `apt` from the app's. The stale file is
+     * the fault, and it gates because of what it does to everything after it: every dpkg and apt
+     * command refuses in about a second, without contacting anything, in a sentence about "another
+     * process" that is not true — and nothing else in the userspace is the slightest bit wrong, so
+     * no other field here will notice.
+     */
+    val staleLocks: List<String> = emptyList(),
 ) {
     /**
      * Healthy — and therefore card-worthy — only when every field passes.
@@ -1942,10 +2069,15 @@ data class HealthReport(
      * [missingPrograms] gates because it is the exact state that makes the package manager
      * unusable: `dpkg` searches `PATH` for `sh`, `rm` and `tar` before it will unpack anything, so
      * a userspace missing one of them cannot install, remove or repair a package at all. A missing
-     * program is therefore not a detail of a working install; it is the install not working.
+     * program is therefore not a detail of a working install; it is the install not working. The
+     * same holds for the two fields the ladder's local rung repairs — a temporary directory nothing
+     * can write to, and a package lock left behind by a run that was killed: both leave the
+     * userspace unable to do the one thing it exists for, and both are fixed by one Repair that
+     * downloads nothing.
      */
     val healthy: Boolean
-        get() = shellWorks && accountCorrect && networkUp && aptUsable && missingPrograms.isEmpty()
+        get() = shellWorks && accountCorrect && networkUp && aptUsable && missingPrograms.isEmpty() &&
+            unusableTempDirs.isEmpty() && staleLocks.isEmpty()
 
     /**
      * The failing fields as one sentence, for NeedsRepair's detail and the settings screen. Names
@@ -1962,6 +2094,17 @@ data class HealthReport(
                 // as a PATH problem; naming the programs says which of the two causes it actually is
                 // as soon as the PATH below is read next to it.
                 add("the package manager cannot find ${missingPrograms.joinToString(", ")}")
+            }
+            if (unusableTempDirs.isNotEmpty()) {
+                // The guest's paths, not the archive's relative names: this sentence is read by
+                // someone looking at their own terminal, where the directory is `/tmp`.
+                add("Ubuntu's temporary directories cannot be written to (${unusableTempDirs.joinToString(", ") { "/$it" }})")
+            }
+            if (staleLocks.isNotEmpty()) {
+                add(
+                    "an interrupted package operation left its lock behind (${staleLocks.joinToString(", ")}) " +
+                        "- Repair clears it",
+                )
             }
         }.joinToString(", ").ifEmpty { "healthy" }
 }

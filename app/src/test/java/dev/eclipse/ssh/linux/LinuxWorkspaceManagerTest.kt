@@ -22,7 +22,7 @@ class LinuxWorkspaceManagerTest {
 
     private class Harness {
         val rootDir: File = Files.createTempDirectory("linux-workspace").toFile().apply { deleteOnExit() }
-        val workspace = LinuxWorkspaceManager(ProotRuntime(rootDir, "/fake/native/lib", ScriptedPtySpawner()))
+        val workspace = LinuxWorkspaceManager(ProotRuntime(rootDir, fakeNativeLibraryDir(), ScriptedPtySpawner()))
         val dir: File get() = workspace.workspaceDir
 
         fun file(path: String, content: String = "x\n"): File =
@@ -90,5 +90,44 @@ class LinuxWorkspaceManagerTest {
 
         assertThat(entries).hasSize(2)
         assertThat(entries).containsExactly("loop", "work.txt")
+    }
+
+    @Test
+    fun `a workspace that is there is left alone, and one that is gone comes back`() = runTest {
+        val harness = Harness()
+        harness.file("work.txt")
+
+        // The common case costs a `stat`: the directory exists, so nothing is deleted and no file
+        // in it is touched. "Did something" is the answer, not "is it there now" - a repair that
+        // reported the second would claim a victory it had not checked.
+        assertThat(harness.workspace.ensureExists()).isFalse()
+        assertThat(harness.dir.resolve("work.txt").readText()).isEqualTo("x\n")
+
+        // What a user who deleted the folder in their own terminal left: `/home` is a preserved
+        // member, so no rung writes it back, and every session from here on opens in a home with no
+        // workspace in it.
+        deleteTreeNoFollow(harness.dir)
+
+        assertThat(harness.workspace.ensureExists()).isTrue()
+        assertThat(harness.dir.isDirectory).isTrue()
+        assertThat(harness.dir.listFiles()).isEmpty()
+    }
+
+    @Test
+    fun `a workspace that is a link is replaced by a real directory, and its target is untouched`() = runTest {
+        // The one shape where "it is a directory" is not enough: a link makes `clear()` empty
+        // whatever it points at, which may be outside the rootfs entirely. Following it here would
+        // hand the user's project tree - or their whole home - to a delete they did not ask for.
+        val harness = Harness()
+        val outside = Files.createTempDirectory("outside-the-workspace").toFile().apply { deleteOnExit() }
+        File(outside, "keep.txt").writeText("not the workspace's to delete\n")
+        Files.createDirectories(harness.dir.parentFile.toPath())
+        Files.createSymbolicLink(harness.dir.toPath(), outside.toPath())
+
+        assertThat(harness.workspace.ensureExists()).isTrue()
+
+        assertThat(Files.isSymbolicLink(harness.dir.toPath())).isFalse()
+        assertThat(harness.dir.isDirectory).isTrue()
+        assertThat(File(outside, "keep.txt").readText()).isEqualTo("not the workspace's to delete\n")
     }
 }

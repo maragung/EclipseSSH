@@ -64,6 +64,7 @@ import dev.eclipse.ssh.feature.wakeonlan.parseMac
 import dev.eclipse.ssh.linux.LocalLinuxHost
 import dev.eclipse.ssh.linux.LocalTerminalChannel
 import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.sessionEndBlamesUserspace
 import dev.eclipse.ssh.presentation.files.FilesExplorerController
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.ssh.SftpDirectoryService
@@ -2144,6 +2145,24 @@ class MainViewModel @Inject constructor(
                     idleForMs = terminal.idleForMs(),
                     upForMs = upForMs,
                 )
+                // The one ending that says something about the userspace rather than about the
+                // session: a local pty whose child exited 127 could not run the program proot was
+                // asked for, which for an interactive session means the guest's own shell is gone.
+                // Nothing else would conclude it - this ending is deliberately *not* a fault (a shell
+                // that ran and exited is finished, see [SessionEnd.isFault]), so the tab is
+                // DISCONNECTED, the userspace stays Running, and the card goes on offering a terminal
+                // that cannot open while the Repair that would fix it is never offered.
+                //
+                // On [transportScope] rather than inline, and that is the point of the scope: the
+                // verdict belongs to the userspace, not to this tab. Deciding it costs a health probe
+                // (a proot fork), and this collector can be cancelled a moment later by a reconnect
+                // or a Stop; the manager takes its own mutex and applies its own conditions before it
+                // concludes anything. See [LinuxUserspaceManager.noteSessionEnded].
+                if (LocalLinuxHost.isLocalHost(hostId) && sessionEndBlamesUserspace(end)) {
+                    linuxUserspace.graph?.manager?.let { manager ->
+                        transportScope.launch { manager.noteSessionEnded(sessionKey, end) }
+                    }
+                }
                 if (willReconnect) {
                     scheduleAutoReconnect(sessionKey, hostId, reason)
                 } else {

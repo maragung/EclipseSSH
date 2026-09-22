@@ -1,5 +1,6 @@
 package dev.eclipse.ssh.linux
 
+import dev.eclipse.ssh.ssh.SessionEnd
 import java.io.File
 import java.io.IOException
 import java.util.Properties
@@ -246,9 +247,10 @@ class LinuxUserspaceManager(
     }
 
     /**
-     * Re-runs whatever is broken, in the order of what each answer costs the user: the setup
-     * pipeline again, then the base files the archive says are missing, then the base system
-     * rewritten wholesale, and only then a full reinstall from the pin.
+     * Re-runs whatever is broken, in the order of what each answer costs the user: the local state
+     * nothing else can restore, the package database, the setup pipeline again, then the base files
+     * the archive says are missing, then the base system rewritten wholesale, and only then a full
+     * reinstall from the pin.
      *
      * Until this ladder existed, Repair had exactly one rung — re-extract if there is no rootfs,
      * otherwise set up again — and the failure it was reported against ("Installing base packages
@@ -261,20 +263,28 @@ class LinuxUserspaceManager(
      *
      * The boundary the ladder refuses to cross is a failure a rebuild cannot fix — no network, no
      * DNS, a disk with nothing left to free, a mirror that refuses or serves an unsigned index, a
-     * step that timed out, an archive that no longer matches its pin. Those stop it with a typed
-     * message ([aRebuildCouldFix]) rather than rewriting a working base system: on a metered
-     * connection, a rebuild is the one repair that makes the state worse, and it would not have
-     * worked anyway. The disk is the exception the ladder acts on before it starts: the space a
-     * userspace's own package caches hold is regenerable, so it is given up rather than reported
-     * (see the space step in [repairLadder]) and a full disk stops the ladder only when there is
-     * nothing left that can be freed without costing the user something.
+     * step that timed out, an archive that no longer matches its pin, a process the system killed, an
+     * app runtime that is not on the device. Those stop it with a typed message ([aRebuildCouldFix])
+     * rather than rewriting a working base system: on a metered connection, a rebuild is the one
+     * repair that makes the state worse, and it would not have worked anyway. The disk is the
+     * exception the ladder acts on before it starts: the space a userspace's own package caches hold
+     * is regenerable, so it is given up rather than reported (see the space step in [repairLadder])
+     * and a full disk stops the ladder only when there is nothing left that can be freed without
+     * costing the user something.
      *
-     * What no rung touches is the user's own data: `/home` (the workspace inside it), `/var/lib/dpkg`
-     * and the state trees beside it are preserved everywhere (see [RootfsInstaller.isPreservedMember]),
-     * and the one rung that does replace the rootfs — the reinstall — parks the workspace first and
-     * puts it back when it is done. A repair therefore never costs the user a package they installed
-     * or a file they wrote; the price of a success it cannot achieve more cheaply is the base
-     * system's own bytes, re-fetched from the same SHA256-verified pin the install used.
+     * What no rung touches is the user's own data — with two narrow, deliberate exceptions, both of
+     * them state the package manager itself owns and neither of them anything the user wrote. `/home`
+     * (the workspace inside it) is preserved everywhere and the one rung that replaces the rootfs —
+     * the reinstall — parks the workspace first and puts it back when it is done. `/var/lib/dpkg` and
+     * the state trees beside it are preserved too, but one *named* file inside `/var/lib/dpkg` is the
+     * exception that makes the rest of the ladder reachable at all: a package database that cannot be
+     * read is a state no rung can work in, so rung D restores that one file and parks what was there
+     * as `status.broken` (see [RootfsInstaller.restorePackageDatabase], which is also where the price
+     * of the archive's copy is stated). Apt's caches and index lists are regenerable by definition and
+     * rung L clears them; a workspace the user deleted is recreated empty, and told about. A repair
+     * therefore never costs the user a package they installed or a file they wrote; the price of a
+     * success it cannot achieve more cheaply is the base system's own bytes, re-fetched from the same
+     * SHA256-verified pin the install used.
      *
      * @throws UserspaceFailure when the failure is one a rebuild cannot fix, unchanged, so the
      *   controller renders its own sentence rather than this layer's prose
@@ -387,11 +397,148 @@ class LinuxUserspaceManager(
                 ?: throw repairFailed(attempted, lastFailure)
         }
 
-        return rung("setup", { setUpAgain(warnings) })
+        // Rungs L and D — the two repairs that are entirely local. They sit above the setup rung
+        // because the failures they answer make every rung below fail identically and instantly: a
+        // package lock nothing holds makes every dpkg and apt call refuse in a second ("Could not get
+        // lock ... is another process using it?"), and an unreadable package database makes them
+        // refuse before they read anything else — so the old ladder spent all four of its rungs on
+        // the same refusal, and the reinstall it ended with did not touch either one. Neither rung
+        // downloads anything it does not have to, which matters here more than anywhere else on the
+        // ladder: a repair that reads the network before it has looked at the rootfs spends a metered
+        // connection on a run that cannot get past its own first command.
+        return rung("restore local state", { restoreLocalState(warnings) })
+            ?: rung("restore the package database", { restorePackageDatabase(warnings) })
+            ?: rung("setup", { setUpAgain(warnings) })
             ?: rung("restore missing files", { restoreDamaged(warnings) })
             ?: rung("rewrite the base system", { overlayBase(warnings) })
             ?: rung("reinstall", { reinstall(warnings) })
             ?: throw repairFailed(attempted, lastFailure)
+    }
+
+    /**
+     * Rung L — the repairs that need nothing but the rootfs: the package locks an interrupted run
+     * left behind, the apt-owned state the next update rebuilds, and the guest directories that
+     * nothing else puts back.
+     *
+     * Each part answers a failure the ladder could otherwise not see. The locks are a *marker* a
+     * killed dpkg leaves on disk while the kernel has already dropped the lock itself, so every
+     * package step of every rung refuses in a second and the user is told the same thing four times
+     * (see [RootfsInstaller.clearStalePackageLocks], which proves nothing holds a lock before
+     * removing it rather than deleting a file that happens to be named `lock`). The apt state is
+     * what `Hash Sum mismatch` and an unparseable index live in, and it is *only* ever cleared by
+     * rung S — which runs on a disk gate, so on a device with space to spare a corrupt index was
+     * unfixable by anything short of the rebuild (see [RootfsInstaller.clearRegenerableState]). The
+     * guest's `tmp` and `run` are preserved members that no rung writes and no archive overlay
+     * replaces, and the setup rung's own attempt to create them — `prepareWorkspace`, which runs on
+     * every rung below this one — throws its result away, so a `tmp` that is a *file* and a
+     * workspace that is not a real directory both survived every repair there was, silently.
+     *
+     * Unconditional rather than gated on the failure that brought the user here, which is a
+     * deliberate trade and not an oversight: the ladder has no structured record of that failure
+     * (the state carries a sentence, and a sentence is not something to branch on), and every part
+     * here is cheap, local, and costs the user nothing — apt's caches are its own bytes, locks that
+     * something holds are left alone, and the directories are recreated only when they are missing
+     * or wrong. The one real cost is a re-download of the package index: a few megabytes against
+     * the base system's thirty, on a repair the user asked for, and only when the index was not
+     * already cleared by rung S in this same pass.
+     *
+     * Returns null when it found nothing to do, which is the honest answer for a userspace whose
+     * damage is elsewhere — the setup rung below is the one that says so, and running it twice would
+     * only double the network's share of a repair.
+     */
+    private suspend fun restoreLocalState(warnings: MutableList<String>): SetupReport? {
+        var changed = false
+
+        val sweep = installer.clearStalePackageLocks()
+        if (sweep.removed.isNotEmpty()) {
+            changed = true
+            warnings += "cleared ${sweep.removed.size} package-manager lock(s) an interrupted run " +
+                "left behind: ${sweep.removed.joinToString(", ")}"
+        }
+        if (sweep.held.isNotEmpty()) {
+            // Not this rung's failure and not hidden either: something really is holding these, and
+            // the package steps below will refuse in dpkg's own words rather than this one's.
+            diagnostics.record(
+                UserspaceDiagnosticCategory.APT,
+                "package locks are still held; the package steps below will refuse",
+                detail = sweep.held.joinToString(", "),
+            )
+        }
+
+        val freed = installer.clearRegenerableState()
+        if (freed > 0L) {
+            changed = true
+            warnings += "cleared ${freed / (1024 * 1024)} MB of apt's own caches and package lists, " +
+                "which its next update rebuilds"
+        }
+
+        val temp = installer.ensureGuestTemp()
+        if (temp.isNotEmpty()) {
+            changed = true
+            warnings += "recreated the guest's temporary directories: " +
+                temp.joinToString(", ") { "/$it" }
+        }
+
+        if (workspace.ensureExists()) {
+            changed = true
+            // Two sentences, because these are two different pieces of news and only one of them is
+            // about the user's files. A workspace that is simply gone took their projects with it —
+            // the snapshot that survives an uninstall is not involved, since nothing here deletes a
+            // rootfs — while one that was a link or a file was never a workspace at all.
+            if (workspace.exists()) {
+                warnings += "the workspace in your home was missing or was not a real directory; an " +
+                    "empty one was created in its place"
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.ROOTFS,
+                    "the workspace was missing from /home/ubuntu and was recreated empty",
+                    detail = "projects that were in it are not recoverable from the rootfs",
+                )
+            } else {
+                warnings += "the workspace in your home is missing and could not be created"
+            }
+        }
+
+        if (!changed) return null
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "local state restored; setting the userspace up again",
+            detail = "the rootfs itself was not written",
+        )
+        return setUpAgain(warnings)
+    }
+
+    /**
+     * Rung D — the package database, the one file no other rung may touch and every rung needs.
+     *
+     * `var/lib/dpkg` is a preserved member, so nothing writes it: not the setup rung, not the
+     * file-level restore, not the overlay — and not the reinstall either, because a rebuild replaces
+     * the base system but the preserved trees are the user's. That is the deadlock this rung exists
+     * for: every repair of anything else begins with `dpkg --configure -a`, which reads
+     * `/var/lib/dpkg/status` first, so a database that is truncated or unparseable fails every rung
+     * in the same second and the ladder ends by rebuilding a rootfs whose only broken part was one
+     * file. [RootfsInstaller.restorePackageDatabase] is where the three sources and their prices are
+     * described; what belongs here is what the rung does with the answer.
+     *
+     * Returns null when the database read as a database, which is the common case and means this
+     * rung has no opinion about the failure being repaired.
+     */
+    private suspend fun restorePackageDatabase(warnings: MutableList<String>): SetupReport? {
+        val source = installer.restorePackageDatabase(onProgress = ::emitArchiveProgress) ?: return null
+        warnings += when (source) {
+            // dpkg's own previous generation: the same database one write ago, so every package the
+            // user installed is still recorded and nothing has to be reinstalled.
+            PackageDatabaseSource.PREVIOUS ->
+                "the package database could not be read and was restored from dpkg's own previous " +
+                    "copy; the unreadable file was kept as /var/lib/dpkg/status.broken"
+            // The archive's copy: honest about the one thing it costs, because the user is the only
+            // one who can put it back.
+            PackageDatabaseSource.ARCHIVE ->
+                "the package database could not be read and was rebuilt from the Ubuntu archive, so " +
+                    "packages installed on top of the base system are no longer tracked as " +
+                    "installed; their files are still on disk and reinstalling them with apt puts " +
+                    "the record back"
+        }
+        return setUpAgain(warnings)
     }
 
     /**
@@ -514,18 +661,24 @@ class LinuxUserspaceManager(
      *
      * The failures this refuses are the ones the *environment* owns: no network, no DNS, a full disk,
      * a mirror that refuses or serves an index whose signature does not verify, a step that ran out
-     * of time, an archive that no longer matches its pin. A deeper rung cannot touch any of them —
-     * they all read the same network and the same disk — and the deepest one would rewrite a working
-     * base system to no purpose, which on a metered connection or a nearly-full device leaves the
-     * user worse off than the failure did. Everything else, including every failure whose evidence
-     * is inside the rootfs (a missing program, a broken package database, proot's own exit 127),
-     * passes: those are what the ladder is for.
+     * of time, a clock that disagrees with the archive's timestamps, an archive that no longer matches
+     * its pin, a process the system killed, an app runtime that is not there. A deeper rung cannot
+     * touch any of them — they all read the same network, the same disk and the same device — and the
+     * deepest one would rewrite a working base system to no purpose, which on a metered connection or
+     * a nearly-full device leaves the user worse off than the failure did. Everything else, including
+     * every failure whose evidence is inside the rootfs (a missing program, a broken package database,
+     * proot's own exit 127, a lock an interrupted run left behind), passes: those are what the ladder
+     * is for.
      *
      * The message prefixes are the same contracts the taxonomy reads ([RUNTIME_STORAGE_PREFIX],
      * [DISK_FULL_PREFIX]), checked along the cause chain as well as at the top, because a failure
      * that has been wrapped is still the failure.
+     *
+     * Internal rather than private so the gate can be tested as the table it is — one test per
+     * failure type against its verdict — instead of only through a ladder that has to reach the type
+     * by making something fail for real.
      */
-    private fun aRebuildCouldFix(failure: Throwable): Boolean {
+    internal fun aRebuildCouldFix(failure: Throwable): Boolean {
         var seen: Throwable? = failure
         var depth = 0
         while (seen != null && depth++ < MAX_CAUSE_DEPTH) {
@@ -542,10 +695,31 @@ class LinuxUserspaceManager(
             is UserspaceFailure.RepositoryUnsigned,
             is UserspaceFailure.DiskFull,
             is UserspaceFailure.StepTimedOut,
+            // The device's clock, which nothing inside the rootfs can move: apt's index reads as
+            // expired (or as not valid yet) because the phone's date is wrong, and the deepest rung
+            // would spend thirty megabytes and a base-system rewrite to reach the same sentence.
+            is UserspaceFailure.ClockSkew,
+            // The device, not the userspace: a kill by the system's low-memory killer or a crash is
+            // an answer about the phone's memory or about a binary that segfaulted, and the deepest
+            // rung is 30 MB of download and extraction that ends the same way. 137 in particular is
+            // the one failure where a rebuild leaves the user worse off — the memory it needs is the
+            // memory that was already gone.
+            is UserspaceFailure.KilledBySignal,
+            // The app's own runtime is what is missing (a wrong-ABI split, a half-updated app), so no
+            // amount of writing the rootfs supplies it. See [ProotRuntime]'s loader check.
+            is UserspaceFailure.NativeRuntimeMissing,
+            // A device that cannot fork another pty: the rebuild forks them too.
+            is UserspaceFailure.TooManyTerminals,
             -> false
             // ProotLaunchFailed and PackageDbBroken are inside the rootfs' side of the line:
             // exit 127 is a program that is not there, and a broken package database is what
-            // `dpkg --configure -a` exists for. Both are what the deeper rungs repair.
+            // `dpkg --configure -a` exists for. Both are what the deeper rungs repair. So are the
+            // rungs' own new types — a held package lock (rung L clears it), a hash-mismatched
+            // index (rung L clears the state it lives in), a database that could not be restored in
+            // place (rung D's own last resort is the rebuild, and the archive's copy of the database
+            // is no worse than the archive's copy of everything else), a dpkg subprocess that
+            // failed, and a guest temp directory: the rebuild re-extracts the whole tree, and that
+            // is what puts all five back.
             else -> true
         }
     }
@@ -633,6 +807,61 @@ class LinuxUserspaceManager(
             _state.value = LinuxUserspaceState.NeedsRepair(health.describe())
         }
         health
+    }
+
+    /**
+     * A local terminal session ended with the guest's own shell missing, which the manager has to be
+     * told because nothing else would conclude it: a shell that exits is not a fault as far as the tab
+     * is concerned ([SessionEnd.isFault]), so the ending lands as DISCONNECTED, the userspace stays
+     * Running, and the host card goes on offering a terminal that cannot open while the Repair that
+     * would fix it is never offered at all. That is the failure this closes: exit 127 from a pty the
+     * app forked means proot ran and the program it was asked for was not in the rootfs, and no
+     * ending an SSH session can produce means that about *this* userspace.
+     *
+     * Three conditions, and they are the same three the class's own reasoning about a Running
+     * userspace implies (see [refreshHealth], which deliberately leaves a running environment alone):
+     * the ending has to blame the userspace ([sessionEndBlamesUserspace]), no other local session may
+     * still be live — a sibling terminal that is still typing is proof the environment works, whatever
+     * this one exit says — and the health probe has to disagree too. Only when all three hold does the
+     * state become NeedsRepair, and the probe is what keeps a user who typed a command that does not
+     * exist, or `exit 127` by hand, from being told their environment is broken: it passes, and the
+     * userspace stays exactly as it was.
+     *
+     * The probe runs here rather than being left to Repair's first rung, because by then the user has
+     * pressed a button and the answer is already needed: a card that offers Repair for a healthy
+     * userspace is its own kind of lie.
+     */
+    suspend fun noteSessionEnded(sessionKey: String, end: SessionEnd) = transition.withLock {
+        if (!sessionEndBlamesUserspace(end)) return@withLock
+        val current = _state.value
+        if (current !is LinuxUserspaceState.Running && current !is LinuxUserspaceState.Starting) {
+            return@withLock
+        }
+        val live = processes.liveCountExcept(sessionKey)
+        if (live > 0) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "a terminal session ended with exit 127, but $live other session(s) are still open",
+                detail = "the environment is in use, so the ending was not treated as its verdict",
+            )
+            return@withLock
+        }
+        val health = distribution.healthProbe()
+        _lastHealth.value = health
+        if (health.healthy) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "a terminal session ended with exit 127; the environment still passes its health check",
+                detail = health.describe(),
+            )
+            return@withLock
+        }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "a terminal session ended with exit 127 and the health check now fails",
+            detail = health.describe(),
+        )
+        _state.value = LinuxUserspaceState.NeedsRepair(health.describe())
     }
 
     // ------------------------------------------------------------------ internals
@@ -811,6 +1040,47 @@ class LinuxUserspaceManager(
         return report
     }
 }
+
+/**
+ * Whether a session ending is evidence about the *userspace* rather than about the session.
+ *
+ * Exactly one ending is, and it is not the one an eye would pick: not a fault ([SessionEnd.isFault]),
+ * which is a tab's distinction and puts a killed shell in the same bucket as a broken one, but exit
+ * 127 with no signal — the status a proot child leaves when the program it was asked to run is not in
+ * the rootfs. A missing `bash`, a missing `sh`, a startup program `dpkg` needs that is not there: that
+ * is exactly the damage the repair ladder's deeper rungs exist for, and it is invisible to every other
+ * part of the app — the shell "ran and exited", so the tab says DISCONNECTED, and nothing reports the
+ * environment as broken while every new terminal fails the same way.
+ *
+ * The endings deliberately *not* included, and why the line is drawn here rather than at "any fault":
+ *
+ *  - a signal death — 137 (the low-memory killer) above all — is the device's answer, not the
+ *    rootfs's. Treating it as evidence would send the user to Repair over a userspace that is
+ *    intact, and the probe that adjudicates forks another proot into the same shortage of memory.
+ *  - an ordinary exit (`exit`, `exit 1`, a shell script that finished) is a session doing what it was
+ *    asked, and `exit 127` typed by hand is indistinguishable from the damage by the status alone:
+ *    the health probe is what tells them apart, and this predicate is only the first of the three
+ *    conditions [LinuxUserspaceManager.noteSessionEnded] requires before it concludes anything.
+ *  - every other [SessionEnd] is about a transport, and a local pty has none.
+ *
+ * A top-level function rather than a method because both sides need it and neither owns the other:
+ * MainViewModel decides whether a session ending is worth reporting, and the manager decides what to
+ * do about it, and a rule that lived in one of them would be re-derived — or drift — in the other.
+ */
+internal fun sessionEndBlamesUserspace(end: SessionEnd): Boolean = when (end) {
+    is SessionEnd.ShellEnded -> end.signal == null && end.status == GUEST_SHELL_MISSING
+    else -> false
+}
+
+/**
+ * Exit 127, the status of a child whose program could not be executed.
+ *
+ * Named rather than repeated, because it means two different things in this feature and only one of
+ * them is this: `ProotLaunchFailed` carries it as "the launcher could not start" for a non-interactive
+ * command, and here it is the interactive ending that says the same thing about a pty — proot ran,
+ * and the program it was told to run was not there.
+ */
+internal const val GUEST_SHELL_MISSING = 127
 
 /**
  * The userspace's lifecycle states. Every state is observable by the UI; the card shows only for

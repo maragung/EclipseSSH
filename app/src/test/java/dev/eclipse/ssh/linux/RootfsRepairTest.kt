@@ -4,10 +4,7 @@ import com.google.common.truth.Truth.assertThat
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
-import java.util.zip.GZIPOutputStream
 import kotlinx.coroutines.runBlocking
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry
-import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
 import org.junit.Test
 
 /**
@@ -20,11 +17,11 @@ import org.junit.Test
  * repairs that need the archive's bytes have to fetch it again from the pin. The download counter in
  * [Installed] is what says whether they did.
  *
- * The fixture is the stock [TestTarballs] rootfs re-written with the trees a real Ubuntu Base image
- * ships and no repair may write (`/home`, `/var/lib/dpkg`, `/etc/ssh`, `/root`). That is not
- * decoration: "the archive carries this member and the scan still calls the rootfs whole" is the only
- * shape in which the preservation rule can be tested at all, because a name the archive never
- * mentions is a name the scan never looks at.
+ * The fixture is [TestTarballs.writeRepairFixture]: the stock rootfs re-written with the trees a real
+ * Ubuntu Base image ships and no repair may write (`/home`, `/var/lib/dpkg`, `/etc/ssh`, `/root`).
+ * That is not decoration: "the archive carries this member and the scan still calls the rootfs whole"
+ * is the only shape in which the preservation rule can be tested at all, because a name the archive
+ * never mentions is a name the scan never looks at.
  */
 class RootfsRepairTest {
 
@@ -375,46 +372,9 @@ class RootfsRepairTest {
          * is also what makes the pin in each test's distro the same pin.
          */
         private val FIXTURE: File by lazy {
-            writeFixtureWithPreservedMembers(
+            TestTarballs.writeRepairFixture(
                 Files.createTempDirectory("linux-repair-fixture").toFile().resolve("rootfs.tar.gz"),
             )
-        }
-
-        /**
-         * [TestTarballs.writeRootfsFixture]'s entries, copied through one by one into a new tarball,
-         * with the preserved trees appended after them.
-         *
-         * Re-writing the fixture rather than hand-building a second one keeps these tests on the same
-         * base tree as the installer's own: a change there reaches here, instead of the two drifting
-         * until a repair test passes against a rootfs no install produces.
-         */
-        private fun writeFixtureWithPreservedMembers(target: File): File {
-            val base = TestTarballs.writeRootfsFixture(target.parentFile!!.resolve("base.tar.gz"))
-            target.parentFile?.mkdirs()
-            GZIPOutputStream(target.outputStream().buffered()).use { gzip ->
-                TarArchiveOutputStream(gzip).use { out ->
-                    openTarStream(base, 64 * 1024).use { source ->
-                        while (true) {
-                            val entry = source.nextTarEntry ?: break
-                            out.putArchiveEntry(entry)
-                            // Exactly the entry's own bytes: the writer refuses to close an entry whose
-                            // size does not match what was written under it.
-                            if (entry.isFile) source.copyTo(out)
-                            out.closeArchiveEntry()
-                        }
-                    }
-                    putDirectory(out, "home")
-                    putDirectory(out, "home/ubuntu")
-                    putFile(out, "home/ubuntu/notes.txt", "my notes\n")
-                    putDirectory(out, "root")
-                    putFile(out, "root/.bashrc", "alias ll='ls -l'\n")
-                    putDirectory(out, "var/lib/dpkg")
-                    putFile(out, "var/lib/dpkg/status", "Package: base-files\n")
-                    putDirectory(out, "etc/ssh")
-                    putFile(out, "etc/ssh/sshd_config", "Port 22\n")
-                }
-            }
-            return target
         }
 
         /** Every member name the archive carries, as the installer spells them: archive-relative, no
@@ -428,23 +388,6 @@ class RootfsRepairTest {
                 }
             }
             return names
-        }
-
-        private fun putDirectory(tar: TarArchiveOutputStream, name: String) {
-            val entry = TarArchiveEntry("$name/")
-            entry.mode = 0b111_101_101
-            tar.putArchiveEntry(entry)
-            tar.closeArchiveEntry()
-        }
-
-        private fun putFile(tar: TarArchiveOutputStream, name: String, content: String, mode: Int = 0b110_100_100) {
-            val bytes = content.toByteArray()
-            val entry = TarArchiveEntry(name)
-            entry.size = bytes.size.toLong()
-            entry.mode = mode
-            tar.putArchiveEntry(entry)
-            tar.write(bytes)
-            tar.closeArchiveEntry()
         }
     }
 }

@@ -18,6 +18,7 @@ import dev.eclipse.ssh.linux.ScriptedPtySpawner
 import dev.eclipse.ssh.linux.TestTarballs
 import dev.eclipse.ssh.linux.UbuntuDistributionManager
 import dev.eclipse.ssh.linux.UserspaceDiagnostics
+import dev.eclipse.ssh.linux.fakeNativeLibraryDir
 import java.io.File
 import java.nio.file.Files
 import kotlinx.coroutines.Dispatchers
@@ -56,7 +57,7 @@ class LinuxUserspaceControllerTest {
     private class Harness(distro: LinuxDistro) {
         val rootDir: File = Files.createTempDirectory("linux-controller").toFile().apply { deleteOnExit() }
         val spawner = ScriptedPtySpawner()
-        val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
+        val runtime = ProotRuntime(rootDir, fakeNativeLibraryDir(), spawner)
         // One ring for both halves of the install, exactly as the DI graph wires it: a log that
         // held only the apt phase would answer half the questions a failed install raises.
         private val diagnostics = UserspaceDiagnostics()

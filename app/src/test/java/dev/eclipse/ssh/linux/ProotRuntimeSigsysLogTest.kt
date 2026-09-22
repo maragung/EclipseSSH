@@ -17,7 +17,7 @@ import org.junit.Test
 class ProotRuntimeSigsysLogTest {
 
     private fun runtime(root: File): ProotRuntime =
-        ProotRuntime(root, "/fake/native/lib", ScriptedPtySpawner())
+        ProotRuntime(root, fakeNativeLibraryDir(), ScriptedPtySpawner())
 
     private fun root(): File =
         Files.createTempDirectory("proot-sigsys").toFile().apply { deleteOnExit() }

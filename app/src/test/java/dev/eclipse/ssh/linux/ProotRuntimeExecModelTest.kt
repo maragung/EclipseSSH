@@ -32,7 +32,7 @@ class ProotRuntimeExecModelTest {
     private fun root(): File =
         Files.createTempDirectory("proot-exec-model").toFile().apply { deleteOnExit() }
 
-    private fun runtime(): ProotRuntime = ProotRuntime(root(), "/fake/native/lib", spawner)
+    private fun runtime(): ProotRuntime = ProotRuntime(root(), fakeNativeLibraryDir(), spawner)
 
     /**
      * An interactive session — the argv the terminal tab actually forks — is fake root.
@@ -52,7 +52,7 @@ class ProotRuntimeExecModelTest {
         // shell. A `-0` that drifted after `/bin/bash` would be passed to bash instead.
         assertThat(argv.indexOf("-0")).isLessThan(argv.indexOf("-b"))
         assertThat(argv).containsExactly(
-            "/fake/native/lib/libproot.so",
+            "${fakeNativeLibraryDir()}/libproot.so",
             "--rootfs=${runtime.rootfsDir.absolutePath}",
             "-0",
             "-b", "/dev",
@@ -101,5 +101,36 @@ class ProotRuntimeExecModelTest {
         assertThat(runtime.homePath).isEqualTo("/home/ubuntu")
         assertThat(runtime.workspacePath).isEqualTo("/home/ubuntu/workspace")
         assertThat(spawner.spawns.single().envp).contains("HOME=/home/ubuntu")
+    }
+
+    /**
+     * An app whose own runtime is not installed properly refuses before it forks, and says which
+     * file is missing.
+     *
+     * What this replaces: an exec of a file that is not there fails *inside* the child, so the pty
+     * comes up, the shell reports 126/127, and every rung of the ladder reads a shell's exit code
+     * instead of the fact that this installation is half missing — the whole userspace is then
+     * rebuilt, three times, over an APK split for the wrong ABI. The check is here rather than in
+     * each caller because a session, a setup step and a health probe all fork through this.
+     */
+    @Test
+    fun `a session refuses to fork when the app's own runtime is not installed`() {
+        val empty = Files.createTempDirectory("no-native-runtime").toFile().apply { deleteOnExit() }
+        val runtime = ProotRuntime(root(), empty.path, spawner)
+
+        // Both files, in the order they are exec'd — a wrong-ABI split extracts neither, and a
+        // half-finished update can leave one without an exec bit, which is why executability is
+        // asked of both rather than existence alone.
+        assertThat(runtime.missingNativeComponents())
+            .containsExactly("${empty.path}/libproot.so", "${empty.path}/libproot-loader.so")
+            .inOrder()
+
+        val failure = runCatching { runtime.spawnSession(rows = 24, columns = 80) }.exceptionOrNull()
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.NativeRuntimeMissing::class.java)
+        assertThat(failure!!.message).contains("libproot.so")
+        // Nothing was forked: the failure is this app's installation, and it is caught before a
+        // child exists to report it as anything else.
+        assertThat(spawner.spawns).isEmpty()
     }
 }

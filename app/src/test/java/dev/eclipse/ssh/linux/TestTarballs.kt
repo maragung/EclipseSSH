@@ -94,6 +94,70 @@ internal object TestTarballs {
         return target
     }
 
+    /**
+     * The rootfs fixture plus the trees a real Ubuntu Base image ships and no repair may write:
+     * the user's own `/home` and `/root`, the package database under `/var/lib/dpkg`, and the SSH
+     * host keys under `/etc/ssh`.
+     *
+     * Built by copying [writeRootfsFixture]'s entries through one by one rather than by hand-building
+     * a second rootfs, so the repair suites stay on the same base tree as the installer's own: a
+     * change there reaches them, instead of the two drifting until a repair test passes against a
+     * rootfs no install produces.
+     *
+     * @param dpkgStatus what the archive's `var/lib/dpkg/status` holds, or null to ship no such
+     *   member. The two are different tests — a database the repair rung has to take from the archive,
+     *   and an archive that cannot supply one at all — and this is the switch between them.
+     */
+    fun writeRepairFixture(target: File, dpkgStatus: String? = dpkgStatusText()): File {
+        val base = writeRootfsFixture(target.parentFile!!.resolve("base.tar.gz"))
+        target.parentFile?.mkdirs()
+        GZIPOutputStream(target.outputStream().buffered()).use { gzip ->
+            TarArchiveOutputStream(gzip).use { out ->
+                openTarStream(base, 64 * 1024).use { source ->
+                    while (true) {
+                        val entry = source.nextTarEntry ?: break
+                        out.putArchiveEntry(entry)
+                        // Exactly the entry's own bytes: the writer refuses to close an entry whose
+                        // size does not match what was written under it.
+                        if (entry.isFile) source.copyTo(out)
+                        out.closeArchiveEntry()
+                    }
+                }
+                putDirectory(out, "home")
+                putDirectory(out, "home/ubuntu")
+                putFile(out, "home/ubuntu/notes.txt", "my notes\n".toByteArray())
+                putDirectory(out, "root")
+                putFile(out, "root/.bashrc", "alias ll='ls -l'\n".toByteArray())
+                putDirectory(out, "var/lib/dpkg")
+                if (dpkgStatus != null) putFile(out, "var/lib/dpkg/status", dpkgStatus.toByteArray())
+                putDirectory(out, "etc/ssh")
+                putFile(out, "etc/ssh/sshd_config", "Port 22\n".toByteArray())
+            }
+        }
+        return target
+    }
+
+    /**
+     * A `status` file with the shape the installer's reader demands of one: records, past its
+     * 512-byte floor, ending where a record ends. A test that needs a *readable* database should not
+     * have to know what that floor is — or to discover, as one 21-byte fixture did, that a file dpkg
+     * would accept is one this reader calls truncated.
+     *
+     * The padding is the description field's own continuation lines rather than filler bytes outside
+     * a field: a file whose records do not parse is the opposite of what this is for.
+     */
+    fun dpkgStatusText(vararg packages: String): String = buildString {
+        for (name in packages.ifEmpty { arrayOf("base-files") }) {
+            append("Package: $name\n")
+            append("Status: install ok installed\n")
+            append("Priority: required\n")
+            append("Architecture: arm64\n")
+            append("Version: 12ubuntu4\n")
+            append("Description: fixture package $name\n")
+            append(" " + "a continuation line long enough to carry the file past the reader's floor. ".repeat(8) + "\n")
+        }
+    }
+
     fun sha256(file: File): String =
         MessageDigest.getInstance("SHA-256").let { digest ->
             file.inputStream().use { input ->
