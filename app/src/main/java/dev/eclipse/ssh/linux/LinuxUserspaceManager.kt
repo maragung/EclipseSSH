@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.linux
 
 import java.io.File
+import java.io.IOException
 import java.util.Properties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,6 +58,14 @@ class LinuxUserspaceManager(
      * tests that isolate each harness's backup from its neighbours in a shared temp directory.
      */
     private val backupFile: File = backupFile ?: storage.workspaceBackupFile
+
+    /**
+     * The repair ladder's window into the install log — the ring the user reads, shared with every
+     * other phase of the userspace (see `LinuxUserspaceGraphProvider`, which hands one instance to
+     * the installer and the distribution). A repair that escalates through four rungs is exactly the
+     * run whose log has to say which rung did the work, and it says it here.
+     */
+    private val diagnostics: UserspaceDiagnostics get() = distribution.diagnostics
 
     private val _state = MutableStateFlow<LinuxUserspaceState>(initialState())
     val state: StateFlow<LinuxUserspaceState> = _state
@@ -237,8 +246,39 @@ class LinuxUserspaceManager(
     }
 
     /**
-     * Re-runs whatever is broken: a missing rootfs is re-downloaded and extracted, the setup
-     * pipeline runs again over whatever is there, and the health check has the final word.
+     * Re-runs whatever is broken, in the order of what each answer costs the user: the setup
+     * pipeline again, then the base files the archive says are missing, then the base system
+     * rewritten wholesale, and only then a full reinstall from the pin.
+     *
+     * Until this ladder existed, Repair had exactly one rung — re-extract if there is no rootfs,
+     * otherwise set up again — and the failure it was reported against ("Installing base packages
+     * failed (exit 100): dpkg: error: 1 expected program not found in PATH or not executable") was
+     * one it could not climb: the rootfs was present, complete enough to pass an existence check and
+     * missing the programs dpkg runs, so every rung of the apt pipeline failed the same way and the
+     * app answered the only failure it exists to clear. A rootfs that is *there* and wrong is the
+     * case the deeper rungs are for, and the deepest of them cannot fail for want of a file: it
+     * writes the pinned archive's own base system over whatever is on disk.
+     *
+     * The boundary the ladder refuses to cross is a failure a rebuild cannot fix — no network, no
+     * DNS, a disk with nothing left to free, a mirror that refuses or serves an unsigned index, a
+     * step that timed out, an archive that no longer matches its pin. Those stop it with a typed
+     * message ([aRebuildCouldFix]) rather than rewriting a working base system: on a metered
+     * connection, a rebuild is the one repair that makes the state worse, and it would not have
+     * worked anyway. The disk is the exception the ladder acts on before it starts: the space a
+     * userspace's own package caches hold is regenerable, so it is given up rather than reported
+     * (see the space step in [repairLadder]) and a full disk stops the ladder only when there is
+     * nothing left that can be freed without costing the user something.
+     *
+     * What no rung touches is the user's own data: `/home` (the workspace inside it), `/var/lib/dpkg`
+     * and the state trees beside it are preserved everywhere (see [RootfsInstaller.isPreservedMember]),
+     * and the one rung that does replace the rootfs — the reinstall — parks the workspace first and
+     * puts it back when it is done. A repair therefore never costs the user a package they installed
+     * or a file they wrote; the price of a success it cannot achieve more cheaply is the base
+     * system's own bytes, re-fetched from the same SHA256-verified pin the install used.
+     *
+     * @throws UserspaceFailure when the failure is one a rebuild cannot fix, unchanged, so the
+     *   controller renders its own sentence rather than this layer's prose
+     * @throws IOException when every rung ran and none of them worked, naming the last failure
      */
     suspend fun repair(): SetupReport = transition.withLock {
         storage.requireReady()
@@ -249,30 +289,11 @@ class LinuxUserspaceManager(
         storage.acquireInstallLock(distro.id, "repair")
         try {
             writeInstallingMarker("repair")
-            // Same rule as install(): a re-extraction deletes the old rootfs — and the workspace
-            // inside it — so the workspace is parked where the restore below picks it back up.
-            if (!installer.isExtracted() && workspace.exists() && workspace.fileCount() > 0) {
-                workspace.snapshotTo(backupFile)
-            }
             try {
-                val plan = installPlan()
-                var extractionWarnings: List<String> = emptyList()
-                if (!installer.isExtracted()) {
-                    storage.updateInstallLockPhase("download")
-                    installer.install(
-                        onProgress = { progress ->
-                            _state.value = LinuxUserspaceState.Installing(progress.toInstallStep(), plan)
-                        },
-                        onExtractionWarnings = { extractionWarnings = it },
-                    )
-                }
-                // Same belt as install(): a repair whose re-extraction still left nothing must fail
-                // as a repair, not as setup's missing-file error.
-                check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
-                storage.updateInstallLockPhase("setup")
-                val report = setUpAndVerify(plan, "Ubuntu was repaired but still fails its health check")
+                val warnings = mutableListOf<String>()
+                val report = repairLadder(warnings)
                 writeInstalledState()
-                val warnings = (extractionWarnings + report.warnings).toMutableList()
+                warnings += report.warnings
                 if (backupFile.isFile) {
                     val restored = runCatching { workspace.restoreFrom(backupFile) }.isSuccess
                     if (restored) {
@@ -292,6 +313,274 @@ class LinuxUserspaceManager(
         } finally {
             storage.releaseInstallLock()
         }
+    }
+
+    /**
+     * The rungs, cheapest first, each collected into [warnings] as it goes. Returns the report of
+     * the first rung that ended with a healthy userspace, and throws when the ladder runs out.
+     *
+     * @param warnings the caller's list: warnings from a rung that failed are kept, because the
+     *   extraction that skipped a hardlink is still a fact about the rootfs even when the rung built
+     *   on top of it was superseded by a deeper one
+     */
+    private suspend fun repairLadder(warnings: MutableList<String>): SetupReport {
+        var lastFailure: Throwable? = null
+        val attempted = mutableListOf<String>()
+
+        /**
+         * One rung. A rung that succeeds returns its report; one that has nothing to do returns
+         * null, as does one that fails for a reason a deeper rung could still fix — the difference
+         * the user sees is only that the ladder keeps going. A failure no rebuild could fix is
+         * thrown straight out, which is what stops the ladder before it does harm.
+         */
+        suspend fun rung(label: String, action: suspend () -> SetupReport?): SetupReport? {
+            attempted += label
+            return try {
+                action()
+            } catch (t: Throwable) {
+                lastFailure = t
+                if (!aRebuildCouldFix(t)) throw t
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.ROOTFS,
+                    "repair step left the userspace broken: $label",
+                    detail = t.message ?: t.javaClass.simpleName,
+                )
+                null
+            }
+        }
+
+        // Rung 0 — a crashed extraction: a whole rootfs with a staging tree left beside it.
+        // isExtracted() is false only because of the leftover, and every rung below checks it, so
+        // the leftover is cleared before the ladder starts rather than mistaken for a missing
+        // install. Nothing is deleted but the staging tree a failed run already abandoned.
+        if (!installer.isExtracted() && installer.rootfsInPlace()) {
+            installer.reclaimFailedExtraction()
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "reclaimed an interrupted extraction",
+                detail = "the rootfs was in place; the staging tree beside it was not",
+            )
+        }
+
+        // Rung S — the disk, before any rung that could need it. The space the deeper rungs work in
+        // is the one thing about the environment a repair *can* change: the userspace's own apt
+        // caches run to hundreds of megabytes after a package or two, and every byte of them is
+        // rebuilt by the next `apt-get update`. So they are given up whenever the space is short —
+        // and whenever the platform will not say how much there is, because a repair that cannot
+        // prove there is room makes room rather than finding out partway through an extraction.
+        // Nothing here can fail the ladder: it takes only what is regenerable, and takes it
+        // best-effort (see [RootfsInstaller.reclaimSpace]).
+        val free = storage.freeBytes()
+        if (free <= 0L || free < installer.requiredFreeBytes) {
+            val reclaimed = installer.reclaimSpace()
+            if (reclaimed > 0L) {
+                warnings += "freed ${reclaimed / (1024 * 1024)} MB of package caches and temporary " +
+                    "files to make room for the repair"
+            }
+        }
+
+        // Rung A — no rootfs at all. There is nothing to repair, only something to build, and the
+        // ladder's later rungs all read the archive: going straight to the install is both the
+        // cheapest answer here and the only one that can work.
+        if (!installer.rootfsInPlace()) {
+            return rung("reinstall", { reinstall(warnings) })
+                ?: throw repairFailed(attempted, lastFailure)
+        }
+
+        return rung("setup", { setUpAgain(warnings) })
+            ?: rung("restore missing files", { restoreDamaged(warnings) })
+            ?: rung("rewrite the base system", { overlayBase(warnings) })
+            ?: rung("reinstall", { reinstall(warnings) })
+            ?: throw repairFailed(attempted, lastFailure)
+    }
+
+    /**
+     * The rung that costs nothing but time: the setup pipeline again over a rootfs that is there.
+     * Most repairs end here — a mirror that was down, a dpkg run that was interrupted, a package
+     * half-configured — and it is the only rung the ladder used to have.
+     */
+    private suspend fun setUpAgain(warnings: MutableList<String>): SetupReport {
+        storage.updateInstallLockPhase("setup")
+        return setUpAndVerify(InstallPlan.SETUP_ONLY, HEALTH_FAILURE).also { warnings += it.warnings }
+    }
+
+    /**
+     * The rung for a rootfs that is missing base files: the archive is compared with what is on
+     * disk, the absent members are written back from it, and the setup pipeline runs over the
+     * result.
+     *
+     * This is the rung the reported dpkg failure needs — `rm`, `tar` and `ldconfig` missing from the
+     * rootfs are exactly members of the archive that are not on disk — and it is the cheapest way to
+     * put a handful of binaries back, because it writes only those. Nothing else on disk is touched:
+     * not the user's packages, not their files, and not a base file that happens to have been
+     * upgraded rather than lost.
+     *
+     * Returns null when the scan found nothing missing, which is the honest answer for a rootfs
+     * whose damage is not an absent file — the scan asks presence and kind, never bytes, so a
+     * replaced library reads as whole and the rung has nothing to say about it. The overlay below
+     * does not care what the scan thinks and rewrites the base system regardless.
+     */
+    private suspend fun restoreDamaged(warnings: MutableList<String>): SetupReport? {
+        val integrity = installer.inspectAgainstPinnedArchive(onProgress = ::emitArchiveProgress)
+        if (integrity.whole) return null
+        val restored = installer.restoreFromPinnedTarball(integrity.damaged, onProgress = ::emitArchiveProgress)
+        if (restored.isEmpty()) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "nothing could be restored from the archive",
+                detail = integrity.describe(),
+            )
+            return null
+        }
+        warnings += "restored ${restored.size} missing file(s) from the Ubuntu archive: " +
+            restored.take(4).joinToString(", ") +
+            (if (restored.size > 4) " and ${restored.size - 4} more" else "")
+        return setUpAgain(warnings)
+    }
+
+    /**
+     * The rung for a base system that is present but wrong — a library replaced by something that
+     * does not load, a binary that is there and not executable, damage no file-level restore can
+     * name. Every member the archive carries is written over what the rootfs holds at that name,
+     * with the preserved trees left alone (see [RootfsInstaller.isPreservedMember]), so packages the
+     * user installed stay installed and tracked while the base system becomes the base system again.
+     *
+     * Returns null only when the archive named nothing to write, which no real archive does: a
+     * non-null result of this rung means the rewrite happened, whether or not the setup after it
+     * worked.
+     */
+    private suspend fun overlayBase(warnings: MutableList<String>): SetupReport? {
+        val members = installer.overlayFromPinnedArchive(
+            onProgress = ::emitArchiveProgress,
+            onWarning = { warnings += it },
+        )
+        if (members == 0) return null
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "base system rewritten, then set up again",
+            detail = "$members member(s)",
+        )
+        return setUpAgain(warnings)
+    }
+
+    /**
+     * The last rung: the rootfs is thrown away and built again from the pinned archive, which is the
+     * one repair that cannot fail for want of a file in the rootfs — whatever was wrong with the old
+     * one, the new one is not it.
+     *
+     * It is last because it is the only rung that costs the user something: their installed packages
+     * are gone with the base system they were installed into. Their *files* are not — the workspace
+     * is parked before the rootfs is replaced and restored by [repair] when the run finishes, and a
+     * snapshot that fails aborts the rung rather than proceeding without it.
+     */
+    private suspend fun reinstall(warnings: MutableList<String>): SetupReport {
+        parkWorkspaceForRebuild()
+        storage.updateInstallLockPhase("download")
+        installer.install(
+            onProgress = { progress ->
+                _state.value = LinuxUserspaceState.Installing(progress.toInstallStep(), InstallPlan.FULL)
+            },
+            onExtractionWarnings = { warnings += it },
+        )
+        // The same belt as install(): an extraction that produced nothing must fail here, as a
+        // repair the UI can name, rather than deep inside setup as a missing-file error.
+        check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "rootfs rebuilt from the pinned archive",
+            detail = "packages installed on top of the old base system are gone with it",
+        )
+        return setUpAgain(warnings)
+    }
+
+    /** Reports the archive scans to the install screen as if they were an extraction, which they are. */
+    private fun emitArchiveProgress(progress: RootfsInstaller.Progress) {
+        _state.value = LinuxUserspaceState.Installing(progress.toInstallStep(), InstallPlan.SETUP_ONLY)
+    }
+
+    /**
+     * Parks the workspace where a rebuild's restore picks it back up. A snapshot failure propagates:
+     * the rung that calls this is about to delete the rootfs the workspace lives in, and losing the
+     * user's projects to an IO hiccup is the one outcome worth failing a repair over.
+     */
+    private suspend fun parkWorkspaceForRebuild() {
+        if (!workspace.exists() || workspace.fileCount() <= 0) return
+        workspace.snapshotTo(backupFile)
+    }
+
+    /**
+     * Whether a rebuild could plausibly fix [failure] — the gate between "this rootfs is broken" and
+     * "this rootfs cannot be repaired right now".
+     *
+     * The failures this refuses are the ones the *environment* owns: no network, no DNS, a full disk,
+     * a mirror that refuses or serves an index whose signature does not verify, a step that ran out
+     * of time, an archive that no longer matches its pin. A deeper rung cannot touch any of them —
+     * they all read the same network and the same disk — and the deepest one would rewrite a working
+     * base system to no purpose, which on a metered connection or a nearly-full device leaves the
+     * user worse off than the failure did. Everything else, including every failure whose evidence
+     * is inside the rootfs (a missing program, a broken package database, proot's own exit 127),
+     * passes: those are what the ladder is for.
+     *
+     * The message prefixes are the same contracts the taxonomy reads ([RUNTIME_STORAGE_PREFIX],
+     * [DISK_FULL_PREFIX]), checked along the cause chain as well as at the top, because a failure
+     * that has been wrapped is still the failure.
+     */
+    private fun aRebuildCouldFix(failure: Throwable): Boolean {
+        var seen: Throwable? = failure
+        var depth = 0
+        while (seen != null && depth++ < MAX_CAUSE_DEPTH) {
+            if (seen is PinnedArchiveUnavailable) return false
+            val message = seen.message ?: ""
+            if (message.startsWith(RUNTIME_STORAGE_PREFIX) || message.startsWith(DISK_FULL_PREFIX)) return false
+            seen = seen.cause
+        }
+        if (failure !is UserspaceFailure) return true
+        return when (failure) {
+            is UserspaceFailure.Offline,
+            is UserspaceFailure.DnsUnresolved,
+            is UserspaceFailure.MirrorUnreachable,
+            is UserspaceFailure.RepositoryUnsigned,
+            is UserspaceFailure.DiskFull,
+            is UserspaceFailure.StepTimedOut,
+            -> false
+            // ProotLaunchFailed and PackageDbBroken are inside the rootfs' side of the line:
+            // exit 127 is a program that is not there, and a broken package database is what
+            // `dpkg --configure -a` exists for. Both are what the deeper rungs repair.
+            else -> true
+        }
+    }
+
+    /**
+     * What the user is told when every rung ran and the userspace is still broken. The last failure
+     * is the one worth naming — the rungs above it were superseded by a deeper one, and the deepest
+     * is the one that had the whole archive to work from.
+     *
+     * A typed failure stays typed: the controller renders its own sentence for those, and rewording
+     * it here would fork one explanation into two.
+     */
+    private fun repairFailed(attempted: List<String>, failure: Throwable?): Throwable {
+        failure?.let { UserspaceFailure.fromMessage(it.message ?: "", it) }?.let { return it }
+        return IOException(
+            "Ubuntu could not be repaired: ${failure?.message ?: "every repair step failed"}" +
+                " (tried: ${attempted.joinToString(", ")})",
+            failure,
+        )
+    }
+
+    private companion object {
+        /**
+         * The sentence a rung that ends with an unhealthy userspace is reported with. The probe's own
+         * [HealthReport.describe] completes it, and it names the repair rather than the rung, because
+         * which rung ran is the log's business and the user's business is only that it did not work.
+         */
+        const val HEALTH_FAILURE = "Ubuntu was repaired but still fails its health check"
+
+        /**
+         * How far down a cause chain [aRebuildCouldFix] looks before giving up. Three is deeper than
+         * this code wraps — a typed failure wraps the IOException it classified, and nothing wraps
+         * that — and a bound is what keeps a self-referential cause from spinning the check.
+         */
+        const val MAX_CAUSE_DEPTH = 4
     }
 
     /**

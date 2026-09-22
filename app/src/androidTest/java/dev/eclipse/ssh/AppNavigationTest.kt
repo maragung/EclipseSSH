@@ -50,7 +50,7 @@ class AppNavigationTest {
 
     /**
      * A Settings section, scrolled into view first: the shell hosts every destination in a
-     * `verticalScroll` Column, so all five sections compose but only the first screenful is on
+     * `verticalScroll` Column, so every section composes but only the first screenful is on
      * screen. Asserting display without scrolling asserts the device's height, not the app.
      */
     private fun assertSettingsSection(title: String) {
@@ -91,6 +91,7 @@ class AppNavigationTest {
         compose.onNodeWithText("deploy.sh").assertExists()
 
         tab("Settings").performClick()
+        assertSettingsSection("Linux userspace")
         assertSettingsSection("Security")
         assertSettingsSection("Workspace")
         assertSettingsSection("Port forwarding")

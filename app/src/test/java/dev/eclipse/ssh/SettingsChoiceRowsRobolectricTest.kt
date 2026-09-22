@@ -197,7 +197,7 @@ class SettingsChoiceRowsRobolectricTest {
     }
 
     /**
-     * Reconnect delay opens its own window. It lives in Background processing, four sections down a
+     * Reconnect delay opens its own window. It lives in Background processing, five sections down a
      * list that opens at the top, so this is the furthest of the six from where Settings starts — the
      * case [tapRowButton] scrolls for.
      */

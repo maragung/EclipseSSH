@@ -19,9 +19,11 @@ the app's sandbox, with no VM, no root and no ISO.
 5. [ABI support](#abi-support)
 6. [The filesystem contract](#the-filesystem-contract)
    - [Browsing it from Files](#browsing-it-from-files)
-7. [Lifecycle](#lifecycle)
-8. [Security](#security)
-9. [Troubleshooting](#troubleshooting)
+7. [Backing it up and restoring it](#backing-it-up-and-restoring-it)
+8. [Lifecycle](#lifecycle)
+   - [What Repair tries](#what-repair-tries)
+9. [Security](#security)
+10. [Troubleshooting](#troubleshooting)
 
 ## Architecture
 
@@ -232,6 +234,7 @@ filesDir/linux/
 ├── rootfs/            the extracted Ubuntu (deleted on uninstall)
 │   └── home/ubuntu/workspace/   ← the persisted workspace
 ├── rootfs.staging/    where a tarball is unpacked before it is validated and moved into place
+├── rootfs.import/     where an imported archive is unpacked before it is validated and swapped in
 ├── downloads/         the tarballs, before verification
 ├── tmp/               PROOT_TMP_DIR (proot's own scratch)
 ├── install.lock       the cross-process install lock
@@ -257,7 +260,10 @@ permission bit to be set for anyone, because the only process that ever opens th
 ### Browsing it from Files
 
 The tree is also a Files-tab session of its own — the third backend beside SFTP and SAF, offered as an
-**Ubuntu on this device** chip whenever a rootfs is installed. What it shows is guest paths, not the
+**Ubuntu on this device** chip while the userspace is *running*. An installed rootfs that is stopped
+does not earn one: a chip is not a fact about a directory, it is an entry in a list of places the app
+can take you, and every other entry in that list is a machine that is up. The chip appears when the
+userspace starts and goes when it stops, without a relaunch. What it shows is guest paths, not the
 sandbox's: `/home/ubuntu/workspace/main.kt`, never `filesDir/linux/rootfs/home/ubuntu/…`.
 
 That mapping is where the care is, because a rootfs is not a tree the host's own path semantics can
@@ -271,6 +277,103 @@ binds the host's over them and the Files tab has "This device" for the real ones
 guard, since one mapping decides both. The editor's `onlyIfUnmodifiedSince` check applies here as it
 does on SFTP: a file the guest changed underneath the editor is a question for the user, not a silent
 overwrite.
+
+## Backing it up and restoring it
+
+A userspace is a directory, so it can be copied out whole and put back later. **Export** on the
+Ubuntu on this device screen writes one to a `.tar.gz` document the user picks; **Import** reads one
+back in place of what is installed. What that buys is the case an install cannot cover — a phone
+about to be replaced, a userspace broken past what Repair fixes, an experiment worth keeping before
+it is tried, the same carefully built environment on a second device — each of which would otherwise
+mean a fresh download and a fresh `apt-get install`.
+
+The bytes are `app/src/main/java/dev/eclipse/ssh/linux/RootfsArchive.kt` and the ordering is
+`app/src/main/java/dev/eclipse/ssh/linux/RootfsTransfer.kt`. The split is deliberate: the first
+holds every property that makes an untrusted archive safe and has no Android type in it, which is
+what lets those properties be tested on trees and streams, and the second is the only one that knows
+what a lock and a state machine are.
+
+### What an export contains
+
+The guest filesystem *as the guest sees it* — the tree the Files tab browses, and nothing the host
+lends it:
+
+- the base rootfs and everything `apt` has added since, with the modes and symlinks they have. A
+  usrmerged Ubuntu Base is half symlinks, and a `bin/sh` restored as a copy of `bin/bash` is a shell
+  `apt` will never upgrade again;
+- the workspace under `/home/ubuntu`. The user's own files are what a backup is *for*, and the
+  Import row says so in as many words;
+- `/dev`, `/proc` and `/sys` as **empty directories** — the same three names, and the same reason,
+  as the Files tab's own rule: what a rootfs holds there are mount-point stubs that proot binds the
+  device's own over, and archiving one phone's stubs into a file that claims to be somebody's
+  userspace is exactly the mixture a restore must not produce;
+- no `PROOT_TMP_DIR`, which is outside the rootfs by construction.
+
+Hard links are written as duplicates. The cost is real and the trade is the right one: the rootfs
+ships a few, a `node_modules`-shaped tree ships many, and a link that came back as a plain file is
+invisible until something writes through one name and expects the other to change — a class of bug
+no error message can explain to the user who finds it.
+
+Both directions stream; a userspace is 90–250 MB and neither end holds it in memory. Progress
+(bytes, entries, percentage) is a row under the buttons, and **Cancel** stops it. An abandoned
+export leaves the half-written document *deleted* rather than on disk, because a file no extractor
+will open is worse than no file at all.
+
+### What an import does, in order
+
+An imported archive is **untrusted input**: it may be the backup the user made, and it may be a file
+from anywhere. So it goes through the same guards the pinned tarball does — the path-traversal and
+link guards in `app/src/main/java/dev/eclipse/ssh/linux/TarSafety.kt`, and the same expansion budget
+of ten times the archive's own size (a fixed ceiling when the picker will not report one) — plus one
+check the pinned tarball does not need: the tree must carry one of the three names that make a
+tarball a Linux system rather than a directory of files — a shell, `dpkg`, `apt-get`. A tarball of
+photographs unpacks perfectly and is refused here, before anything is swapped, rather than five
+minutes later as `apt` failing in a rootfs with no shell.
+
+Then the order, which is the whole of the promise the confirmation dialog makes:
+
+1. whatever is running is stopped: the tree about to be replaced is the one its sessions run on;
+2. the archive is unpacked into `rootfs.import/`, a staging directory of its own — deliberately not
+   the installer's `rootfs.staging/`, because *that* directory is what `RootfsInstaller.isExtracted()`
+   reads, so an import through it would make the installed userspace report itself as not extracted
+   for the length of the import, and a concurrent install would clear the tree out from under it;
+3. the staged tree is checked for being a usable userspace of **this** device's release, so an
+   archive of another Ubuntu series is refused before anything is swapped rather than becoming an
+   install that cannot work and cannot say why;
+4. only then is the installed rootfs renamed aside and the staged tree renamed into its place,
+   parking the old one first and putting it back if the rename fails — the installer's own
+   move-into-place ordering, mirrored rather than reused, because that method is private and its
+   staging directory is not this one;
+5. the setup pipeline runs over the result: `install()` when nothing was installed, `repair()` when
+   something was. Neither downloads a byte (the tree is already extracted) and both end in the
+   health probe, so an imported userspace counts as installed only once it has been shown to work.
+
+So an import that fails — a traversing entry, a tarball that is not a userspace, one that expands
+past the budget, a document the user cancelled — leaves the installed userspace byte-for-byte as it
+was, and a failure *after* step 4 leaves a userspace that is installed but not yet healthy, which is
+what NeedsRepair names and Repair fixes.
+
+That last point is what a cancellation is arranged around. It is answered *before* the swap, where
+nothing has been replaced, and refused after it, where the tree on disk is already the archive's and
+the only honest ending is the pipeline running to completion; a cancel that arrives too late to
+matter is reported as the import it turned out to be rather than as a failed one.
+
+An archive carries the **exporting** device's app uid in `/etc/passwd`, its resolvers and its apt
+mirror, and none of those belong on this one — step 5 is what rewrites all three, which is why an
+import is not a file copy. It also discards any workspace snapshot a keep-workspace uninstall left
+parked for the next install: the archive's workspace is the newer intent by definition, since the
+user asked for it by importing it.
+
+### One operation at a time
+
+Both directions take `install.lock` for their whole length — the same lock an install and a repair
+take — so a transfer and an install can never be in flight together. That is not decoration: a
+repair rewriting the tree while an export reads it would produce an archive of a state nobody was
+ever in, and an import landing under a running install is a race no one wins.
+
+A transfer does *not* get the foreground service, and that is the one gap worth knowing: the service
+is derived from the states that hold a process, and a copy is not one. What an app killed mid-way
+leaves behind is in the Troubleshooting table below.
 
 ## Lifecycle
 
@@ -310,6 +413,34 @@ Crash recovery is the constructor: the persisted `state.properties` is re-checke
 files actually on disk, and a disagreement yields NeedsRepair rather than a state the UI would
 render as healthy. A stale "installed" flag can never present as a working install.
 
+### What Repair tries
+
+Repair is a ladder, cheapest rung first, and it stops at the first one that ends with a healthy
+userspace. The state it was reported against — a rootfs that is *there* and wrong, so every rung of
+the old two-step repair (`apt-get update`, `dpkg --configure -a && apt-get -f install`) failed with
+the same `1 expected program not found in PATH or not executable` — is exactly the case the lower
+rungs exist for.
+
+| Rung | What it does | What it costs |
+|---|---|---|
+| Reclaim the staging tree | A crash mid-extraction leaves a whole rootfs *and* `rootfs.staging` beside it; `isExtracted()` is false because of the leftover alone, so the leftover goes before anything reads the install as missing | Nothing: the tree is what the failed run already abandoned |
+| Free space | Empties apt's package cache, its lists, the binary index caches, `/tmp` and `/var/tmp`, rotated logs, a download fragment, and a `rootfs.old` parked by a crashed swap — and only when a rootfs is in place. Runs whenever the free space is short or unknown | Nothing the user owns: every byte is one apt regenerates |
+| Set up again | The setup pipeline again: `apt-get update`, the dpkg prologue (which restores any of dpkg's own programs that are really gone, out of the pinned archive), the base packages | Time, and one archive fetch if the prologue needs it |
+| Restore what the archive says is missing | One pass over the pinned tarball comparing presence, kind and the executable bit against the rootfs, then the absent members written back | One archive fetch (~30 MB, from the pin) |
+| Rewrite the base system | Every member the pinned archive carries, written over whatever the rootfs holds at that name — the repair for damage no file-level scan can name (a library replaced by something that does not load) | The base system's own bytes; installed packages stay installed |
+| Reinstall | The rootfs is thrown away and built from the pin again | The base system *and* the packages installed on top of it |
+
+Nothing in the ladder writes `/home` (the workspace inside it), `/var/lib/dpkg` and the state trees
+beside it, and the last rung parks the workspace before it replaces the rootfs and restores it
+afterwards — so no rung costs the user a file they wrote or a package they installed, except the
+reinstall, which costs the packages.
+
+The ladder refuses a failure a rebuild cannot fix, and hands it back unchanged rather than rewriting
+a working base system over it: no network, no DNS, an archive that no longer matches its pin, a
+mirror that refuses or serves an unsigned index, a step that timed out, and a disk with nothing left
+to free. On a metered connection a rebuild is the one repair that leaves the user worse off, and it
+would not have worked anyway.
+
 ## Security
 
 - **No root, anywhere.** The app never elevates: it holds no Android privilege it did not already
@@ -321,12 +452,15 @@ render as healthy. A stale "installed" flag can never present as a working insta
   before extraction; the proot/talloc sources are pinned tarballs with SHA256s in
   `linux/build.gradle.kts`; every package the install adds comes from the distribution's own
   archive, through apt.
-- **No escape from filesDir.** Every archive the app extracts — the rootfs and its own workspace
-  snapshots — goes through the same path-traversal guard. The rootfs never writes outside
-  `filesDir/linux`. proot does bind the host's `/dev`, `/proc` and `/sys` into the guest, so that
-  `ps` reports something and device nodes resolve — but those are the host's directories shared in
-  rather than private copies, and the argument vector asks for no read-only form of the bind:
-  `ProotRuntime.commandArgv` passes a plain `-b /dev`, `-b /proc`, `-b /sys`.
+- **No escape from filesDir.** Every archive the app extracts — the rootfs, its own workspace
+  snapshots, and an imported userspace backup the user picked from anywhere — goes through the same
+  path-traversal guard, the same expansion budget and the same "is this actually a userspace" check.
+  A backup is untrusted input by definition: that it was exported by this app is a fact about a
+  filename, not about the bytes. The rootfs never writes outside `filesDir/linux`. proot does bind
+  the host's `/dev`, `/proc` and `/sys` into the guest, so that `ps` reports something and device
+  nodes resolve — but those are the host's directories shared in rather than private copies, and the
+  argument vector asks for no read-only form of the bind: `ProotRuntime.commandArgv` passes a plain
+  `-b /dev`, `-b /proc`, `-b /sys`.
 - **No secrets in source.** No credentials, keys or tokens are needed by any of this — the
   environment is entered by process identity, the downloads are public.
 - **Sandboxed by construction.** The userspace runs under the app's Android uid: it has the app's
@@ -340,10 +474,13 @@ render as healthy. A stale "installed" flag can never present as a working insta
 | Card never appears | Health probe failing — the probe's field-by-field report is the Health check row of the Ubuntu on this device window (Settings → Ubuntu on this device → Verify) | Repair |
 | "proot: cannot execute" at shell start | `nativeLibraryDir` mismatch after an app update changed the ABI | Restart the app: the directory is read once, when the userspace graph is built, so a Stop and Start inside the same process reads the same stale path. Reinstall if it persists |
 | `apt-get` fails with hash/404 errors | Stale archive pin or interrupted update | Repair (re-runs `apt-get update`); check DNS in the probe report |
-| `dpkg: warning: 'rm' not found in PATH or not executable`, then `E: Sub-process /usr/bin/dpkg returned an error code (2)` | Two causes that read identically: the rootfs is genuinely missing one of dpkg's programs (`rm`, `tar`, `sh`), or the guest's own `sudo`, `su -` or login shell rebuilt a short `PATH` from files the app was not writing — `dpkg` is named as the broken sub-process either way | Verify first, and it says which: `missingPrograms` lists every program `command -v` cannot find and `loginPath` is the PATH a login shell actually ended up with. Repair restores anything that is really gone from the pinned, SHA-256-verified tarball *before* it asks dpkg anything, since dpkg cannot answer when dpkg is the broken thing, and re-writes all four PATH files (`/etc/environment`, `/etc/profile.d/00-eclipse-path.sh`, `login.defs`, the sudoers drop-in) |
+| `dpkg: warning: 'rm' not found in PATH or not executable`, then `E: Sub-process /usr/bin/dpkg returned an error code (2)` | Two causes that read identically: the rootfs is genuinely missing one of dpkg's programs (`rm`, `tar`, `sh`), or the guest's own `sudo`, `su -` or login shell rebuilt a short `PATH` from files the app was not writing — `dpkg` is named as the broken sub-process either way | Verify first, and it says which: `missingPrograms` lists every program `command -v` cannot find and `loginPath` is the PATH a login shell actually ended up with. Repair restores anything that is really gone from the pinned, SHA-256-verified tarball *before* it asks dpkg anything, since dpkg cannot answer when dpkg is the broken thing, and re-writes all four PATH files (`/etc/environment`, `/etc/profile.d/00-eclipse-path.sh`, `login.defs`, the sudoers drop-in). A rootfs whose damage is not an absent file — a library replaced by something that does not load — is what the ladder's last two rungs are for (see [What Repair tries](#what-repair-tries)) |
 | `whoami` is not `root` (a number, or `ubuntu`) | `/etc/passwd`'s root entry lost, or the shell did not get proot's `-0` — without it `apt install` and `su` cannot work | Repair |
 | DNS does not resolve | Network changed since setup wrote `resolv.conf` | Repair rewrites it; the wiring layer passes the live resolvers |
 | `groups: cannot find name for group ID 3003` (or 9997, 20504, 50504) | The names for the app's own Android groups are missing from the rootfs's `/etc/group` — an install made before the app wrote them | Nothing to repair: starting the userspace rewrites the file, so opening the terminal once after the update clears it. The IDs are the app's real groups (`inet`, `everybody`, and the cache and shared groups derived from its app id); `id` and `ls -l` print them by number until then |
 | Download dies mid-install | Network drop; the verified-tarball resume only covers completed downloads | Retry install; nothing half-extracted is left behind |
+| Install or Repair fails on space | The tarball plus the extracted rootfs plus apt's caches exceed what the volume has | Repair reclaims apt's caches, its lists, the temporary directories and the rotated logs before it does anything else, and reports how much it freed. Uninstalling with "delete the workspace" is the other half: the rootfs is the large item |
+| Repair ran and the terminal still fails | The failure is environmental — no network, no DNS, a mirror refusing, an archive that no longer matches its pin, a step timing out, a disk with nothing left to free | Repair says so instead of rebuilding: it hands back the numbered failure the taxonomy names (see [What Repair tries](#what-repair-tries)), and the install log records which rung ran and what each one answered |
 | Sessions die when app is backgrounded | The foreground service was stopped by the user or the system | Settings → Ubuntu on this device → Start; sessions cannot be revived (their ptys died) but the workspace is untouched |
 | Huge `filesDir` after many installs | A kept backup plus a new rootfs | Settings shows storage used; uninstall deletes the rootfs, keep-workspace keeps only the snapshot |
+| Export or Import stops with no result after the app is closed | Transfers are not covered by the foreground service — a copy holds no process, so a process death takes it with it | Nothing installed was lost. An interrupted export is a truncated document to delete (the app deletes its own if it was still running); an interrupted import leaves a `rootfs.import/` staging tree, which the next import deletes before it starts. Start the transfer again |

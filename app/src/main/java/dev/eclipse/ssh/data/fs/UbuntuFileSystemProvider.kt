@@ -73,11 +73,16 @@ class UbuntuFileSystemProvider @Inject constructor(
     override val supportsPermissions: Boolean = true
 
     /**
-     * Whether there is a rootfs to browse at all, for the session list to decide on a chip.
+     * Whether there is a rootfs to browse at all — a fact about the disk, not about the machine.
      *
-     * Cheap and synchronous on purpose: it is asked while building a list, and the answer is a
-     * directory test in the app's own sandbox. Deliberately *not* a suspend function, so a caller
-     * cannot accidentally turn the chip into a wait — the list is rebuilt on every Files resume.
+     * Cheap and synchronous on purpose: the answer is a directory test in the app's own sandbox.
+     * Deliberately *not* a suspend function, so a caller cannot accidentally turn it into a wait.
+     *
+     * The session list does **not** use this to decide on a chip: a rootfs outlives the process
+     * that installed it, so "there are files" is true after a Stop and after a reboot, and a chip
+     * there would advertise a userspace that is not running. The chip is gated on the userspace
+     * state (`FilesExplorerController.ubuntuRunning`); this stays as the provider's own answer for
+     * callers that want the narrower question — whether a path in here can be listed at all.
      */
     fun isAvailable(): Boolean = rootfs.rootfsDir()?.isDirectory == true
 

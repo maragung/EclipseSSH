@@ -11,6 +11,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -84,11 +85,24 @@ class RootfsInstaller(
     }
 
     /**
-     * Whether the rootfs is present and plausibly complete: the staging directory is gone and the
+     * Whether the rootfs is present, complete and alone: the staging directory is gone and the
      * rootfs holds a `/bin` directory. Deliberately cheap — the real health check is the
      * distribution manager's probe, which actually runs a shell.
+     *
+     * The staging half is a *promise* about a completed extraction rather than a check of one (see
+     * the class doc: extraction lands in staging and is renamed into place), which is why a leftover
+     * staging tree makes this false for a rootfs that is perfectly whole — [rootfsInPlace] is the
+     * question to ask when the difference matters, and [reclaimFailedExtraction] is the way to
+     * restore this one's answer.
      */
-    fun isExtracted(): Boolean = !stagingDir.exists() && File(rootfsDir, "bin").isDirectory
+    fun isExtracted(): Boolean = !stagingDir.exists() && rootfsInPlace()
+
+    /**
+     * Whether a rootfs is on disk at all, whatever a crashed run left beside it in staging. A repair
+     * that finds this true and [isExtracted] false has a leftover to reclaim, not an install to
+     * redo.
+     */
+    fun rootfsInPlace(): Boolean = File(rootfsDir, "bin").isDirectory
 
     /**
      * Deletes the download and every extracted tree — the uninstall path, which owns the "none of
@@ -170,6 +184,14 @@ class RootfsInstaller(
     }
 
     /**
+     * What an install of this distribution needs free, by the same arithmetic [checkFreeSpace]
+     * gates on. Public because the repair ladder asks the same question before it decides whether
+     * freeing space is worth doing, and a second copy of the formula would be a second answer.
+     */
+    val requiredFreeBytes: Long
+        get() = distro.rootfsSizeBytes * NEEDED_TARBALL_MULTIPLE + FREE_SPACE_HEADROOM_BYTES
+
+    /**
      * Refuses to start a download the disk cannot hold. The budget is deliberately coarse — the
      * tarball, several multiples of it unpacked (the extracted rootfs plus apt's working space),
      * and a headroom for everything else the app stores — because the alternative failure is
@@ -181,7 +203,7 @@ class RootfsInstaller(
     private fun checkFreeSpace() {
         val free = storage.freeBytes()
         if (free <= 0L) return
-        val needed = distro.rootfsSizeBytes * NEEDED_TARBALL_MULTIPLE + FREE_SPACE_HEADROOM_BYTES
+        val needed = requiredFreeBytes
         // Recorded either way, like the apt phase's gate: the number that proves an ENOSPC twenty
         // minutes later is the one taken before the write started.
         diagnostics.record(
@@ -198,6 +220,150 @@ class RootfsInstaller(
             )
         }
     }
+
+    /**
+     * Frees the bytes a userspace can regenerate, and answers how many were freed.
+     *
+     * Written for the one environmental failure a repair can do something about. "Ubuntu needs about
+     * N MB of free storage" and the guest's own `No space left on device` are facts about the disk
+     * rather than about the rootfs, and the app's answer to both used to be to tell the user to go
+     * and free some — advice rather than a repair, on a device where the largest expendable trees
+     * are inside the very userspace they are being asked to fix. A userspace that has installed and
+     * upgraded packages holds hundreds of megabytes of apt's downloaded `.deb` files and unpacked
+     * index lists, every byte of which the next `apt-get update` rebuilds.
+     *
+     * What it takes is what is *generated* rather than owned:
+     *
+     * - apt's package cache and package lists — the two directories are kept and only emptied, the
+     *   way `apt-get clean` leaves them, because they are part of the base system's structure and
+     *   apt expects them to exist. The next setup run's `apt-get update` refills the lists.
+     * - apt's own binary index caches (`pkgcache.bin`, `srcpkgcache.bin`), which it rewrites on the
+     *   next run by definition.
+     * - the contents of the guest's `/tmp` and `/var/tmp` — emptied, never deleted: the directories
+     *   are the archive's, and a repair that removed them would leave a rootfs no restore puts back
+     *   (both are preserved members — see [isPreservedMember]).
+     * - rotated log files (`*.gz`, `*.1`), which are the large ones; a live log is left alone,
+     *   because it is often the evidence of the failure being repaired.
+     * - a download fragment a failed fetch left behind — never a resume point.
+     * - a previous rootfs parked by a swap that crashed between parking it and deleting it. Only
+     *   when a rootfs is in place: otherwise that parked tree is the user's only copy of everything
+     *   they have, and deleting it would be the worst thing this class could do.
+     *
+     * It takes nothing the user owns: no file under `/home`, no installed package, no package
+     * database, no configuration. Every step is best-effort and the answer counts only what is
+     * actually gone — a file that will not delete is a file that did not free anything, and a repair
+     * must not fail over one.
+     *
+     * Nothing here descends through a symbolic link, and that is the load-bearing rule of the whole
+     * function: a rootfs' links are absolute and guest-rooted, so `<rootfs>/var/log` as the link
+     * `-> /run` names the *host's* `/run` to every call this function could make — a listing would
+     * enumerate the device's own files and the delete that followed would take them. Directories are
+     * entered only when they are directories [LinkOption.NOFOLLOW_LINKS] says they are, and the
+     * deletions themselves go through [deleteTreeNoFollow], which treats a link as the entry it is.
+     */
+    suspend fun reclaimSpace(): Long = withContext(Dispatchers.IO) {
+        // How much each kind of thing gave back, for the log line: which tree was holding the bytes
+        // is the question a report asks, and the total alone cannot answer it.
+        val freed = linkedMapOf<String, Long>()
+
+        /** Deletes [target] whole — for a cache apt owns as a unit, and for single files. */
+        fun reclaim(label: String, target: File) {
+            if (!target.exists() && !java.nio.file.Files.isSymbolicLink(target.toPath())) return
+            val bytes = sizeNoFollow(target)
+            deleteTreeNoFollow(target)
+            if (target.exists()) return
+            freed[label] = (freed[label] ?: 0L) + bytes
+        }
+
+        /** Empties [dir] of its contents, keeping the directory itself. */
+        fun empty(label: String, dir: File) {
+            if (!isRealDirectory(dir)) return
+            dir.listFiles()?.forEach { reclaim(label, it) }
+        }
+
+        /**
+         * Deletes the rotated logs directly under [dir] and under its immediate subdirectories —
+         * `/var/log/apt` is where a long install's transcripts live. Two levels, not a walk, for the
+         * reason the function's own doc gives.
+         */
+        fun reclaimRotatedLogs(dir: File) {
+            if (!isRealDirectory(dir)) return
+            val entries = dir.listFiles().orEmpty().toList()
+            val rotated = { file: File -> isRealFile(file) && isRotatedLog(file.name) }
+            entries.filter(rotated).forEach { reclaim("rotated logs", it) }
+            entries.filter { isRealDirectory(it) }
+                .flatMap { it.listFiles().orEmpty().filter(rotated).toList() }
+                .forEach { reclaim("rotated logs", it) }
+        }
+
+        val startedAt = System.currentTimeMillis()
+        empty("apt package cache", File(rootfsDir, "var/cache/apt/archives"))
+        empty("apt package lists", File(rootfsDir, "var/lib/apt/lists"))
+        reclaim("apt index caches", File(rootfsDir, "var/cache/apt/pkgcache.bin"))
+        reclaim("apt index caches", File(rootfsDir, "var/cache/apt/srcpkgcache.bin"))
+        empty("temporary files", File(rootfsDir, "tmp"))
+        empty("temporary files", File(rootfsDir, "var/tmp"))
+        reclaimRotatedLogs(File(rootfsDir, "var/log"))
+        reclaim("download fragments", File(storage.downloadsDir, "${tarballFile.name}.part"))
+        if (rootfsInPlace()) {
+            // The condition is the whole safety of this line: a parked rootfs with nothing in place
+            // is the user's system, mid-swap, and not this function's to delete.
+            reclaim("a previous rootfs", File(storage.rootDir, "rootfs.old"))
+        }
+
+        val total = freed.values.sum()
+        if (total > 0L) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.STORAGE,
+                "reclaimed space in the userspace",
+                durationMs = System.currentTimeMillis() - startedAt,
+                detail = "${total / MIB}MB: " +
+                    freed.entries.joinToString(", ") { "${it.key} ${it.value / MIB}MB" },
+            )
+        }
+        total
+    }
+
+    /**
+     * The bytes [target] occupies without following links — a link counts as its own entry, never
+     * as what it points at — or 0 when the tree cannot be measured. The count is for a log line and
+     * a sentence to the user, never for a decision, which is why a failure here is answered with
+     * zero rather than propagated.
+     */
+    private fun sizeNoFollow(target: File): Long {
+        val path = target.toPath()
+        if (java.nio.file.Files.isSymbolicLink(path)) return 0L
+        return runCatching {
+            var total = 0L
+            java.nio.file.Files.walkFileTree(
+                path,
+                emptySet<java.nio.file.FileVisitOption>(),
+                Int.MAX_VALUE,
+                object : java.nio.file.SimpleFileVisitor<java.nio.file.Path>() {
+                    override fun visitFile(
+                        file: java.nio.file.Path,
+                        attrs: java.nio.file.attribute.BasicFileAttributes,
+                    ): java.nio.file.FileVisitResult {
+                        total += attrs.size()
+                        return java.nio.file.FileVisitResult.CONTINUE
+                    }
+                },
+            )
+            total
+        }.getOrDefault(0L)
+    }
+
+    /** Whether [file] is a directory itself, rather than a link to one. */
+    private fun isRealDirectory(file: File): Boolean =
+        java.nio.file.Files.isDirectory(file.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)
+
+    /** Whether [file] is a regular file itself, rather than a link to one. */
+    private fun isRealFile(file: File): Boolean =
+        java.nio.file.Files.isRegularFile(file.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)
+
+    /** Whether [name] is a log a rotation has already closed: the large ones, and the expendable ones. */
+    private fun isRotatedLog(name: String): Boolean =
+        name.endsWith(".gz") || name.endsWith(".1") || name.endsWith(".old")
 
     private suspend fun download(onProgress: (Progress) -> Unit) {
         migrateLegacyTarball()
@@ -219,31 +385,39 @@ class RootfsInstaller(
         var receivedFinal = 0L
         var reportedTotal = 0L
         try {
-            downloader.download(
-                distro.rootfsTarballUrl,
-                temp,
-                onChunk = { received, total ->
-                    job?.ensureActive()
-                    receivedFinal = received
-                    if (total > 0) reportedTotal = total
-                    // The server's content length versus the pin: wildly off in either direction
-                    // means the URL is no longer serving the file this build was verified against
-                    // (an error page with a 200, a redirect to something else) — fail now, not
-                    // after 30 MB of the wrong bytes.
-                    if (total > 0 && distro.rootfsSizeBytes > 0) {
-                        val expected = distro.rootfsSizeBytes
-                        if (total > expected * 2 || total < expected / 2) {
-                            throw IOException(
-                                "the rootfs download is $total bytes, but the pinned ${distro.displayName} " +
-                                    "tarball is about $expected bytes - the URL is serving something else",
-                            )
+            try {
+                downloader.download(
+                    distro.rootfsTarballUrl,
+                    temp,
+                    onChunk = { received, total ->
+                        job?.ensureActive()
+                        receivedFinal = received
+                        if (total > 0) reportedTotal = total
+                        // The server's content length versus the pin: wildly off in either direction
+                        // means the URL is no longer serving the file this build was verified against
+                        // (an error page with a 200, a redirect to something else) — fail now, not
+                        // after 30 MB of the wrong bytes.
+                        if (total > 0 && distro.rootfsSizeBytes > 0) {
+                            val expected = distro.rootfsSizeBytes
+                            if (total > expected * 2 || total < expected / 2) {
+                                throw PinnedArchiveUnavailable(
+                                    "the rootfs download is $total bytes, but the pinned ${distro.displayName} " +
+                                        "tarball is about $expected bytes - the URL is serving something else",
+                                )
+                            }
                         }
-                    }
-                    onProgress(Progress.Downloading(received, total))
-                },
-            )
+                        onProgress(Progress.Downloading(received, total))
+                    },
+                )
+            } catch (e: IOException) {
+                // Typed here rather than at each throw site, because the fetch has three: the
+                // downloader's own HTTP failure, the size check above, and the truncation check
+                // below. They are one fact — the archive could not be obtained — and the repair
+                // ladder reads it that way (see [PinnedArchiveUnavailable]).
+                throw PinnedArchiveUnavailable(e.message ?: "the rootfs download failed", e)
+            }
             if (reportedTotal > 0 && receivedFinal != reportedTotal) {
-                throw IOException(
+                throw PinnedArchiveUnavailable(
                     "the rootfs download was truncated: $receivedFinal of $reportedTotal bytes arrived",
                 )
             }
@@ -255,7 +429,7 @@ class RootfsInstaller(
                     "tarball checksum mismatch",
                     detail = "expected ${distro.rootfsSha256.take(16)}…, ${receivedFinal} bytes arrived",
                 )
-                throw IOException("Rootfs checksum mismatch for ${distro.displayName}")
+                throw PinnedArchiveUnavailable("Rootfs checksum mismatch for ${distro.displayName}")
             }
             // Bytes and seconds, not a progress transcript: the rate is what says whether a slow
             // install was the network or the unpack, which is the first question a report raises.
@@ -295,8 +469,21 @@ class RootfsInstaller(
 
     private fun verify() {
         if (!verifyFileSha256(tarballFile, distro.rootfsSha256)) {
-            throw IOException("Rootfs checksum mismatch for ${distro.displayName}")
+            throw PinnedArchiveUnavailable("Rootfs checksum mismatch for ${distro.displayName}")
         }
+    }
+
+    /**
+     * The verified pinned archive on disk, fetched if it is not there.
+     *
+     * A successful install deletes the tarball — it is spare bytes once the rootfs is in place — so
+     * every repair that needs the archive's bytes has to be ready to fetch it again: 34 MB once,
+     * after which the repairs that worked from it leave it where the next one finds it.
+     */
+    private suspend fun ensurePinnedArchive(onProgress: (Progress) -> Unit) {
+        if (tarballFile.isFile && verifyFileSha256(tarballFile, distro.rootfsSha256)) return
+        download(onProgress)
+        verify()
     }
 
     /**
@@ -343,16 +530,25 @@ class RootfsInstaller(
                     TarArchiveEntry.LF_LINK -> {
                         target.parentFile?.mkdirs()
                         val source = resolveInside(stagingDir, entry.linkName)
-                        // Hardlinks inside one tarball are duplicates of an earlier entry; copying
-                        // is the portable equivalent and costs one file. A link whose target has
-                        // not arrived yet (a forward link) is skipped — the tree works, but the
-                        // gap is recorded so the setup report can name it instead of a later
-                        // "file not found" standing in for it.
-                        if (source.isFile) {
-                            source.copyTo(target, overwrite = true)
-                            written += target.length()
-                        } else {
-                            extractionWarnings += "hardlink ${entry.name} skipped: its target ${entry.linkName} was not extracted"
+                        target.delete()
+                        deleteTreeNoFollow(target)
+                        // A hard link is what the tarball says, and what costs nothing on disk.
+                        // The platform refuses link(2) inside app data (EACCES — the same refusal
+                        // linux/proot-patches/0003 emulates for the guest), so a symlink stands in
+                        // for it: same bytes, one file, followed transparently by everything that
+                        // opens it. Copying instead is what broke Ubuntu 26.04 — its coreutils is
+                        // one 11 MB binary under 113 names, so a copy per name writes 1.28 GB and
+                        // trips the budget below, aborting the install partway through the tarball.
+                        // A copy is kept only as a last resort, and only then does it count
+                        // against the budget.
+                        if (!linkFile(target, source)) {
+                            if (source.isFile) {
+                                source.copyTo(target, overwrite = true)
+                                written += target.length()
+                                extractionWarnings += "hardlink ${entry.name} copied: neither a hard link nor a symlink to ${entry.linkName} could be made"
+                            } else {
+                                extractionWarnings += "hardlink ${entry.name} skipped: its target ${entry.linkName} was not extracted"
+                            }
                         }
                     }
                     TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
@@ -400,6 +596,42 @@ class RootfsInstaller(
                 (extractionWarnings.takeIf { it.isNotEmpty() }?.let { ": " + it.first() } ?: ""),
         )
         return extractionWarnings
+    }
+
+    /**
+     * Point [target] at [source] the way the archive's hard link means it: a hard link where the
+     * platform allows one, a relative symlink where it does not. Returns false when neither could be
+     * made, leaving the caller to copy the bytes instead — or to name the gap, when there is nothing
+     * to copy either.
+     *
+     * The symlink is relative and computed between the two paths inside the root, so it keeps
+     * pointing at the right file after the staging tree is swapped into place — and it needs neither
+     * the permission a hard link needs nor a source that exists. A source that does *not* exist is
+     * refused before either is attempted: a forward hardlink is a gap in the tree, and a link to
+     * nothing standing where a program belongs is worse than the gap, because opening it fails later
+     * and elsewhere. The extractor names it instead (see the forward-hardlink warning there).
+     */
+    private fun linkFile(target: File, source: File): Boolean {
+        if (!source.exists()) return false
+        return try {
+            java.nio.file.Files.createLink(target.toPath(), source.toPath())
+            true
+        } catch (e: IOException) {
+            val parent = target.parentFile ?: return false
+            try {
+                java.nio.file.Files.createSymbolicLink(
+                    target.toPath(),
+                    parent.toPath().relativize(source.toPath()),
+                )
+                true
+            } catch (e: IOException) {
+                false
+            } catch (e: UnsupportedOperationException) {
+                false
+            } catch (e: SecurityException) {
+                false
+            }
+        }
     }
 
     /**
@@ -496,53 +728,296 @@ class RootfsInstaller(
         onProgress: (Progress) -> Unit = {},
     ): List<String> {
         if (memberNames.isEmpty()) return emptyList()
-        if (!tarballFile.isFile || !verifyFileSha256(tarballFile, distro.rootfsSha256)) {
-            download(onProgress)
-        }
+        ensurePinnedArchive(onProgress)
         val restored = sortedSetOf<String>()
         val startedAt = System.currentTimeMillis()
+        val warnings = mutableListOf<String>()
         openTarStream(tarballFile, DOWNLOAD_BUFFER) {}.use { tar ->
             while (true) {
                 val entry = tar.nextTarEntry ?: break
                 val name = entry.name.removePrefix("./")
                 if (name !in memberNames) continue
+                // Refused for the same reason the overlay refuses it, and not left to the caller:
+                // no repair writes a preserved member — `/home`, the package database, the state
+                // trees (see [isPreservedMember]) — however the member set was built. Today's callers
+                // never name one, and a caller that did would be writing the archive's `/home` over
+                // the user's.
+                if (isPreservedMember(name)) continue
                 val target = resolveInside(rootfsDir, name)
-                when (entry.linkFlag) {
-                    TarArchiveEntry.LF_DIR -> target.mkdirs()
-                    TarArchiveEntry.LF_SYMLINK -> {
-                        target.parentFile?.mkdirs()
-                        // The link target is checked by the same guard extraction uses: a tarball
-                        // whose symlink points out of the root is not made acceptable by arriving
-                        // through a repair instead of an install.
-                        resolveLinkInsideRoot(rootfsDir, name, entry.linkName)
-                        target.delete()
-                        deleteTreeNoFollow(target)
-                        java.nio.file.Files.createSymbolicLink(target.toPath(), java.nio.file.Path.of(entry.linkName))
-                    }
-                    TarArchiveEntry.LF_LINK -> {
-                        target.parentFile?.mkdirs()
-                        val source = resolveInside(rootfsDir, entry.linkName)
-                        if (source.isFile) source.copyTo(target, overwrite = true)
-                    }
-                    TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
-                        target.parentFile?.mkdirs()
-                        target.outputStream().use { output -> tar.copyTo(output) }
-                        applyMode(target, entry.mode)
-                    }
-                    else -> continue
-                }
-                restored += name
+                if (writeMember(name, target, entry, tar, warnings)) restored += name
             }
         }
         diagnostics.record(
             UserspaceDiagnosticCategory.ROOTFS,
             "restored from the pinned archive",
             durationMs = System.currentTimeMillis() - startedAt,
-            detail = "${restored.size} of ${memberNames.size} member(s): " +
+            detail = "${restored.size} of ${memberNames.size} member(s) put back: " +
                 (restored.take(6).joinToString(", ").ifEmpty { "none" }),
         )
         return restored.toList()
     }
+
+    /**
+     * Every archive member the installed rootfs is missing, or has as something other than what the
+     * archive says it is — [RootfsIntegrity] carries what that means and what it deliberately does
+     * not.
+     *
+     * The archive is fetched if a successful install has deleted it, which is the one slow part of
+     * this and the reason the repair ladder calls it only after a cheaper repair has already failed.
+     * One pass over the tarball and one filesystem lookup per member: on the phone this is a second
+     * or two for a whole base system, and it is the only check in the app that can say *which* of
+     * the archive's two thousand members went missing.
+     *
+     * @throws PinnedArchiveUnavailable when the archive cannot be fetched or does not match its pin
+     */
+    suspend fun inspectAgainstPinnedArchive(
+        onProgress: (Progress) -> Unit = {},
+    ): RootfsIntegrity = withContext(Dispatchers.IO) {
+        ensurePinnedArchive(onProgress)
+        val paths = RootfsPaths(rootfsDir)
+        val damaged = sortedSetOf<String>()
+        var examined = 0
+        var consumed = 0L
+        val tarballBytes = tarballFile.length()
+        val startedAt = System.currentTimeMillis()
+        openTarStream(tarballFile, DOWNLOAD_BUFFER) { consumed = it }.use { tar ->
+            while (true) {
+                val entry = tar.nextTarEntry ?: break
+                val name = entry.name.removePrefix("./")
+                if (name.isEmpty() || isPreservedMember(name)) continue
+                examined++
+                if (!memberIsPresent(paths, name, entry)) damaged += name
+                if (examined % PROGRESS_EVERY_ENTRIES == 0) {
+                    coroutineContext.ensureActive()
+                    onProgress(Progress.Extracting(examined, fraction = tarballFraction(consumed, tarballBytes)))
+                }
+            }
+        }
+        val integrity = RootfsIntegrity(examined = examined, damaged = damaged)
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "rootfs compared with the pinned archive",
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = integrity.describe(),
+        )
+        integrity
+    }
+
+    /**
+     * Rewrites the base system from the pinned archive, in place: every member the archive carries is
+     * written over whatever the rootfs holds at that name, and nothing the archive does not name is
+     * touched — no directory is cleared, no tree is replaced.
+     *
+     * This is the repair for a base system that is *present but wrong*: a library replaced by
+     * something else, a binary whose mode or contents no longer match what the image shipped,
+     * damage the file-level restore cannot describe because nothing is missing. It is not an install,
+     * and the difference is [isPreservedMember]: the user's `/home`, the package database under
+     * `/var/lib/dpkg` and the log, cache and temporary directories are never written, so a system
+     * with packages installed comes out of this with those packages' files still on disk and still
+     * tracked by dpkg, and with everything the base image owns replaced by the base image's own
+     * bytes.
+     *
+     * A directory entry means "this directory exists" and is created, never cleared — clearing one
+     * would be deleting the user's files to satisfy a mkdir — and a *directory* standing where the
+     * archive names a file is removed, because that is the one case where the archive's own bytes
+     * cannot be written at all.
+     *
+     * No decompression-bomb budget guards this the way [extract] is guarded: the bytes come from the
+     * same SHA256-verified pin the install trusts, and what is written replaces files that are
+     * already on disk rather than adding to them.
+     *
+     * @return how many members the archive's own entries put in place — a device node or fifo is
+     *   never written, and is not counted (see [writeMember])
+     * @throws PinnedArchiveUnavailable when the archive cannot be fetched or does not match its pin
+     */
+    suspend fun overlayFromPinnedArchive(
+        onProgress: (Progress) -> Unit = {},
+        onWarning: (String) -> Unit = {},
+    ): Int = withContext(Dispatchers.IO) {
+        ensurePinnedArchive(onProgress)
+        val startedAt = System.currentTimeMillis()
+        var members = 0
+        var replacedDirectories = 0
+        var consumed = 0L
+        val tarballBytes = tarballFile.length()
+        val warnings = mutableListOf<String>()
+        openTarStream(tarballFile, DOWNLOAD_BUFFER) { consumed = it }.use { tar ->
+            while (true) {
+                val entry = tar.nextTarEntry ?: break
+                val name = entry.name.removePrefix("./")
+                if (name.isEmpty() || isPreservedMember(name)) continue
+                val target = resolveInside(rootfsDir, name)
+                if (!entry.isDirectory && target.isDirectory) {
+                    deleteTreeNoFollow(target)
+                    replacedDirectories++
+                }
+                if (writeMember(name, target, entry, tar, warnings)) members++
+                if (members % PROGRESS_EVERY_ENTRIES == 0) {
+                    coroutineContext.ensureActive()
+                    onProgress(Progress.Extracting(members, warnings.toList(), tarballFraction(consumed, tarballBytes)))
+                }
+            }
+        }
+        onProgress(Progress.Extracting(members, warnings.toList(), 1f))
+        warnings.forEach(onWarning)
+        diagnostics.record(
+            UserspaceDiagnosticCategory.ROOTFS,
+            "base system rewritten from the pinned archive",
+            durationMs = System.currentTimeMillis() - startedAt,
+            detail = "$members member(s) written" +
+                (replacedDirectories.takeIf { it > 0 }?.let { ", $it directory/directories replaced" } ?: "") +
+                (warnings.firstOrNull()?.let { "; $it" } ?: ""),
+        )
+        members
+    }
+
+    /**
+     * Writes one archive member onto [target], replacing whatever is there — the shared body of the
+     * two repairs that put the archive's own bytes back into a live rootfs.
+     *
+     * The link rules are [extract]'s, because they are the same decision made over the same archive:
+     * a symlink's target is checked by the guard extraction uses (a tarball whose link points out of
+     * the root is not made acceptable by arriving through a repair instead of an install), and a hard
+     * link becomes one where the platform allows it and a relative symlink where it does not — see
+     * [linkFile]. A device node or fifo is skipped for the reason the extractor skips it: proot binds
+     * the device's own `/dev`, and creating them needs privileges the app does not have.
+     *
+     * @return whether the member is in place afterwards, which both callers report and count: a
+     *   device node is never written, and a hard link whose source is not in the rootfs cannot be
+     *   made — and neither of those is a member that came back, however the entry was visited.
+     */
+    private fun writeMember(
+        name: String,
+        target: File,
+        entry: TarArchiveEntry,
+        tar: TarArchiveInputStream,
+        warnings: MutableList<String>,
+    ): Boolean = when (entry.linkFlag) {
+        // `mkdirs()` answers false for a directory that already exists, which is the common case in
+        // a repair and not a failure: the member's meaning is "this directory exists", and it does.
+        TarArchiveEntry.LF_DIR -> target.mkdirs() || target.isDirectory
+        TarArchiveEntry.LF_SYMLINK -> {
+            target.parentFile?.mkdirs()
+            resolveLinkInsideRoot(rootfsDir, name, entry.linkName)
+            target.delete()
+            deleteTreeNoFollow(target)
+            java.nio.file.Files.createSymbolicLink(target.toPath(), java.nio.file.Path.of(entry.linkName))
+            true
+        }
+        TarArchiveEntry.LF_LINK -> {
+            target.parentFile?.mkdirs()
+            val source = resolveInside(rootfsDir, entry.linkName)
+            target.delete()
+            deleteTreeNoFollow(target)
+            if (linkFile(target, source)) {
+                true
+            } else if (source.isFile) {
+                // The platform refused the link (see [linkFile]): the source's bytes, as one copy.
+                source.copyTo(target, overwrite = true)
+                true
+            } else {
+                warnings += "hard link $name could not be made: ${entry.linkName} is not in the rootfs"
+                false
+            }
+        }
+        TarArchiveEntry.LF_NORMAL, 0.toByte() -> {
+            target.parentFile?.mkdirs()
+            // A *directory* standing where the archive names a file is the one obstruction
+            // `File.delete()` cannot clear — and a repair that stopped there would leave the
+            // member exactly as damaged as it found it. The tree goes, because the archive's own
+            // bytes cannot be written over it any other way; deleteTreeNoFollow treats a link as
+            // the entry it is, so nothing outside [rootfsDir] is ever reached through one.
+            target.delete()
+            deleteTreeNoFollow(target)
+            target.outputStream().use { output -> tar.copyTo(output) }
+            applyMode(target, entry.mode)
+            true
+        }
+        // A device node, a fifo, or a type this archive has no business carrying: nothing is created,
+        // so nothing came back.
+        else -> false
+    }
+
+    /**
+     * Whether the installed rootfs holds the thing [name] names, as the kind of thing the archive
+     * says it is.
+     *
+     * Three questions, and deliberately not a fourth. Presence, kind, and — for a member the archive
+     * marks executable — the executable bit: those are the three states a file can be in that make
+     * dpkg's `'<program>' not found in PATH or not executable` true, and every one of them is one
+     * lookup. What is *not* asked is whether the bytes match, and that is the deliberate part: a
+     * rootfs the user has run `apt-get upgrade` in carries files that legitimately differ from the
+     * pin, so a size or hash comparison would report a healthy, updated system as damaged — and the
+     * repair it triggered would rewrite that system's base for no fault. Bytes that are wrong in a
+     * way that matters are the health probe's and the package manager's business; this answers for
+     * files.
+     *
+     * A path that cannot even be resolved inside the root (a link that loops, one that climbs out)
+     * counts as damage rather than as an error: it is a name no program in the guest can reach
+     * either, which is the same verdict for the same reason [UbuntuDistributionManager]'s
+     * essential-programs check reaches it.
+     */
+    private fun memberIsPresent(paths: RootfsPaths, name: String, entry: TarArchiveEntry): Boolean =
+        runCatching {
+            when {
+                entry.isDirectory -> paths.hostPath("/$name").isDirectory
+                entry.isSymbolicLink -> {
+                    // The link itself, not what it points at: usrmerge's `/bin -> usr/bin` re-pointed
+                    // elsewhere would break every path through it while still "existing", and the
+                    // target has its own entry to answer for.
+                    val link = leafInside(paths, name)
+                    java.nio.file.Files.isSymbolicLink(link.toPath()) &&
+                        runCatching { java.nio.file.Files.readSymbolicLink(link.toPath()).toString() }
+                            .getOrNull() == entry.linkName
+                }
+                // A hard link is present when its source is: the extraction may have spelled it as a
+                // symlink (see linkFile), which hostPath follows, and a dangling one is damage here
+                // exactly as it is to the program that opens it.
+                entry.isLink || entry.isFile -> {
+                    val file = paths.hostPath("/$name")
+                    file.isFile && (entry.mode and EXECUTABLE_BITS == 0 || file.canExecute())
+                }
+                // Device nodes, fifos: never created by any of this app's extractors, so their
+                // absence is not damage.
+                else -> true
+            }
+        }.getOrDefault(false)
+
+    /**
+     * The host file [name] names, with a link at the last component left unresolved — see
+     * [memberIsPresent], which is asking about the link itself. The components *above* it resolve as
+     * everywhere else, so `sbin/ldconfig` is asked about as the file behind the `/sbin` link, which
+     * is the file the guest reaches.
+     */
+    private fun leafInside(paths: RootfsPaths, name: String): File {
+        val cut = name.lastIndexOf('/')
+        if (cut < 0) return File(paths.hostPath("/"), name)
+        return File(paths.hostPath("/" + name.substring(0, cut)), name.substring(cut + 1))
+    }
+
+    /**
+     * Whether [name] is a member no repair ever writes, whoever asks and however deep the repair
+     * goes.
+     *
+     * Two reasons, two rules. `/home` and `/root` are the user's — their projects, their shell
+     * history, their keys — and replacing them with a base image's version would be a repair that
+     * loses data. `/var/lib/dpkg` is the *record* of what is installed: the archive's copy of it
+     * describes a system with nothing beyond the base packages, so writing it back would untrack
+     * every package the user ever installed while leaving those packages' files on disk, which is a
+     * worse state than the one being repaired. `/var/lib/apt`, `/var/cache`, `/var/log` and `/tmp`
+     * are the same fact in smaller ways: state, not system, and state the guest is writing to while
+     * this runs. `/etc/ssh` stays because a host key regenerated by a repair is a repair that breaks
+     * every `known_hosts` entry pointing at this userspace.
+     *
+     * The preserved trees are invisible to [inspectAgainstPinnedArchive] as well as to the overlay,
+     * so what a repair reports and what it fixes are the same set of names.
+     */
+    private fun isPreservedMember(name: String): Boolean =
+        PRESERVED_MEMBERS.any { name == it || name.startsWith("$it/") }
+
+    /** The fraction of the tarball read, or null when the platform will not report its length. */
+    private fun tarballFraction(consumed: Long, total: Long): Float? =
+        if (total > 0L) (consumed.toFloat() / total).coerceIn(0f, 1f) else null
 
     private fun verifyFileSha256(file: File, expected: String): Boolean {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -562,6 +1037,32 @@ class RootfsInstaller(
         private const val DOWNLOAD_BUFFER = 64 * 1024
         private const val PROGRESS_EVERY_ENTRIES = 200
 
+        /** The mode bits the archive's own entries carry for "this is a program" (0111). */
+        private const val EXECUTABLE_BITS = 0b001_001_001
+
+        /**
+         * The trees no repair writes, however deep it goes — see [isPreservedMember], which is where
+         * the reasoning lives. Names are archive-relative and without a leading `/`, the way the
+         * tarball spells them.
+         */
+        private val PRESERVED_MEMBERS = listOf(
+            // The user's own: their projects, their keys, their history.
+            "home",
+            "root",
+            // The record of what is installed, and the state the package tools keep beside it.
+            "var/lib/dpkg",
+            "var/lib/apt",
+            "var/cache",
+            // State the guest is writing to while a repair runs.
+            "var/log",
+            "var/tmp",
+            "tmp",
+            "run",
+            // A regenerated host key would invalidate every known_hosts entry pointing at this
+            // userspace, which is data loss outside the rootfs.
+            "etc/ssh",
+        )
+
         /** The tarball plus this many multiples of it: the extracted rootfs and apt's working space. */
         private const val NEEDED_TARBALL_MULTIPLE = 5L
 
@@ -577,6 +1078,55 @@ class RootfsInstaller(
         private const val MIB = 1024L * 1024
     }
 }
+
+/**
+ * What a rootfs looks like measured against the archive it was installed from: how many members were
+ * examined, and which of them are not there in the shape the archive describes.
+ *
+ * [damaged] holds archive-relative names — `usr/bin/rm`, not `/usr/bin/rm` — because that is what
+ * restores them ([RootfsInstaller.restoreFromPinnedTarball]) and what the diagnostic ring records;
+ * translating in either direction at each call site is how a name and the thing it names drift apart.
+ *
+ * The set is a *lower* bound on what is wrong, by construction: [RootfsInstaller.inspectAgainstPinnedArchive]
+ * asks whether each member is present and of the right kind, never whether its bytes are the
+ * archive's, so a base system whose `/lib/x86_64-linux-gnu/libc.so.6` has been replaced by something
+ * else scans as whole. That is deliberate — see the scan's own doc for why a byte comparison would
+ * condemn a rootfs that has legitimately been upgraded — and it is why the repair ladder has a rung
+ * that rewrites the base system whether or not this found anything.
+ */
+data class RootfsIntegrity(
+    /** How many archive members were looked at — the preserved trees are not among them. */
+    val examined: Int,
+    /** The members that are missing, of the wrong kind, or not executable where the archive says so. */
+    val damaged: Set<String>,
+) {
+    /** Whether every member examined is where the archive says it is, as what it says it is. */
+    val whole: Boolean get() = damaged.isEmpty()
+
+    /** One line for the log and the failure message; [limit] names members, then counts the rest. */
+    fun describe(limit: Int = 6): String {
+        if (damaged.isEmpty()) return "$examined member(s) examined, all present"
+        val named = damaged.take(limit.coerceAtLeast(0)).joinToString(", ")
+        val rest = damaged.size - limit.coerceAtLeast(0)
+        return "$examined member(s) examined, ${damaged.size} missing or wrong: $named" +
+            (if (rest > 0) " and $rest more" else "")
+    }
+}
+
+/**
+ * The pinned rootfs archive cannot be obtained, or is not the archive the pin describes.
+ *
+ * Typed rather than a bare [IOException] because it is the one failure a repair must *not* answer by
+ * rebuilding: the bytes came from the network, and every rung that could still run needs them. An
+ * offline phone, a mirror that answers 503, a truncated transfer or a checksum that does not match
+ * the pin all land here — and the honest response to all four is to stop and say so, not to wipe a
+ * user's base system to no purpose. The repair ladder keys on exactly this type to tell the
+ * difference between "this rootfs is broken" and "this rootfs cannot be repaired *right now*".
+ */
+class PinnedArchiveUnavailable(
+    message: String,
+    cause: Throwable? = null,
+) : IOException(message, cause)
 
 /** A byte-range-progressing HTTP(S) GET; an interface so tests never touch the network. */
 fun interface HttpDownloader {

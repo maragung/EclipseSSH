@@ -3,8 +3,10 @@ package dev.eclipse.ssh.presentation.linux
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.util.Log
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -21,12 +23,15 @@ import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxUserspaceManager
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LinuxUserspaceState.NotInstalled
+import dev.eclipse.ssh.linux.RootfsTransferState
 import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -70,6 +75,17 @@ data class LinuxUserspaceUiState(
     val hasPendingWorkspaceBackup: Boolean = false,
     /** Live terminal sessions held by the userspace right now. */
     val sessionCount: Int = 0,
+    /**
+     * What an export or an import is doing right now, [RootfsTransferState.Idle] between them.
+     *
+     * Beside [state] rather than inside it, because the two answer different questions: [state] is
+     * what is installed, this is what is being done to it. An import is [state] = Not Installed and
+     * [transfer] = Importing for the whole of its unpack, and the screen needs both halves to be
+     * honest about a userspace that is still installed while a replacement is being read.
+     */
+    val transfer: RootfsTransferState = RootfsTransferState.Idle,
+    /** The last export's outcome; cleared by [clearTransferNotice] or the next transfer. */
+    val transferNotice: String? = null,
     /** The last operation's failure, verbatim; cleared by [clearError] or the next operation. */
     val error: String? = null,
     /** The last install/repair's non-fatal warnings (npm tools that did not install, sudo skipped). */
@@ -130,6 +146,15 @@ class LinuxUserspaceController @Inject constructor(
 
     private val _error = MutableStateFlow<String?>(null)
     private val _installWarnings = MutableStateFlow<List<String>>(emptyList())
+    private val _transferNotice = MutableStateFlow<String?>(null)
+
+    /**
+     * The transfer in flight, so the screen can abandon one. Only ever touched from the main thread —
+     * launched by the actions below, cancelled by [cancelTransfer] — and a completed job cancels as a
+     * no-op, which is what makes "the button was still on screen for a moment after it finished" a
+     * non-event rather than a special case.
+     */
+    private var transferJob: Job? = null
 
     /**
      * Whether the app is on screen, from the process-wide lifecycle. The binding's re-promotion
@@ -170,11 +195,16 @@ class LinuxUserspaceController @Inject constructor(
                             graph.manager.state,
                             graph.manager.lastHealth,
                             _storageFacts,
-                            combine(_error, _installWarnings, graph.manager.sessionCount) {
-                                error, warnings, sessions ->
-                                Extras(error, warnings, sessions)
+                            graph.transfer.state,
+                            combine(
+                                _error,
+                                _installWarnings,
+                                _transferNotice,
+                                graph.manager.sessionCount,
+                            ) { error, warnings, notice, sessions ->
+                                Extras(error, warnings, notice, sessions)
                             },
-                        ) { state, health, storage, extras ->
+                        ) { state, health, storage, transfer, extras ->
                             LinuxUserspaceUiState(
                                 supported = true,
                                 distro = graph.distro,
@@ -185,6 +215,8 @@ class LinuxUserspaceController @Inject constructor(
                                 workspaceFileCount = storage.workspaceFiles,
                                 hasPendingWorkspaceBackup = storage.hasPendingBackup,
                                 sessionCount = extras.sessionCount,
+                                transfer = transfer,
+                                transferNotice = extras.notice,
                                 error = extras.error,
                                 installWarnings = extras.warnings,
                             )
@@ -271,6 +303,8 @@ class LinuxUserspaceController @Inject constructor(
             availableVersions = graphProvider.versions,
             state = graph.manager.state.value,
             health = graph.manager.lastHealth.value,
+            transfer = graph.transfer.state.value,
+            transferNotice = _transferNotice.value,
         )
     }
 
@@ -309,6 +343,98 @@ class LinuxUserspaceController @Inject constructor(
     /** Re-runs the health probe on demand; the settings screen's status line is its answer. */
     fun refreshHealth() = act("Health check") { it.refreshHealth() }
 
+    /**
+     * Writes the installed userspace into [uri] — the document the user picked to export to — and
+     * reports the outcome on the state's notice line.
+     *
+     * The document is opened here rather than handed to the transfer as a URI, because the transfer
+     * is Android-free by design and the SAF plumbing is this layer's. Its failures are two different
+     * things and only one of them is the transfer's: the stream could not be opened (a revoked
+     * grant, a provider that disappeared), or the write itself failed. Both are reported the same
+     * way, and both leave the document deleted rather than half-written.
+     */
+    fun exportRootfs(uri: Uri) {
+        val graph = graphProvider.graph ?: return
+        transferJob = scope.launch {
+            _error.value = null
+            _transferNotice.value = null
+            try {
+                withContext(Dispatchers.IO) {
+                    val output = appContext.contentResolver.openOutputStream(uri, "wt")
+                        ?: throw IOException("the document chosen for the export could not be opened")
+                    output.use { graph.transfer.exportTo(it) }
+                }
+                _transferNotice.value = "Rootfs exported to the document you chose"
+            } catch (c: CancellationException) {
+                // Cancelled is not failed, but the document is just as unfinished: the archive's
+                // trailer was never written, and a file that no extractor will open is worse than
+                // no file at all.
+                discardDocument(uri)
+                _transferNotice.value = "Export cancelled - the unfinished document was removed"
+                throw c
+            } catch (t: Throwable) {
+                discardDocument(uri)
+                reportFailure("Export", t)
+            }
+        }
+    }
+
+    /**
+     * Replaces the installed userspace with the archive in [uri] — the document the user picked —
+     * and has it set up for this device.
+     *
+     * The length is read from the provider when it will report one: it is the progress bar's
+     * denominator and the basis of the expansion budget, and -1 (or a provider that throws) leaves
+     * both at their honest fallbacks rather than refusing an archive whose size nobody stated.
+     */
+    fun importRootfs(uri: Uri) {
+        val graph = graphProvider.graph ?: return
+        transferJob = scope.launch {
+            _error.value = null
+            _transferNotice.value = null
+            try {
+                withContext(Dispatchers.IO) {
+                    val bytes = runCatching {
+                        appContext.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+                            ?: UNKNOWN_LENGTH
+                    }.getOrDefault(UNKNOWN_LENGTH)
+                    val input = appContext.contentResolver.openInputStream(uri)
+                        ?: throw IOException("the document chosen for the import could not be opened")
+                    input.use { graph.transfer.importFrom(it, bytes) }
+                }
+            } catch (c: CancellationException) {
+                // Which of two endings this is, the transfer is the only one that knows: it refuses a
+                // cancellation once the swap has happened, so this exception arriving with the flag
+                // set means the cancel landed too late to matter.
+                _transferNotice.value = if (graph.transfer.importSwapped) {
+                    "Import cancelled after the swap - the archive's userspace is installed"
+                } else {
+                    "Import cancelled - nothing that was installed was changed"
+                }
+                throw c
+            } catch (t: Throwable) {
+                reportFailure("Import", t)
+            }
+        }
+    }
+
+    /**
+     * Abandons the transfer in flight, if any — the Cancel button's action.
+     *
+     * What the cancellation is allowed to do is the transfer's own decision, not this one's: it stops
+     * an unpacking archive and refuses once the swap has happened, because past that line the tree on
+     * disk is already the archive's and the setup pipeline has to finish for the userspace to work at
+     * all. This method only hands the request over.
+     */
+    fun cancelTransfer() {
+        transferJob?.cancel()
+    }
+
+    /** Clears the export notice once the user has read it. */
+    fun clearTransferNotice() {
+        _transferNotice.value = null
+    }
+
     /** Clears the error line once the user has read it. */
     fun clearError() { _error.value = null }
 
@@ -324,6 +450,7 @@ class LinuxUserspaceController @Inject constructor(
     private data class Extras(
         val error: String?,
         val warnings: List<String>,
+        val notice: String?,
         val sessionCount: Int,
     )
 
@@ -352,14 +479,26 @@ class LinuxUserspaceController @Inject constructor(
             } catch (c: CancellationException) {
                 throw c
             } catch (t: Throwable) {
-                val detail = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
-                _error.value = "$name failed: $detail"
-                // Logcat is the one channel that outlives the screen: the settings row below is
-                // the user's copy, but a field log or an E2E artifact ships only the log, and
-                // without this line a failed install's cause dies with the row that showed it.
-                Log.w("EclipseSSH", "Linux userspace $name failed: $detail", t)
+                reportFailure(name, t)
             }
         }
+    }
+
+    /**
+     * The one failure story every operation shares: the sentence the settings screen shows beneath
+     * the row that failed, and the logcat line that outlives the screen. Logcat is the channel a
+     * field log or an E2E artifact ships, and without this line a failed operation's cause dies with
+     * the row that showed it.
+     */
+    private fun reportFailure(name: String, t: Throwable) {
+        val detail = t.message?.takeIf { it.isNotBlank() } ?: t::class.java.simpleName
+        _error.value = "$name failed: $detail"
+        Log.w("EclipseSSH", "Linux userspace $name failed: $detail", t)
+    }
+
+    /** Best-effort removal of a document this app created and failed to fill; see [exportRootfs]. */
+    private fun discardDocument(uri: Uri) {
+        runCatching { DocumentFile.fromSingleUri(appContext, uri)?.delete() }
     }
 
     /**
@@ -509,5 +648,14 @@ class LinuxUserspaceController @Inject constructor(
             }.getOrDefault(_storageFacts.value)
         }
         _storageFacts.value = facts
+    }
+
+    private companion object {
+        /**
+         * `AssetFileDescriptor.UNKNOWN_LENGTH`, spelled out rather than imported: a provider that
+         * cannot state its own size is the ordinary case for a pipe or a cloud-backed document, and
+         * the import treats it as "no denominator" rather than as a failure.
+         */
+        const val UNKNOWN_LENGTH = -1L
     }
 }

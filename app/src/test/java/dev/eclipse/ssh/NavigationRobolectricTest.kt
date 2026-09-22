@@ -125,9 +125,9 @@ class NavigationRobolectricTest {
     /**
      * A Settings section, scrolled into view first.
      *
-     * The shell hosts every destination in a `verticalScroll` Column, so all five sections compose
-     * but only the first screenful is on screen — asserting display without scrolling would be
-     * asserting the viewport height, not the app.
+     * The shell hosts every destination in a `verticalScroll` Column, so every section composes but
+     * only the first screenful is on screen — asserting display without scrolling would be asserting
+     * the viewport height, not the app.
      */
     private fun assertSettingsSection(title: String) {
         compose.waitUntil(timeoutMillis = 10_000) {
@@ -239,6 +239,7 @@ class NavigationRobolectricTest {
         compose.onNodeWithText("deploy.sh").assertExists()
 
         tab("Settings").performClick()
+        assertSettingsSection("Linux userspace")
         assertSettingsSection("Security")
         assertSettingsSection("Workspace")
         assertSettingsSection("Port forwarding")
@@ -248,6 +249,39 @@ class NavigationRobolectricTest {
         // And back, without the round trip having disturbed anything.
         tab("Hosts").performClick()
         assertDisplayed("Search hosts, tags, or usernames")
+    }
+
+    /**
+     * The Linux userspace section is the one Settings opens on.
+     *
+     * Position, not reachability, and that is the whole point of the test: [assertSettingsSection]
+     * scrolls a section into view wherever it sits, so every assertion above stays green with the
+     * userspace moved anywhere on the list — the walk pins that the section still renders, never
+     * that it renders first. What a user sees first is the section nearest the top, so that is what
+     * is compared, by the same node bounds [assertDisplayed] reports a failure with.
+     *
+     * The two sections the comparison reads are both inside the first screenful of a phone — the
+     * userspace section is one row — so neither is off the bottom of the viewport at the list's own
+     * opening position, and no scroll is needed to make the bounds meaningful.
+     */
+    @Test
+    fun theLinuxUserspaceSectionIsTheFirstOneOnSettings() {
+        compose.waitForIdle()
+        tab("Settings").performClick()
+
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodes(section("Linux userspace")).fetchSemanticsNodes().isNotEmpty() &&
+                compose.onAllNodes(section("Security")).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNode(section("Linux userspace")).assertIsDisplayed()
+        val userspace = compose.onNode(section("Linux userspace")).fetchSemanticsNode()
+        val security = compose.onNode(section("Security")).fetchSemanticsNode()
+
+        assertWithMessage(
+            "the Linux userspace section is no longer the first one on Settings: its header's " +
+                "bottom is at ${userspace.boundsInRoot.bottom} and Security's top is at " +
+                "${security.boundsInRoot.top}, so Security now opens the list",
+        ).that(userspace.boundsInRoot.bottom).isLessThan(security.boundsInRoot.top)
     }
 
     @Test

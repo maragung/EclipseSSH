@@ -9,6 +9,8 @@ import dev.eclipse.ssh.data.fs.SftpProviderFactory
 import dev.eclipse.ssh.data.fs.UbuntuFileSystemProvider
 import dev.eclipse.ssh.data.fs.UbuntuTransfers
 import dev.eclipse.ssh.data.model.HostProfile
+import dev.eclipse.ssh.di.LinuxUserspaceGraphProvider
+import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.ssh.SshSessionStore
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -17,9 +19,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -169,11 +178,43 @@ class FilesExplorerController @Inject constructor(
     private val sftpFactory: SftpProviderFactory,
     private val sessionStore: SshSessionStore,
     private val hostRepository: HostRepository,
+    private val userspaceGraph: LinuxUserspaceGraphProvider,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val _state = MutableStateFlow(ExplorerState())
     val state: StateFlow<ExplorerState> = _state.asStateFlow()
+
+    /**
+     * Whether the userspace is actually *running*, which is not the same question as whether a
+     * rootfs is on disk.
+     *
+     * A rootfs outlives the process that installed it: it sits there after a reboot, after a Stop,
+     * and after a Start that failed its health probe. Browsing it is still possible in all three
+     * (the files are simply there), but *offering* it is a claim about the machine — a chip that
+     * opens onto a userspace no process is holding advertises something that is not running, and
+     * the person reading it has no way to tell the difference from the Files tab alone.
+     *
+     * So the chip is gated on [LinuxUserspaceState.Running] and nothing else, and it is re-derived
+     * from the state flow rather than read once, because starting and stopping happen while this
+     * controller is alive: the chip has to appear and disappear with the userspace, not with the
+     * next launch.
+     */
+    private val ubuntuRunning: StateFlow<Boolean> =
+        userspaceGraph.graphFlow
+            .flatMapLatest { graph -> graph?.manager?.state ?: flowOf(null) }
+            .map { it is LinuxUserspaceState.Running }
+            .distinctUntilChanged()
+            .stateIn(scope, SharingStarted.Eagerly, false)
+
+    init {
+        // The chip follows the userspace, and the session list is rebuilt for it — the same rebuild
+        // the hosts trigger, on the same rule. `drop(1)` because the initial value is already what
+        // the first refresh reads; collecting it would only list the sessions twice on startup.
+        scope.launch {
+            ubuntuRunning.drop(1).collect { refreshSessions() }
+        }
+    }
 
     /**
      * The local session's breadcrumb trail. SAF document URIs cannot be split into crumbs the way a
@@ -240,14 +281,20 @@ class FilesExplorerController @Inject constructor(
     }
 
     /**
-     * Rebuilds the session list — the device first, then Ubuntu when it is installed, then every
+     * Rebuilds the session list — the device first, then Ubuntu when it is *running*, then every
      * saved host, live or not.
      *
-     * The Ubuntu chip is offered only when there is a rootfs to open. A device whose ABI maps to no
-     * Ubuntu architecture can never install one, and a chip that opens onto "no userspace is
-     * installed" is worse than no chip: it advertises a place that does not exist. The check is the
-     * same one the provider makes on every call, so a rootfs uninstalled while the app is running
-     * loses its chip on the next refresh rather than on the next launch.
+     * The Ubuntu chip is offered only while the userspace is running. An installed-but-stopped
+     * rootfs used to earn a chip, on the reasoning that the files are simply there — but a chip is
+     * not a fact about a directory, it is an entry in a list of places the app can take you, and
+     * every other entry in that list is a machine that is up. A stopped userspace is not running a
+     * shell, holds no session and reports no health; offering it here made the Files tab the one
+     * screen that claimed otherwise. A device whose ABI maps to no Ubuntu architecture can never
+     * run one, and gets no chip for the same reason.
+     *
+     * The gate moved with the claim: it reads [ubuntuRunning] rather than the rootfs's presence, so
+     * a Stop takes the chip away on the next state change rather than on the next launch, and a
+     * Start puts it back.
      */
     fun refreshSessions() {
         scope.launch {
@@ -255,10 +302,12 @@ class FilesExplorerController @Inject constructor(
             lastHosts = hosts
             val live = withContext(Dispatchers.IO) { sessionStore.liveHostIds() }
             val local = ExplorerSession(LOCAL_SESSION_ID, "This device", ExplorerSessionKind.DEVICE, live = true)
-            val ubuntu = ubuntuProvider.isAvailable().let { available ->
-                // Ubuntu is "live" when it is installed, which is the only liveness it has: there is
+            val ubuntu = if (ubuntuRunning.value) {
+                // Ubuntu is "live" when it is running, which is the only liveness it has: there is
                 // no session to hold open, because the files are simply there.
-                if (available) listOf(ExplorerSession(UBUNTU_SESSION_ID, "Ubuntu on this device", ExplorerSessionKind.UBUNTU, live = true)) else emptyList()
+                listOf(ExplorerSession(UBUNTU_SESSION_ID, "Ubuntu on this device", ExplorerSessionKind.UBUNTU, live = true))
+            } else {
+                emptyList()
             }
             val remote = hosts
                 .filter { it.id != LOCAL_SESSION_ID }
@@ -270,7 +319,21 @@ class FilesExplorerController @Inject constructor(
                         live = host.id in live,
                     )
                 }
-            _state.update { it.copy(sessions = listOf(local) + ubuntu + remote) }
+            val sessions = listOf(local) + ubuntu + remote
+            _state.update { current ->
+                // A session that has just left the list cannot stay open, or the explorer would be
+                // browsing a place with no chip to come back to — the Ubuntu userspace being
+                // stopped under it, or a host deleted while its tree was on screen. Falling back to
+                // a null path is what the tab's own first-listing effect watches: it opens the
+                // device session as soon as the list it lands in is the real one.
+                val stranded = current.sessions.any { it.id == current.activeSessionId } &&
+                    sessions.none { it.id == current.activeSessionId }
+                if (stranded) {
+                    current.copy(sessions = sessions, activeSessionId = LOCAL_SESSION_ID, path = null)
+                } else {
+                    current.copy(sessions = sessions)
+                }
+            }
         }
     }
 

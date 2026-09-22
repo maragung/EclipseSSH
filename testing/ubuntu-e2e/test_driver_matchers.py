@@ -1014,6 +1014,19 @@ class LinuxSectionWalkEvidence(unittest.TestCase):
         self.driver.require_linux_section()
         self.assertEqual([], self.driver.adb.swipes)
 
+    def test_the_walk_drags_the_list_back_toward_its_start(self):
+        """The one list walk that swipes the other way, because the section it looks
+        for is the first one on Settings. Every other walk here drags toward the
+        list's end, which is right for a row below the fold and wrong for this one:
+        from a list the shell left scrolled down - the offset every tab shares, see
+        _tab_active - dragging toward the end walks away from the section above it,
+        and the walk would spend its cap doing it."""
+        self.driver.adb = _ScrollingAdb([self.HOSTS, OpenWindowButton.LIST])
+        self.assertTrue(self.driver.scroll_to_linux_section(max_swipes=2))
+        self.assertEqual(1, len(self.driver.adb.swipes))
+        _, y1, _, y2, _ = self.driver.adb.swipes[0]
+        self.assertLess(y1, y2)
+
 
 class StorageGateCleanup(unittest.TestCase):
     """_remove_filler runs from storage_gate's `finally`, so anything it raises

@@ -5134,7 +5134,33 @@ private fun SettingsScreen(
     // actually wrote, but an entry whose secrets were all forgotten individually can still be present
     // with nothing in it, so the count filters rather than reading `size`.
     val savedCredentialCount = state.savedCredentials.count { (_, saved) -> !saved.isEmpty }
+    // First on the list, ahead of Security: the one entry here that is a whole environment rather
+    // than a preference over the app's own behaviour, and the one most users open Settings for. The
+    // control panel it leads to is a window of its own now ([UbuntuActivity]) - everything that acts
+    // on the environment (install, uninstall, start, stop, repair, the version chooser, and the
+    // install log with its two exports) needed more room than a Settings row has, and the log in
+    // particular was a capped dialog body. What stays on this list is the one fact the list is
+    // for: whether there is an environment, and what it is doing.
+    val linuxUi by linuxUserspace.uiState.collectAsStateWithLifecycle()
     Spacer(Modifier.height(8.dp))
+    SettingsSection("Linux userspace") {
+        SettingRow(
+            Icons.Default.Computer,
+            "Ubuntu on this device",
+            linuxUserspaceSummary(linuxUi),
+        ) {
+            // Absent, not disabled, on a device that cannot run it - the rule the section kept: an
+            // unsupported device cannot be offered an install that cannot finish, but it also
+            // should not look like a feature that went missing.
+            if (linuxUi.supported) {
+                TextButton(
+                    onClick = { context.startActivity(Intent(context, UbuntuActivity::class.java)) },
+                    modifier = Modifier.semantics { contentDescription = "Ubuntu on this device" },
+                ) { Text("Open") }
+            }
+        }
+    }
+    Spacer(Modifier.height(14.dp))
     SettingsSection("Security") {
         SettingRow(Icons.Default.Lock, "Biometric vault lock", "Protect passwords and private keys") { Switch(checked = state.settings.biometricUnlock, onCheckedChange = onBiometric) }
         // Building the pair is the window's own work now, not this list's: generating one is seconds
@@ -5306,34 +5332,10 @@ private fun SettingsScreen(
             } else {
                 "${state.diagnostics.size} event(s) recorded · no secrets"
             },
-        // "View" alone is ambiguous on this list - the Ubuntu row below carries a control too, and
+        // "View" alone is ambiguous on this list - the Ubuntu row above carries a control too, and
         // the About row at the end of this block records that a screen reader once heard two rows
         // as the same word.
         ) { TextButton(onClick = { context.startActivity(Intent(context, DiagnosticsActivity::class.java)) }, modifier = Modifier.semantics { contentDescription = "Connection diagnostics" }) { Text("View") } }
-    }
-    Spacer(Modifier.height(14.dp))
-    // The userspace control panel is a window of its own now. Everything that acts on the
-    // environment - install, uninstall, start, stop, repair, the version chooser, and the install
-    // log with its two exports - needed more room than a Settings row has, and the log in
-    // particular was a capped dialog body. What stays on this list is the one fact the list is
-    // for: whether there is an environment, and what it is doing.
-    val linuxUi by linuxUserspace.uiState.collectAsStateWithLifecycle()
-    SettingsSection("Linux userspace") {
-        SettingRow(
-            Icons.Default.Computer,
-            "Ubuntu on this device",
-            linuxUserspaceSummary(linuxUi),
-        ) {
-            // Absent, not disabled, on a device that cannot run it - the rule the section kept: an
-            // unsupported device cannot be offered an install that cannot finish, but it also
-            // should not look like a feature that went missing.
-            if (linuxUi.supported) {
-                TextButton(
-                    onClick = { context.startActivity(Intent(context, UbuntuActivity::class.java)) },
-                    modifier = Modifier.semantics { contentDescription = "Ubuntu on this device" },
-                ) { Text("Open") }
-            }
-        }
     }
     Spacer(Modifier.height(14.dp))
     SettingsSection("About") {
