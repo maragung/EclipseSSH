@@ -96,6 +96,7 @@ object VaultBackup {
             put("blockScreenshots", settings.blockScreenshots)
             put("reconnectAskFirst", settings.reconnectAskFirst)
             put("terminalKeepSystemBars", settings.terminalKeepSystemBars)
+            put("terminalScrollbackCountVisible", settings.terminalScrollbackCountVisible)
             // Opt-keyed and length-capped like every untrusted string the vault round-trips: an
             // absent key is "old backup" (reader defaults the field), never a parse failure. The
             // blob's own codec decodes tolerantly, so a mangled value becomes defaults, not a
@@ -229,6 +230,15 @@ object VaultBackup {
             blockScreenshots = settingsObj.optBoolean("blockScreenshots", defaults.blockScreenshots),
             reconnectAskFirst = settingsObj.optBoolean("reconnectAskFirst", defaults.reconnectAskFirst),
             terminalKeepSystemBars = settingsObj.optBoolean("terminalKeepSystemBars", defaults.terminalKeepSystemBars),
+            // Absent from backups written before this setting existed. It travels with the rest of
+            // the display settings rather than staying on the device that set it, because a restore
+            // is the only path a preference has to a new phone, and this is one a user turns off on
+            // purpose: an import that quietly turned the count back on would undo that decision
+            // while looking like it had restored their settings.
+            terminalScrollbackCountVisible = settingsObj.optBoolean(
+                "terminalScrollbackCountVisible",
+                defaults.terminalScrollbackCountVisible,
+            ),
             // The blob is decoded by EditorPrefsCodec, which never throws — a hand-edited or
             // truncated value becomes the editor's defaults rather than a failed import. Capped
             // on the way in for the same reason every vault string is: a backup is untrusted.

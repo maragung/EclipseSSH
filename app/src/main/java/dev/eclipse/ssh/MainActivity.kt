@@ -1525,6 +1525,7 @@ private fun EclipseWorkspace(
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
+                    onTerminalScrollbackCount = viewModel::setTerminalScrollbackCountVisible,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1719,6 +1720,7 @@ private fun EclipseWorkspace(
                     onReconnectAskFirst = viewModel::setReconnectAskFirst,
                     onTerminalTheme = viewModel::setTerminalTheme,
                     onTerminalKeepSystemBars = viewModel::setTerminalKeepSystemBars,
+                    onTerminalScrollbackCount = viewModel::setTerminalScrollbackCountVisible,
                     // The shell is the one screen that must not be inset by this Scaffold. Its own
                     // padding comes from `safeDrawingPadding` inside the terminal, and applying both
                     // would inset the grid twice - once for a navigation bar that is not there and
@@ -2439,6 +2441,12 @@ private fun WorkspaceScaffold(
     // The keep-system-bars switch was wired into SettingsScreen and both scaffold call sites, but
     // never into the scaffold's own parameter list, so all three references failed to resolve.
     onTerminalKeepSystemBars: (Boolean) -> Unit = {},
+    /**
+     * The scrolled-back badge's count, from Settings. Wired into all four sites at once - this
+     * scaffold, both of its call sites and [SettingsScreen] - because a parameter missing from one
+     * of them fails to resolve three screens away from the omission.
+     */
+    onTerminalScrollbackCount: (Boolean) -> Unit = {},
     // The shortcut bar's configuration blob and the diagnostics copy/save/clear trio stood here for
     // the same reason as the six above - to carry a dialog's answer back out to the clipboard and the
     // SAF picker this scaffold owns. All four rows have a window of their own now, and each of those
@@ -2641,6 +2649,7 @@ private fun WorkspaceScaffold(
                     onReconnectAskFirst = onReconnectAskFirst,
                     onTerminalTheme = onTerminalTheme,
                     onTerminalKeepSystemBars = onTerminalKeepSystemBars,
+                    onTerminalScrollbackCount = onTerminalScrollbackCount,
                     onImportSshConfig = onImportSshConfig,
                 )
             }
@@ -3260,6 +3269,10 @@ private fun TerminalScreen(
                     ScrollbackBadge(
                         lines = frame.totalLines - (frame.firstLine + frame.lines.size),
                         onJump = { onScrollTo(activeTab.id, 0) },
+                        // Read from the state this screen already has, the way the key row's own
+                        // visibility is read below: a preference that changes what the terminal draws
+                        // needs no plumbing to reach the thing that draws it.
+                        showCount = state.settings.terminalScrollbackCountVisible,
                         modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
                     )
                 }
@@ -3772,9 +3785,24 @@ private fun MainUiState.terminalLine(sessionKey: String, line: Int): String {
     return text.lineSequence().elementAtOrNull(line).orEmpty()
 }
 
-/** The scrolled-back indicator: how far behind the live output the view is, and a way back. */
+/**
+ * The scrolled-back indicator: how far behind the live output the view is, and a way back.
+ *
+ * [showCount] hides the "$lines lines below" text and nothing else — the arrow, the tap target and
+ * the "Jump to live output" description all stay, because the badge is the only thing that
+ * distinguishes a scrolled-back terminal from a hung one. What the count costs is width over the
+ * busiest corner of the grid, which is the trade the Settings row offers; what it must never cost is
+ * the way back. The padding is therefore the same in both states: with the text gone it is symmetric
+ * around the arrow rather than a gap where a number used to be, and the target the user has to hit to
+ * get back to live output does not shrink along with the thing that was hidden.
+ */
 @Composable
-private fun ScrollbackBadge(lines: Int, onJump: () -> Unit, modifier: Modifier = Modifier) {
+private fun ScrollbackBadge(
+    lines: Int,
+    onJump: () -> Unit,
+    showCount: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
     Surface(
         modifier = modifier.clickable(onClick = onJump).semantics { contentDescription = "Jump to live output" },
         shape = RoundedCornerShape(12.dp),
@@ -3782,8 +3810,10 @@ private fun ScrollbackBadge(lines: Int, onJump: () -> Unit, modifier: Modifier =
     ) {
         Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.ArrowDownward, null, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("$lines lines below", style = MaterialTheme.typography.labelMedium)
+            if (showCount) {
+                Spacer(Modifier.width(6.dp))
+                Text("$lines lines below", style = MaterialTheme.typography.labelMedium)
+            }
         }
     }
 }
@@ -5105,6 +5135,7 @@ private fun SettingsScreen(
     onReconnectAskFirst: (Boolean) -> Unit = {},
     onTerminalTheme: (String) -> Unit,
     onTerminalKeepSystemBars: (Boolean) -> Unit = {},
+    onTerminalScrollbackCount: (Boolean) -> Unit = {},
     // Six more `onXxx` callbacks stood here for the same reason and went the same way, with one worth
     // naming: `verifyPin` was never only this screen's. The lock screen that gates app startup takes
     // its own, and it still does - PIN lock's Settings window calls `SettingsRepository.verifyPin`
@@ -5251,6 +5282,15 @@ private fun SettingsScreen(
             "Keep system bars during sessions",
             "Off by default: sessions take the whole screen. On, the status and navigation bars stay visible over the terminal",
         ) { Switch(checked = state.settings.terminalKeepSystemBars, onCheckedChange = onTerminalKeepSystemBars) }
+        // The switch hides the count and never the badge. The arrow that stays is the only thing on
+        // screen that tells a scrolled-back terminal from a hung one, so the subtitle says what is
+        // kept rather than only what goes - a row promising "hide the badge" would be describing a
+        // change this does not make.
+        SettingRow(
+            Icons.Default.Terminal,
+            "Scrolled-back line count",
+            "How far behind the live output the view is. Off hides the number and keeps the arrow that jumps back",
+        ) { Switch(checked = state.settings.terminalScrollbackCountVisible, onCheckedChange = onTerminalScrollbackCount) }
         SettingRow(Icons.Default.Security, "Legacy algorithms", "Also offer CBC, SHA-1 and dh-group1 to reach older servers") { Switch(checked = state.settings.legacyAlgorithms, onCheckedChange = onLegacyAlgorithms) }
         SettingRow(Icons.Default.Lock, "Block screenshots", "Hides this app from screenshots, screen recording and the recents preview") { Switch(checked = state.settings.blockScreenshots, onCheckedChange = onBlockScreenshots) }
     }

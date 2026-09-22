@@ -55,6 +55,7 @@ internal object Keys {
         val reconnectBaseSeconds = intPreferencesKey("reconnect_base_seconds")
         val terminalFontSize = intPreferencesKey("terminal_font_size")
         val terminalKeyRowVisible = booleanPreferencesKey("terminal_key_row_visible")
+        val terminalScrollbackCountVisible = booleanPreferencesKey("terminal_scrollback_count_visible")
         val terminalMinColumns = intPreferencesKey("terminal_min_columns")
         val terminalRows = intPreferencesKey("terminal_rows")
         val pinEnabled = booleanPreferencesKey("pin_enabled")
@@ -89,6 +90,9 @@ internal fun settingsFrom(prefs: Preferences) = AppSettings(
     // backup, where the number is whatever the file says, and a 200 sp grid is one cell wide.
     terminalFontSize = SettingsRepository.normalizeFontSize(prefs[Keys.terminalFontSize] ?: SettingsRepository.DEFAULT_TERMINAL_FONT_SIZE),
     terminalKeyRowVisible = prefs[Keys.terminalKeyRowVisible] ?: true,
+    // Absent from every install that predates it, and the default is the badge those installs
+    // already drew rather than a blank one-by-accident.
+    terminalScrollbackCountVisible = prefs[Keys.terminalScrollbackCountVisible] ?: false,
     terminalMinColumns = prefs[Keys.terminalMinColumns] ?: SettingsRepository.DEFAULT_TERMINAL_MIN_COLUMNS,
     // Clamped on the way out for the same reason as the columns below it: this number also arrives
     // from a restored backup, and a height the pty would refuse is one the status line would report
@@ -255,6 +259,17 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setTerminalKeyRowVisible(visible: Boolean) = editPrefs {
         it[Keys.terminalKeyRowVisible] = visible
+    }
+
+    /**
+     * Whether the scrolled-back indicator spells out how many lines behind it is.
+     *
+     * A plain stored flag with no clamp and no guard, unlike the numbers above it: it is a boolean
+     * the user flipped, every value is a valid one, and the setting cannot be reached from a
+     * restored backup in a state the switch itself could not produce.
+     */
+    suspend fun setTerminalScrollbackCountVisible(visible: Boolean) = editPrefs {
+        it[Keys.terminalScrollbackCountVisible] = visible
     }
 
     /**
