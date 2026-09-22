@@ -22,7 +22,11 @@ Each patch's preamble documents the failure it fixes, the evidence, and why
 it is not upstream. When a patch is superseded by a new fork pin that
 includes it upstream, delete the patch and bump the pin in the same change.
 
-One boundary is worth knowing before relying on any of this: 0004's record of
+Two boundaries are worth knowing before relying on any of this: 0005 restores
+the *name* a program is executed under, not the path, so a program that reads
+its own AT_EXECFN for its name (multi-call dispatch, rustix's
+`linux_execfn()`) is fixed and one that reads it for its directory is not; and
+0004's record of
 an emulated hard link lives in the proot process that made the link, so its
 answer holds inside one command, not across the guest's filesystem. The app
 runs one proot process per command, so a tool that links in one command and

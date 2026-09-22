@@ -1,0 +1,180 @@
+exec the loader under the program's own name
+
+The kernel records the path it was given to execve(2) as AT_EXECFN,
+and a multi-call binary looks itself up by it.  proot executes the
+loader in place of the guest program, so under this app's exec model -
+PROOT_LOADER lives in the native library directory because the platform
+refuses execve(2) on app data - every AT_EXECFN in the guest names the
+loader.  Ubuntu 26.04's default coreutils provider is uutils, whose
+dispatch reads AT_EXECFN, so its applets died with
+
+    coreutils: unknown program 'libproot-loader'
+
+while the applets still served by GNU binaries under the same rootfs
+kept working: /usr/bin/rm -> gnurm was fine, /usr/bin/ls -> the uutils
+multi-call was not.  "and the session runs as 'coreutils: unknown
+program libproot-loader' instead of 'root'" is this, in whoami.
+
+The loader already rewrites AT_EXECFN on the stack it hands over
+(loader/loader.c), which is why getauxval(AT_EXECFN) and
+/proc/self/comm are already right inside the guest.  The kernel's own
+copy - what /proc/<pid>/auxv serves, and what a Rust program reads
+through rustix's linux_execfn() - is written at execve(2) time and
+cannot be changed from userspace afterwards, by the loader or by
+anyone else.  So the name has to be right when the loader is exec'd.
+
+Evidence, x86_64 Linux, the pinned fork + this patch set, the pinned
+amd64 26.04 rootfs:
+
+    $ PROOT_LOADER=.../libproot-loader.so proot -r rootfs -0 -b /proc /usr/bin/ls /
+    coreutils: unknown program 'libproot-loader'
+    $ PROOT_LOADER=.../libproot-loader.so proot -r rootfs -0 -b /proc /usr/bin/auxv-probe
+    argv0=/usr/bin/auxv-probe
+    getauxval(AT_EXECFN)=/usr/bin/auxv-probe          <- the stack copy, rewritten
+    proc/self/auxv AT_EXECFN=.../libproot-loader.so   <- the kernel's copy
+    comm=auxv-probe
+
+    $ ln -s .../libproot-loader.so alias/ls
+    $ PROOT_LOADER=.../alias/ls proot -r rootfs -0 -b /proc /usr/bin/ls /     # lists /
+    $ PROOT_LOADER=.../alias/ls proot -r rootfs -0 -b /proc /usr/bin/cat /etc/hostname
+    /etc/hostname          # cat acted as ls, though its argv[0] is cat:
+                           # the applet comes from AT_EXECFN, not argv[0]
+
+Hence the loader is now reached through a symbolic link named after
+the program being executed, in a private temporary directory.  A link
+rather than a copy, for two reasons: AT_EXECFN is the path as *given*
+to execve(2) and not the resolved one, so a link keeps the program's
+name while the kernel still executes the loader it points to; and the
+loader must stay the single file the app installed, at a path the
+platform allows to be execve'd.  The link is reused for every run of a
+program in a session, and its directory is removed with the process'
+other temporary files.
+
+When no link can be made - an unwritable temporary directory, a name
+longer than NAME_MAX, "." or ".." - the loader is exec'd under its own
+path exactly as before.  Nothing else is ever exec'd.
+
+Not upstreamed: no write access to oonid/pr; applied by
+fetchLinuxSource in linux/build.gradle.kts (stacks on 0004).
+
+What this does not fix, and should not be read as fixing: the *path*
+is not restored, only the name.  A program that reads its own AT_EXECFN
+for its name (multi-call dispatch, rustix's linux_execfn) is fixed; one
+that reads it for its directory sees .../exec-<pid>-XXXXXX/ where a
+native kernel would report the path the guest passed.  proot's own
+AT_EXECFN rewrite, /proc/self/exe and /proc/<pid>/comm are unchanged,
+and the guest's own argv[] was never involved.
+--- a/src/proot/src/execve/enter.c
++++ b/src/proot/src/execve/enter.c
+@@ -588,6 +588,96 @@
+ }
+
+ /**
++ * Return the path the loader has to be executed through for the sake
++ * of @tracee, or @loader_path itself when no better path can be
++ * built.
++ *
++ * The kernel records the path it is given to execve(2) as AT_EXECFN,
++ * and a program that multiplexes on its own name -- the uutils
++ * coreutils, busybox, ... -- looks itself up by it.  Since the loader
++ * is executed in place of the guest program, such a program would
++ * otherwise see the loader's name and refuse to run:
++ *
++ *     $ ls /
++ *     coreutils: unknown program 'libproot-loader'
++ *
++ * Hence the loader is reached through a symbolic link named after the
++ * program it stands in for.  A link rather than a copy, for two
++ * reasons: AT_EXECFN is the path as *given* to execve(2), not the
++ * resolved one, so a link keeps the program's name while the kernel
++ * still executes the loader it points to; and the loader stays the
++ * single file the app installed at a path the platform allows to be
++ * execve'd (app data does not, the native library directory does).
++ *
++ * The links live in a private temporary directory, removed along with
++ * this process' other temporary files.
++ */
++static const char *get_loader_exec_path(Tracee *tracee, const char *loader_path)
++{
++	static const char *alias_directory = NULL;
++	const char *guest_path;
++	const char *name;
++	char alias_path[PATH_MAX];
++	char link_target[PATH_MAX];
++	ssize_t status;
++
++	/* The name the guest asked for: the program itself, or the
++	 * script when a shebang line was expanded.  This is the same
++	 * path the loader reports to the program as AT_EXECFN.  */
++	guest_path = (tracee->load_info != NULL
++		? tracee->load_info->raw_path
++		: NULL);
++	if (guest_path == NULL)
++		return loader_path;
++
++	name = strrchr(guest_path, '/');
++	name = (name == NULL ? guest_path : name + 1);
++
++	/* Nothing to name a link after: keep the loader's own path,
++	 * as before this function existed.  */
++	if (name[0] == '\0'
++	    || strcmp(name, ".") == 0
++	    || strcmp(name, "..") == 0
++	    || strlen(name) > NAME_MAX)
++		return loader_path;
++
++	if (alias_directory == NULL) {
++		alias_directory = create_temp_directory(NULL, "exec");
++		if (alias_directory == NULL)
++			return loader_path;
++	}
++
++	status = snprintf(alias_path, sizeof(alias_path), "%s/%s", alias_directory, name);
++	if (status <= 0 || (size_t) status >= sizeof(alias_path))
++		return loader_path;
++
++	/* An up-to-date link is the common case: every run of a
++	 * program in a session goes through the same one.  */
++	status = readlink(alias_path, link_target, sizeof(link_target) - 1);
++	if (status < 0 || (size_t) status >= sizeof(link_target) - 1) {
++		/* Absent, or not a link at all: replace it.  */
++		unlink(alias_path);
++	}
++	else {
++		link_target[status] = '\0';
++		if (strcmp(link_target, loader_path) == 0)
++			return talloc_strdup(tracee->ctx, alias_path);
++
++		/* Left behind by another loader: replace it.  */
++		unlink(alias_path);
++	}
++
++	/* Never execute anything but the loader, whatever is in the
++	 * way: an unwritable temporary directory, or a name already
++	 * taken, leaves this process with the path it had before
++	 * instead of an unvetted one.  */
++	if (symlink(loader_path, alias_path) < 0)
++		return loader_path;
++
++	return talloc_strdup(tracee->ctx, alias_path);
++}
++
++/**
+  * Extract all the information that will be required by
+  * translate_load_*().  This function returns -errno if an error
+  * occured, otherwise 0.
+@@ -713,6 +803,14 @@
+ 	if (loader_path == NULL)
+ 		return -ENOENT;
+
++	/* ... but through a name the program can recognize as its
++	 * own, otherwise a multi-call binary reads the loader's name
++	 * from AT_EXECFN and refuses to run.  See
++	 * get_loader_exec_path().  */
++	loader_path = get_loader_exec_path(tracee, loader_path);
++	if (loader_path == NULL)
++		return -ENOMEM;
++
+ 	status = set_sysarg_path(tracee, loader_path, SYSARG_1);
+ 	if (status < 0)
+ 		return status;
