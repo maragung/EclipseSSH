@@ -211,7 +211,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,982 JVM/Robolectric test methods in 176 test files and contacts nothing off the
+The suite is 2,005 JVM/Robolectric test methods in 177 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot
@@ -234,15 +234,16 @@ need a device or emulator.
 
 ## Continuous integration
 
-Ten GitHub Actions workflows in all; [`docs/ci.md`](docs/ci.md) holds the full table. Three of them
+Eleven GitHub Actions workflows in all; [`docs/ci.md`](docs/ci.md) holds the full table. Three of them
 are what a release passes through:
 
 - [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — the gate that runs on every push to
-  `main` and every pull request. Seven jobs, so a failure lands on the thing that is actually broken:
+  `main` and every pull request. Eight jobs, so a failure lands on the thing that is actually broken:
   a documentation figure check, both native modules, release lint, the unit and integration suite
   (the debug variant only, since AGP 9 removed `testReleaseUnitTest`), the instrumentation and AAB
-  builds with their signature checks, and an emulator crash-on-open smoke — with the idle stress
-  matrix as a seventh job that runs only when a `workflow_dispatch` sets its `stress` input. A
+  builds with their signature checks, an emulator crash-on-open smoke, and the job that closes the
+  CI window — with the idle stress matrix as a job that runs only when a `workflow_dispatch` sets
+  its `stress` input. A
   push-triggered idle test would burn the runner's metered time for a regression the rest of the
   suite cannot see anyway, and a 30-minute idle test behind every on-demand run would put a
   75-minute tail on checks that otherwise answer in 35. The

@@ -1110,3 +1110,15 @@ jobs:
             app/build/test-results/
             .tmp-build/sshd-test/sshd.log
           retention-days: 14
+
+  # Closes a window opened by scripts/ci-window.sh. Skipped - and so free, and
+  # secret-free - whenever the repository is private, which is every ordinary
+  # push, PR and dispatch. It needs the other jobs only to know when the run is
+  # over, so `stress` is in the list even though it is usually skipped: a
+  # skipped dependency has settled, and `always()` still runs this job after it.
+  close-window:
+    name: Close the CI window
+    needs: [docs, native, lint, test, assemble, smoke, stress]
+    if: always()
+    uses: ./.github/workflows/close-ci-window.yml
+    secrets: inherit

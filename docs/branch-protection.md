@@ -71,6 +71,12 @@ block a merge. It is also the one `ci.yml` job a plain `workflow_dispatch` does
 not start — it needs the dispatch's `stress` input set, because a job that holds
 a connection open for 30 minutes should not be the tail of every on-demand run.
 
+`CI`'s `Close the CI window` (`close-window`) is **not** in the list either, and unlike `stress` it
+must never be added to it. It is `skipped` on every ordinary run — it appears only in a run that
+started while the repository was public, which is the one situation it exists for — and a required
+check that reports `skipped` never reports success, so requiring it would make `main` permanently
+unmergeable. A job whose whole purpose is to be absent most of the time can never be a gate.
+
 The `Release build` workflow is **not** a required check for `main`, because it
 is gated by the `release` environment (see below) and should not block a merge.
 The `Tagged release` workflow only runs on tag pushes and is not on the `main`
