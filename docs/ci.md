@@ -293,6 +293,17 @@ The watchdog is installed once:
 scripts/ci-window-watchdog.sh --install-cron
 ```
 
+**A window also decides whether `main` is protected at all.** Branch protection is a paid feature on a
+private repository for this account and a free one on a public repository, so the rule is possible
+only while a window is open — and a close does not suspend it, it deletes it. That was measured in
+that order: a pull request carrying a red check read `mergeStateStatus: BLOCKED` while the window was
+open, read `UNSTABLE` with the same red check still present minutes after `close`, and a later window
+found the endpoint answering `404 Branch not protected`. So a window opened without re-applying the
+rule leaves `main` guarded by nothing for its own duration as well as after it — and the whole point
+of running a release this way is that the merge and the tag happen inside the window. The `PUT` that
+re-applies it is on [Branch protection](branch-protection.md); it is by hand today, and folding it
+into `open` is the open item that page names.
+
 ## Reproducing a CI failure locally
 
 The documentation check needs nothing but `bash` and the checkout, so it is the one gate that is

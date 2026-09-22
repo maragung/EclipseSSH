@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 38 / versionName 1.7.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 39 / versionName 1.8.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §59, *Releasing 1.7.0*; the newest of them that releases a version is §59, *Releasing 1.7.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §60, *Releasing 1.8.0*; the newest of them that releases a version is §60, *Releasing 1.8.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6352,3 +6352,139 @@ commit also settled a debt the two hours between the merges left: §58's README 
 test methods in 176 files, were still standing when #155's own tests made them 2,005 in 177, so the
 documentation gate disagreed with the tree from #155's merge until the CI window's commit corrected
 it.
+
+---
+
+## 60. Releasing 1.8.0
+
+1.7.0 was the first release cut inside a CI window. This is the second, and work on its own branch
+turned up something the window's documentation did not say: **branch protection is a public-repository
+feature on this account, so the rule that guards `main` stops existing whenever the window is closed**
+— which means the window that makes a release affordable is also what takes away the guard over the
+merge and the tag it was opened for.
+
+### What it carries
+
+**The scrolled-back badge's count became a setting, off by default.** The pill that appears over the
+top-right of the grid when the terminal is scrolled back reads `137 lines below`. It sits exactly
+where a `tail -f`, a `top` header or a wrapped command line has its busiest text, and it spends that
+width on a number the reader is about to leave anyway: the tap that dismisses the badge is the same
+tap that makes the number irrelevant. It is now **Settings › Workspace › "Scrolled-back line count"**,
+off by default.
+
+What the switch hides is the count and never the badge, and that distinction is the whole of the
+argument for defaulting it off. The arrow that stays is the only thing on screen that distinguishes a
+scrolled-back terminal from a hung one and the only way back to the live output, so it keeps its tap
+target and its `"Jump to live output"` description either way — what the switch withholds is a
+number, not a control. The padding is 12dp in both states; shrinking it to 10dp was tried first and
+reverted, because the one control whose tap returns the user to live output should not be the one that
+grows smaller when a preference is set. Where that reasoning does not hold, this app's defaults go
+the other way: the key row in the same section is on by default, since off would take away the only
+way a phone keyboard can send ESC.
+
+The setting takes the nine steps every setting here takes — the `AppSettings` field, the DataStore
+key, `settingsFrom`'s default, the repository setter, the view model's `writeSetting` wrapper, the
+scaffold parameter, the Settings row, both call sites, and the vault backup. Two of them are the ones
+that have gone wrong before. `WorkspaceScaffold`'s parameter list has to be edited *with* the two call
+sites and `SettingsScreen`, because the sibling keep-system-bars switch was once added to three of the
+four and the fourth failed to resolve three screens away from the omission. And `VaultBackup`
+enumerates the settings it carries, so a field missing from `toJson` travels one way and is dropped on
+import with nothing to say so — which is why `VaultBackupTest`'s whole-object round-trip sets this
+field to the opposite of its default, the only way that comparison can notice a field that stopped
+being written.
+
+Two test-side repairs came with it. `SettingsRepositoryTest.restoreTheDefaults()` exists so a sibling
+class reading the shared DataStore never sees a value it did not write, and `terminalKeepSystemBars`
+was not in its list — test `02` sets it true and nothing put it back, which is the exact leak that
+method's KDoc says it prevents. It is in the list now. `02` writes the new setting to `true`, against
+its default, since an assertion that agrees with the default proves nothing about the write; and `11`
+covers the round-trip both ways plus the read-side default, which is what would catch the default
+drifting back.
+
+### What running a whole release inside the window revealed
+
+**The protection rule is not a property of the repository; it is a property of being public.**
+`GET /repos/maragung/EclipseSSH/branches/main/protection`, `GET .../rulesets` and
+`GET .../rules/branches/main` all answer the same way while the repository is private:
+
+```
+{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","status":"403"}
+```
+
+The rule was restored by hand while a window was open, and it *was* binding: PR #158 read
+`mergeStateStatus: BLOCKED` with a red check present. Minutes after `ci-window.sh close` the same pull
+request read `UNSTABLE` with the same red check still present — nothing was required any more, so
+nothing was blocking. A window opened afterwards answered `404 Branch not protected` instead: the rule
+had not been waiting to come back, the private interval had deleted it, and it has to be applied again
+by hand. `docs/branch-protection.md` opened by saying the rule was "in force since 2026-09-17", and
+that sentence was false every hour the repository spent private. It now says what is true, in the
+terms that file's own "a recipe mistaken for a safeguard is worse than no recipe" passage asks for.
+Re-read while writing this, with the repository private and no window open, `/branches/main/protection`
+and `/rulesets` both answer the 403 above — the state a reader who checks today will find.
+
+The consequence for a merge is the part worth stating plainly: **while the window is closed, nothing
+in this repository guards `main`.** The required-check rule is gone, and a red check merges without
+complaint. The merge of #158 was therefore made behind a check read by hand — every check run on the
+head commit printed by name, with exactly one tolerated red (below) and any other failing the guard —
+which is a weaker guard than the platform's, and is the honest description of what happened.
+
+**The closer cannot close yet.** `close-ci-window.yml` fails, by design and loudly, whenever the
+repository is public and `REPO_ADMIN_TOKEN` is unset:
+
+> This run started while the repository was public, and REPO_ADMIN_TOKEN is not set, so nothing here
+> can close the window. The repository is STILL PUBLIC.
+
+That is the second of the three closers described in `docs/ci.md`, and on this account it is
+inoperative: the opener's `EXIT` trap and the cron watchdog are the two that work. It is also one
+reason a `ci.yml` run that starts with a window open ends `failure` as a whole, which is why
+`mergeStateStatus` for a merge made during one reads `UNSTABLE` rather than `CLEAN` — the tolerated red
+is the window being open, not the change under test.
+
+### The verification
+
+The app tree this release carries is `3514f65` — `main` at `7b2101c`, #158 and nothing else, with the
+version bump and this section on top. It ran on GitHub-hosted runners on 2026-09-22 between 09:29:13Z
+and 10:15:05Z as `ci.yml` run `35710648644`:
+
+| Job | Result |
+| --- | --- |
+| Documentation figures | success, 8s |
+| FreeRDP native (4 ABIs) | success, 11m32s |
+| Lint (release variant) | success, 18m7s |
+| Unit and integration tests | success, 21m13s |
+| APKs, AAB and signatures | success, 26m57s |
+| Boot the built APKs (crash-on-open gate) | success, 3m0s |
+| Long idle stress test | skipped — the run did not ask for it |
+| Close the CI window | failure, by design — see above |
+
+Two further workflows ran against the same commit. `instrumentation.yml` run `35710648320` was green,
+its `connectedAndroidTest` taking 19m40s on a runner that booted its own AVD — the result §59's "what
+has not run" passage left to a release's own pull request, repeated here on this tree (the suite had
+reached runners before it, in the 1.7.0 window's runs; §59's note was about its own tree and says so).
+`schema-dump.yml`'s `Generate app/schemas` was green in 11m18s.
+
+The documentation gate earned its place in this release rather than merely passing it: the new test
+moved `README.md`'s JVM method count from 2,005 to 2,006, and `Documentation figures` went red on the
+first push of the branch with *"README.md says 2005 JVM test methods; the sources hold 2006"*. The
+README moved with it, and `AUDIT-REPORT.md`'s own 2,005 — the figure §59 left — was left alone,
+because it is a record of what that pass saw.
+
+### Why this one can be installed over an existing app
+
+The signing identity is unchanged. `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the
+runner before it signs, so this release carries `0c69794b…`, the identity v1.7.0 and every release
+through v1.4.0, v1.5.1 and v1.6.0 was signed with, and an install of any of them upgrades to 1.8.0
+normally. The v1.5.0 exception §56 describes is unchanged.
+
+The two version lines in this file's header moved, `app/build.gradle.kts` moved with them
+(`versionCode 39`, `versionName "1.8.0"`), and this section, `docs/branch-protection.md` and
+`docs/ci.md` are the rest of the change. `versionName` is a **minor** bump rather than the patch §41
+and §56 both argue for, and the test they set is the one that decides it: a patch number is honest
+when the artifact a user installs behaves as its predecessor's does, and this one does not — it gains
+a Settings row and stops drawing a number it drew before.
+
+`scripts/check-doc-figures.sh` counts 159 claims as of this commit, against §59's 157. One is this
+section naming `schema-dump.yml`, which no earlier section had a reason to name. The other is
+`docs/branch-protection.md` naming `scripts/ci-window.sh` — the script whose silence on protection is
+what the correction above is about, and a citation that had no business being absent from the page
+that depends on it.

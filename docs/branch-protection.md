@@ -1,13 +1,56 @@
 # Branch protection
 
-**In force since 2026-09-17.** `GET
-/repos/maragung/EclipseSSH/branches/main/protection` answers with the rule below
-as stored, and that read-back is the evidence — a `PUT` returning `200` is a
-claim, not a state. Until that date the same endpoint answered `Branch not
-protected`, and the six pull requests before it — every one authored and merged
-by the same account — are what that looked like in practice: the discipline was
-the author's, not GitHub's. Settings are at
-`github.com/maragung/EclipseSSH/settings/branches`.
+**The rule below exists only while the repository is public, and the repository is public only while a
+CI window is open.** Read that before the table, because the table describes something that is absent
+almost all of the time — and until 2026-09-22 this file said "In force since 2026-09-17", which was
+true of the day it was written and false of every private hour after it.
+
+`GET /repos/maragung/EclipseSSH/branches/main/protection` answers with the rule as stored, and that
+read-back — not a `PUT` returning `200` — is the evidence. But on this account it answers that way
+only while the repository is public. While it is private, all three endpoints that could describe the
+rule answer the same way:
+
+```
+{"message":"Upgrade to GitHub Pro or make this repository public to enable this feature.","status":"403"}
+```
+
+`/branches/main/protection`, `/rulesets` and `/rules/branches/main` alike. Branch protection is a
+paid feature on a private repository for this account and a free one on a public repository, so the
+window that makes Actions minutes free is also what makes this rule possible — and
+[closing the window](ci.md#the-ci-window) takes it away again.
+
+**A close does not suspend the rule; it deletes it.** That distinction was measured in that order.
+The rule was re-applied while a window was open and it bound: a pull request with a red check read
+`mergeStateStatus: BLOCKED`. Minutes after `scripts/ci-window.sh close`, the same pull request read
+`UNSTABLE` with the same red check still present — nothing was required any more, so nothing was
+blocked. Re-opening a window afterwards, the endpoint answered `404 Branch not protected`: the rule
+had not been waiting to come back, it was gone, and it has to be applied again by hand.
+
+| While the repository is | What guards `main` |
+| --- | --- |
+| public — a window is open **and** the rule has been re-applied | The rule below, enforced by GitHub, including against the administrator |
+| private — every ordinary hour, and most of a window's too | The author's discipline, read by hand. Nothing on the platform |
+
+**What the hand-read guard costs, stated plainly.** While the window is closed a red check merges
+without complaint, because nothing is required. The one merge made that way read every check run on
+the head commit by name, printed them whether they passed or not, tolerated exactly one red — the
+closer's, which is red by design — and failed on any other. That is a weaker guard than the platform's
+and it lived in a local script rather than in this repository, so it guards nobody else. The six pull
+requests that landed before the rule existed — every one authored and merged by the same account —
+are what that discipline looks like in practice without a platform behind it. Anyone merging while
+the window is closed should say so in the pull request rather than let the merge imply a gate that was
+not there.
+
+**Putting the rule back is a by-hand `PUT`** to
+`/repos/maragung/EclipseSSH/branches/main/protection` with the settings in the table below, run while
+the repository is public. Nothing in `scripts/` does it today: `ci-window.sh` opens and closes the
+window and never touches protection, and the closer's job cannot — it runs under the default token,
+which has no `administration` permission to grant at any level. Moving this `PUT` into
+`ci-window.sh open`, so a window arrives with the rule already back, is the open item; until it
+exists, a window opened and closed without a hand-applied `PUT` leaves `main` unguarded for its whole
+duration *and* every hour after it.
+
+Settings are at `github.com/maragung/EclipseSSH/settings/branches`.
 
 ## Rule for `main`
 
