@@ -40,10 +40,14 @@ RFB or RDP is driven from the app that already holds its credentials.
 local shell that is the same terminal channel an SSH one is. That shell is proot's fake root, which
 is what lets `apt install` unpack packages and `su` change identity without the device ever being
 rooted. Anything past the base (Python, Node.js, an editor, a compiler) is one `apt-get install`
-away inside the terminal. Its tree is browsable too: **Ubuntu on this device** appears in the Files
-tab as a session of its own, so the workspace is edited, renamed, copied in and out and searched the
-way a host's files are — with guest paths in every row, never the sandbox's. Architecture and
-operating manual: [`docs/linux-userspace.md`](docs/linux-userspace.md).
+away inside the terminal. Its tree is browsable too: while the userspace is running, **Ubuntu on
+this device** appears in the Files tab as a session of its own, so the workspace is edited, renamed,
+copied in and out and searched the way a host's files are — with guest paths in every row, never the
+sandbox's. The whole userspace is portable: **Export** writes it — the base system, everything `apt`
+added since, and the workspace under `/home/ubuntu` — to a `.tar.gz` you choose, and **Import** puts
+one back, replacing whatever is installed after asking once, so a factory reset, a second device or a
+userspace that stopped working costs a file rather than a fresh download. Architecture and operating
+manual: [`docs/linux-userspace.md`](docs/linux-userspace.md).
 
 **Files.** A text editor for the files the app browses — opened from the explorer, a preview window or
 the New File dialog — in its own opaque window rather than a panel over the workspace. An archive
@@ -68,9 +72,9 @@ travel in an export.
 widget and a Quick Settings tile; vault export/import.
 
 **Settings, one window per subject.** Every Settings entry opens an Activity of its own rather than
-a dialog over the list — key generation, PIN lock, auto-lock, known hosts, saved credentials,
-keep-alive, clipboard auto-clear, font size, the shortcut bar, terminal width and height, the
-encrypted backup export, reconnect delay, connection diagnostics, the Ubuntu userspace, and About —
+a dialog over the list — the Ubuntu userspace first, then key generation, PIN lock, auto-lock, known
+hosts, saved credentials, keep-alive, clipboard auto-clear, font size, the shortcut bar, terminal
+width and height, the encrypted backup export, reconnect delay, connection diagnostics, and About —
 and Add Host /
 Edit host opens the same kind of window. Each one edits a store the Settings list already reads, so
 a change is visible when the list resumes without a result code being handed back. The one
@@ -207,7 +211,7 @@ is 28).
 
 ## Tests
 
-The suite is 1,947 JVM/Robolectric test methods in 173 test files and contacts nothing off the
+The suite is 1,982 JVM/Robolectric test methods in 176 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot

@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Article
+import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Computer
@@ -28,6 +29,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -46,11 +48,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dagger.hilt.android.AndroidEntryPoint
 import dev.eclipse.ssh.data.model.AppSettings
@@ -58,9 +62,11 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.feature.vault.VaultUnlockGate
 import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.RootfsTransferState
 import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
 import dev.eclipse.ssh.linux.percent
+import dev.eclipse.ssh.linux.percentDone
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceController
 import dev.eclipse.ssh.presentation.linux.LinuxUserspaceUiState
 import dev.eclipse.ssh.security.SecureClipboard
@@ -100,10 +106,20 @@ import kotlinx.coroutines.withContext
  * trace and the failure lines keep their controls, because reading what went wrong while it is
  * happening is the one thing a user wants mid-operation, and neither can restart anything.
  *
+ * The Import and Export rows obey the same rule for the same reason — an export started over an
+ * import would read a tree the import is about to replace, and both take the install lock, so a
+ * second tap could only ever be refused underneath. Their own progress rows are the one thing that
+ * *does* appear while they run: a transfer that showed no sign of itself would be indistinguishable
+ * from a tap that did nothing, and a 250 MB write is a long time to wonder. That row carries the
+ * screen's only mid-operation control, and it is a Cancel rather than a second Start: giving up on a
+ * copy is a thing a user may do, and it is the one action that cannot race anything — nothing has
+ * been replaced yet.
+ *
  * The three dialogs below stay dialogs. `confirmInstall`, `confirmUninstall` and the install-log view
  * are questions asked of the screen, not places to go: the first two name what a destructive tap is
  * about to do and are two lines of prose each, and the third is a reading surface opened over the row
- * that changes with the state underneath it.
+ * that changes with the state underneath it. `confirmImport` joins them for the same reason, with the
+ * heaviest question of the three: it replaces a userspace that is already working.
  */
 @AndroidEntryPoint
 class UbuntuActivity : SettingsDestinationActivity() {
@@ -179,6 +195,46 @@ class UbuntuActivity : SettingsDestinationActivity() {
                     writeDocument(context, uri, text.toByteArray(Charsets.UTF_8))
                         .onFailure { reportWriteFailure(report, "the install log", it) }
                 }
+            }
+        }
+
+        /**
+         * The chosen archive, held until the confirmation dialog's answer.
+         *
+         * The picker's own result is not the decision to import: it only says *which* file. What
+         * replaces the installed userspace is the dialog's question, so the URI waits here — the
+         * name is read off the document while the grant is still alive, because a name resolved
+         * after the dialog is a name that may no longer be readable.
+         */
+        var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
+        var pendingImportName by remember { mutableStateOf<String?>(null) }
+        var confirmImport by remember { mutableStateOf(false) }
+
+        val exportPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.CreateDocument("application/gzip"),
+        ) { uri: Uri? ->
+            // Released first and unconditionally, like the log's picker and for the same reason: this
+            // is the moment the other app's activity is gone, and a flag left held suspends the
+            // auto-lock countdown for the rest of the process's life.
+            vaultUnlockGate.release()
+            if (uri != null) linuxUserspace.exportRootfs(uri)
+        }
+        val importPicker = rememberLauncherForActivityResult(
+            // OpenDocument rather than GetContent: this is a file the user already has, and the
+            // difference that matters here is that OpenDocument's grant is what lets the read
+            // happen in the same session the archive was chosen in.
+            ActivityResultContracts.OpenDocument(),
+        ) { uri: Uri? ->
+            vaultUnlockGate.release()
+            if (uri != null) {
+                pendingImportUri = uri
+                // Best effort, and never guessed from the URI's last segment unless the provider
+                // gives nothing better: it is only ever shown back to the user as the name of the
+                // file they picked, and "document:1234" would be a worse answer than null.
+                pendingImportName = runCatching {
+                    DocumentFile.fromSingleUri(context, uri)?.name
+                }.getOrNull() ?: uri.lastPathSegment
+                confirmImport = true
             }
         }
 
@@ -293,18 +349,26 @@ class UbuntuActivity : SettingsDestinationActivity() {
                 }
             }
 
+            // One predicate for every control below, because a transfer writes the same tree the
+            // lifecycle actions do: two rules about what may be tapped now would be two rules that
+            // could disagree, and the tap that got through the gap would be the one that matters.
+            // (`state == null` is the compiler's proof that a graph exists, not a state a device
+            // reaches — see the `when` above.)
+            val busy = state == null ||
+                ui.transfer !is RootfsTransferState.Idle ||
+                state is LinuxUserspaceState.Installing ||
+                state is LinuxUserspaceState.Starting ||
+                state is LinuxUserspaceState.Stopping
+
             // The action row. Kept out of SettingRow's width-capped trailing slot on purpose: Start,
             // Restart and Uninstall are three coequal controls and capping the third to fit a label
             // column would demote whichever action the layout happened to squeeze.
             //
-            // Absent, not disabled, while an operation is in flight - the rule in the class KDoc. A
-            // disabled Install would still be a control that names an action already running, and this
-            // row is the one place on the screen where a stray tap can restart a pipeline or end one.
-            if (state != null &&
-                state !is LinuxUserspaceState.Installing &&
-                state !is LinuxUserspaceState.Starting &&
-                state !is LinuxUserspaceState.Stopping
-            ) {
+            // Absent, not disabled, while an operation is in flight - the rule in the class KDoc, and
+            // the same `busy` the transfer rows below obey. A disabled Install would still be a
+            // control that names an action already running, and this row is the one place on the
+            // screen where a stray tap can restart a pipeline or end one.
+            if (!busy) {
                 Row(
                     Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -347,6 +411,99 @@ class UbuntuActivity : SettingsDestinationActivity() {
                         }
                     }
                 }
+            }
+
+            if (!busy) {
+                // Offered only where there is a tree to read: an Export button on a fresh device
+                // could only ever produce the error line that says so.
+                if (state !is LinuxUserspaceState.NotInstalled) {
+                    SettingRow(
+                        Icons.Default.Upload,
+                        "Export the root filesystem",
+                        "Installed packages, settings and the workspace · one .tar.gz you choose",
+                    ) {
+                        TextButton(
+                            onClick = {
+                                // Held, then launched, in that order: the callback can only fire after
+                                // the picker has been on screen, and the flag has to be up before that.
+                                vaultUnlockGate.hold()
+                                // Named for what it is, version included: a user who keeps two exports
+                                // has nothing else to tell them apart, and the extension is what makes
+                                // the file openable by the next Import.
+                                exportPicker.launch("eclipse-ubuntu-${distro.release}-rootfs.tar.gz")
+                            },
+                        ) { Text("Export") }
+                    }
+                }
+                // Offered even when nothing is installed, and that is the point of it: restoring a
+                // backup is a way to *get* a userspace, and it is the one path that installs one
+                // without downloading a byte of it.
+                SettingRow(
+                    Icons.Default.ArrowDownward,
+                    "Import a root filesystem",
+                    if (state is LinuxUserspaceState.NotInstalled) {
+                        "Restore a .tar.gz exported here or from another device · nothing installed to lose"
+                    } else {
+                        "Restore a .tar.gz exported here or from another device · this one is replaced"
+                    },
+                ) {
+                    TextButton(
+                        onClick = {
+                            vaultUnlockGate.hold()
+                            // Everything, deliberately: an export is a .tar.gz but arrives labelled
+                            // `application/gzip`, `application/x-tar` or `application/octet-stream`
+                            // depending on who wrote it, and the filter that admits all three is no
+                            // filter at all. What the file actually is gets decided by reading it —
+                            // see RootfsArchive's marker check — not by the provider's guess.
+                            importPicker.launch(arrayOf("*/*"))
+                        },
+                    ) { Text("Import") }
+                }
+            }
+
+            // Where the transfer itself is shown, and the one row that appears *while* the buttons
+            // above are gone: a 250 MB write is a long time to look at a screen that could equally be
+            // showing a tap that never registered. The bar and the number beside it read the one
+            // percentage off the one state, exactly as the install row's do.
+            val transfer = ui.transfer
+            if (transfer !is RootfsTransferState.Idle) {
+                SettingRow(
+                    transferIcon(transfer),
+                    transferTitle(transfer),
+                    describeTransfer(transfer),
+                ) {
+                    // Only while the transfer can still be abandoned. Past the swap the row is this
+                    // screen's own install row again — the setup pipeline the import handed off to —
+                    // and there is no Cancel there for the same reason an install has none: stopping
+                    // it half way is what NeedsRepair is for, not what a tap on it means.
+                    if (transfer is RootfsTransferState.Exporting || transfer is RootfsTransferState.Importing) {
+                        TextButton(onClick = { linuxUserspace.cancelTransfer() }) { Text("Cancel") }
+                    }
+                }
+                val percent = transfer.percentDone
+                if (percent == null) {
+                    // No denominator (a provider that will not report a size): an indeterminate bar
+                    // is the honest drawing, where a bar at zero would claim to know it is at zero.
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
+                    )
+                } else {
+                    LinearProgressIndicator(
+                        progress = { percent / 100f },
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(8.dp)),
+                    )
+                }
+            }
+
+            // The last export's outcome. A success with no line to say so is the one thing an export
+            // cannot show any other way: the file is in another app's directory, and nothing on this
+            // screen changes when it lands there.
+            if (ui.transferNotice != null) {
+                SettingRow(
+                    Icons.Default.CheckCircle,
+                    "Root filesystem",
+                    ui.transferNotice ?: "",
+                ) { TextButton(onClick = { linuxUserspace.clearTransferNotice() }) { Text("OK") } }
             }
 
             // The install and repair trace, reachable at last. It sits outside the installed-states
@@ -443,6 +600,64 @@ class UbuntuActivity : SettingsDestinationActivity() {
                         }
                         TextButton(onClick = { confirmUninstall = false }) { Text("Cancel") }
                     }
+                },
+            )
+        }
+        if (confirmImport) {
+            // The plain confirmation the brief asks for, and the wording is load-bearing: what the
+            // tap replaces is a userspace the user may have spent an hour of apt-get inside, and the
+            // only protection against that is a sentence that says so plainly. It is also honest
+            // about when the risk actually starts — nothing is deleted until a complete, verified
+            // copy of the archive is on disk, so the state named here is the state that ends up
+            // installed, not a state a failure could leave behind.
+            val name = pendingImportName
+            AlertDialog(
+                onDismissRequest = { confirmImport = false },
+                title = { Text("Import this root filesystem?") },
+                text = {
+                    val opening =
+                        (if (name != null) "$name is " else "The chosen archive is ") +
+                            "unpacked and checked before anything is replaced, and "
+                    val consequence =
+                        if (ui.state is LinuxUserspaceState.NotInstalled) {
+                            "nothing is installed to lose. The workspace at /home/ubuntu/workspace " +
+                                "comes from the archive."
+                        } else {
+                            "the installed ${distroTitle(ui)} — packages, files and the workspace at " +
+                                "/home/ubuntu/workspace — is replaced when it has been. Uninstalling " +
+                                "first would keep nothing that is not in the archive or already exported."
+                        }
+                    Text(
+                        opening + consequence +
+                            " Anything the archive was set up for — an account, a DNS server, an apt " +
+                            "mirror — is rewritten for this device afterwards, and the userspace then " +
+                            "has to pass the same health check an install does.",
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            confirmImport = false
+                            // The URI was handed over at picker time; the read is the controller's,
+                            // because the stream, the byte count and the failure report all belong to
+                            // the same operation the progress row above is drawing.
+                            pendingImportUri?.let { linuxUserspace.importRootfs(it) }
+                            pendingImportUri = null
+                            pendingImportName = null
+                        },
+                    ) { Text("Import", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            // Dropped, not kept: a confirmation that was declined is a decision, and
+                            // holding the URI would arm the next tap of Import with a file the user
+                            // has since said no to.
+                            pendingImportUri = null
+                            pendingImportName = null
+                            confirmImport = false
+                        },
+                    ) { Text("Cancel") }
                 },
             )
         }
@@ -615,6 +830,56 @@ private fun describeSetupStep(step: SetupStep, detail: String?): String {
     // Capped because an apt line is unbounded prose, and this sits in a settings row's subtitle.
     return if (detail.isNullOrBlank()) label else "$label · ${detail.trim().take(80)}"
 }
+
+/** The transfer progress row's heading: what is being moved, in the direction it is moving. */
+private fun transferTitle(state: RootfsTransferState): String = when (state) {
+    RootfsTransferState.Idle -> "Root filesystem"
+    is RootfsTransferState.Exporting -> "Exporting the root filesystem"
+    is RootfsTransferState.Importing -> "Importing the root filesystem"
+    RootfsTransferState.Swapping -> "Replacing the root filesystem"
+}
+
+/**
+ * The icon of the transfer row, pointing the way the bytes are going — the same two icons the rows
+ * that start a transfer carry, so the progress line is recognisably the continuation of the tap.
+ */
+private fun transferIcon(state: RootfsTransferState): ImageVector = when (state) {
+    RootfsTransferState.Idle,
+    is RootfsTransferState.Exporting,
+    -> Icons.Default.Upload
+    is RootfsTransferState.Importing,
+    RootfsTransferState.Swapping,
+    -> Icons.Default.ArrowDownward
+}
+
+/**
+ * A transfer's progress as its row's subtitle: the phase, then the same percentage the bar under it
+ * draws.
+ *
+ * Shaped like [describeInstallStep] and for the same reason — the first word is what is happening and
+ * the trailing number is how far in — with one difference that is the point of it: a transfer's
+ * percentage is absent while its total is unknown (a provider that will not report the size of the
+ * document it handed over), and the bytes moved are what it has instead.
+ */
+private fun describeTransfer(state: RootfsTransferState): String = when (state) {
+    RootfsTransferState.Idle -> ""
+    is RootfsTransferState.Exporting ->
+        "Written ${transferBytes(state.bytes, state.totalBytes)} · ${state.entries} entries" +
+            percentSuffix(state.percentDone)
+    is RootfsTransferState.Importing ->
+        "Read ${transferBytes(state.bytes, state.totalBytes)} · ${state.entries} entries" +
+            percentSuffix(state.percentDone)
+    // Deliberately no byte count and no percentage: this phase reads nothing and its length is a
+    // rename, so a number here would be a number about the phase before it.
+    RootfsTransferState.Swapping -> "Verified · swapping it in"
+}
+
+/** "12.4 MB of 118.0 MB", or only the first when what it is a fraction of is unknown. */
+private fun transferBytes(bytes: Long, totalBytes: Long): String =
+    if (totalBytes > 0) "${formatTransferBytes(bytes)} of ${formatTransferBytes(totalBytes)}"
+    else formatTransferBytes(bytes)
+
+private fun percentSuffix(percent: Int?): String = if (percent == null) "" else " · $percent%"
 
 /**
  * Bytes in the units installs actually reach, for the "4.2 GB / 1.8 GB" progress lines.

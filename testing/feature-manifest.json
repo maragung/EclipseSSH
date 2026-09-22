@@ -50,6 +50,7 @@
     { "id": "ssh.connect-and-shell", "screen": "Terminal", "priority": "critical", "testedBy": "JVM suite (embedded MINA server: TerminalSessionLifecycle, ConnectionMatrix); on-device requires a reachable SSH server, covered by the session-driven loop" },
     { "id": "sftp.file-operations", "screen": "Files", "priority": "high", "testedBy": "JVM suite (embedded MINA SFTP)" },
     { "id": "linux.userspace-install", "screen": "Settings > Workspace", "priority": "critical", "testedBy": "JVM suite (RootfsInstaller, UbuntuDistributionManager, LinuxUserspaceManager); the on-device install needs ~600 MB and network, exercised by the session-driven loop" },
+    { "id": "linux.rootfs-export-import", "screen": "Settings > Workspace", "priority": "high", "testedBy": "JVM suite (RootfsArchiveTest, RootfsTransferTest) for the archive, the swap and the cancellation; the SAF pickers and the progress row are on-device only" },
     { "id": "editor.open-and-edit", "screen": "TextEditorActivity", "priority": "medium", "testedBy": "JVM suite (TextEditorActivityRobolectricTest)" },
     { "id": "rdp.connect", "screen": "RemoteDesktopActivity", "priority": "medium", "testedBy": "JVM suite (FreeRDP native build verification); a live RDP server is not in CI" },
     { "id": "widget.quick-connect", "screen": "Launcher", "priority": "low", "testedBy": "not automated - manifest presence and boot receiver verified by build + lint" },

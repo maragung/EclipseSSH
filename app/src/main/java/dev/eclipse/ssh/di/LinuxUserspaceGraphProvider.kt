@@ -16,6 +16,7 @@ import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LinuxWorkspaceManager
 import dev.eclipse.ssh.linux.ProotRuntime
 import dev.eclipse.ssh.linux.RootfsInstaller
+import dev.eclipse.ssh.linux.RootfsTransfer
 import dev.eclipse.ssh.linux.RuntimeStorageManager
 import dev.eclipse.ssh.linux.UbuntuDistributionManager
 import dev.eclipse.ssh.linux.UserspaceDiagnostics
@@ -44,6 +45,20 @@ class LinuxUserspaceGraph(
     val processes: LinuxProcessManager,
     val workspace: LinuxWorkspaceManager,
     val manager: LinuxUserspaceManager,
+    /**
+     * The import/export half, on the same manager: a transfer and the state machine it hands off to
+     * must be the same userspace's, or an import would swap a tree the manager does not know it
+     * swapped.
+     *
+     * Defaulted because the tests that hand-build a graph have no storage manager to share, and the
+     * default derives one from the same root [runtime] was built over; [buildGraph] passes the one
+     * instance the whole graph shares, so nothing about the default reaches the app.
+     */
+    val transfer: RootfsTransfer = RootfsTransfer(
+        rootDir = runtime.rootDir,
+        manager = manager,
+        distro = distro,
+    ),
 )
 
 /**
@@ -200,7 +215,27 @@ class LinuxUserspaceGraphProvider @Inject constructor(
             workspace = workspace,
             storage = storage,
         )
-        return LinuxUserspaceGraph(distro, runtime, installer, distribution, processes, workspace, manager)
+        // Built from the same storage and the same diagnostics as everything above it: an import's
+        // events belong in the ring the "Install log" row shows, beside the install's, because the
+        // setup it hands off to writes there too and a failure's cause is usually the one it came
+        // from.
+        val transfer = RootfsTransfer(
+            rootDir = rootDir,
+            manager = manager,
+            distro = distro,
+            diagnostics = diagnostics,
+            storage = storage,
+        )
+        return LinuxUserspaceGraph(
+            distro,
+            runtime,
+            installer,
+            distribution,
+            processes,
+            workspace,
+            manager,
+            transfer,
+        )
     }
 
     /** Installed distro, else the user's pick, else the default — as the class doc resolves it. */

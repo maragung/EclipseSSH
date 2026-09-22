@@ -892,8 +892,10 @@ class E2eDriver:
         return width, height
 
     def _scroll_swipe(self, els, span=(0.58, 0.21)):
-        """One upward scroll swipe across the current screen's own extent,
-        from `span`'s top fraction to its bottom one."""
+        """One swipe across the current screen's own extent, from `span`'s top
+        fraction to its bottom one. The default span drags upward, which walks a
+        list toward its end - the direction every window walk here needs - and the
+        reversed span pulls it back toward its beginning."""
         width, height = self._window_extent(els)
         if width < 100 or height < 100:
             # A sparse or failed dump has nothing to anchor on; the portrait
@@ -904,11 +906,17 @@ class E2eDriver:
         self.adb.swipe(x, int(height * span[0]), x, int(height * span[1]), 400)
 
     def scroll_to_linux_section(self, max_swipes=24):
-        """The Linux userspace section sits far down the settings list; swipe until
-        its row is on screen. Swiping is content-anchored: stop the moment the
-        row is visible, so over-scrolling never skips past it. Landscape shows
-        less of the list per screen, so the cap is generous - the loop exits on
-        first sight and a higher cap costs nothing when the section is near.
+        """The Linux userspace section is the first one on the settings list, so
+        its row is normally on screen the moment Settings opens; swipe until it is
+        visible anyway, because the shell keeps one list offset shared by every tab
+        (see _tab_active) and a phase that left the list scrolled down can open
+        Settings part-way through it. That offset is also why this is the one walk
+        here that swipes the other way: dragging toward the list's end, as every
+        other walk does, moves away from a section that now sits above the viewport.
+        Swiping is content-anchored: stop the moment the row is visible, so
+        over-scrolling never skips past it. Landscape shows less of the list per
+        screen, so the cap is generous - the loop exits on first sight and a higher
+        cap costs nothing when the section is near.
 
         This is the Settings LIST, and on it the section is one row: its title, the
         state as a summary line, and the button that opens the window. The section
@@ -918,7 +926,7 @@ class E2eDriver:
             els = self.dump()
             if self.find(els, "Ubuntu on this device", "Linux userspace"):
                 return True
-            self._scroll_swipe(els)
+            self._scroll_swipe(els, span=(0.21, 0.58))
             time.sleep(1.2)
         return self.visible("Ubuntu on this device", "Linux userspace")
 

@@ -172,7 +172,7 @@ class SettingsHeavyRowsRobolectricTest {
     }
 
     /**
-     * Exporting the vault opens its own window. The row is in Backup & restore, three sections down
+     * Exporting the vault opens its own window. The row is in Backup & restore, four sections down
      * a list that opens at the top, and the window it opens is where the passphrase is typed and the
      * destination picked — one motion, which a row could not hold.
      */
