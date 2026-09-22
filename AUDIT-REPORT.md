@@ -6488,3 +6488,76 @@ section naming `schema-dump.yml`, which no earlier section had a reason to name.
 `docs/branch-protection.md` naming `scripts/ci-window.sh` — the script whose silence on protection is
 what the correction above is about, and a citation that had no business being absent from the page
 that depends on it.
+
+### Cutting it, and the one red that was not the change
+
+The merge is the first this repository can *show* was gated by the platform rather than by a script.
+The window was opened by hand with a 240-minute deadline — the repository variable
+`CI_WINDOW_DEADLINE` was set to `2026-09-22T15:31:51Z` before the visibility flipped, so the deadline
+belongs to the window and not to the process that opened it — and the rule was re-applied by hand
+inside it. What makes the gate real is the read-back rather than the `PUT` that answered `200`:
+`/branches/main/protection` returning `strict=true`, `enforce_admins=true` and the seven contexts by
+name. PR #159 then read `mergeable_state: unstable` and merged at 12:15:18Z, which is the shape this
+rule produces here — every required check green, and the one red left over is `Close the CI window`'s,
+the job that is red by design whenever the window it would close is open. No earlier merge has a
+read-back to point at; #158's, as the passage above records, was made with the rule deleted and behind
+a check read by hand.
+
+`v1.8.0` is a lightweight tag on `5b8e68a`, the commit `ci.yml` run `35710648644` verified, which is
+the convention v1.7.0 set. `git describe --exact-match HEAD` does not see it — `git describe` ignores
+lightweight tags unless it is given `--tags` — and what that prints reads exactly like a tag which was
+never created. `tagged-release.yml` passes `--tags`, so the disagreement is in the local read and not
+in the workflow, and the tag was pushed as it stood rather than re-made.
+
+`Tagged release` run `35726171079` built from it and was green in 21m27s. The draft it left held all
+seven assets, `SHA256SUMS.txt` among them, and its step 18 verified the signing key against
+`0c69794b…` before anything was published — so the signer check ran against this release, not only
+against the one the verification table above describes. It was published at 12:38:23Z as release
+`393721979`, and one of its assets was then downloaded and checked against the sums the workflow had
+computed for it: the bytes served are the bytes built.
+
+The release's own validation run is where the artifact is checked, and it is the third shape of this
+section's subject — a run that concludes `failure` while the thing it exists to assert passed on both
+API levels. `android-release-test.yml` run `35728403233` was dispatched by the publish at 12:38:26Z.
+`Release APK on API 30` (20m45s) and `Release APK on API 35` (21m15s) each downloaded
+`app-x86_64-release.apk` from the release — the published asset, not a fresh build — installed it,
+smoke-launched it and ran the whole instrumented suite against it. Both legs' reports read `PASS`:
+49 tests ran, 0 failed, the crash scan clean, and `release-validation.json` naming `versionCode 39`,
+`versionName 1.8.0`, the signer `0c69794b…` and the APK's own SHA-256 as `4b3ad92b…` — the sum
+`SHA256SUMS.txt` carries for that file, measured on the downloaded bytes rather than on the built
+ones. The failure is the tail of the same run: `Release gate` and `Autonomous repair`, both
+`failure`, both with **zero steps and an empty runner name**, which is the signature of exhausted
+Actions minutes on a repository that had just been made private again. The window was closed while
+the run was in flight; the two jobs started at 12:59:50Z and 12:59:53Z and each died three seconds
+later.
+
+That matters beyond the bookkeeping, because the jobs that decide the verdict are the same ones that
+act on it: `gate` is what pulls a bad release back to draft and opens the tracking issue, and
+`auto-fix` fires on `failure()`. A dead runner therefore takes the verdict and the safety net away
+together, and leaves a red run that says nothing about the release. The reading here is the legs' own
+reports for that reason, and the run's conclusion is not one.
+
+**The pull request's own instrumented run came back red, and the red was a flake.** Recording it is
+the duty §41 discharged for `rotatingThroughEveryDestinationKeepsTheScreenUsable`:
+`instrumentation.yml` run `35722204644` failed on attempt 1 with a `ComposeTimeoutException` —
+*Condition still not satisfied after 10000 ms* — raised from `ReleaseChaosJourneyTest.awaitForeground`
+at `:110`, reached from the cancel step of `theAddHostFormSurvivesARotation` at `:251`, a test that
+took 17.5s and gave up ten seconds into waiting for the window behind the finished form to come back.
+Same class as §41's, same ten-second wait for an activity to resume, a different helper and a
+different test.
+
+What settles it is not the exception's text but the arithmetic of the XMLs. Attempt 1 read
+`tests=49 failures=17`. Attempt 2 — same run, after `rerun-failed-jobs`, green in 15m39s — read
+`tests=49 failures=16`, and so did `instrumentation.yml` run `35710648320`, the green run on the same
+app tree. In all three, the sixteen are `UbuntuE2eVerificationTest`'s arg-gated assumption violations,
+which AGP writes as `failure` while the job concludes `success`; the two green XMLs contain **no**
+other failure, and the red one contains exactly one, `theAddHostFormSurvivesARotation`. Seventeen
+minus sixteen is therefore one real failure, on a tree that differs from the green run's in its
+version metadata and in nothing else — which is the cheapest available proof that a red run is not
+the diff. The wait was not lengthened, for the reason §41 gives: inflating a timeout hides the hang it
+exists to catch. It stays on the record as residual fragility of this suite, where §41 left the same
+class of failure in the same file.
+
+This addendum adds no claim the section did not already make — the same `scripts/check-doc-figures.sh`
+counts 159 with it in place — so the figure above still describes the commit it names rather than
+being a number left behind by it.
