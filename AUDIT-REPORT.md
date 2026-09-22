@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 36 / versionName 1.5.1 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 37 / versionName 1.6.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §57, *The gate that checks the key, and the bill that stops the runner*; the newest of them that releases a version is §56, *Releasing 1.5.1*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §58, *Releasing 1.6.0*; the newest of them that releases a version is §58, *Releasing 1.6.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6150,3 +6150,77 @@ fixes the moment it can run; the third is not a code change at all.
 
 `scripts/check-doc-figures.sh` counts 147 claims as of this commit, against §56's 144, and the three
 came with this one.
+
+## 58. Releasing 1.6.0
+
+The first release this file records that is a *feature* release since §54's 1.4.0, and the first whose
+whole verification happened on this host rather than on a runner — because the block §57 recorded was
+still in force for every commit that went into it.
+
+### What it carries, and the failure it was opened for
+
+The report that started this pass was a userspace that could not be repaired at all:
+
+```
+Installing base packages failed (exit 100): dpkg: error: 1 expected program not found in PATH or not executable
+Note: root's PATH should usually contain /usr/local/sbin, /usr/sbin and /sbin
+E: Sub-process /usr/bin/dpkg returned an error code (2)
+```
+
+A rootfs that is present, complete enough to pass the install's existence check, and missing a program
+`dpkg` itself runs. Every recovery the app had went through `dpkg`, so every rung of the only ladder
+there was failed with the same message: Repair could not clear the one state it exists to clear. Repair
+now climbs rungs — reclaim an interrupted extraction, give up the regenerable caches a full disk needs,
+run the setup pipeline, restore the members of the pinned archive that are absent, rewrite the base
+system from that archive, and only then reinstall — and the setup prologue restores any of `dpkg`'s own
+programs that are missing *before* it asks `dpkg` anything, out of the same SHA-256-verified tarball the
+install came from. A failure no rebuild could fix stops the ladder with its own typed message rather
+than rewriting a working base system.
+
+Three more changes ride with it. Proot patch `0005` makes proot exec the guest's loader through a
+symlink named after the program, so `AT_EXECFN` is the name the shell invoked — the fix for the second
+half of the report, `coreutils: unknown program 'libproot-loader'` in every session. Import/Export
+writes the installed rootfs to a `.tar.gz` and puts one back, through the same traversal, link and
+expansion guards the pinned tarball goes through. And the Files tab gained the userspace as a session
+of its own, offered only while it is running, with Linux Userspace moved to the top of Settings.
+
+### The verification, and what it cost to have any
+
+CI could not answer. The push that carried this work produced runs that died with zero steps and an
+empty `runner_name` — the annotation §55 and §57 both quote — so the suite was run here instead, in
+package-sized chunks under `nice -n 10 taskset -c 0-1`, `--offline`, `--no-daemon`, `-Xmx1280m`,
+because a foreground invocation is the only one the host's memory reaper leaves alone. All 41 packages
+were covered: **1,982 JVM/Robolectric test methods, green**, against one flake — `ConnectionMatrix`
+timed out at its 90-second budget inside a 120-test batch and passed 20/20 in a class-sized run of its
+own, which is the load of this host and not a difference in the tree.
+
+Three real defects came out of that run, all of them in the tests this release adds, and all of them
+invisible to a compiler: a fixture that wrote `var/lib/pad` without creating `var/lib`; two assertions
+using Truth methods that do not exist on the subject they were written against; and a cancellation test
+driven with `cancelAndJoin()` on a `launch {}` the test dispatcher had not started — which made one
+test pass for the wrong reason and its sibling fail for one, since the import it cancelled had never
+reached the swap. The last of those is the one worth remembering: a coroutine that never runs satisfies
+every assertion of the form "nothing changed".
+
+What the split verification could not be is complete. `connectedAndroidTest`, the crash-on-open gate,
+lint with network access and the four-ABI native build are the runners' to run, and this tag is the
+first time any of them sees this tree; the local evidence for the native side is the patch set's own
+fingerprint — `linux/build/linux-src/pr-*/.patches-applied` lists all five patches with SHA-256s that
+match the files on disk, and `:linux:fetchLinuxSource` and `:linux:buildLinuxNative` are `UP-TO-DATE`
+against it, so patch `0005` applied and compiled without CI.
+
+### Why this one can be installed over an existing app
+
+The account was settled the same morning this tag was pushed, which is what makes the release build
+possible at all; the repository is private again, so the minutes are billed and finite. The signature
+is not built here: `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the runner before it
+signs, so this release carries `0c69794b…` — the identity every release through v1.4.0 and v1.5.1 was
+signed with — and an install of any of them upgrades to 1.6.0 normally. An install of v1.5.0 still
+cannot, for the reason §56 gives.
+
+The two version lines in this file's header moved, `app/build.gradle.kts` moved with them
+(`versionCode 37`, `versionName "1.6.0"`), and this section is the only other change.
+
+`scripts/check-doc-figures.sh` counts 150 claims as of this commit, against §57's 147 — the three
+came with the userspace documentation the merged work added, not with this section, which moves two
+re-derived values without adding a claim to re-derive.
