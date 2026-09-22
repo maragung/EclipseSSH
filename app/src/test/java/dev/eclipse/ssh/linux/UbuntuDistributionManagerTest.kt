@@ -1185,6 +1185,83 @@ class UbuntuDistributionManagerTest {
         assertThat(report.describe()).isEqualTo("healthy")
     }
 
+    @Test
+    fun `a temporary directory nothing can write to and a stale lock are reported, and both gate`() = runTest {
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        // The installer is what can look at the guest's own filesystem, so the probe reads these two
+        // through it — a manager with no installer wired reports neither, which is the honest answer
+        // for a caller that cannot ask.
+        val harness = Harness(distro(arch = "arm64"), pinnedTarball = fixture)
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("eclipse-uid=") ->
+                    0 to "eclipse-uid=0\neclipse-path=${UbuntuDistributionManager.LINUX_PATH}\n"
+                command == "echo eclipse-probe-ok" -> 0 to "eclipse-probe-ok\n"
+                command == "whoami" -> 0 to "root\n"
+                else -> baseline(command)
+            }
+        }
+        // What a real install leaves behind. This fixture has neither, and a probe that called every
+        // fixture broken would be testing the fixture rather than the probe.
+        val rootfs = harness.runtime.rootfsDir
+        File(rootfs, "tmp").mkdirs()
+        File(rootfs, "run").mkdirs()
+        assertThat(harness.distribution.healthProbe().healthy).isTrue()
+
+        // A `touch` where the directory was, and the marker a killed apt leaves behind: nothing
+        // holds it — the kernel dropped the lock with the process — but the file is still there, and
+        // every dpkg and apt command refuses in about a second because of it.
+        File(rootfs, "tmp").deleteRecursively()
+        File(rootfs, "tmp").writeText("not a directory\n")
+        File(rootfs, "var/lib/dpkg").mkdirs()
+        File(rootfs, "var/lib/dpkg/lock-frontend").writeText("")
+
+        val report = harness.distribution.healthProbe()
+
+        // Everything a shell can see still passes: this is the pair of failures nothing else in the
+        // userspace notices. A shell starts, `apt-get check` is happy, and only the tool that needs a
+        // temporary file or the next package command says anything — in words that name neither /tmp
+        // nor the lock.
+        assertThat(report.shellWorks).isTrue()
+        assertThat(report.aptUsable).isTrue()
+        assertThat(report.unusableTempDirs).containsExactly("tmp")
+        assertThat(report.staleLocks).containsExactly("var/lib/dpkg/lock-frontend")
+        assertThat(report.healthy).isFalse()
+        // The sentence names the guest's own path — `/tmp`, not the archive's relative `tmp` — and the
+        // lock's sentence says what to do about it, because it is the one Repair clears by itself.
+        assertThat(report.describe()).contains("/tmp")
+        assertThat(report.describe()).contains("Repair clears it")
+    }
+
+    @Test
+    fun `a ladder that times out on every archive is named a timeout, not a mirror failure`() = runTest {
+        // Every rung wedges: a pty read that produces nothing and ends nothing, which is what an
+        // apt-get on a connection too slow to answer looks like. The ladder then exhausts with no
+        // exit code and no output anywhere in its evidence, and the generic sentence it used to
+        // produce — "failed on every archive tried" — reads as the mirrors' doing while the mirrors
+        // were never heard from. It also let the ladder climb to a reinstall that would time out the
+        // same way, which is the failure this type exists to prevent.
+        //
+        // Each wedged rung parks for the runtime's reader-drain budget (see the wedge test above),
+        // so this test is seconds rather than milliseconds: the budget is real, bounded time.
+        val harness = Harness(
+            distro(arch = "arm64"),
+            wedgeOn = { command -> command.startsWith("apt-get update") },
+            aptUpdateAttemptTimeoutMs = 250,
+        )
+
+        val failure = runCatching { harness.distribution.setup() }.exceptionOrNull()
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.StepTimedOut::class.java)
+        val timedOut = failure as UserspaceFailure.StepTimedOut
+        // The step, worded as the install screen words it, and every archive the ladder tried.
+        assertThat(timedOut.step).isEqualTo("Updating package lists")
+        assertThat(timedOut.message).contains("did not finish in time")
+        assertThat(timedOut.message).contains("ports.ubuntu.com/ubuntu-ports")
+    }
+
     // ------------------------------------------------------------------ fixtures
 
     /**
@@ -1221,7 +1298,7 @@ class UbuntuDistributionManagerTest {
         val runtime =
             ProotRuntime(
                 rootDir,
-                "/fake/native/lib",
+                fakeNativeLibraryDir(),
                 if (wedgeOn != null) WedgingPtySpawner(scripted, wedgeOn) else scripted,
                 storage = RuntimeStorageManager(rootDir, freeBytesProbe = { freeBytes() }),
             )

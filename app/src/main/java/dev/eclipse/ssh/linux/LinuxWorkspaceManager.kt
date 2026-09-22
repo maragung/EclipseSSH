@@ -67,6 +67,33 @@ class LinuxWorkspaceManager(
     }
 
     /**
+     * Makes sure the workspace directory is there, and answers whether it had to be created.
+     *
+     * `/home` is a preserved member — no repair writes it, in place or from the archive — so a
+     * workspace the user deleted stays deleted for as long as the userspace lives: every session then
+     * opens in a home with no workspace in it, and nothing in the app puts it back short of an install
+     * that rebuilds the whole rootfs. This is the cheap answer to that, and it belongs beside [clear]
+     * because it is the same directory's lifecycle.
+     *
+     * A path that is a *symlink* is replaced rather than written through: the workspace is the one
+     * directory the rest of the app assumes it can delete inside, and a link makes [clear] empty
+     * whatever it points at — potentially something outside the rootfs entirely. The link is deleted
+     * NOFOLLOW, so only the link goes.
+     *
+     * The answer is "it was not a plain directory and this had to do something", not "the directory
+     * is there now": whether the `mkdirs` worked is a second question, and the caller has to ask it
+     * anyway to know whether to tell the user their projects are gone or that even an empty
+     * replacement could not be made.
+     */
+    fun ensureExists(): Boolean {
+        val linked = java.nio.file.Files.isSymbolicLink(workspaceDir.toPath())
+        if (workspaceDir.isDirectory && !linked) return false
+        deleteTreeNoFollow(workspaceDir)
+        workspaceDir.mkdirs()
+        return true
+    }
+
+    /**
      * Writes the workspace to [target] as a gzipped tar. POSIX long-name mode: Android paths are
      * short but project trees are not, and GNU's `./PaxHeaders` noise would show up on desktop
      * extractors.

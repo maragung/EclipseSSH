@@ -43,9 +43,24 @@ fun interface PtySpawner {
      * [columns] as its controlling terminal and stdio.
      *
      * @throws IOException when anything before the fork fails, or when too many terminals are open
+     *   — the latter being [PTY_TABLE_FULL_MESSAGE], which [ProotRuntime] maps to a typed refusal
+     *   rather than letting a bare native string reach the user
      */
     fun spawn(argv: List<String>, envp: List<String>, cwd: String, rows: Int, columns: Int): PtyProcess
 }
+
+/**
+ * How many terminals the native bridge can hold at once (`MAX_PTYS` in `linuxpty.c`) and the message
+ * it throws when that many are open.
+ *
+ * A cross-language contract: the C side cannot read these constants, so the number and the string
+ * have to be kept in step by hand. The dependency is deliberately one-way — a bridge that grew more
+ * slots and forgot this file would report one number too low, and a bridge that changed the message
+ * would fall back to the raw `IOException`, which is what every caller did before the mapping
+ * existed. Neither is a silent wrong answer.
+ */
+internal const val PTY_SLOTS = 16
+internal const val PTY_TABLE_FULL_MESSAGE = "too many open local terminals"
 
 /** The production spawner: forks through the native PTY bridge in `liblinuxpty.so`. */
 object LinuxPtySpawner : PtySpawner {

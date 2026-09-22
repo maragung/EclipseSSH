@@ -69,6 +69,20 @@ class LinuxSessionRegistry(
     fun channelFor(sessionKey: String): TerminalChannel? = sessions[sessionKey]
 
     /**
+     * How many sessions *other than* [sessionKey] are still registered.
+     *
+     * The caller is [LinuxUserspaceManager.noteSessionEnded], which is deciding whether one
+     * session's bad ending says anything about the userspace as a whole, and a sibling terminal
+     * still registered is proof that it does not. The session being judged has to be excluded by
+     * key rather than by asking [sessionCount] and subtracting: this registry evicts a session from
+     * its own supervisor coroutine the moment the channel's ending arrives, and that coroutine and
+     * the collector reporting the ending are two threads with nothing ordering them — so at the
+     * moment of the question the ending session may or may not still be counted, and "one other
+     * session is live" would otherwise be read as "this one is still alive".
+     */
+    fun liveCountExcept(sessionKey: String): Int = sessions.keys.count { it != sessionKey }
+
+    /**
      * Closes every live local session and returns the keys that were closed, for the caller's
      * bookkeeping (tab teardown). A channel whose close throws is still removed — Stop must not be
      * held hostage by one dead process — and the failure is swallowed here because the channel's

@@ -1,6 +1,7 @@
 package dev.eclipse.ssh.linux
 
 import com.google.common.truth.Truth.assertThat
+import dev.eclipse.ssh.ssh.SessionEnd
 import java.io.IOException
 import org.junit.Test
 
@@ -29,11 +30,101 @@ class UserspaceFailureTest {
     }
 
     @Test
-    fun `exit 126 and signal deaths are the launcher's too`() {
+    fun `exit 126 is the launcher's, and a signal death is not`() {
         assertThat(UserspaceFailure.fromAptRun("http://x.example/ubuntu", 126, "")).isInstanceOf(UserspaceFailure.ProotLaunchFailed::class.java)
-        assertThat(UserspaceFailure.fromAptRun("http://x.example/ubuntu", 137, "")).isInstanceOf(UserspaceFailure.ProotLaunchFailed::class.java)
+        // 128 is a shell's encoding of signal zero, which is not a death by signal: it has always
+        // been read on the launcher's side of the line.
+        assertThat(UserspaceFailure.fromAptRun("http://x.example/ubuntu", 128, "")).isInstanceOf(UserspaceFailure.ProotLaunchFailed::class.java)
         // 100 is apt's own generic failure — the ladder's business, not the launcher's.
         assertThat(UserspaceFailure.fromAptRun("http://x.example/ubuntu", 100, "E: Failed to fetch …")).isNull()
+    }
+
+    @Test
+    fun `a child killed by a signal is named by the signal, not blamed on proot`() {
+        // The low-memory killer's 137, in the shape the E2E runs produced it: proot started, ran,
+        // and its child was SIGKILLed. The old taxonomy called this "proot failed to start", which
+        // sent the user to reinstall an app whose runtime was working.
+        val killed = UserspaceFailure.fromAptRun("http://x.example/ubuntu", 137, "Killed\n")
+        assertThat(killed).isInstanceOf(UserspaceFailure.KilledBySignal::class.java)
+        assertThat((killed as UserspaceFailure.KilledBySignal).signal).isEqualTo(9)
+        // The sentence says what the user can do about it — memory, not mirrors.
+        assertThat(killed.message).contains("memory")
+        assertThat(killed.message).doesNotContain("proot failed")
+        // 139 is a crash inside a program, which is a bug in that program rather than in Ubuntu.
+        val crashed = UserspaceFailure.fromAptRun("http://x.example/ubuntu", 139, "Segmentation fault\n")
+        assertThat((crashed as UserspaceFailure.KilledBySignal).signal).isEqualTo(11)
+        assertThat(crashed.message).contains("crashed")
+        // The last thing the command said still rides along: it usually names which program died.
+        assertThat(crashed.message).contains("Segmentation fault")
+    }
+
+    // ------------------------------------------------------------------ locks and the database
+
+    @Test
+    fun `apt's own lock refusals name the files and the holder`() {
+        val failure = UserspaceFailure.fromAptRun(
+            "http://x.example/ubuntu",
+            100,
+            "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 4321 (apt-get)\n" +
+                "E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), is another process using it?\n",
+        )
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.PackageLocksHeld::class.java)
+        assertThat((failure as UserspaceFailure.PackageLocksHeld).holderPid).isEqualTo(4321)
+        assertThat(failure.locks).contains("/var/lib/dpkg/lock-frontend")
+        // Trailing punctuation is not part of the path a user would type.
+        assertThat(failure.locks).doesNotContain("/var/lib/dpkg/lock-frontend.")
+        assertThat(failure.message).contains("process 4321")
+    }
+
+    @Test
+    fun `a database dpkg cannot open is the repair pass's subject, not a mirror's`() {
+        val failure = UserspaceFailure.fromCommandOutput(
+            "Installing base packages",
+            2,
+            "dpkg: failed to open package info file '/var/lib/dpkg/status' for reading: No such file or directory\n",
+        )
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.PackageDbBroken::class.java)
+        assertThat(failure!!.message).contains("repair pass")
+    }
+
+    // ------------------------------------------------------------------ the clock
+
+    @Test
+    fun `an index that expired and one that is not valid yet are told apart`() {
+        val expired = UserspaceFailure.fromAptRun(
+            "http://x.example/ubuntu",
+            100,
+            "E: Release file for http://x.example/ubuntu/dists/jammy/InRelease is expired (invalid since 3d 4h).\n",
+        )
+        assertThat(expired).isInstanceOf(UserspaceFailure.ClockSkew::class.java)
+        assertThat((expired as UserspaceFailure.ClockSkew).expired).isTrue()
+        assertThat(expired.message).contains("automatic date and time")
+
+        val behind = UserspaceFailure.fromAptRun(
+            "http://x.example/ubuntu",
+            100,
+            "E: Release file for http://x.example/ubuntu/dists/jammy/InRelease is not valid yet (invalid for another 2h).\n",
+        )
+        assertThat((behind as UserspaceFailure.ClockSkew).expired).isFalse()
+        // The clock is nobody's to fix inside the rootfs, and the sentence has to say so.
+        assertThat(behind.message).contains("automatic date and time")
+    }
+
+    // ------------------------------------------------------------------ the regenerable state
+
+    @Test
+    fun `a hash mismatch is a corrupted download, and the indexes are what is cleared`() {
+        val failure = UserspaceFailure.fromAptRun(
+            "http://x.example/ubuntu",
+            100,
+            "E: Failed to fetch http://x.example/ubuntu/dists/jammy/main/binary-arm64/Packages.gz  Hash Sum mismatch\n",
+        )
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.IndexHashMismatch::class.java)
+        assertThat((failure as UserspaceFailure.IndexHashMismatch).uri).isEqualTo("http://x.example/ubuntu")
+        assertThat(failure.message).contains("corrupted in transit")
     }
 
     @Test
@@ -142,6 +233,39 @@ class UserspaceFailureTest {
     @Test
     fun `any other message stays the original exception's`() {
         assertThat(UserspaceFailure.fromMessage("some unrelated IOException")).isNull()
+    }
+
+    // ------------------------------------------------------------------ the session-ending rule
+
+    @Test
+    fun `only a 127 with no signal makes a session's ending evidence about the userspace`() {
+        // The one ending that is: proot ran, and the program it was asked to run was not in the
+        // rootfs — a missing `bash`, a missing `sh`, a startup program dpkg needs that is gone. That
+        // is precisely the damage the ladder's deeper rungs exist for, and the tab cannot see it: the
+        // shell "ran and exited", so it says DISCONNECTED while every new terminal fails the same way.
+        assertThat(sessionEndBlamesUserspace(SessionEnd.ShellEnded(GUEST_SHELL_MISSING, null))).isTrue()
+
+        // Deliberately not the fault flag, which is the tempting shortcut: a signal death is that
+        // same flag, and 137 is the low-memory killer taking the largest process on the phone. Acting
+        // on it would send the user to Repair over an intact userspace — and the probe that
+        // adjudicates forks another proot into the same shortage of memory.
+        assertThat(sessionEndBlamesUserspace(SessionEnd.ShellEnded(137, "KILL"))).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.ShellEnded(null, "SEGV"))).isFalse()
+
+        // An ordinary exit is a session doing what it was asked, and `exit 127` typed by hand is
+        // indistinguishable from the damage by the status alone — which is why this predicate is only
+        // the first of the three conditions the manager requires, and the probe is the second.
+        assertThat(sessionEndBlamesUserspace(SessionEnd.ShellEnded(0, null))).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.ShellEnded(1, null))).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.ShellEnded(null, null))).isFalse()
+
+        // Every other ending is about a transport, and a local pty has none — these are the remote
+        // SSH endings arriving on a host id that happens to be local, which the caller also checks.
+        assertThat(sessionEndBlamesUserspace(SessionEnd.Disconnected(11, "bye", byPeer = true))).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.TransportFailed(IOException("reset")))).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.NetworkLost)).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.TransportClosed)).isFalse()
+        assertThat(sessionEndBlamesUserspace(SessionEnd.Released)).isFalse()
     }
 
     // ------------------------------------------------------------------ the base type

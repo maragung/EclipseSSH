@@ -39,7 +39,7 @@ class RootfsTransferTest {
             "https://fixtures.invalid/rootfs.tar.gz",
             TestTarballs.sha256(FIXTURE),
         )
-        val runtime = ProotRuntime(rootDir, "/fake/native/lib", spawner)
+        val runtime = ProotRuntime(rootDir, fakeNativeLibraryDir(), spawner)
 
         /**
          * The one storage manager the whole harness shares, and the pid it records is this JVM's:

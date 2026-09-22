@@ -3,6 +3,7 @@ package dev.eclipse.ssh.linux
 import android.util.Log
 import dev.eclipse.ssh.ssh.TerminalChannel
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlinx.coroutines.CoroutineScope
@@ -143,6 +144,63 @@ class ProotRuntime(
     private val prootLoader: String get() = File(nativeLibraryDir, "libproot-loader.so").path
 
     /**
+     * Which of the app's own native runtime files are missing or unusable, in the order they are
+     * exec'd — empty when both are there.
+     *
+     * A question about the *app*, not about the userspace, and the two failures it names are
+     * indistinguishable from anywhere else: an APK split installed for the wrong ABI extracts no
+     * native libraries at all (the file is not there), and a half-finished update can leave one with
+     * a mode the kernel will not exec. Both make every proot run fail before a line of Ubuntu's own
+     * tooling runs, which the repair ladder reads as a rootfs worth rebuilding.
+     *
+     * Executability is asked of both rather than existence alone, because both really are exec'd:
+     * `PROOT_LOADER` points the kernel at the loader, and the loader is not something proot reads and
+     * copies — the alternative, proot's own embedded loader extracted under `filesDir`, is exactly
+     * the EACCES this arrangement exists to avoid (see the class doc).
+     */
+    fun missingNativeComponents(): List<String> =
+        listOf(prootBinary, prootLoader).filter { path ->
+            val file = File(path)
+            !file.isFile || !file.canExecute()
+        }
+
+    /**
+     * Refuses to fork when the app's own runtime is not installed properly, as
+     * [UserspaceFailure.NativeRuntimeMissing] — a verdict the ladder refuses rather than repairs:
+     * no rung writes the app's installation, and every one of them would fail identically.
+     */
+    private fun requireNativeRuntime() {
+        val missing = missingNativeComponents().firstOrNull() ?: return
+        throw UserspaceFailure.NativeRuntimeMissing(File(missing).name, missing)
+    }
+
+    /**
+     * One fork, with the two refusals that belong to this layer translated into the taxonomy.
+     *
+     * [requireNativeRuntime] comes first, because an exec of a file that is not there fails *inside
+     * the child*: the pty comes up, the shell reports 126/127, and the evidence the caller ends up
+     * classifying is a shell's exit code instead of the fact that this installation is missing half
+     * of its runtime. Checking here rather than in each caller is what makes that verdict
+     * unavoidable — a session, a setup step and a health probe all fork through this.
+     *
+     * Then the fork itself, where the pty bridge's one resource refusal — a bare `IOException` once
+     * its slot table is full — becomes [UserspaceFailure.TooManyTerminals]: a fact about this app
+     * holding every terminal it can, not about the userspace, and one a scripted command must not
+     * report as a package step failing for its own reasons.
+     */
+    private fun spawn(argv: List<String>, env: List<String>, rows: Int, columns: Int): PtyProcess {
+        requireNativeRuntime()
+        return try {
+            spawner.spawn(argv, env, spawnCwd.absolutePath, rows, columns)
+        } catch (error: IOException) {
+            if (error.message?.contains(PTY_TABLE_FULL_MESSAGE) == true) {
+                throw UserspaceFailure.TooManyTerminals(PTY_SLOTS, cause = error)
+            }
+            throw error
+        }
+    }
+
+    /**
      * The home *inside* the rootfs: where every session starts, and where the app's own file
      * surfaces point. It is `/home/ubuntu` rather than `/root` even though the session is fake
      * root — see [baseEnv].
@@ -236,7 +294,7 @@ class ProotRuntime(
      */
     fun spawnSession(rows: Int, columns: Int): PtyProcess {
         storage.requireReady()
-        return spawner.spawn(sessionArgv(), baseEnv(), spawnCwd.absolutePath, rows, columns)
+        return spawn(sessionArgv(), baseEnv(), rows, columns)
     }
 
     /**
@@ -290,7 +348,7 @@ class ProotRuntime(
         val command = (argv.lastOrNull() ?: "proot").take(COMMAND_LOG_CHARS)
         val startedAt = System.currentTimeMillis()
         Log.i(UserspaceDiagnostics.TAG, "proot command started: $command")
-        val process = spawner.spawn(argv, env, spawnCwd.absolutePath, rows = 24, columns = 80)
+        val process = spawn(argv, env, rows = 24, columns = 80)
         liveScripted += process
         // The reader is deliberately NOT a child of this scope. It parks in a blocking JNI
         // read that no cancellation can reach, and structured concurrency would make this
