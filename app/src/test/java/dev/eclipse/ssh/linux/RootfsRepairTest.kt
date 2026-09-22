@@ -13,9 +13,10 @@ import org.junit.Test
  * is allowed to take.
  *
  * Every test installs a real rootfs from a real tarball first, because that is the state each repair
- * is defined against — and because a successful install deletes the tarball on purpose, so the
- * repairs that need the archive's bytes have to fetch it again from the pin. The download counter in
- * [Installed] is what says whether they did.
+ * is defined against, and because a successful install keeps the tarball (see
+ * [RootfsInstaller.moveIntoPlace]), so the archive the repairs write from is the one the install
+ * already verified. The download counter in [Installed] is what says so: it starts at one, from the
+ * install's own fetch, and any repair that reads the network moves it.
  *
  * The fixture is [TestTarballs.writeRepairFixture]: the stock rootfs re-written with the trees a real
  * Ubuntu Base image ships and no repair may write (`/home`, `/var/lib/dpkg`, `/etc/ssh`, `/root`).
@@ -91,11 +92,10 @@ class RootfsRepairTest {
         assertThat(damaged.examined).isEqualTo(healthy.examined)
         assertThat(damaged.describe()).contains("usr/bin/rm")
 
-        // Two fetches for three passes over the archive: the install downloaded (and then deleted) the
-        // tarball, the first scan re-fetched it, and the second scan found it still there. That is the
-        // repair path's deliberate difference from the install path — re-downloading 30 MB on every
-        // rung would be worse than pinning it.
-        assertThat(installed.downloads()).isEqualTo(2)
+        // One fetch for three passes over the archive, and that one is the install's own: the scans
+        // read the tarball the install kept. It is what makes the ladder's deeper rungs local, and
+        // the userspace that needs them is exactly the userspace whose network may also be broken.
+        assertThat(installed.downloads()).isEqualTo(1)
     }
 
     @Test
@@ -145,9 +145,10 @@ class RootfsRepairTest {
         // Only the named member: a restore that swept the whole archive would be the overlay, and the
         // member it was not asked for is how that difference becomes visible.
         assertThat(File(rootfs, "usr/bin/tar").exists()).isFalse()
-        // Kept, not consumed: the next rung of the ladder works from the same file.
+        // Kept, not consumed: the next rung of the ladder works from the same file, and this restore
+        // did not have to ask for it. One download, the install's.
         assertThat(installed.installer.tarballFile.isFile).isTrue()
-        assertThat(installed.downloads()).isEqualTo(2)
+        assertThat(installed.downloads()).isEqualTo(1)
     }
 
     @Test
@@ -277,6 +278,34 @@ class RootfsRepairTest {
         // And nothing the user owns was touched.
         assertThat(project.readText()).isEqualTo("my project\n")
         assertThat(status.readText()).isEqualTo("Package: mine\n")
+        // Nor is the pinned archive the disk's to take. It is the one file that makes the ladder's
+        // deeper rungs local, so giving it up is a separate step with its own caller and its own
+        // arithmetic ([RootfsInstaller.releasePinnedArchive]) rather than something a reclaim does
+        // on the way past.
+        assertThat(installed.installer.pinnedArchiveOnDisk()).isTrue()
+    }
+
+    @Test
+    fun `the pinned archive is given up only when something asks for the space`() = runBlocking {
+        val installed = installFixture()
+        val archive = installed.installer.tarballFile
+        val bytes = archive.length()
+
+        // The repair ladder's disk step, and the whole of its argument: this file is the largest
+        // thing the app owns that can be got again by asking for it, and a repair that cannot fit on
+        // the device cannot run at all.
+        assertThat(installed.installer.releasePinnedArchive()).isEqualTo(bytes)
+        assertThat(installed.installer.pinnedArchiveOnDisk()).isFalse()
+        assertThat(archive.exists()).isFalse()
+
+        // Idempotent, because a ladder that ran the step twice must not report bytes it did not free.
+        assertThat(installed.installer.releasePinnedArchive()).isEqualTo(0L)
+
+        // And the price is paid by the next rung that needs the archive's bytes: it fetches them
+        // again, which is what the counter says.
+        assertThat(installed.downloads()).isEqualTo(1)
+        installed.installer.inspectAgainstPinnedArchive()
+        assertThat(installed.downloads()).isEqualTo(2)
     }
 
     @Test
@@ -337,6 +366,26 @@ class RootfsRepairTest {
     }
 
     @Test
+    fun `a repair with no network works from the archive the install kept`() = runBlocking {
+        val installed = installFixture()
+        val rootfs = installed.installer.rootfsDir
+        assertThat(File(rootfs, "usr/bin/rm").delete()).isTrue()
+
+        // The state a phone with no network is in when the user asks it to repair — and the reason the
+        // install keeps its tarball. Nothing below can be fetched, and nothing below needs to be: the
+        // archive the install verified is still on disk, so the repair reads those bytes instead.
+        val offline = RootfsInstaller(
+            installed.root,
+            TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)),
+            HttpDownloader { _, _, _ -> throw IOException("no route to host") },
+        )
+
+        assertThat(offline.inspectAgainstPinnedArchive().damaged).containsExactly("usr/bin/rm")
+        assertThat(offline.restoreFromPinnedTarball(setOf("usr/bin/rm"))).containsExactly("usr/bin/rm")
+        assertThat(File(rootfs, "usr/bin/rm").readText()).isEqualTo("fake rm\n")
+    }
+
+    @Test
     fun `a repair that cannot fetch the archive says so instead of reporting the rootfs broken`() = runBlocking {
         val installed = installFixture()
         val offline = RootfsInstaller(
@@ -344,8 +393,9 @@ class RootfsRepairTest {
             TestTarballs.fixtureDistro("https://fixtures.invalid/rootfs.tar.gz", TestTarballs.sha256(FIXTURE)),
             HttpDownloader { _, _, _ -> throw IOException("no route to host") },
         )
-        // The state a phone with no network is in when the user asks it to repair: the install deleted
-        // the tarball on purpose and the archive cannot be got again.
+        // The one state in which a repair genuinely has to fetch: the disk step gave the archive up to
+        // make room for a repair that could not otherwise run, and the network is what is missing.
+        assertThat(installed.installer.releasePinnedArchive()).isGreaterThan(0L)
         assertThat(offline.tarballFile.exists()).isFalse()
 
         var thrown: PinnedArchiveUnavailable? = null

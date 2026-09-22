@@ -9,9 +9,9 @@ import org.junit.Test
 
 /**
  * The two repairs that need nothing but the rootfs, tested as the primitives they are: the
- * package-manager locks an interrupted run left behind, the apt state that is regenerable by
- * definition, the guest directories nothing else puts back, and the package database that no other
- * rung may touch.
+ * package-manager locks an interrupted run left behind, the apt state that is regenerable and that a
+ * repair now gives up only when the evidence names it, the guest directories nothing else puts back,
+ * and the package database that no other rung may touch.
  *
  * These are the four failures the ladder used to be blind to. A killed apt leaves a lock *file* the
  * kernel has already released, and every dpkg and apt call after it refuses in a second — so every
@@ -141,22 +141,52 @@ class RootfsLocalRepairTest {
         assertThat(childrenOf(outside)).isEmpty()
     }
 
-    // ------------------------------------------------------------------ the regenerable state
+    // ------------------------------------------------------------------ apt's own state
 
-    @Test
-    fun `clearing apt's own state leaves the guest's tmp and the user's files alone`() = runBlocking {
-        val installed = installFixture()
-        val rootfs = installed.installer.rootfsDir
+    /** The three trees this section is about, at sizes the byte counts below are built from. */
+    private fun plantAptState(rootfs: File): Long {
         val caches = listOf(
             "var/cache/apt/archives/foo.deb" to 4096,
             "var/lib/apt/lists/bar" to 2048,
             "var/cache/apt/pkgcache.bin" to 64,
         )
-        var cacheBytes = 0L
+        var bytes = 0L
         for ((path, size) in caches) {
             writeFile(File(rootfs, path), size)
-            cacheBytes += size
+            bytes += size
         }
+        return bytes
+    }
+
+    @Test
+    fun `apt's own state is left alone when nothing named it`() = runBlocking {
+        val installed = installFixture()
+        val rootfs = installed.installer.rootfsDir
+        val planted = plantAptState(rootfs)
+
+        // The premise of the zero below: there was something there to take, and the common repair
+        // does not take it.
+        assertThat(planted).isEqualTo(4096L + 2048L + 64L)
+
+        // The whole point of the verdict, and the answer for the common repair: a failure that did not
+        // name apt's trees leaves them where they are. This is what a press of Repair no longer costs
+        // the user — the index was tens of megabytes to re-fetch, and the package cache is every byte
+        // apt had already downloaded.
+        val freed = installed.installer.clearAptState(AptDamage.NONE)
+
+        assertThat(freed).isEqualTo(0L)
+        assertThat(File(rootfs, "var/cache/apt/archives/foo.deb").length()).isEqualTo(4096)
+        assertThat(File(rootfs, "var/lib/apt/lists/bar").length()).isEqualTo(2048)
+        assertThat(File(rootfs, "var/cache/apt/pkgcache.bin").length()).isEqualTo(64)
+        assertThat(installed.installer.aptIndexLooksDamaged()).isFalse()
+        assertThat(File(rootfs, "home/ubuntu/notes.txt").readText()).isEqualTo("my notes\n")
+    }
+
+    @Test
+    fun `an index apt cannot read costs one update, not the packages already downloaded`() = runBlocking {
+        val installed = installFixture()
+        val rootfs = installed.installer.rootfsDir
+        val planted = plantAptState(rootfs)
         // What apt does not own, which is the whole difference between this and reclaimSpace: a
         // repair that is fetching a fresh index must not empty a scratch directory a running tool is
         // using, and a rotated log the user may still want to read is not its to take.
@@ -164,19 +194,87 @@ class RootfsLocalRepairTest {
         writeFile(File(rootfs, "var/tmp/scratch"), 512)
         writeFile(File(rootfs, "var/log/syslog.1"), 128)
 
-        val freed = installed.installer.clearRegenerableState()
+        // The index verdict: the lists and the binary caches built from them are re-fetched either
+        // way, and the update that rebuilds them is nearly free when the lists are the only thing
+        // missing. The `.deb` is not, which is why it stays.
+        val freed = installed.installer.clearAptState(AptDamage.INDEX)
 
-        assertThat(freed).isEqualTo(cacheBytes)
-        assertThat(childrenOf(File(rootfs, "var/cache/apt/archives"))).isEmpty()
+        assertThat(freed).isEqualTo(planted - 4096)
         assertThat(childrenOf(File(rootfs, "var/lib/apt/lists"))).isEmpty()
-        // Emptied, never deleted: apt expects both directories to exist, and the next update fills
-        // them again.
-        assertThat(File(rootfs, "var/cache/apt/archives").isDirectory).isTrue()
+        assertThat(File(rootfs, "var/cache/apt/pkgcache.bin").exists()).isFalse()
+        assertThat(File(rootfs, "var/cache/apt/archives/foo.deb").length()).isEqualTo(4096)
+        // Emptied, never deleted: apt expects the directory to exist, and the next update fills it.
         assertThat(File(rootfs, "var/lib/apt/lists").isDirectory).isTrue()
         assertThat(File(rootfs, "tmp/scratch").length()).isEqualTo(1024)
         assertThat(File(rootfs, "var/tmp/scratch").length()).isEqualTo(512)
         assertThat(File(rootfs, "var/log/syslog.1").isFile).isTrue()
         assertThat(File(rootfs, "home/ubuntu/notes.txt").readText()).isEqualTo("my notes\n")
+    }
+
+    @Test
+    fun `a package apt says is wrong is given up with the index, because it will not be rewritten`() = runBlocking {
+        val installed = installFixture()
+        val rootfs = installed.installer.rootfsDir
+        val planted = plantAptState(rootfs)
+
+        // `Hash Sum mismatch` is the case where the bytes are the failure: apt reports it for an index
+        // and for a `.deb` in the same words, a corrupt `.deb` makes every install of that package fail
+        // identically until it is gone, and unlike the index apt will not rewrite it on its own.
+        val freed = installed.installer.clearAptState(AptDamage.INDEX_AND_CACHE)
+
+        assertThat(freed).isEqualTo(planted)
+        assertThat(childrenOf(File(rootfs, "var/lib/apt/lists"))).isEmpty()
+        assertThat(childrenOf(File(rootfs, "var/cache/apt/archives"))).isEmpty()
+        assertThat(File(rootfs, "var/cache/apt/archives").isDirectory).isTrue()
+        assertThat(File(rootfs, "var/lib/apt/lists").isDirectory).isTrue()
+    }
+
+    @Test
+    fun `the phrases apt prints for its own bookkeeping are the only ones that count`() {
+        // apt's own refusal, verbatim, in the three shapes it takes. Matched case-insensitively
+        // because the step's output is not normalised before it reaches this.
+        assertThat(AptDamage.of("E: Unable to parse package file /var/lib/apt/lists/foo_Packages (1)"))
+            .isEqualTo(AptDamage.INDEX)
+        assertThat(AptDamage.of("E: Problem with MergeList /var/lib/apt/lists/bar"))
+            .isEqualTo(AptDamage.INDEX)
+        assertThat(AptDamage.of("E: Encountered a section with no Package: header"))
+            .isEqualTo(AptDamage.INDEX)
+        // A mismatch blames the bytes as well: it is the only phrase that justifies the second half.
+        assertThat(AptDamage.of("E: Failed to fetch foo.deb\n  Hash Sum mismatch"))
+            .isEqualTo(AptDamage.INDEX_AND_CACHE)
+        assertThat(AptDamage.of("Size mismatch for bar.deb")).isEqualTo(AptDamage.INDEX_AND_CACHE)
+
+        // Everything else leaves apt's trees alone, and these are the failures where that matters
+        // most: each one is a repair the ladder goes on to answer some other way, and clearing the
+        // index for any of them would buy a re-download of tens of megabytes and nothing else.
+        assertThat(AptDamage.of("Could not resolve 'archive.ubuntu.com'")).isEqualTo(AptDamage.NONE)
+        assertThat(AptDamage.of("Unable to fetch some archives, maybe run apt-get update")).isEqualTo(AptDamage.NONE)
+        assertThat(AptDamage.of("E: Could not get lock /var/lib/dpkg/lock-frontend")).isEqualTo(AptDamage.NONE)
+        assertThat(AptDamage.of("No space left on device")).isEqualTo(AptDamage.NONE)
+        assertThat(AptDamage.of(null)).isEqualTo(AptDamage.NONE)
+        assertThat(AptDamage.of("")).isEqualTo(AptDamage.NONE)
+    }
+
+    @Test
+    fun `an index that was killed mid-update or half-written is damage the host can see`() = runBlocking {
+        val installed = installFixture()
+        val rootfs = installed.installer.rootfsDir
+        val lists = File(rootfs, "var/lib/apt/lists")
+        writeFile(File(lists, "archive.ubuntu.com_ubuntu_dists_noble_InRelease"), 4096)
+
+        assertThat(installed.installer.aptIndexLooksDamaged()).isFalse()
+
+        // A killed `apt-get update` leaves its staging directory populated, and the index it was
+        // writing is exactly the one apt then refuses to parse. This is the shape no failure message
+        // has to report, because it is answerable by looking.
+        writeFile(File(lists, "partial/archive.ubuntu.com_ubuntu_dists_noble_main_binary-amd64_Packages"), 2048)
+        assertThat(installed.installer.aptIndexLooksDamaged()).isTrue()
+
+        // And the other shape: a write that never finished, which leaves the file it was writing.
+        childrenOf(File(lists, "partial")).forEach { File(lists, "partial/$it").delete() }
+        assertThat(installed.installer.aptIndexLooksDamaged()).isFalse()
+        writeFile(File(lists, "archive.ubuntu.com_ubuntu_dists_noble_main_binary-amd64_Packages"), "")
+        assertThat(installed.installer.aptIndexLooksDamaged()).isTrue()
     }
 
     // ------------------------------------------------------------------ the package database

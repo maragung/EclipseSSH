@@ -6566,3 +6566,180 @@ class of failure in the same file.
 This addendum adds no claim the section did not already make — the same `scripts/check-doc-figures.sh`
 counts 159 with it in place — so the figure above still describes the commit it names rather than
 being a number left behind by it.
+
+## 61. A repair stops paying for what it already has, and the arrow leaves the corner
+
+Two reports, one press each. The first was the one that mattered: **Repair did not repair.** *"I want
+the Repair button to fix an Ubuntu that is broken and will not run — why does it always download
+everything again every time it repairs, and it does not even succeed."* The second was cosmetic and is
+recorded at the bottom of this section: an icon button in the terminal, a downward arrow below the
+size readout, that the user wanted gone.
+
+The complaint named three separate things and they were all true, which is why the repair felt like it
+was doing nothing: a press re-fetched the base system, then re-fetched the package index, then failed
+at the same place it failed before, and the next press did it all again.
+
+### What the ladder was paying for, three times over
+
+**The install deleted the archive it had just verified.** `moveIntoPlace` ended with
+`tarballFile.delete()` and the comment *"the tarball has served its purpose; keeping it would pin 30 MB
+for nothing"* — true when it was written, and false from the moment the repair ladder was built on top
+of it. Every rung at or below *restore missing files* writes base bytes out of that exact archive:
+`restoreFromPinnedTarball` compares the rootfs against it member by member, the overlay rewrites from
+it, the reinstall extracts it, and the package database's last source pulls one file out of it. Deleting
+it at the end of a successful install meant that a userspace which then broke was repaired by
+downloading thirty-four megabytes first — on the one device state where the connection may be the thing
+that is also broken. That is the arithmetic of the failure the user described: it downloads because
+there is nothing on disk to repair from, and it does not succeed because the download is the thing that
+cannot complete.
+
+The archive is now kept, and the record of that decision is in the code rather than in a comment that
+could drift: `moveIntoPlace` records *"pinned archive kept for repair"* with its size, and the file's
+own doc says where it is given up. There are exactly three such places, each deliberate.
+`deleteRootfs()` still deletes it, so **Uninstall leaves no 34 MB behind** — a userspace the user
+removed is not a userspace anyone repairs. The repair ladder's disk step gives it up
+(`releasePinnedArchive`), and only against a *measured* shortfall: a device whose free space is unknown
+reads 0, and trading the one file that makes the deeper rungs local for a number nobody took is not a
+repair. It says what it cost out loud — *"gave up the base system archive (34 MB) to make room for the
+repair; the next rung that needs it will download it again"* — and the byte count it returns is what
+the ladder adds to its warnings, so the one case where the download returns is the one case the user is
+told about. The third is a pin that no longer matches: the next `ensurePinnedArchive` downloads over it,
+which is a version change and not a repair.
+
+**Apt's trees were emptied on every press, whatever the failure was.** Rung L called
+`clearRegenerableState()` unconditionally, and that method emptied `var/lib/apt/lists` *and*
+`var/cache/apt/archives`. Its own KDoc defended the cost — *"a few megabytes against the base system's
+thirty"* — and the figure was wrong in the direction that matters: `main restricted universe multiverse`
+across three suites is tens of megabytes for the index alone, and the archives directory holds every
+package the user has downloaded, which is precisely the set apt will have to fetch *again* to install
+the same things. Both were being thrown away to answer failures that had nothing to do with either.
+
+The clearing now has its own rung, directly below the setup run, because the evidence it needs is that
+run's own outcome. Two questions, and either firing is enough. What did the failed step say?
+`AptDamage.of` matches apt's own words — *unable to parse package file*, *problem with mergelist*, *the
+package lists or status file could not be parsed*, *hash sum mismatch*, *size mismatch* — which is the
+same trade `UserspaceFailure` already makes when it reads a lock holder out of dpkg's refusal, and it
+is argued in that type's own doc: there is no exit code that separates "the list is unparseable" from
+"the mirror is unreachable", and the alternative is the blanket wipe this replaced. What do the trees
+look like? `aptIndexLooksDamaged()` answers by looking, which is the only kind of check available when
+asking apt is what just failed: a `lists/partial` with anything in it is an update killed mid-download,
+and a zero-length `*_Packages`, `*_InRelease` or `*_Release` is a write that never finished.
+
+The verdict is a cost, not a boolean, and that distinction is the whole design. `INDEX` gives up the
+lists, which one update rebuilds — and with the lists gone but the release files intact that update is
+nearly free. `INDEX_AND_CACHE` also gives up the downloaded packages, and it is reached by *phrase
+alone*: a `Hash Sum mismatch` on a `.deb` is apt naming the bytes as wrong, and a corrupt package in
+the cache makes every install of it fail identically until the file is gone — which is a real failure
+that the old unconditional wipe used to fix by accident, and is now fixed on purpose. A failure that
+names neither — a library replaced by one that does not load, a mirror that is down, a disk that filled
+— leaves both trees exactly where they are, and the diagnostics ring says so: *"apt's state left alone:
+nothing named it"*.
+
+One boundary is worth stating rather than leaving to be discovered: this gating is the *setup* rung's
+answer to a failure, and the disk rung above it still empties both trees whenever the free space is
+short — or *unknown*, because a repair that cannot prove there is room makes room rather than finding
+out halfway through an extraction. That is the documented behaviour of that rung and unchanged here;
+what changed is that a device which can say how much room it has, and has it, no longer pays for a
+clear it never needed. A device whose storage probe fails therefore behaves as it always did.
+
+**The same pipeline ran three times in one press.** The two local rungs were `rung(...)` like every
+other, which means each of them ran the whole setup pipeline when it changed anything: *restore local
+state* cleared the apt trees (so it always changed something, so it always ran the pipeline), and
+*restore the package database* ran it again when it put a database back, and then the rung named
+*setup* ran it a third time. Every one of those runs begins with an `apt-get update`, so the ladder was
+spending the user's connection three times to answer one question. The two local rungs are now
+`localRung(...)`: they prepare the rootfs and hand nothing back, and the pipeline runs once, in its own
+rung, after both have had their turn. The ladder's worst case is two runs and not three — the setup rung
+and, only when it failed over apt's own state, the retry that clearing those trees makes possible.
+
+### What is asserted, and where
+
+`RootfsRepairTest` carries the archive's policy. *The pinned archive is given up only when something
+asks for the space* asserts the release returns the byte count it freed, is idempotent, and that the
+next `inspectAgainstPinnedArchive` moves the download counter from one to two — the mechanism, not the
+intent. *A repair with no network works from the archive the install kept* installs, releases nothing,
+and then inspects and restores `usr/bin/rm` with no fetch at all; the suite's existing offline-refusal
+test now has to release the archive *first* to make its point, which is the same statement from the
+other side. `RootfsInstallerTest`'s assertion that the archive is consumed — the one at the end of
+`a verified tarball extracts with files, modes and symlinks`, where a comment used to say the tarball
+was spent — now asserts the opposite on both counts, and the two tests that counted two downloads
+assert one.
+
+`RootfsLocalRepairTest` holds the apt verdicts as a table. The five cases are the ones a phrase list
+can get wrong: nothing named → both trees untouched; an index apt cannot read → the lists go and the
+downloaded packages stay; a package apt says is wrong → both go, *because apt will not rewrite a `.deb`
+on its own*; a dpkg-subprocess failure that merely contains no apt-ish phrase → nothing; and the two
+states only the host can see — a `lists/partial` with a file in it, a zero-length `Packages` — which
+must be damage even when the failure said nothing. `LinuxUserspaceManagerTest` drives the rung itself
+through the manager, with the tree the fakes build: a setup run that fails while apt's index is present
+gives the index up and runs the pipeline again, and the counter that proves it is self-synchronizing
+rather than attempt-based (it starts counting only once the planted index is gone, so the install's own
+updates cannot satisfy it) — and a setup run that fails over something else leaves apt's state where it
+is, asserted through `distribution.diagnostics.export()`. The harness also gained a dead mirror-list URL
+on port 1, because an exhausted ladder calls `fetchMirrorList()` and a test that reaches the network for
+its verdict is not a test.
+
+### The arrow in the corner
+
+§60 argued that the scrolled-back badge must keep its arrow — *"the only thing on screen that
+distinguishes a scrolled-back terminal from a hung one and the only way back to the live output"* — and
+spent a setting on the count so the arrow could stay. The user asked for the arrow itself to go, and the
+argument it was defended with was half wrong: it is not the only way back. The terminal's overflow menu
+carries a **Jump to live output** row, and
+`TerminalScreenRobolectricTest.theOverflowMenuStillOffersEveryActionTheCardInterfaceHad` asserts it
+exists — that test's whole purpose is to fail if a card-era action is dropped rather than relocated, and
+this is exactly the case it was written for.
+
+So the badge is now count-only, `ArrowDownward` is gone from the import list with it, and the setting
+hides the chip entire rather than dimming half of it: with the count off by default, a scrolled-back
+terminal draws nothing at all in that corner. What survives is one honest sentence in the setting's
+subtitle — *"How far behind the live output the view is, shown over the grid when the view is scrolled
+back"* — and the tap target, for anyone who turns it back on. §60's sentences about the arrow keeping
+its tap target and its 12dp padding are history rather than description from here, as its own figures
+about the setting's nine wiring steps still are: the field, the DataStore key, the default, the setter,
+the view-model wrapper, the scaffold parameter, the row, both call sites and the vault backup are all
+still exactly where it put them.
+
+### The verification
+
+The four suites that own the ladder — `LinuxUserspaceManagerTest`, `RootfsInstallerTest`,
+`RootfsRepairTest`, `RootfsLocalRepairTest` — ran locally on this host on 2026-09-22 under
+`nice -n 10 taskset -c 0-1 ./gradlew testDebugUnitTest --offline --no-daemon`: **61 tests, 0
+failures** (24 / 13 / 12 / 12), in 1m18s of test time with the native modules already built. The suite
+is 2,014 JVM/Robolectric methods in 177 files, which is what the README now says.
+
+The first run of those four classes is worth recording, because two of its five failures were the
+change working and the tests not yet knowing it. Two tests asserted that a repair fetches the archive
+again — `expected: 2 but was: 1` — which was the old behaviour to the byte. One, *repair refuses to
+rebuild over a failure a rebuild cannot fix*, cut the network and expected the refusal to arrive when
+the deeper rungs tried to fetch; with the archive on disk the ladder rebuilt locally instead, which is
+the whole point of the change, so the test now gives the archive up first to reach the state it is
+about. And the two that failed on apt's trees were a finding rather than a slip: the harness left the
+free-space probe to the JVM's unmocked `StatFs`, which answers **0**, and the disk rung treats 0 as
+*unknown* and empties apt's lists and downloaded packages on an unknown reading exactly as it does on a
+short one. The harness now answers the probe — a device that can say how much room it has, and has it —
+which is the case the new gating exists for.
+
+`scripts/check-doc-figures.sh` reports all 159 claims agreeing with the build, and the
+brace/comment-nesting scanner passes over all seven changed Kotlin files, both re-run after the last
+edit to this section.
+
+**What has not run, and why.** No CI gate. Every push this branch made started both workflows, and
+every job in them that was not skipped ended the same way: `steps=0`, an empty `runner_name`, and this
+annotation on the check run, quoted rather than paraphrased:
+
+> The job was not started because recent account payments have failed or your spending limit needs to
+> be increased. Please check the 'Billing & plans' section in your settings
+
+The first push — `5a69893` — started `ci.yml` as run `35762315726` and `instrumentation.yml` as run
+`35762315218` at 17:41:09Z; the amended tip started them again as `35762413727` and `35762412983` at
+17:42:05Z, with the same annotation. That is the signature §60 recorded for exhausted Actions minutes,
+and it is the reason three check runs read `failure` — *Documentation figures*, *FreeRDP native (4
+ABIs)* and *connectedAndroidTest* — while the jobs that depend on them were skipped. A red check that
+never started says nothing about the change, and the same three would be red on any commit in this
+repository today, so nothing here was built on a runner and the per-ABI release APKs are not built
+either. Nothing has forked proot either: `connectedAndroidTest` cannot run on this host (no usable
+emulator) and every rung of this ladder ends in a proot spawn, so the end-to-end claim — break a
+userspace, press Repair, watch it repair *without* a download — is a device check, as is the badge
+arrow's absence under a finger. What is verified here is the ladder's logic against fakes that record
+every command and every byte: which rung ran, what it wrote, and what it fetched.

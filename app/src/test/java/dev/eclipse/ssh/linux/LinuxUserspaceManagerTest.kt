@@ -62,10 +62,29 @@ class LinuxUserspaceManagerTest {
             // "1 expected program not found in PATH" failure needs. A harness without it exercises
             // a distribution that can only warn about a missing `rm`, which is not the app.
             installer = installer,
+            // Nothing listens on port 1, so the mirror feed is unreachable in a millisecond and the
+            // apt-update ladder is the three archives [builtinMirrorUrls] names and no more. Only
+            // the tests that drive an *exhausted* update ever read it, and they have to be hermetic:
+            // the default endpoint is a real host, and a unit test that waited on it would be a test
+            // of the build machine's network.
+            mirrorListUrl = UNREACHABLE_MIRROR_FEED,
         )
         val processes = LinuxProcessManager()
         val workspace = LinuxWorkspaceManager(runtime)
         val backupFile = File(rootDir.parentFile, "${rootDir.name}-workspace-backup.tar.gz")
+
+        /**
+         * A device with room to spare, said out loud rather than measured — because the JVM's
+         * unmocked `StatFs` answers 0, and 0 means *unknown*, and the ladder's disk rung runs on an
+         * unknown reading exactly as it does on a short one. A harness that took the default probe
+         * would therefore have every repair begin by emptying apt's lists and the packages already
+         * downloaded, which is the behaviour these tests exist to pin down the *absence* of: the
+         * rungs below are only testable when the trees they argue about are still there when they
+         * get to them. `RuntimeStorageManager.freeBytes`'s own doc says 0 is "do not gate on this",
+         * and the disk rung's gate is what this is holding open.
+         */
+        val storage = RuntimeStorageManager(rootDir, freeBytesProbe = { ROOM_TO_SPARE })
+
         val manager = LinuxUserspaceManager(
             rootDir,
             distro,
@@ -75,6 +94,7 @@ class LinuxUserspaceManagerTest {
             processes,
             workspace,
             backupFile,
+            storage = storage,
         )
     }
 
@@ -91,6 +111,14 @@ class LinuxUserspaceManagerTest {
                 Files.createTempDirectory("linux-userspace-fixture").toFile().resolve("rootfs.tar.gz"),
             )
         }
+
+        internal const val UNREACHABLE_MIRROR_FEED = "http://127.0.0.1:1/mirrors.txt"
+
+        /**
+         * Far more than any rung of the ladder needs, so the disk rung's gate stays shut: see the
+         * harness's own note on why the probe has to be answered rather than left to `StatFs`.
+         */
+        private const val ROOM_TO_SPARE = 64L * 1024 * 1024 * 1024
 
         private fun newHarness(supplementaryGids: () -> IntArray = { IntArray(0) }): Harness =
             Harness(
@@ -249,10 +277,12 @@ class LinuxUserspaceManagerTest {
         assertThat(rm.readText()).isEqualTo("fake rm\n")
         assertThat(rm.canExecute()).isTrue()
         assertThat(userPackage.readText()).isEqualTo("installed by the user\n")
-        // The install deleted the tarball once it was unpacked ("the tarball has served its
-        // purpose"), so putting the file back fetches it again - one download, and the first rung
-        // is enough.
-        assertThat(harness.downloads).isEqualTo(downloadsBeforeRepair + 1)
+        // And it cost the network nothing at all. This used to be one download, because the install
+        // deleted the tarball once it was unpacked ("the tarball has served its purpose") and
+        // putting one file back therefore meant fetching thirty-four megabytes for it. The archive
+        // is kept for exactly this, and the assertion is +0 rather than +1 so that a future change
+        // which starts fetching again fails here rather than at the user's data plan.
+        assertThat(harness.downloads).isEqualTo(downloadsBeforeRepair)
     }
 
     @Test
@@ -280,7 +310,9 @@ class LinuxUserspaceManagerTest {
         // Back, and the whole 3 MB of it: the archive's own bytes over the hole, not an empty file
         // standing in for one.
         assertThat(pad.length()).isEqualTo(3L * 1024 * 1024)
-        assertThat(harness.downloads).isEqualTo(downloadsBeforeRepair + 1)
+        // Written out of the archive the install kept, so the repair fetched nothing: see the test
+        // above for why this is +0 and not +1.
+        assertThat(harness.downloads).isEqualTo(downloadsBeforeRepair)
     }
 
     @Test
@@ -321,6 +353,13 @@ class LinuxUserspaceManagerTest {
         }
         val userPackage = harness.installer.rootfsDir.resolve("usr/bin/user-package")
         userPackage.writeText("installed by the user\n")
+        // The archive has to go first, and that is the whole point of this test's premise rather
+        // than a detail of it: an install *keeps* its verified tarball precisely so the deeper rungs
+        // can write base bytes without the network, which means a device with nothing on disk to
+        // rebuild from is the only one left to refuse. The sibling test below — "repair climbs to a
+        // rebuild when nothing cheaper clears the fault, and keeps the work" — is the other side of
+        // that line: it reaches the deepest rung and rebuilds out of the archive, fetching nothing.
+        assertThat(harness.installer.releasePinnedArchive()).isGreaterThan(0L)
         harness.downloadFails = true
 
         val failure = runCatching { harness.manager.repair() }.exceptionOrNull()
@@ -376,6 +415,16 @@ class LinuxUserspaceManagerTest {
         // this repair is not one.
         val userPackage = harness.installer.rootfsDir.resolve("usr/bin/user-package")
         userPackage.writeText("installed by the user\n")
+        // And apt's own trees, at the size a real device has them: an index apt has already fetched
+        // and a package it has already downloaded. This repair has nothing to do with either, and it
+        // is the repair that used to take both — a full re-index plus every cached `.deb`, on the
+        // user's connection, to answer a marker on disk.
+        val index = harness.installer.rootfsDir.resolve("var/lib/apt/lists/fixture_Packages")
+        index.parentFile?.mkdirs()
+        index.writeText("Package: fixture\n")
+        val cachedDeb = harness.installer.rootfsDir.resolve("var/cache/apt/archives/fixture.deb")
+        cachedDeb.parentFile?.mkdirs()
+        cachedDeb.writeText("already downloaded\n")
         val downloadsBeforeRepair = harness.downloads
 
         // What the real userspace does with that file on disk: every dpkg and apt command refuses in
@@ -404,6 +453,96 @@ class LinuxUserspaceManagerTest {
         // base system, and the repair that clears it costs the user no network at all.
         assertThat(userPackage.readText()).isEqualTo("installed by the user\n")
         assertThat(harness.downloads).isEqualTo(downloadsBeforeRepair)
+        // Including apt's trees, which this repair never named and therefore never touched. This is
+        // the whole of "every press of Repair re-downloads the world": the old rung emptied both of
+        // these before the setup run, on every failure there was.
+        assertThat(index.readText()).isEqualTo("Package: fixture\n")
+        assertThat(cachedDeb.readText()).isEqualTo("already downloaded\n")
+    }
+
+    @Test
+    fun `a setup run that fails over apt's own lists gives them up and runs the pipeline again`() = runTest {
+        val harness = newHarness()
+        harness.manager.install()
+        val rootfs = harness.installer.rootfsDir
+        // The two things a repair used to throw away whether or not anything was wrong with them.
+        val index = rootfs.resolve("var/lib/apt/lists/fixture_Packages")
+        index.parentFile?.mkdirs()
+        index.writeText("Package: fixture\n")
+        val cachedDeb = rootfs.resolve("var/cache/apt/archives/fixture.deb")
+        cachedDeb.parentFile?.mkdirs()
+        cachedDeb.writeText("already downloaded\n")
+
+        // apt's own words for its own bookkeeping, and it keeps saying them until the lists it blames
+        // are actually gone — so the second setup run is the one that succeeds. Keyed on the file
+        // rather than on an attempt count, because a count would make this test pass by outlasting
+        // the ladder instead of by the repair working; and the updates that happen *after* the lists
+        // went are counted, because those are the pipeline running again, which is the rung's claim.
+        var updatesAfterTheListsWent = 0
+        val healthyRespond = harness.spawner.respond
+        harness.spawner.respond = { command ->
+            if (command.startsWith("apt-get update")) {
+                if (index.exists()) {
+                    100 to "E: Failed to fetch http://m.example/ubuntu/dists/noble/main/binary-amd64/Packages  " +
+                        "Hash Sum mismatch\n" +
+                        "E: Some index files failed to download. They have been ignored, or old ones used instead.\n"
+                } else {
+                    updatesAfterTheListsWent++
+                    healthyRespond(command)
+                }
+            } else {
+                healthyRespond(command)
+            }
+        }
+
+        val report = harness.manager.repair()
+
+        assertThat(harness.manager.state.value).isEqualTo(LinuxUserspaceState.Stopped)
+        // Both halves, because apt named the bytes themselves: a corrupt `.deb` is the one file apt
+        // will never rewrite for itself, and every install of that package fails identically until it
+        // is gone. The index would have been re-fetched on the next update either way.
+        assertThat(index.exists()).isFalse()
+        assertThat(cachedDeb.exists()).isFalse()
+        assertThat(report.warnings.joinToString("\n"))
+            .contains("apt's package lists and the packages it had already downloaded were given up")
+        // And the setup pipeline ran again: the rung that won needed one update, and the unscoped
+        // confirmation beside it is the second. A repair that cleared the lists and stopped there
+        // would leave the user with a userspace no update has ever completed.
+        assertThat(updatesAfterTheListsWent).isEqualTo(2)
+    }
+
+    @Test
+    fun `a setup run that fails over something else leaves apt's state where it is`() = runTest {
+        val harness = newHarness()
+        harness.manager.install()
+        val rootfs = harness.installer.rootfsDir
+        val index = rootfs.resolve("var/lib/apt/lists/fixture_Packages")
+        index.parentFile?.mkdirs()
+        index.writeText("Package: fixture\n")
+
+        // A failure with nothing to do with apt's bookkeeping: dpkg's own subprocess died while
+        // configuring a package. The ladder's answer to that is files put back or the base system
+        // rewritten — the rungs below the setup run — and never a download. Emptying the index here
+        // would buy the user thirty megabytes of fresh index and fix nothing, which is exactly the
+        // trade this rung exists to refuse.
+        val healthyRespond = harness.spawner.respond
+        harness.spawner.respond = { command ->
+            if (command.startsWith("apt-get update")) {
+                100 to "dpkg: error processing package fixture (--configure):\n" +
+                    " installed fixture package post-installation script subprocess returned error exit status 1\n" +
+                    "Errors were encountered while processing:\n fixture\n"
+            } else {
+                healthyRespond(command)
+            }
+        }
+
+        runCatching { harness.manager.repair() }
+
+        // The rung ran and declined, in the record rather than in the tree: the deeper rungs rewrite
+        // the base system and with it the lists, so what the file looks like at the end says nothing
+        // about what this rung decided. The diagnostic is the decision itself.
+        assertThat(harness.distribution.diagnostics.export())
+            .contains("apt's state left alone: nothing named it")
     }
 
     @Test

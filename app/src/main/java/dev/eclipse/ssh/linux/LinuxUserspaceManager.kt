@@ -248,9 +248,9 @@ class LinuxUserspaceManager(
 
     /**
      * Re-runs whatever is broken, in the order of what each answer costs the user: the local state
-     * nothing else can restore, the package database, the setup pipeline again, then the base files
-     * the archive says are missing, then the base system rewritten wholesale, and only then a full
-     * reinstall from the pin.
+     * nothing else can restore, the package database, the setup pipeline again, apt's own state —
+     * and only if that run's failure named it — then the base files the archive says are missing,
+     * then the base system rewritten wholesale, and only then a full reinstall from the pin.
      *
      * Until this ladder existed, Repair had exactly one rung — re-extract if there is no rootfs,
      * otherwise set up again — and the failure it was reported against ("Installing base packages
@@ -260,6 +260,13 @@ class LinuxUserspaceManager(
      * app answered the only failure it exists to clear. A rootfs that is *there* and wrong is the
      * case the deeper rungs are for, and the deepest of them cannot fail for want of a file: it
      * writes the pinned archive's own base system over whatever is on disk.
+     *
+     * Every rung that writes base bytes reads them from the archive the install already fetched and
+     * verified, which the installer now keeps on disk for exactly this reason: a repair is the one
+     * flow where the connection may be the thing that is broken, and a ladder that answered a broken
+     * userspace by downloading thirty-four megabytes per rung would be answering it with the one
+     * resource that is not available. Nothing here downloads unless the archive was never fetched,
+     * was given up to a disk that could not fit the repair, or no longer matches its pin.
      *
      * The boundary the ladder refuses to cross is a failure a rebuild cannot fix — no network, no
      * DNS, a disk with nothing left to free, a mirror that refuses or serves an unsigned index, a
@@ -280,11 +287,12 @@ class LinuxUserspaceManager(
      * exception that makes the rest of the ladder reachable at all: a package database that cannot be
      * read is a state no rung can work in, so rung D restores that one file and parks what was there
      * as `status.broken` (see [RootfsInstaller.restorePackageDatabase], which is also where the price
-     * of the archive's copy is stated). Apt's caches and index lists are regenerable by definition and
-     * rung L clears them; a workspace the user deleted is recreated empty, and told about. A repair
-     * therefore never costs the user a package they installed or a file they wrote; the price of a
-     * success it cannot achieve more cheaply is the base system's own bytes, re-fetched from the same
-     * SHA256-verified pin the install used.
+     * of the archive's copy is stated). Apt's index lists and downloaded packages are the other
+     * exception, and they are given up only when a failed step names them (see [clearAptState]); a
+     * workspace the user deleted is recreated empty, and told about. A repair therefore never costs
+     * the user a package they installed or a file they wrote; the price of a success it cannot
+     * achieve more cheaply is the base system's own bytes, written from the same SHA256-verified pin
+     * the install used.
      *
      * @throws UserspaceFailure when the failure is one a rebuild cannot fix, unchanged, so the
      *   controller renders its own sentence rather than this layer's prose
@@ -359,6 +367,33 @@ class LinuxUserspaceManager(
             }
         }
 
+        /**
+         * One rung that only *prepares* the rootfs: it changes something or it does not, and it
+         * never runs the setup pipeline itself.
+         *
+         * The split exists because the pipeline is expensive in exactly the currency this ladder's
+         * whole shape is about — it updates apt, and apt re-fetches whatever its own state no longer
+         * answers for. A rung that only puts the rootfs back into a state the pipeline can work in
+         * has nothing to learn from running it, so the pipeline runs once, in its own rung below,
+         * after every rung of this kind has had its turn. What each one did is in [warnings] and in
+         * the diagnostics ring; none of them has a report of its own to hand back, which is the
+         * difference between this and [rung].
+         */
+        suspend fun localRung(label: String, action: suspend () -> Unit) {
+            attempted += label
+            try {
+                action()
+            } catch (t: Throwable) {
+                lastFailure = t
+                if (!aRebuildCouldFix(t)) throw t
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.ROOTFS,
+                    "repair step left the userspace broken: $label",
+                    detail = t.message ?: t.javaClass.simpleName,
+                )
+            }
+        }
+
         // Rung 0 — a crashed extraction: a whole rootfs with a staging tree left beside it.
         // isExtracted() is false only because of the leftover, and every rung below checks it, so
         // the leftover is cleared before the ladder starts rather than mistaken for a missing
@@ -387,6 +422,21 @@ class LinuxUserspaceManager(
                 warnings += "freed ${reclaimed / (1024 * 1024)} MB of package caches and temporary " +
                     "files to make room for the repair"
             }
+            // The kept archive is the last thing given up, and it is given up only against a reading
+            // that says the disk is short. A reading of 0 means "unknown" (see
+            // [RootfsInstaller.reclaimSpace]'s caller), and trading the one file that makes this
+            // ladder's deeper rungs local for a number nobody measured is not a repair. Nor is it
+            // worth doing when there is no rootfs to repair: the install is about to need those same
+            // bytes, so freeing them and re-fetching them is a no-op with a download in the middle.
+            if (free > 0L && installer.rootfsInPlace() &&
+                free - reclaimed < installer.requiredFreeBytes
+            ) {
+                val released = installer.releasePinnedArchive()
+                if (released > 0L) {
+                    warnings += "gave up the base system archive (${released / (1024 * 1024)} MB) to " +
+                        "make room for the repair; the next rung that needs it will download it again"
+                }
+            }
         }
 
         // Rung A — no rootfs at all. There is nothing to repair, only something to build, and the
@@ -401,14 +451,18 @@ class LinuxUserspaceManager(
         // because the failures they answer make every rung below fail identically and instantly: a
         // package lock nothing holds makes every dpkg and apt call refuse in a second ("Could not get
         // lock ... is another process using it?"), and an unreadable package database makes them
-        // refuse before they read anything else — so the old ladder spent all four of its rungs on
-        // the same refusal, and the reinstall it ended with did not touch either one. Neither rung
-        // downloads anything it does not have to, which matters here more than anywhere else on the
-        // ladder: a repair that reads the network before it has looked at the rootfs spends a metered
-        // connection on a run that cannot get past its own first command.
-        return rung("restore local state", { restoreLocalState(warnings) })
-            ?: rung("restore the package database", { restorePackageDatabase(warnings) })
-            ?: rung("setup", { setUpAgain(warnings) })
+        // refuse before they read anything else — so a ladder without them spent every rung on the
+        // same refusal, and the reinstall it ended with did not touch either one. Neither rung
+        // downloads anything, which matters here more than anywhere else on the ladder: a repair that
+        // reads the network before it has looked at the rootfs spends a metered connection on a run
+        // that the rootfs itself can already say will not work.
+        localRung("restore local state") { restoreLocalState(warnings) }
+        localRung("restore the package database") { restorePackageDatabase(warnings) }
+
+        return rung("setup", { setUpAgain(warnings) })
+            // The one rung that answers a *failed* setup run, and the only reason it is below it:
+            // the evidence it acts on is that run's own outcome. See [clearAptState].
+            ?: rung("clear apt's package lists", { clearAptState(warnings, lastFailure) })
             ?: rung("restore missing files", { restoreDamaged(warnings) })
             ?: rung("rewrite the base system", { overlayBase(warnings) })
             ?: rung("reinstall", { reinstall(warnings) })
@@ -424,29 +478,28 @@ class LinuxUserspaceManager(
      * killed dpkg leaves on disk while the kernel has already dropped the lock itself, so every
      * package step of every rung refuses in a second and the user is told the same thing four times
      * (see [RootfsInstaller.clearStalePackageLocks], which proves nothing holds a lock before
-     * removing it rather than deleting a file that happens to be named `lock`). The apt state is
-     * what `Hash Sum mismatch` and an unparseable index live in, and it is *only* ever cleared by
-     * rung S — which runs on a disk gate, so on a device with space to spare a corrupt index was
-     * unfixable by anything short of the rebuild (see [RootfsInstaller.clearRegenerableState]). The
-     * guest's `tmp` and `run` are preserved members that no rung writes and no archive overlay
-     * replaces, and the setup rung's own attempt to create them — `prepareWorkspace`, which runs on
-     * every rung below this one — throws its result away, so a `tmp` that is a *file* and a
-     * workspace that is not a real directory both survived every repair there was, silently.
+     * removing it rather than deleting a file that happens to be named `lock`). The guest's `tmp`
+     * and `run` are preserved members that no rung writes and no archive overlay replaces, and the
+     * setup pipeline's own attempt to create them — `prepareWorkspace` — throws its result away, so
+     * a `tmp` that is a *file* and a workspace that is not a real directory both survived every
+     * repair there was, silently.
      *
-     * Unconditional rather than gated on the failure that brought the user here, which is a
-     * deliberate trade and not an oversight: the ladder has no structured record of that failure
-     * (the state carries a sentence, and a sentence is not something to branch on), and every part
-     * here is cheap, local, and costs the user nothing — apt's caches are its own bytes, locks that
-     * something holds are left alone, and the directories are recreated only when they are missing
-     * or wrong. The one real cost is a re-download of the package index: a few megabytes against
-     * the base system's thirty, on a repair the user asked for, and only when the index was not
-     * already cleared by rung S in this same pass.
+     * What is deliberately *not* here is apt's own state. This rung used to empty the package cache
+     * and the index lists on every repair, whether or not either had anything to do with the failure
+     * — which cost the user a full re-download of the index (tens of megabytes: `main restricted
+     * universe multiverse` over three suites) and every package they had already downloaded, on
+     * every press of Repair, to answer failures that were neither's. That clear now has its own rung
+     * below the setup run, where the evidence for it exists: see [clearAptState].
      *
-     * Returns null when it found nothing to do, which is the honest answer for a userspace whose
-     * damage is elsewhere — the setup rung below is the one that says so, and running it twice would
-     * only double the network's share of a repair.
+     * Everything here is unconditional in the other direction — it is gated on the *state*, not on
+     * the failure — and that is safe because none of it can cost the user anything: a lock something
+     * holds is left alone, and the directories are recreated only when they are missing or wrong.
+     *
+     * What it did goes into [warnings] and the diagnostics ring as it goes; there is no summary to
+     * hand back, because the ladder does not branch on this rung — the setup rung below runs either
+     * way, since a repair the user asked for is a repair that runs the pipeline.
      */
-    private suspend fun restoreLocalState(warnings: MutableList<String>): SetupReport? {
+    private suspend fun restoreLocalState(warnings: MutableList<String>) {
         var changed = false
 
         val sweep = installer.clearStalePackageLocks()
@@ -463,13 +516,6 @@ class LinuxUserspaceManager(
                 "package locks are still held; the package steps below will refuse",
                 detail = sweep.held.joinToString(", "),
             )
-        }
-
-        val freed = installer.clearRegenerableState()
-        if (freed > 0L) {
-            changed = true
-            warnings += "cleared ${freed / (1024 * 1024)} MB of apt's own caches and package lists, " +
-                "which its next update rebuilds"
         }
 
         val temp = installer.ensureGuestTemp()
@@ -498,12 +544,64 @@ class LinuxUserspaceManager(
             }
         }
 
-        if (!changed) return null
-        diagnostics.record(
-            UserspaceDiagnosticCategory.ROOTFS,
-            "local state restored; setting the userspace up again",
-            detail = "the rootfs itself was not written",
-        )
+        if (changed) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.ROOTFS,
+                "local state restored; the setup rung takes it from here",
+                detail = "the rootfs itself was not written",
+            )
+        }
+    }
+
+    /**
+     * The rung for apt's own state, and the one rung on the ladder whose evidence is the *failure
+     * that came before it*: it runs directly below the setup rung and asks that run's outcome what to
+     * do, rather than emptying apt's trees pre-emptively on the way past.
+     *
+     * Two questions, and either one firing is enough. What did the failed step say? `Hash Sum
+     * mismatch`, a list apt cannot parse, a merge list it will not read — apt naming its own
+     * bookkeeping is the one piece of evidence that the bookkeeping is the problem (see
+     * [AptDamage.of], which is where the phrases and their limits are argued). And what do the trees
+     * look like? A `lists/partial` with something in it is an update that was killed mid-download,
+     * and a zero-length index file is a write that never finished (see
+     * [RootfsInstaller.aptIndexLooksDamaged], which answers both without running apt — the only kind
+     * of check available here, since running apt is what just failed).
+     *
+     * Returns null when neither question names apt's state, and that is the point of the rung: a
+     * setup run that failed over something else — a library replaced by one that does not load, a
+     * mirror that is down, a disk that filled — leaves the index and every downloaded package exactly
+     * where they are, so the rungs below it do not pay for a re-download to answer a failure that was
+     * never apt's. The cost of the two clears is stated in the warnings, because it is the user's
+     * connection: the lists cost one update, and the packages cost every byte apt will have to fetch
+     * again.
+     */
+    private suspend fun clearAptState(
+        warnings: MutableList<String>,
+        failure: Throwable?,
+    ): SetupReport? {
+        val said = AptDamage.of(failure?.message)
+        val damage = when {
+            said == AptDamage.INDEX_AND_CACHE -> AptDamage.INDEX_AND_CACHE
+            said == AptDamage.INDEX || installer.aptIndexLooksDamaged() -> AptDamage.INDEX
+            else -> AptDamage.NONE
+        }
+        if (damage == AptDamage.NONE) {
+            diagnostics.record(
+                UserspaceDiagnosticCategory.APT,
+                "apt's state left alone: nothing named it",
+                detail = failure?.message ?: "the setup run did not report a failure",
+            )
+            return null
+        }
+        val freed = installer.clearAptState(damage)
+        val mb = freed / (1024 * 1024)
+        warnings += if (damage == AptDamage.INDEX_AND_CACHE) {
+            "apt's package lists and the packages it had already downloaded were given up " +
+                "($mb MB) because the step that failed named them; the next update re-fetches both"
+        } else {
+            "apt's package lists were given up ($mb MB) because the step that failed named them, " +
+                "and the next update rebuilds them"
+        }
         return setUpAgain(warnings)
     }
 
@@ -519,11 +617,11 @@ class LinuxUserspaceManager(
      * file. [RootfsInstaller.restorePackageDatabase] is where the three sources and their prices are
      * described; what belongs here is what the rung does with the answer.
      *
-     * Returns null when the database read as a database, which is the common case and means this
-     * rung has no opinion about the failure being repaired.
+     * A database that reads as a database is the common answer, and it means this rung has no
+     * opinion about the failure being repaired — the setup rung below it is the one that speaks.
      */
-    private suspend fun restorePackageDatabase(warnings: MutableList<String>): SetupReport? {
-        val source = installer.restorePackageDatabase(onProgress = ::emitArchiveProgress) ?: return null
+    private suspend fun restorePackageDatabase(warnings: MutableList<String>) {
+        val source = installer.restorePackageDatabase(onProgress = ::emitArchiveProgress) ?: return
         warnings += when (source) {
             // dpkg's own previous generation: the same database one write ago, so every package the
             // user installed is still recorded and nothing has to be reinstalled.
@@ -538,7 +636,6 @@ class LinuxUserspaceManager(
                     "installed; their files are still on disk and reinstalling them with apt puts " +
                     "the record back"
         }
-        return setUpAgain(warnings)
     }
 
     /**

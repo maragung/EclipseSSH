@@ -76,7 +76,6 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
@@ -3263,16 +3262,18 @@ private fun TerminalScreen(
                         selection?.let { onCopySelection(activeTab.id, it) }
                     },
                 )
-                if (frame.totalLines > 0 && frame.firstLine + frame.lines.size < frame.totalLines) {
-                    // Scrolled back, so the live output is no longer on screen. Without this the only
-                    // clue is that nothing moves, which reads as a hung session.
+                // Scrolled back, so the live output is no longer on screen. Without this the only
+                // clue is that nothing moves, which reads as a hung session — so it is drawn when
+                // the count is asked for, and the grid is left alone when it is not. Read from the
+                // state this screen already has, the way the key row's own visibility is read
+                // below: a preference that changes what the terminal draws needs no plumbing to
+                // reach the thing that draws it.
+                if (state.settings.terminalScrollbackCountVisible &&
+                    frame.totalLines > 0 && frame.firstLine + frame.lines.size < frame.totalLines
+                ) {
                     ScrollbackBadge(
                         lines = frame.totalLines - (frame.firstLine + frame.lines.size),
                         onJump = { onScrollTo(activeTab.id, 0) },
-                        // Read from the state this screen already has, the way the key row's own
-                        // visibility is read below: a preference that changes what the terminal draws
-                        // needs no plumbing to reach the thing that draws it.
-                        showCount = state.settings.terminalScrollbackCountVisible,
                         modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
                     )
                 }
@@ -3788,19 +3789,22 @@ private fun MainUiState.terminalLine(sessionKey: String, line: Int): String {
 /**
  * The scrolled-back indicator: how far behind the live output the view is, and a way back.
  *
- * [showCount] hides the "$lines lines below" text and nothing else — the arrow, the tap target and
- * the "Jump to live output" description all stay, because the badge is the only thing that
- * distinguishes a scrolled-back terminal from a hung one. What the count costs is width over the
- * busiest corner of the grid, which is the trade the Settings row offers; what it must never cost is
- * the way back. The padding is therefore the same in both states: with the text gone it is symmetric
- * around the arrow rather than a gap where a number used to be, and the target the user has to hit to
- * get back to live output does not shrink along with the thing that was hidden.
+ * A count and nothing else. The down-arrow that used to sit beside it was the tallest, brightest
+ * thing in the busiest corner of the grid — directly under the size readout (`120x60`) — and it
+ * spent that position on a gesture the terminal already has: scrolling to the bottom. What it
+ * *said*, that the view is behind the live output rather than hung, is what the count says, so the
+ * count is what is left.
+ *
+ * It is drawn only when Settings → Terminal → "Show lines below" is on, which is off by default:
+ * with the arrow gone this chip is the count, and a terminal that does not want the count wants
+ * nothing here at all. The way back is never lost by the setting — it is the menu's own "Jump to
+ * live output", which the full-screen terminal has always had, and this chip keeps its tap target
+ * and its description for as long as it is drawn.
  */
 @Composable
 private fun ScrollbackBadge(
     lines: Int,
     onJump: () -> Unit,
-    showCount: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -3808,13 +3812,11 @@ private fun ScrollbackBadge(
         shape = RoundedCornerShape(12.dp),
         color = MaterialTheme.colorScheme.primaryContainer,
     ) {
-        Row(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.ArrowDownward, null, modifier = Modifier.size(16.dp))
-            if (showCount) {
-                Spacer(Modifier.width(6.dp))
-                Text("$lines lines below", style = MaterialTheme.typography.labelMedium)
-            }
-        }
+        Text(
+            "$lines lines below",
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        )
     }
 }
 
@@ -5282,14 +5284,14 @@ private fun SettingsScreen(
             "Keep system bars during sessions",
             "Off by default: sessions take the whole screen. On, the status and navigation bars stay visible over the terminal",
         ) { Switch(checked = state.settings.terminalKeepSystemBars, onCheckedChange = onTerminalKeepSystemBars) }
-        // The switch hides the count and never the badge. The arrow that stays is the only thing on
-        // screen that tells a scrolled-back terminal from a hung one, so the subtitle says what is
-        // kept rather than only what goes - a row promising "hide the badge" would be describing a
-        // change this does not make.
+        // The switch hides the chip entire, because the chip is now the count and nothing else: a
+        // terminal that does not want the number would be drawing an empty surface over the grid.
+        // The way back to live output is not this chip's to lose either way — the terminal menu's
+        // own "Jump to live output" has always been there.
         SettingRow(
             Icons.Default.Terminal,
             "Scrolled-back line count",
-            "How far behind the live output the view is. Off hides the number and keeps the arrow that jumps back",
+            "How far behind the live output the view is, shown over the grid when the view is scrolled back",
         ) { Switch(checked = state.settings.terminalScrollbackCountVisible, onCheckedChange = onTerminalScrollbackCount) }
         SettingRow(Icons.Default.Security, "Legacy algorithms", "Also offer CBC, SHA-1 and dh-group1 to reach older servers") { Switch(checked = state.settings.legacyAlgorithms, onCheckedChange = onLegacyAlgorithms) }
         SettingRow(Icons.Default.Lock, "Block screenshots", "Hides this app from screenshots, screen recording and the recents preview") { Switch(checked = state.settings.blockScreenshots, onCheckedChange = onBlockScreenshots) }
