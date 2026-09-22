@@ -281,26 +281,59 @@ class RootfsInstaller(
     }
 
     /**
-     * Gives up the apt-owned trees alone — the package cache, the index lists, apt's binary index
-     * caches — and answers how many bytes that freed.
+     * Gives up the apt-owned trees the verdict names, and answers how many bytes that freed.
      *
-     * The same work [reclaimSpace] does, for a different reason, and the split is deliberate: that
-     * one is the answer to a *disk* that is short, this one is the answer to a *download* that is
-     * wrong. `Hash Sum mismatch` and an index apt cannot parse are both regenerable state and
-     * nothing else — the next `apt-get update` rewrites every byte of them — so clearing them is a
-     * repair no user file pays for, and the repair ladder runs it before it spends a single byte of
-     * a metered connection on the fetch that replaces them.
+     * This is the repair ladder's rung, and it exists because the two trees are not the same
+     * bargain. The *index lists* are what a wrong or interrupted `apt-get update` leaves behind —
+     * half a `Packages` file, a `lists/partial` that never landed — and every apt command that reads
+     * them fails until they are gone; they cost one update to rebuild, and with the lists intact
+     * that update is nearly free, because apt re-reads the release file and leaves the indexes
+     * alone. The *downloaded packages* are the other direction entirely: they are the bytes apt will
+     * otherwise have to fetch again, so giving them up is a cost rather than a saving, and the only
+     * evidence that justifies it is apt saying the bytes themselves are wrong (a `Hash Sum
+     * mismatch` on a `.deb`).
      *
-     * It is deliberately *not* part of [reclaimSpace]'s callers' disk gate: the failure it answers
-     * happens on a device with all the space in the world, which is exactly why the gate never fired
-     * for it. Nothing here descends a symlink, for the reason [reclaimSpace]'s own doc gives at
-     * length — the helper functions it shares with that one are where that rule is enforced.
+     * Hence the verdict rather than a blanket wipe. This used to empty both trees on *every* repair,
+     * whether or not either had anything to do with the failure, which turned every repair into a
+     * fresh download of the whole index — `main restricted universe multiverse` across three suites
+     * is tens of megabytes, re-fetched on a connection the user is paying for — and threw away every
+     * package they had already downloaded, to answer a failure that was neither's.
+     *
+     * Nothing here descends a symlink, for the reason [reclaimSpace]'s own doc gives at length — the
+     * helper functions it shares with that one are where that rule is enforced.
      */
-    suspend fun clearRegenerableState(): Long = withContext(Dispatchers.IO) {
+    suspend fun clearAptState(damage: AptDamage): Long = withContext(Dispatchers.IO) {
+        if (damage == AptDamage.NONE) return@withContext 0L
         val freed = linkedMapOf<String, Long>()
         val startedAt = System.currentTimeMillis()
-        reclaimAptState(freed)
-        recordReclaimed(freed, startedAt, "cleared apt's regenerable state")
+        reclaimAptIndex(freed)
+        if (damage == AptDamage.INDEX_AND_CACHE) reclaimAptCache(freed)
+        recordReclaimed(freed, startedAt, "cleared apt's own regenerable state")
+    }
+
+    /**
+     * Whether apt's index lists look like something apt cannot read, judged on the host and without
+     * running apt — which matters, because this question is asked exactly when asking apt has
+     * already failed.
+     *
+     * Two things are answerable by looking: a `lists/partial` with anything in it is an `apt-get
+     * update` that was killed mid-download (apt's own staging directory, and how a killed update
+     * leaves an index apt will not parse), and an index file of zero bytes is a write that did not
+     * finish. Everything else — a `Packages` file of the right length and the wrong content — cannot
+     * be told by looking, and is what [AptDamage.of] is for: apt names that one itself when it fails
+     * on it.
+     */
+    fun aptIndexLooksDamaged(): Boolean {
+        val lists = File(rootfsDir, "var/lib/apt/lists")
+        if (!isRealDirectory(lists)) return false
+        val partial = File(lists, "partial")
+        if (isRealDirectory(partial) && partial.listFiles()?.isNotEmpty() == true) return true
+        return lists.listFiles().orEmpty().any { entry ->
+            val name = entry.name
+            val isIndex = name.endsWith("_Packages") || name.endsWith("_InRelease") ||
+                name.endsWith("_Release")
+            isIndex && entry.isFile && entry.length() == 0L
+        }
     }
 
     /**
@@ -309,12 +342,25 @@ class RootfsInstaller(
      * expects them to exist, which is also why nothing here needs to know whether a rootfs is in
      * place. The two `pkgcache.bin` files beside them are apt's own binary indexes, which it rewrites
      * on the next run by definition.
+     *
+     * Both trees, because the caller is [reclaimSpace] and its question is the disk's: when space is
+     * what is short, everything apt can build again is fair to take.
      */
     private fun reclaimAptState(freed: MutableMap<String, Long>) {
-        emptyDirectory("apt package cache", File(rootfsDir, "var/cache/apt/archives"), freed)
+        reclaimAptIndex(freed)
+        reclaimAptCache(freed)
+    }
+
+    /** The index lists and the binary caches built from them — the half of apt's state that is cheap to rebuild. */
+    private fun reclaimAptIndex(freed: MutableMap<String, Long>) {
         emptyDirectory("apt package lists", File(rootfsDir, "var/lib/apt/lists"), freed)
         reclaim("apt index caches", File(rootfsDir, "var/cache/apt/pkgcache.bin"), freed)
         reclaim("apt index caches", File(rootfsDir, "var/cache/apt/srcpkgcache.bin"), freed)
+    }
+
+    /** The packages apt has already downloaded — the half that costs a download to rebuild. */
+    private fun reclaimAptCache(freed: MutableMap<String, Long>) {
+        emptyDirectory("apt package cache", File(rootfsDir, "var/cache/apt/archives"), freed)
     }
 
     /** Deletes [target] whole — for a cache apt owns as a unit, and for single files. */
@@ -619,14 +665,42 @@ class RootfsInstaller(
     /**
      * The verified pinned archive on disk, fetched if it is not there.
      *
-     * A successful install deletes the tarball — it is spare bytes once the rootfs is in place — so
-     * every repair that needs the archive's bytes has to be ready to fetch it again: 34 MB once,
-     * after which the repairs that worked from it leave it where the next one finds it.
+     * Since an install keeps the tarball (see [moveIntoPlace]) this is usually a `stat` and a
+     * SHA256 read, and only a first install or a released archive pays for the download. That is
+     * the whole point of keeping it: the ladder's rungs that write base bytes — the file-level
+     * restore, the overlay, the reinstall, and the package database's last source — are the rungs a
+     * user reaches when something is already wrong, and none of them should depend on the network
+     * being the thing that still works.
      */
     private suspend fun ensurePinnedArchive(onProgress: (Progress) -> Unit) {
         if (tarballFile.isFile && verifyFileSha256(tarballFile, distro.rootfsSha256)) return
         download(onProgress)
         verify()
+    }
+
+    /** Whether the archive the repair rungs write from is on disk. */
+    fun pinnedArchiveOnDisk(): Boolean = tarballFile.isFile && tarballFile.length() > 0L
+
+    /**
+     * Gives up the kept archive, and answers how many bytes that freed.
+     *
+     * The one caller is the repair ladder's disk step, and the argument for it is arithmetic rather
+     * than policy: this is the largest file the app owns that can be obtained again by asking for
+     * it, a repair that cannot fit cannot run at all, and the alternative source of the space — the
+     * rootfs — costs the user their system instead of a download. What it costs is said out loud at
+     * the call site rather than discovered later: the next rung that needs the archive's bytes
+     * fetches it again.
+     */
+    suspend fun releasePinnedArchive(): Long = withContext(Dispatchers.IO) {
+        if (!pinnedArchiveOnDisk()) return@withContext 0L
+        val bytes = tarballFile.length()
+        tarballFile.delete()
+        diagnostics.record(
+            UserspaceDiagnosticCategory.STORAGE,
+            "pinned archive given up to make room for the repair",
+            detail = "freed ${bytes / MIB}MB; the next rung that needs it will download it again",
+        )
+        if (tarballFile.exists()) 0L else bytes
     }
 
     /**
@@ -813,8 +887,21 @@ class RootfsInstaller(
             throw IOException("Could not move the extracted rootfs into place at $rootfsDir")
         }
         deleteTreeNoFollow(parked)
-        // The tarball has served its purpose; keeping it would pin 30 MB for nothing.
-        tarballFile.delete()
+        // The tarball stays. It used to be deleted here — "it is spare bytes once the rootfs is in
+        // place" — and that sentence was true until the repair ladder was built on top of it: every
+        // rung at or below "restore missing files" writes from this archive ([ensurePinnedArchive]),
+        // and a userspace that needs one of those rungs is exactly the userspace whose connection
+        // may also be the thing that is broken. Keeping it is what makes those rungs local, and it
+        // costs the 34 MB the install has already fetched and verified. It is given up in three
+        // places, each of them deliberate: [deleteRootfs] when the userspace is removed, the repair
+        // ladder's own disk step ([releasePinnedArchive], with a warning) when the device is too
+        // short of space for the repair to run at all, and a pin that no longer matches (the next
+        // [ensurePinnedArchive] downloads over it).
+        diagnostics.record(
+            UserspaceDiagnosticCategory.STORAGE,
+            "pinned archive kept for repair",
+            detail = "${tarballFile.name} ${tarballFile.length() / MIB}MB",
+        )
     }
 
     /**
@@ -1535,6 +1622,73 @@ data class RootfsIntegrity(
         val rest = damaged.size - limit.coerceAtLeast(0)
         return "$examined member(s) examined, ${damaged.size} missing or wrong: $named" +
             (if (rest > 0) " and $rest more" else "")
+    }
+}
+
+/**
+ * What apt's own state needs before it can be trusted again — the answer the repair ladder acts on
+ * instead of emptying both of apt's trees every time.
+ *
+ * The distinction the three values carry is a *cost*, and it is the reason this is a verdict rather
+ * than a boolean: an index list is one `apt-get update` away from being rebuilt, while a downloaded
+ * package is a byte the user has already paid for once. Only evidence that names the trees justifies
+ * taking either, and the evidence is of two kinds — what apt said when it failed, and what the trees
+ * look like on disk ([RootfsInstaller.aptIndexLooksDamaged]).
+ */
+enum class AptDamage {
+    /** Nothing the failure said and nothing on disk points at apt's trees. Leave both alone. */
+    NONE,
+
+    /** The index lists are unusable or suspect: they are re-fetched either way, and they are cheap. */
+    INDEX,
+
+    /**
+     * The lists *and* the packages already downloaded. The second half is only ever justified by apt
+     * naming the bytes themselves as wrong, because a corrupt `.deb` in the cache makes every
+     * install of that package fail identically until the file is gone — and clearing the cache
+     * means the next install fetches it again.
+     */
+    INDEX_AND_CACHE,
+    ;
+
+    companion object {
+        /**
+         * The phrases apt uses when the thing it cannot read is its own bookkeeping, matched against
+         * the output of the step that failed.
+         *
+         * Matching on apt's words is the same trade [UserspaceFailure] makes when it reads a lock
+         * holder out of `dpkg`'s refusal: there is no exit code that separates "the list is
+         * unparseable" from "the archive is unreachable", and the alternative — clearing the lists
+         * whenever anything fails — is what this type exists to stop. The phrases are the literal
+         * strings apt prints, and a phrase that stops matching costs a repair nothing worse than the
+         * rebuild path it would have taken anyway.
+         */
+        private val INDEX_PHRASES = listOf(
+            "unable to parse package file",
+            "problem with mergelist",
+            "encountered a section with no package",
+            "the package lists or status file could not be parsed",
+            "hash sum mismatch",
+            "size mismatch",
+        )
+
+        /**
+         * The subset that also blames the downloaded bytes: a mismatch is reported for an index and
+         * for a `.deb` in the same words, and only one of the two is a file apt will not rewrite on
+         * its own.
+         */
+        private val CACHE_PHRASES = listOf("hash sum mismatch", "size mismatch")
+
+        /**
+         * The verdict for a failure whose message is [message] — the output of the step that ended
+         * the previous rung, or null when there was none.
+         */
+        fun of(message: String?): AptDamage {
+            val text = message?.lowercase() ?: return NONE
+            if (CACHE_PHRASES.any { text.contains(it) }) return INDEX_AND_CACHE
+            if (INDEX_PHRASES.any { text.contains(it) }) return INDEX
+            return NONE
+        }
     }
 }
 

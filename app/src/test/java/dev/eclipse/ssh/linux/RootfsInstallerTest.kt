@@ -51,8 +51,12 @@ class RootfsInstallerTest {
         assertThat(java.nio.file.Files.readSymbolicLink(env.toPath()).toString())
             .isEqualTo("../../bin/bash")
 
-        // The tarball is consumed: a completed install must not pin its 30 MB for nothing.
-        assertThat(installer.tarballFile.exists()).isFalse()
+        // The tarball is kept, not consumed: every repair rung that writes base bytes writes them
+        // from this file, and the userspace that needs one of those rungs is exactly the userspace
+        // whose connection may also be the thing that is broken. The cost is the bytes the install
+        // already fetched and verified; giving them up is a separate, deliberate act.
+        assertThat(installer.tarballFile.isFile).isTrue()
+        assertThat(installer.pinnedArchiveOnDisk()).isTrue()
         assertThat(root.resolve("rootfs.staging").exists()).isFalse()
 
         // Progress covered the whole arc - download, verify, extract - so the install screen this
