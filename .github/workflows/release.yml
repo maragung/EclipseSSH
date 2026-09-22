@@ -207,3 +207,15 @@ jobs:
         run: |
           rm -f keystore.properties
           rm -rf keystore
+
+  # Closes a window opened by scripts/ci-window.sh. Skipped - and so free, and
+  # secret-free - whenever the repository is private, which is every ordinary
+  # push. `always()` because a red release is exactly when a window is most
+  # likely to be left open. It needs the other job only to know when the run is
+  # over, not for anything it produces.
+  close-window:
+    name: Close the CI window
+    needs: [release]
+    if: always()
+    uses: ./.github/workflows/close-ci-window.yml
+    secrets: inherit

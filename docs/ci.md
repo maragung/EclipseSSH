@@ -1,10 +1,10 @@
 # Continuous integration
 
-Ten workflows, by purpose:
+Eleven workflows, by purpose:
 
 | Workflow | Trigger | What it does |
 | --- | --- | --- |
-| `ci.yml` | Push to `main`, every pull request, `workflow_dispatch` | The gate. Seven jobs: the documentation figure check, both native modules, release lint, the unit and integration suite, the instrumentation and AAB builds with their signature checks, an emulator crash-on-open smoke, and an idle stress matrix that only a dispatch which asks for it runs. |
+| `ci.yml` | Push to `main`, every pull request, `workflow_dispatch` | The gate. Eight jobs: the documentation figure check, both native modules, release lint, the unit and integration suite, the instrumentation and AAB builds with their signature checks, an emulator crash-on-open smoke, an idle stress matrix that only a dispatch which asks for it runs, and the closer for the CI window. |
 | `fast-test.yml` | Push to `fast-test/**`, `workflow_dispatch` | Lint and the unit/integration suite as a two-entry matrix, each under a hard timeout. The gate a work-in-progress branch uses so it does not have to push to `main` first. |
 | `focused-test.yml` | `workflow_dispatch` (`ref`, `filter`, `task`) | One Gradle task against one `--tests` filter, on any ref. How a single class is run without paying for the whole suite. |
 | `instrumentation.yml` | Push to `main`, every pull request, `workflow_dispatch` | `connectedDebugAndroidTest` on a booted AVD, against the debug build. |
@@ -14,6 +14,7 @@ Ten workflows, by purpose:
 | `universal-apk-test.yml` | `workflow_dispatch` (`apk_source`) | The universal APK on an emulator matrix. Resolve → test → gate → `auto-fix`, which is the autonomous repair loop. |
 | `android-ubuntu-e2e.yml` | `workflow_dispatch` (`mode`) | The Linux userspace end-to-end drive: `SMOKE`, `STANDARD`, or `FULL` (which adds failure injection and needs `adb root`). |
 | `schema-dump.yml` | `workflow_dispatch`, and a path-filtered `pull_request` touching the data layer | `:app:kspDebugKotlin` and uploads `app/schemas`, for a pull request that changes the database layer. The path filter covers `data/local/**`, `data/model/Models.kt` and the workflow file itself. |
+| `close-ci-window.yml` | `workflow_call`, from `ci.yml` and `release.yml` | Flips the repository back to private at the end of a run that started while it was public. Skipped — and so free, and secret-free — whenever the repository is private, which is every ordinary run. See [The CI window](#the-ci-window). |
 
 Only `tagged-release.yml` creates a public release. The three matrix workflows do write outside the
 Actions tab: each has a `gate` job that collects every API level's report before deciding and opens
@@ -35,7 +36,7 @@ wakes up after a red one.
 
 ## ci.yml
 
-Seven jobs, so a failure lands on the thing that is actually broken instead of stopping a chain:
+Eight jobs, so a failure lands on the thing that is actually broken instead of stopping a chain:
 
 | Job | Command | What it protects |
 | --- | --- | --- |
@@ -45,7 +46,8 @@ Seven jobs, so a failure lands on the thing that is actually broken instead of s
 | `test` | `testDebugUnitTest` | The whole JVM suite, Robolectric included, with an isolated OpenSSH sandbox started for the tests that dial a real server. |
 | `assemble` | `:app:dependencies --configuration releaseRuntimeClasspath`, `assembleDebugAndroidTest`, `assembleDebug assembleRelease bundleRelease`, `assembleRelease` again on its own | That the release classpath still resolves against `app/gradle.lockfile` (the report is read, and a `FAILED` row fails the job) before anything is compiled, that the `androidTest` sources still compile, that both APKs and the Play AAB build, that the per-ABI splits build, and that the release APK is signed. The second `assembleRelease` is the one that produces the splits: `splits.abi` stands down inside the first invocation because a `bundle` task shares it, so a run that stopped there would build no per-ABI APK at all — and the per-ABI APKs are what a GitHub release serves. |
 | `smoke` | Boots a headless AVD and launches both APKs | That the app starts and stays up. This is the crash-on-open gate — a window that dies in `onCreate` passes every JVM test there is. |
-| `stress` | `ECLIPSE_STRESS=1 :app:testDebugUnitTest --tests '*RealOpenSshInteropRobolectricTest'`, under a 90-minute job cap | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. The step asserts the class ran with `skipped="0"`, so a leg that quietly skipped is a failure rather than a pass. Runs only when a `workflow_dispatch` sets the `stress` input, which defaults to false — a dispatch that does not ask for it finishes with the other six. |
+| `stress` | `ECLIPSE_STRESS=1 :app:testDebugUnitTest --tests '*RealOpenSshInteropRobolectricTest'`, under a 90-minute job cap | The idle matrix against a real OpenSSH server: connections kept open long enough to catch a keep-alive or NAT-rebinding regression. The step asserts the class ran with `skipped="0"`, so a leg that quietly skipped is a failure rather than a pass. Runs only when a `workflow_dispatch` sets the `stress` input, which defaults to false — a dispatch that does not ask for it finishes with the other seven. |
+| `close-window` | `gh api -X PATCH repos/… -F private=true` | Nothing the repository builds. It closes a CI window, and it only exists in a run that started while the repository was public; every ordinary run reports it as `skipped`, so it spends no runner and needs no secret to be configured. See [The CI window](#the-ci-window). |
 
 The `assemble` job asserts, before it compiles them, that the `androidTest` sources contain at least
 one test, because a suite that compiles to nothing is indistinguishable from a suite that passes.
@@ -211,6 +213,72 @@ present a mismatch fails the release; when they were not, the same output is rep
 a fork's deliberate debug-signed build is still allowed to be built while a published release says
 which key it carries. Rotating the release key therefore means editing that constant in its own
 commit, with the reinstall the rotation costs stated in the release notes. See AUDIT-REPORT.md §57.
+
+## The CI window
+
+Actions minutes are free on a public repository and billed on a private one. This repository is
+private, so its runs are metered — and when the account's minutes run out, every job dies about four
+seconds after it starts with no steps executed and an empty `runner_name`, which is
+[worth recognising on sight](#reading-the-signature-check) because it looks exactly like a real red
+build. The way out is to run the build while the repository is public. That is the CI window:
+`scripts/ci-window.sh` opens it, and three separate things are able to close it.
+
+**The first flip cannot be a job.** A GitHub-hosted runner is precisely what the account cannot
+afford, so no workflow in this repository can run the command that would make the minutes free. That
+one step has to come from outside GitHub, which is why the opener is a script and not a workflow.
+Everything after it can be a job, and the closer is.
+
+```sh
+scripts/ci-window.sh status                       # visibility, and whether a window is open
+scripts/ci-window.sh open --yes                   # release.yml on main, 120-minute deadline
+scripts/ci-window.sh open --workflow ci.yml --ref some-branch --minutes 60 --yes
+scripts/ci-window.sh open --dry-run               # dispatch and wait, flip nothing
+scripts/ci-window.sh close                        # close it now
+```
+
+**The three closers, and what each one covers.** The opener installs its close as an `EXIT` trap, so
+an interrupt or a failure in the script does not leave the door open. That covers the script; it does
+not cover the machine the script runs on. `close-ci-window.yml` covers a run that outlives its opener
+— it is a job in `ci.yml` and `release.yml`, guarded on the repository actually being public, so it
+is `skipped` and costs nothing on every ordinary run, and it closes the window in seconds rather than
+at the next tick. `scripts/ci-window-watchdog.sh` covers the rest: the opener died before it
+dispatched anything, so there is no run to close the window and no trap left to fire. It runs from
+cron, every five minutes, and it acts only when the repository is public *and* carries a deadline
+that has passed. A repository someone made public by hand has no deadline, and the watchdog leaves it
+alone — that is a decision, and the script does not overrule decisions.
+
+**The deadline is the honest part of the design.** The opener records `CI_WINDOW_DEADLINE` as a
+repository variable *before* it flips anything, so a crash between the two leaves a public repository
+that the watchdog knows to close, rather than a public repository nobody has a record of. The
+watchdog closes and *then* deletes the marker, so a failed flip leaves it in place to retry against.
+And the watchdog never clears a deadline it sees while the repository is private: the opener records
+the deadline and only then flips, so clearing it in the gap between those two calls would strip the
+backstop off a window that was about to open, and that race is real at a five-minute interval.
+
+**Opening a window is a one-way decision, and the script makes you say so.** Making the repository
+public publishes its entire history — every commit, branch and tag — to everyone, permanently. Forks
+and third-party archives copy it within minutes and flipping back to private does not recall those
+copies. So `open` prints that and exits 2 without `--yes`. The audit run on 2026-09-22 found no
+credential anywhere in the history: the one `ghp_` occurrence is the literal placeholder
+`ghp_notarealtokenvalue` in a test, every `storePassword=` is the workflow's own `sed` or a `printf`
+format string, every `PRIVATE KEY` hit is a PEM header constant or an assertion about one, no
+keystore, `.jks` or `keystore.properties` has ever been tracked, no workflow echoes a secret into a
+log, there is no `pull_request_target` or `workflow_run` anywhere, and no artifact has ever been named
+for a key or a signature. What a window exposes is therefore the source code — which is the point of
+running a build in public — and nothing else.
+
+**Two things need the maintainer, not the repository.** The closer and the watchdog both need a token
+that can administer the repository; `GITHUB_TOKEN` cannot, at any permission level, because
+repository visibility is an administrative operation and the default token has no `administration`
+permission to grant. The scripts read the token from `~/.netrc` by the same rule as everything else
+here, and the workflow reads it from the `REPO_ADMIN_TOKEN` secret — which is optional by design: the
+job it feeds is skipped in every ordinary run, so a missing secret can never turn a green build red,
+while a *public* repository with no secret configured fails loudly instead of leaving the door open.
+The watchdog is installed once:
+
+```sh
+scripts/ci-window-watchdog.sh --install-cron
+```
 
 ## Reproducing a CI failure locally
 

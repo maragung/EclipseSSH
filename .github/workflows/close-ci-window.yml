@@ -1,0 +1,95 @@
+# Close the CI window: flip the repository back to private at the end of a run
+# that was started while it was public.
+#
+# WHY A JOB AND NOT JUST THE OPENER. scripts/ci-window.sh already closes the
+# window when its own run finishes, and installs that close as an EXIT trap so
+# an interrupt does not leave the door open. What it cannot do is survive the
+# machine it runs on: if that machine dies mid-run, the window stays open until
+# the deadline expires and scripts/ci-window-watchdog.sh closes it - up to five
+# minutes of a public repository that nothing asked for. This job closes it in
+# seconds, from the runner that was already paid for, and it is the only closer
+# that is inside GitHub.
+#
+# WHY IT IS SKIPPED IN THE NORMAL CASE. The job runs only when the repository
+# is public at the moment the caller was triggered. Every ordinary push, PR and
+# dispatch happens while the repository is private, so the job is `skipped`,
+# costs no runner, and needs no secret to exist. That matters beyond tidiness:
+# it means a missing REPO_ADMIN_TOKEN can never turn a green build red, and at
+# the same time a *public* repository with no token configured fails loudly
+# instead of leaving the door open - the one case where failing is correct.
+#
+# WHY GITHUB_TOKEN IS NOT ENOUGH. Repository visibility is an administrative
+# operation and GITHUB_TOKEN cannot perform it at any permission level; the
+# default token has no `administration` permission to grant. So the job needs a
+# PAT with administrative access to the repository, stored as the secret
+# REPO_ADMIN_TOKEN. Without it, the window can still be closed by
+# scripts/ci-window.sh or the watchdog - both use the maintainer's own token.
+#
+# This workflow checks out no code and interpolates nothing from the event into
+# a shell. It is called by ci.yml and release.yml; it does not listen to
+# workflow_run, so it never runs on a fork's behalf.
+name: Close the CI window
+
+on:
+  workflow_call:
+    secrets:
+      REPO_ADMIN_TOKEN:
+        required: false
+
+jobs:
+  close:
+    name: Close the CI window
+    # `== false`, not `!private`: an absent field must skip this job, and the
+    # only absent-value reading of `!null` is "true", which would have run the
+    # close on every event whose payload has no repository object.
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: { }
+    steps:
+      - name: Flip the repository back to private
+        env:
+          # GH_TOKEN, not REPO_ADMIN_TOKEN: `gh api` authenticates from GH_TOKEN
+          # (then GITHUB_TOKEN) and knows no other name. Passing the secret
+          # under its own name would leave `gh` using the default GITHUB_TOKEN,
+          # which cannot administer the repository, and every flip would fail
+          # 403 with the secret correctly configured - a failure that looks
+          # exactly like a permissions problem in the PAT.
+          GH_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::This run started while the repository was public, and" \
+                 "REPO_ADMIN_TOKEN is not set, so nothing here can close the window." \
+                 "The repository is STILL PUBLIC. Close it with" \
+                 "scripts/ci-window.sh close, or add a PAT with administrative" \
+                 "access as the REPO_ADMIN_TOKEN secret."
+            exit 1
+          fi
+          before="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')"
+          if [ "$before" = "private" ]; then
+            echo "the repository is already private; nothing to close"
+            exit 0
+          fi
+
+          echo "closing the window: $GITHUB_REPOSITORY is $before"
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY" -F private=true >/dev/null
+
+          # Verified rather than assumed. A flip that silently did nothing would
+          # otherwise be reported as a closed window, which is the one wrong
+          # answer that leaves the door open while saying it is shut.
+          after="$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')"
+          if [ "$after" != "private" ]; then
+            echo "::error::The API still reports '$after' after the flip." \
+                 "The repository is STILL PUBLIC and needs closing by hand."
+            exit 1
+          fi
+          echo "verified private"
+
+          # The deadline is the record that a window was deliberately opened.
+          # It is deleted only after the flip is confirmed, so a failure above
+          # leaves it in place for the watchdog to retry against.
+          gh api -X DELETE \
+            "repos/$GITHUB_REPOSITORY/actions/variables/CI_WINDOW_DEADLINE" \
+            >/dev/null 2>&1 || true
+          echo "deadline cleared"
