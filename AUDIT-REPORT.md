@@ -4594,8 +4594,11 @@ direction.
 exists. As first merged, this section moved it on to `v1.2.0`, on the grounds that `v1.2.0` "now
 exists and is published". **That was wrong when it was written, and the correction is the point of
 this section.** `v1.2.0` was published at 11:14:41Z and pulled back to draft by its own gate at
-11:36:49Z, the moment issue #121 was filed; it is still a draft. The example therefore named a tag
-whose asset the command it documents cannot fetch.
+11:36:49Z, the moment issue #121 was filed, and it stayed a draft — the worked example of this rule
+in §42, §44 and §47 — until it was deleted on 2026-09-22, four days later. The example therefore
+named a tag whose asset the command it documents cannot fetch, and it points at a tag that now has no
+release to fetch at all. The tag itself was not touched: `v1.2.0` still resolves in this repository's
+history, which is where the commit that was never shipped belongs.
 
 A draft release is invisible to `GET /releases/tags/{tag}`, which answers 404 for one, and
 `gh release view --json tagName` with no tag skips drafts in silence. So the failure this would have
@@ -4732,17 +4735,18 @@ the tag, #126 goes first and the release waits.
 §40.6 put `testing/README.md`'s dispatch example at `v1.1.20` and stated the rule it had been missing:
 the example names the newest release that is **published**, not the newest tag that exists. `v1.2.1`
 is now that release — published 2026-09-18T18:31:11Z with seven assets, and validated green by
-`35380659961` five seconds later — so the example moves to it. `v1.2.0` is still a draft and stays
-where §40.6 left it: a tag whose release the command this example documents cannot fetch.
+`35380659961` five seconds later — so the example moves to it. `v1.2.0` stays where §40.6 left it: a
+tag whose release the command this example documents cannot fetch. It was a draft when this section
+was written and it was deleted on 2026-09-22, so the sentence is true twice over.
 
 Nothing checks this one, and that is deliberate rather than overlooked. The only offline proxy
 available is "the version named by the last `## <n>. Releasing <version>` section", and a section is
 written before its release is published — so the proxy answers *pass* for exactly the mistake §40.6
-exists to prevent, a tag whose release is still a draft. A guard that is blind to the case it is
-there for is worse than no guard — the same lesson the lockfile check ran into in the same batch: #132
-removed the flag that rewrote the file it was meant to check, and the step still could not refuse
-drift, because a report task exits 0 (#133). Publication state lives in the Releases API, and the
-`docs` job has no network.
+exists to prevent, a tag whose release is a draft the command cannot fetch. A guard that is blind to
+the case it is there for is worse than no guard — the same lesson the lockfile check ran into in the
+same batch: #132 removed the flag that rewrote the file it was meant to check, and the step still
+could not refuse drift, because a report task exits 0 (#133). Publication state lives in the Releases
+API, and the `docs` job has no network.
 
 ---
 
@@ -4946,9 +4950,10 @@ reasons and no other, not quite the suite that gated 1.2.1.
 §42 moved `testing/README.md`'s dispatch example to `v1.2.1` on the rule §40.6 stated: the example
 names the newest release that is **published**, not the newest tag that exists. `v1.2.2` is now that
 release — published 2026-09-19T04:49:18Z with the same seven assets — so the example moves to it.
-Nothing else in that paragraph changes, and `v1.2.0` is still a draft, so it is still named nowhere:
-the command this example documents cannot fetch a draft, which is the whole of what §40.6 and §42
-were about, and a release nobody can install is not the release an example should point at.
+Nothing else in that paragraph changes, and `v1.2.0` — the draft §40.6 was about, deleted on
+2026-09-22 — is still named nowhere: the command this example documents cannot fetch a draft, which
+is the whole of what §40.6 and §42 were about, and a release nobody can install is not the release an
+example should point at.
 
 This move differs from §42's in how the release it names was published, and that difference is the
 carry-over from §43.5. The tag was pushed at `fbeccdc` with its release held as a draft;
@@ -5272,9 +5277,9 @@ inventing a test for them.
 §44 moved `testing/README.md`'s dispatch example to `v1.2.2` on the rule §40.6 stated: the example
 names the newest release that is **published**, not the newest tag that exists. `v1.3.0` is now that
 release — published 2026-09-19T14:49:59Z, the same seven assets, its tag on `b2ddeb46e` — so the
-example moves to it. Nothing else in that paragraph changes, and `v1.2.0` is still the one draft, so
-it is still named nowhere: the command this example documents cannot fetch a draft, which is the
-whole of what §40.6 and §42 were about.
+example moves to it. Nothing else in that paragraph changes, and `v1.2.0` — the one draft, deleted on
+2026-09-22 — is still named nowhere: the command this example documents cannot fetch a draft, which
+is the whole of what §40.6 and §42 were about.
 
 The shape is §44's, and by now it is the shape of the line: the tag was pushed with the release held
 as a draft, `tagged-release.yml` (run `35448879770`) built and signed the seven assets, and only then
