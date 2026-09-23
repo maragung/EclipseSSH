@@ -85,7 +85,10 @@ class ProotRuntime(
 
     /**
      * Where the proot fork's blocked-syscall log lives (`PROOT_SIGSYS_LOG`): the userspace root,
-     * not `tmp` — it must survive storage reclaim, which wipes [tmpDir] wholesale.
+     * not `tmp`. `tmp` is proot's own scratch and nothing keeps it — an uninstall deletes it
+     * wholesale, and every start clears the entries of processes that are gone
+     * ([RuntimeStorageManager.sweepOrphanTempDirs]) — while this log has to outlive the launch it
+     * describes.
      */
     val sigsysLogFile: File get() = File(rootDir, "sigsys-log.txt")
 

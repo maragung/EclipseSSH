@@ -35,6 +35,13 @@ covers the lock protocol it was written for (shadow links and verifies inside
 one process) and nothing wider; the patch's preamble says so, and so does the
 E2E probe, which is why the probe asks its questions in a single session.
 
+A third boundary, because it is the one 0006 draws against 0005: 0006 changes
+only how proot removes the temporary directory it made for itself, never what
+is executed or which name a program sees. It is about the teardown of a proot
+that exits normally — the directories a SIGKILLed proot leaves are removed by
+talloc destructors a killed process never runs, and are the app's to clear by
+name (`RuntimeStorageManager.sweepOrphanTempDirs`).
+
 The build needs GNU `patch` on PATH (not in the stock ubuntu-24.04 runner
 image — every CI workflow installs it alongside the native cache step), and
 the `linux-native-*` cache keys hash this directory's `*.patch` files so a

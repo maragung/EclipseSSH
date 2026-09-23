@@ -264,7 +264,10 @@ class UbuntuDistributionManager(
         val unusableTemp = installer?.unusableGuestTemp().orEmpty()
         val staleLocks = installer?.stalePackageLocks().orEmpty()
         val loginLines = login?.outputText()?.lines()?.map { stripEscapes(it).trim() }.orEmpty()
-        val account = whoami?.outputText()?.trim()
+        // The answer line, not the capture. proot writes its own teardown notes to this command's
+        // own pty, after `whoami` has already answered, and read whole they became the "account
+        // name" — see answerLine() for the device transcript that cost this report its verdict.
+        val account = whoami?.outputText()?.answerLine()
         fun marked(prefix: String): String? = loginLines
             .firstOrNull { it.startsWith(prefix) }
             ?.removePrefix(prefix)
@@ -2350,7 +2353,7 @@ data class SetupReport(
 data class HealthReport(
     /** A shell ran and printed our marker. */
     val shellWorks: Boolean,
-    /** What `whoami` printed, for the settings screen's detail line. */
+    /** The answer line of `whoami`'s output, for the settings screen's detail line. */
     val account: String?,
     /** `whoami` printed `root` — the session is fake root, so dpkg and su will work. */
     val accountCorrect: Boolean,

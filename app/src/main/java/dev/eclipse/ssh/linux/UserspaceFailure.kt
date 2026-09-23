@@ -536,7 +536,13 @@ internal const val RUNTIME_STORAGE_PREFIX = "runtime storage not ready:"
 /** Cross-fork contract: the installer's free-space gate words its refusal this way. */
 internal const val DISK_FULL_PREFIX = "Ubuntu needs"
 
-private val PROOT_ERROR = Regex("""(?m)^\s*proot(\s+\w+)?\s*:""", RegexOption.IGNORE_CASE)
+/**
+ * Cross-fork contract: proot's own lines. Its diagnostics and the command's own output share one
+ * pty, so a captured transcript cannot be told apart from the command's answer by position — this
+ * shape is the only thing that distinguishes them, and it is what [answerLine] drops before a
+ * single-value field is read.
+ */
+internal val PROOT_ERROR = Regex("""(?m)^\s*proot(\s+\w+)?\s*:""", RegexOption.IGNORE_CASE)
 
 private val DNS_PATTERNS = listOf(
     Regex("Temporary failure resolving", RegexOption.IGNORE_CASE),

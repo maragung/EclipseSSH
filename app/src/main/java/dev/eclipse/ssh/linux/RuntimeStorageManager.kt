@@ -37,6 +37,24 @@ class RuntimeStorageManager(
     private companion object {
         const val CREATE_ATTEMPTS = 3
         const val CREATE_RETRY_DELAY_MS = 250L
+
+        /** The prefix [ensureReady] gives its probe file; see [sweepOrphanTempDirs]. */
+        const val PROBE_PREFIX = ".probe-"
+
+        /**
+         * How old a probe file must be before it is certainly not a live call's. See
+         * [sweepOrphanTempDirs]: the round trip that creates and deletes one takes milliseconds,
+         * so an hour is a margin, not a threshold anything real approaches.
+         */
+        const val PROBE_LITTER_AGE_MS = 60L * 60L * 1000L
+
+        /**
+         * proot's own temp-name shape, taken from its `create_temp_name`: `"%s/%s-%d-XXXXXX"`, with
+         * `mkdtemp(3)` replacing the six `X`s with `[A-Za-z0-9]`. The whole name is matched, and the
+         * prefix is left free, so this covers every directory proot makes — `exec`, `care`,
+         * `sysvipc_shm` — rather than the one this app has seen.
+         */
+        val PROOT_TEMP_NAME = Regex("""[\w-]+-(\d+)-[A-Za-z0-9]{6}""")
     }
     /** The completed, in-place rootfs. */
     val rootfsDir: File get() = File(rootDir, "rootfs")
@@ -165,6 +183,53 @@ class RuntimeStorageManager(
     }
 
     /**
+     * Deletes the scratch directories proot's own processes left behind in [tmpDir], and the probe
+     * files of an [ensureReady] that was killed mid-call.
+     *
+     * proot creates one private directory per process — `$PROOT_TMP_DIR/<prefix>-<pid>-XXXXXX`,
+     * from its own `create_temp_name` — and removes it at exit. Two things leave one behind: a
+     * process that is SIGKILLed, whose removal runs from talloc destructors a killed process never
+     * runs, and — until proot patch 0006 — an *ordinary* exit, whose teardown chmod'ed the loader
+     * symlink 0005 puts in that directory, was refused by the platform, and skipped the unlink the
+     * refused chmod guarded. The second was one directory per proot process, every session and
+     * every health probe, on a userspace that was otherwise healthy — so what is already on disk
+     * has to be clearable by something, which is this.
+     *
+     * Liveness is read rather than guessed: the pid is part of the name proot chose, so a directory
+     * whose process is still running belongs to a live session and is never touched. That also
+     * bounds the sweep's one imprecision — a pid recycled after a reboot keeps a few empty
+     * directories until that process exits — and is why this runs on every start rather than once.
+     *
+     * `.probe-*` is [ensureReady]'s: created and deleted inside one call, so one present is one
+     * whose call was killed. Its name carries no owner to ask about, so age is the test instead, and
+     * an hour is longer than that round trip by orders of magnitude — which is what makes it safe
+     * against a probe another live process is halfway through.
+     *
+     * Deletion goes through [deleteTreeNoFollow], and not incidentally: the entry being cleared
+     * holds exactly the symlink that must not lead a delete anywhere.
+     *
+     * @return how many entries were removed
+     */
+    fun sweepOrphanTempDirs(): Int {
+        var swept = 0
+        for (entry in tmpDir.listFiles().orEmpty()) {
+            if (!isOrphanTempEntry(entry)) continue
+            if (deleteTreeNoFollow(entry)) swept++
+        }
+        return swept
+    }
+
+    /** Whether one [tmpDir] entry is litter; see [sweepOrphanTempDirs] for both rules. */
+    private fun isOrphanTempEntry(entry: File): Boolean {
+        if (entry.name.startsWith(PROBE_PREFIX)) {
+            return System.currentTimeMillis() - entry.lastModified() > PROBE_LITTER_AGE_MS
+        }
+        val pid = PROOT_TEMP_NAME.matchEntire(entry.name)
+            ?.groupValues?.get(1)?.toIntOrNull() ?: return false
+        return !pidIsAlive(pid)
+    }
+
+    /**
      * The state of one held install lock: who holds it and since when, written so that a *crashed*
      * holder can be told apart from a live one.
      *
@@ -195,7 +260,7 @@ class RuntimeStorageManager(
     fun acquireInstallLock(distroId: String, phase: String): InstallLock {
         rootDir.mkdirs()
         val existing = readInstallLock()
-        if (existing != null && !existing.isStale(currentBootId(), ::processAlive)) {
+        if (existing != null && !existing.isStale(currentBootId(), ::pidIsAlive)) {
             throw IllegalStateException(
                 "an install is already in progress (${existing.phase}, pid ${existing.pid})",
             )
@@ -242,7 +307,15 @@ class RuntimeStorageManager(
     /** The boot id of the running system, or null off-device / without `/proc`. */
     internal fun currentBootId(): String? =
         runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }.getOrNull()
-
-    private fun processAlive(pid: Int): Boolean =
-        pid > 0 && runCatching { File("/proc/$pid").exists() }.getOrDefault(false)
 }
+
+/**
+ * Whether [pid] names a process that is still running: `/proc/<pid>` exists.
+ *
+ * The same fact [RuntimeStorageManager.InstallLock.isStale] decides on, and read the same way — a
+ * `/proc` entry rather than a signal, because a process this app may not signal still owns its
+ * directories. On a system with no `/proc` the answer is "not running", which is the direction that
+ * clears litter rather than the one that keeps it.
+ */
+private fun pidIsAlive(pid: Int): Boolean =
+    pid > 0 && runCatching { File("/proc/$pid").exists() }.getOrDefault(false)

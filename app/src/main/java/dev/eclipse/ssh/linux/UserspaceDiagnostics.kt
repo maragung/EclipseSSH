@@ -119,6 +119,40 @@ class UserspaceDiagnostics {
  */
 internal fun stripEscapes(text: String): String = ANSI_ESCAPES.replace(text, "")
 
+/**
+ * The one line of a command's captured output that answers the question it was asked.
+ *
+ * A command's output is one stream: stdout and stderr interleaved on a pty, in the order they
+ * arrived (see `ProotCommandResult.outputText`). So a field asking "what did `whoami` print" cannot
+ * be the whole capture, because proot writes its own notes to that same stream — and it writes them
+ * at *teardown*, after the command has already answered. From a device, verbatim:
+ *
+ * ```
+ * root
+ * proot warning: cant chmod 'bash': Permission denied
+ * proot warning: cant chmod 'run-parts': Permission denied
+ * proot warning: cant chmod 'locale-check': Permission denied
+ * proot warning: cant chmod 'whoami': Permission denied
+ * proot error: cant remove '.../tmp/exec-8254-bervFx': Directory not empty
+ * ```
+ *
+ * Read whole, that is the session's "account name"; `accountCorrect` compares it against `root`,
+ * finds it unequal, and the health check reports a correctly-root session as not root — and withholds
+ * the host card over it. The answer is the last line left after [stripEscapes] and [PROOT_ERROR] have
+ * had their turn: the escapes because a pty always carries them, proot's own lines because they are
+ * written last and must not be mistaken for the answer. Last rather than first, because the noise
+ * that *precedes* an answer is the ordinary kind — a login profile's banner, a wrapper's notice —
+ * and `bash --login` is how every one of these commands runs.
+ *
+ * Null when nothing survives: an empty capture, or one that was nothing but proot's notes. A caller
+ * reading a value it must judge gets "no answer" rather than a line of proot's prose.
+ */
+internal fun String.answerLine(): String? =
+    lineSequence()
+        .map { stripEscapes(it).trim() }
+        .filter { it.isNotEmpty() && !PROOT_ERROR.containsMatchIn(it) }
+        .lastOrNull()
+
 private val ANSI_ESCAPES = Regex(
     "\\u001B\\[[0-9;?]*[ -/]*[@-~]" + // CSI
         "|\\u001BO[@-~]" + // SS3

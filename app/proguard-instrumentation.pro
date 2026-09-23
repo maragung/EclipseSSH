@@ -271,6 +271,16 @@
 # than a repair of an observed failure - which is the honest way to state it.
 -keep class dev.eclipse.ssh.linux.LinuxUserspaceState { *; }
 -keep class dev.eclipse.ssh.linux.LinuxUserspaceState$* { *; }
+#
+# UserspaceDiagnosticsKt is the file facade that holds stripEscapes()/answerLine() - the sanitizer
+# the suite and the health probe now share, so that "what did this command answer" is read one way
+# in both places. answerLine() has exactly the sessionArgv() shape described just above: one app
+# call site (the probe), a trivial body, so R8 inlines it there and removes the original - which
+# only the release-test suite would notice, as NoSuchMethodError. Kept for the suite's sake, and
+# noted here because check-instrumentation-keeps.sh cannot see this one: it skips dev.eclipse.ssh.*
+# by design (see its header), so this entry is manual for the same reason the two
+# LinuxUserspaceState lines are.
+-keep class dev.eclipse.ssh.linux.UserspaceDiagnosticsKt { *; }
 
 # ---------------------------------------------------------------------------
 # Stage 2: androidx.compose, narrowed from the whole-namespace keep in
