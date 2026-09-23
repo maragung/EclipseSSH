@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 42 / versionName 1.9.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 43 / versionName 1.10.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §66, *A proot that exited cleanly leaked a directory each launch, and the probe read proot's own words as the answer*; the newest of them that releases a version is §65, *Releasing 1.9.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §67, *Releasing 1.10.0*; the newest of them that releases a version is §67, *Releasing 1.10.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7559,3 +7559,51 @@ that `files/linux/tmp` stops growing `exec-*` directories.
 
 **And this does not reach a device by itself.** Half the fix is native, so it ships in a new APK; cutting
 the release is the separate step that puts it on the phone.
+## 67. Releasing 1.10.0
+
+1.9.0 gave the Ubuntu install dialog its extras. 1.10.0 fixes what one phone's Health check found: proot
+left a private scratch directory behind on **every launch it made** — with four `proot warning:` lines and
+one `proot error:` line beside it — and the health probe read those same lines back as the session's
+account name, so a userspace that answered `root` and worked was reported as *not* root and its host card
+was withheld. §66 is the whole of the change.
+
+### Why this is a minor release and not a patch
+
+The rule §41 and §56 both set: **a patch number is honest when the artifact a user installs behaves as its
+predecessor's does.** This one cannot pass that test, and it is the clearest case of it since the rule was
+written. Patch `0006` is compiled into `libproot.so`, so the native binary a device runs is not the binary
+1.9.0 shipped; and what the health probe concludes about a working session changes with it. `versionCode`
+moves 42 → 43 and `versionName` 1.9.0 → 1.10.0.
+
+The proot patch set also moves for the first time since 1.1.0's W^X work: `linux/proot-patches/` holds six
+patches where it held five, and `docs/THIRD-PARTY.md`'s corresponding-source paragraph follows it. Anyone
+building the GPL-2.0 binary from this repository gets the same six, which is the obligation that paragraph
+exists to state.
+
+### What a device gains
+
+- **Five lines per proot process, gone.** `proot warning: cant chmod '<name>': Permission denied`, once per
+  program the launch ran, and `proot error: cant remove '…/tmp/exec-<pid>-XXXXXX': Directory not empty`
+  after them.
+- **`files/linux/tmp` stops growing a directory per launch**, and the ones already there are cleared: on
+  every Start, and by Repair's local rung, which says how many it cleared rather than doing it silently.
+- **The health row stops calling a correctly-root session not root** — which is also what withholds the
+  host card. The row corrects itself on the next probe; nothing has to be reinstalled, and packages
+  install and `su` work the whole time the old row was showing.
+
+### What is not claimed
+
+The fix is half native, so it reaches a device only through this APK — there is no server-side or settings
+change that would have done it. And the last step of the verification is a device's: this release is
+checked here against the host and in CI against an emulator, but the five lines were reported from Android,
+and Android is where their absence has to be seen. §66's own "what is not claimed" says the same thing at
+length; the check that closes the loop is launching Ubuntu on a device after installing this build,
+confirming the five lines are gone, that the health row reads healthy, and that `files/linux/tmp` stops
+growing `exec-*` directories.
+
+### The artifacts
+
+Built and signed by `tagged-release.yml` from the `v1.10.0` tag: the universal APK, the four per-ABI splits
+(`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`), the AAB, and the `SHA256SUMS.txt` over them. The signing
+identity is unchanged from the releases before it — `0c69794b…`, the key the CI secret holds — so this
+build installs over 1.9.0 and every earlier release normally.
