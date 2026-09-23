@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 41 / versionName 1.8.2 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 42 / versionName 1.9.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §64, *Releasing 1.8.2*; the newest of them that releases a version is §64, *Releasing 1.8.2*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §65, *Releasing 1.9.0*; the newest of them that releases a version is §65, *Releasing 1.9.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7258,3 +7258,123 @@ same parent. It also called `git log v1.8.1..main` four commits, where the hones
 `v1.8.1..v1.8.2` and that range is six. Both are corrected above. The tag's own copy of this file
 carries the uncorrected lines, since a tag cannot be edited to follow; the release body does not,
 because the notes step prints this section's heading rather than its prose.
+
+---
+
+## 65. Releasing 1.9.0
+
+1.8.2 was a patch that changed no behaviour at all. 1.9.0 is the opposite: the Ubuntu install dialog now
+carries a list of optional packages — Node.js, Python, the build tools, a terminal editor, and the three
+coding agents — and a tick in that list becomes a step of the install. It is a **minor** release by the
+test §41 and §56 both set: a patch number is honest when the artifact a user installs behaves as its
+predecessor's does, and this one does not, because a user who ticks a box ends up with a userspace 1.8.2
+would not have given them.
+
+**The half that does not change is what makes the other half safe to ship.** `OptionalPackages.resolve`
+answers an empty selection with an empty list, and `setup()` emits `INSTALL_EXTRA_PACKAGES` only when
+that list is not empty — so an install with nothing ticked runs exactly the commands 1.8.2 ran, in the
+same order, and reports the same percentages. The step's 0.19 share exists in `LinuxInstallProgress`
+and is never spent. The 2026-09-18 decision that a base install carries no curated toolchain is
+therefore intact rather than reversed: what it forbade was an install that spends a metered connection
+on packages the user did not ask for, and a ticked box *is* the user asking.
+
+### What it carries
+
+PR #169, whose one commit is `3821cf0` and whose merge is `a8baedd`: **1,144 insertions and 53 deletions
+across thirteen files**, no workflow among them. `OptionalPackages.kt` is new (184 lines) and holds the
+catalogue — seven entries, twenty-seven `apt` packages between the four that are `apt` entries, and
+three npm globals for the agents. `UbuntuDistributionManager.kt` takes `+348` for the step itself,
+`UbuntuActivity.kt` `+161` for the picker, and the four documents that describe the install move with
+them. Three `describeSetupStep` sites — `UbuntuActivity`, `MainActivity` and `LinuxUserspaceService` —
+each gain an arm, which is not bookkeeping: `LinuxInstallProgress.setupWeight` is an exhaustive `when`
+over the same enum, so a step added without one of those arms is a compile error rather than a step that
+silently reports no progress.
+
+### The two rules the step is built on
+
+**The archive first, and NodeSource only on evidence.** The step installs the archive's `nodejs npm`,
+measures the result with `node --version`, and reaches for NodeSource's repository only when the major
+it reads is below 20 — because jammy ships 12.22.9 and noble 18.19.1 while the agents document Node 20.
+The measurement is anchored (`^\s*v?(\d+)\.\d+` under `(?m)`), and a regression test holds it: a
+`bash --login` profile that prints `Ubuntu 22.04.5 LTS` above the version must not be read as major 22.
+The list that pass writes is exempted by name from `disableShippedAptLists`, which retires every
+`.list` and `.sources` in `sources.list.d` on every setup — without the exemption a Repair would walk a
+user back to the archive's Node on the next install.
+
+**Nothing in the step can fail an install.** Every failure in it is a warning on an install whose every
+other byte landed, which is why this step and no other carries no offline gate: a connection that drops
+at that instant is the one case where the gate's own refusal is the worse outcome — a failed install, a
+redownload, and the same two lines in a terminal. A regression test drives exactly that: the base
+packages succeed, the network goes away, and the install must still reach `VERIFY`, report the failure
+as a warning, run no `npm install`, and leave `isConfigured()` true.
+
+### What is asserted, and where
+
+The linux suites are **263 tests in twenty-one files that declare tests**, up from 248 in twenty at
+v1.8.2, and the whole of that +15 is inside this pull request: `UbuntuDistributionManagerTest` 55 → 63
+and `OptionalPackagesTest` 0 → 7, with no other test file in `app/src/test` touched between the two
+tags. `OptionalPackagesTest` is where the catalogue's own invariants live — that an agent pulls Node in
+transitively, that `requires` may only name an entry declared above it, that ticking everything
+deduplicates, and that a cline-only selection installs `nodejs` and `npm` and leaks no
+`python-is-python3`. The README's figures move with them (`scripts/check-doc-figures.sh` reports all
+**160** of its claims agreeing with the build, including the two version lines this release moves) and
+`driver.py` learns the new step's subtitle, which is the only e2e change.
+
+### Why this one can be installed over an existing app
+
+The signing identity is unchanged: `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the runner
+before it signs, so this release carries `0c69794b…` — the identity every release from v1.4.0 through
+v1.8.2 was signed with — and an install of any of them upgrades to 1.9.0 normally. The `versionCode`
+gives the upgrade its room: 41 → 42. There is deliberately no per-ABI offset, so the four splits and
+the universal APK all read 42. The v1.5.0 exception §56 describes is unchanged.
+
+### Cutting it, and what the window did for it
+
+**This release is the first whose checks ran green before the tag rather than after it**, and that is
+the whole difference the CI window makes. PR #169's two runs — `CI` 35823364029 and `Instrumentation`
+35823363828 — were refused **seven times** before the window opened: attempts 1 through 7 each show
+every job at `steps=0` with an empty `runner_name`, which is the account's billing refusal and not a
+code failure, and the reason is legible only in the check-run annotation. With the repository public,
+its minutes are free, and the same two runs were re-run to completion:
+
+| job | result | duration |
+| --- | --- | --- |
+| `Unit and integration tests` | success | 21m12s |
+| `APKs, AAB and signatures` | success | 29m20s |
+| `Lint (release variant)` | success | 18m27s |
+| `FreeRDP native (4 ABIs)` | success | 11m49s |
+| `Boot the built APKs` (crash-on-open gate) | success | 3m7s |
+| `Documentation figures` | success | 7s |
+| `connectedAndroidTest` | success | 19m22s |
+
+The last of those is the one this host cannot produce at all — no KVM, so a guest kills `system_server`
+and `connectedAndroidTest` dies locally — which makes it the first time this branch's instrumentation
+suite was executed rather than only compiled. Both the idle stress matrix and `Close the CI window`
+report `skipped`, and both are expected: the first runs only on a dispatch that sets `stress`, and the
+second reads `github.event.repository.private`, which **a re-run does not refresh** — the payload is the
+one the original push carried, so a job that was skipped while the repository was private stays skipped
+however public the repository is by the time it runs.
+
+The sequence was: merge #169, then this commit and the bump on `release/1.9.0`, then that branch's own
+merge, then the tag on it — the shape `v1.7.0` through `v1.8.2` each used. The tag is lightweight, so
+`git cat-file -t v1.9.0` says `commit`. Then `tagged-release.yml` builds from the tag, asserts
+`git describe --exact-match` lands on it, verifies the signatures, and leaves a **draft** release with
+the APKs, the AAB and their checksums, and the window is closed by hand after that run rather than
+before it.
+
+**One CI job is red on every run started while the window is open, and it is red by design.** The
+`Close the CI window` job runs when the repository is public and fails, loudly, when `REPO_ADMIN_TOKEN`
+is not configured — this repository holds only `RELEASE_KEYSTORE_BASE64` and
+`RELEASE_KEYSTORE_PROPERTIES`. Its message names the state rather than hiding it ("The repository is
+STILL PUBLIC. Close it with `scripts/ci-window.sh close`"), and it exits *before* the flip, so the
+failure cannot be mistaken for a closed window. Adding a PAT with administrative access as
+`REPO_ADMIN_TOKEN` is what turns that job green; until then, the honest reading of that red is "the
+window is open", which is exactly what it says.
+
+### What this release still does not claim
+
+No arm64 device has run it, and nothing in this repository installs the `arm64-v8a` split — the
+validation legs use `x86_64`. The checkboxes have been exercised against a scripted guest in the JVM
+suite and against no real proot: the end-to-end path, from a tick in the dialog to `opencode` running
+under proot on a device, is the `ubuntu-e2e` driver's to prove, and that suite is gated behind an
+argument. The AAB has still not been to Play.
