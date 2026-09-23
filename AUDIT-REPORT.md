@@ -7378,3 +7378,26 @@ validation legs use `x86_64`. The checkboxes have been exercised against a scrip
 suite and against no real proot: the end-to-end path, from a tick in the dialog to `opencode` running
 under proot on a device, is the `ubuntu-e2e` driver's to prove, and that suite is gated behind an
 argument. The AAB has still not been to Play.
+
+### What the validation run did, and the ordering it cost
+
+`tagged-release.yml` is not the only workflow that reads a release. `android-release-test.yml` fires on
+`release: published`, and it is the only thing in this repository that *installs* an artifact — so it
+needs a runner, and this account can only get one while the repository is public. Publishing after the
+window closes therefore costs the release its device check, and that is what this release did: the draft
+was published at 08:14:20Z, minutes after the window was closed, and `Android release test` 35835997316
+was created at 08:14:24Z and refused by 08:14:41Z — `Resolve the target`, `Release gate` and
+`Autonomous repair` each `failure` with `steps=0` and an empty `runner_name`, and both emulator legs
+`skipped` off them. A run reads `in_progress` for those seventeen seconds, so "it has a runner" is a
+claim about `runner_name`, never about the status. **The order is: publish, then close.**
+
+The run was taken again inside a second window, and attempt 2 is green. Two legs, `Release APK on API 30`
+and `Release APK on API 35`, thirty-two steps each and each on a runner: install the APK, smoke-launch
+it, signature-gate the androidTest APK against the app's own identity, run the full instrumentation
+suite, scan the device log for crashes and ANRs, and end in a `Verdict` step that passed. What they
+install is the release's own bytes rather than a rebuild — the resolve job sets `apk_source=release` from
+the event name, and the step downloads `app-x86_64-release.apk` *from `v1.9.0` itself*. `Autonomous
+repair` is `skipped`, which is its normal state on a release event.
+
+So the paragraph above stands with one correction: this release's `x86_64` split has now been run on a
+device at two API levels. The `arm64-v8a` split still has not been, and nothing here installs it.
