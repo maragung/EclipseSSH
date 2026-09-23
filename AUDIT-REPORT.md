@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 40 / versionName 1.8.1 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 41 / versionName 1.8.2 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §63, *The Repair plan, audited against the tree that shipped it*; the newest of them that releases a version is §62, *Releasing 1.8.1*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §64, *Releasing 1.8.2*; the newest of them that releases a version is §64, *Releasing 1.8.2*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7102,3 +7102,109 @@ host (no KVM) and CI is billing-blocked, so the claim the plan itself ends on �
 Repair, watch it repair *without* re-downloading the base system — is still a device check, in the
 plan's own words: *"the end-to-end path ... is a device check."*
 
+
+
+## 64. Releasing 1.8.2
+
+1.8.1 shipped the repair that stops re-fetching what it already has. 1.8.2 ships the audit of the plan
+that repair came from — §63, above — and one change to the code that decides when a repair is allowed
+to spend a rebuild. It is a **patch** release, and the test §41 and §56 both set is what decides it: a
+patch number is honest when the artifact a user installs behaves as its predecessor's does. This one
+passes that test more plainly than any release before it, because **it changes no behaviour at all**. A
+device running 1.8.1 gains nothing by installing this one; the sentence belongs here, in the release's
+own record, rather than only in the diff. What the release is for is putting §63 on the record under a
+version number that names it — the enforced verdict rule is a change to what the *next* change is
+allowed to do, and a repository that ships only when behaviour moves would never ship it.
+
+### What it carries
+
+The app tree `v1.8.2` carries is #166's merge commit — whose tree is identical to the branch tip
+`a16aa3f` it merged, since a release branch cut from `main` and merged back adds no content to it, the
+same shape §62 recorded for #163 — and that tree is `a40aa82`, the merge commit of #165, plus the
+version bump and this section. `git log v1.8.1..main` is four commits and
+no more, which is two pull requests: #164 — `116d7b9` ("Finish §62 with what the release actually did",
+which touched only `AUDIT-REPORT.md`) and its merge `60de87c` — and #165, whose commits are `80bfc66`
+and the merge `a40aa82` above. Nothing else has landed between the two tags.
+
+### The one code change, and why it cannot change what a user sees
+
+`aRebuildCouldFix` ended in `else -> true`. That is the function the ladder consults before it refuses a
+failure outright, so the arm — not the prose above it — is what decided whether the last resort runs.
+Seven types fell through it, all seven correctly, and all seven were enumerated in the comment above the
+`else`. The `when` names them now, each with the argument for its own verdict, because a comment is not
+a check: an eighteenth type added to the sealed class would have joined as *rebuildable* without anyone
+deciding that it was, at a cost of thirty megabytes and a base-system rewrite on a device whose base
+system was fine.
+
+**The mapping from failure to verdict is unchanged, and that is a property rather than a hope.** The
+`when` is exhaustive — it compiles, which is the whole mechanism — so every type reaches an arm; the
+seven new arms return `true`, which is what the `else` returned for exactly those seven; and no other
+arm moved. Every one of the seventeen failure types therefore answers as it answered in 1.8.1, which
+means the ladder descends exactly as far, on exactly the same failures, and stops in exactly the same
+places. The compiled class may differ byte for byte; the behaviour cannot differ at all, and this is the
+sentence a patch release stands on.
+
+The other two main-source edits are KDoc and nothing else: two sentences that said `var/lib/dpkg` is a
+preserved member and so nothing is written in place, contradicted by the rung 1.7.0 shipped, which
+writes that one file in place and says so further down its own doc. §63 has the argument and the
+`git show v1.7.0:` evidence that they were wrong when written rather than drifted.
+
+### What is asserted, and where
+
+The tests are the part of §63 that is new behaviour in the suite, and they are five methods in the three
+files that own the code they cover: `liveCountExcept`'s by-key exclusion (`LinuxSessionRegistryTest`,
+which a `sessionCount() - 1` body fails), the health probe's two sentences and its read-only property
+(`UbuntuDistributionManagerTest` — the lock file is asserted to still be on disk, unchanged, afterwards),
+and the native runtime's exec-bit branch for each of its two components (`ProotRuntimeExecModelTest`,
+each in a private temp directory because the shared fixture is a `by lazy` singleton the whole JVM
+shares). The linux suites are **248 tests in twenty files, 0 failures, 0 errors, 0 skipped** on this
+host and on this branch, under the pinned JDK, `--offline`, `--no-daemon`, one worker; the five are
+§63's own additions and each is present by name in
+the report. `scripts/check-doc-figures.sh` reports all 159 claims agreeing with the build — including
+the two version lines this release moves — and the brace- and comment-nesting scanners were run over
+every changed file before the push, four `/*` openers against four `*/` closers, all KDoc.
+
+### Why this one can be installed over an existing app
+
+The signing identity is unchanged. `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the runner
+before it signs, so this release carries `0c69794b…`, the identity every release from v1.4.0 through
+v1.8.1 was signed with, and an install of any of them upgrades to 1.8.2 normally. The v1.5.0 exception
+§56 describes is unchanged. **That identity has not been read back yet** — the read-back is the APK's
+own bytes, and it happens when a runner has built them; §62 shows what that check consists of
+(`testing/verify-release-signer.sh`, and this host's own manifest parse calibrated against the previous
+release first). Until the build below has run, this paragraph is what the workflow is configured to do
+rather than what an artifact was observed to carry.
+
+### Cutting it, and where it stands
+
+**No runner has built this yet, and the account cannot start one.** `maragung` is a personal account
+and this repository is private, so Actions minutes are billed, and every job the account tries to start
+is refused before its first step — `steps=0`, an empty `runner_name`, about two seconds, and the reason
+only in the check-run annotation, quoted rather than paraphrased because it is the whole diagnosis:
+
+> The job was not started because recent account payments have failed or your spending limit needs to
+> be increased. Please check the 'Billing & plans' section in your settings
+
+`v1.8.2`'s tag push starts `tagged-release.yml`, and with the window closed that run dies this way —
+exactly as §60, §61 and §62 each record, and for the same reason. The window is what fixed it for
+v1.8.1: the repository is flipped public by hand, from
+outside GitHub, because a hosted runner is precisely what the account cannot buy, and minutes are free
+on a public repository. `scripts/ci-window.sh open --yes` is the command; its own header is the argument
+for why the `--yes` is a person's to type, since what making this repository public costs is its entire
+history, to everyone, permanently, and forks and third-party archives copy it within minutes.
+
+**So the release sequence is: this commit, then the tag, then the window.** The bump and this section
+land on `main` first, and the tag is created on that merge commit. The tag is lightweight, the convention
+`v1.7.0` set and `v1.8.0` and `v1.8.1` followed; a lightweight tag is a commit, so `git cat-file -t
+v1.8.2` says `commit` and the local `git describe` needs `--tags`. Then the window opens, and its run
+builds from the tag, asserts `git describe --exact-match` lands on it, verifies the signature, and leaves
+a **draft** release with the five APKs, the AAB and their checksums. Publishing that draft is a
+deliberate second step, which is what `tagged-release.yml` forces by creating the release as a draft
+"regardless of tag shape", so that a tag alone cannot publish a green build nobody has looked at.
+
+**What this section does not record, because it has not happened:** the run id, the step timings, the
+seven asset sizes and their sums, and the two read-backs §62 describes — an asset downloaded through the
+API and hashed against `SHA256SUMS.txt`, and the APK's own bytes parsed for `versionCode=41`,
+`versionName=1.8.2` and the signer. §62 was finished the same way, a section at a time, and this one
+will be finished the same way: the release record is written before the release so that the release is
+the thing that has to agree with it.
