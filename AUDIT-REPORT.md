@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 39 / versionName 1.8.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 40 / versionName 1.8.1 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §60, *Releasing 1.8.0*; the newest of them that releases a version is §60, *Releasing 1.8.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §62, *Releasing 1.8.1*; the newest of them that releases a version is §62, *Releasing 1.8.1*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6743,3 +6743,87 @@ emulator) and every rung of this ladder ends in a proot spawn, so the end-to-end
 userspace, press Repair, watch it repair *without* a download — is a device check, as is the badge
 arrow's absence under a finger. What is verified here is the ladder's logic against fakes that record
 every command and every byte: which rung ran, what it wrote, and what it fetched.
+
+## 62. Releasing 1.8.1
+
+1.8.0 shipped the setting that hides the scrolled-back line count and kept the arrow above it; 1.8.1
+ships the repair that stops re-fetching what it already has, and takes the arrow away. It is a
+**patch** release, and the test §41 and §56 both set is what decides it: a patch number is honest when
+the artifact a user installs behaves as its predecessor's does, and this one does. §61's repair change
+lives entirely behind the Repair button — a press that re-downloads nothing is the same press, on the
+same rungs, reaching the same result on a device that always had room — and what left the screen is an
+arrow drawn *inside* a chip that is itself the tap target, with the terminal's overflow menu carrying
+**Jump to live output** all along. Nothing a user can reach gained or lost a destination. §60 bumped
+minor for the opposite pair of reasons: a new Settings row, and a number that stopped being drawn.
+
+### What it carries
+
+The app tree is `0a28357` — #162 merged into `main`, and nothing else — with the version bump and this
+section on top. The change is §61 in full, and its three sentences are these.
+
+**The install keeps the archive it verified.** `moveIntoPlace` used to delete the 34 MB tarball once the
+rootfs was in place. Every rung at or below *restore missing files* writes base bytes out of exactly
+that file, so a userspace that broke after a successful install could only be repaired by downloading
+the base system first — on the device state where the connection may be the thing that is also broken,
+which is the shape of the report §61 opens with. It is kept now, and given up in exactly three places:
+uninstall (`deleteRootfs`, so a removed userspace leaves no 34 MB behind), the disk step, and only
+against a *measured* shortfall — the step reads 0 as *unknown* and keeps the archive rather than
+trading the one file that makes the deeper rungs local for a number nobody took — and a pin that no
+longer matches, which is a version change and not a repair. The one case where the download returns is
+the one case the user is told about: *"gave up the base system archive (34 MB) to make room for the
+repair; the next rung that needs it will download it again"*.
+
+**Apt's trees are cleared on evidence, not on every press.** Rung L emptied `var/lib/apt/lists` *and*
+`var/cache/apt/archives` unconditionally, which for a failure that named neither was tens of megabytes
+of index and every package the user had downloaded, thrown away to answer a question about something
+else. Clearing has its own rung directly below the setup run now, because the evidence it needs is that
+run's own outcome, and either of two questions firing is enough: what the failed step said
+(`AptDamage.of` matching apt's own words), or what the trees look like (`aptIndexLooksDamaged()` — a
+populated `lists/partial`, a zero-length `*_Packages`, `*_InRelease` or `*_Release`). `INDEX` gives up
+the lists, which one update rebuilds; `INDEX_AND_CACHE` is reached by phrase alone, because a corrupt
+`.deb` makes every install of it fail identically until the file is gone; a failure that names neither
+leaves both trees where they are.
+
+**The pipeline runs once, not three times.** The two local rungs were `rung(...)`, so each ran the whole
+setup pipeline whenever it changed anything — and *restore local state* always changed something. Every
+run begins with an `apt-get update`, so one press was spending the connection three times to answer one
+question. They are `localRung(...)` now: they prepare and hand nothing back, and the pipeline runs in
+its own rung after both have had their turn. Worst case is two runs — setup, and the apt rung's retry
+that clearing those trees makes possible.
+
+**And the arrow.** The badge is count-only, `ArrowDownward` is gone with it, and the setting hides the
+chip entire, so a scrolled-back terminal with the setting off draws nothing in that corner.
+
+### What is asserted, and where
+
+The four suites that own the ladder carry the change rather than a new one: `RootfsRepairTest` holds the
+archive's policy (the release returns the bytes it freed, is idempotent, and the next inspection moves
+the download counter from one to two), `RootfsLocalRepairTest` holds the apt verdicts as a five-case
+table, `RootfsInstallerTest`'s "the tarball is consumed" assertion now asserts the opposite on both
+counts, and `LinuxUserspaceManagerTest` drives the rung through the manager with a dead mirror-list URL
+so no test reaches the network for its verdict. The harness also gained an answered free-space probe,
+which is a finding rather than a fixture: the JVM's unmocked `StatFs` answers **0**, the disk rung
+treats 0 as *unknown*, and 0 therefore emptied the same apt trees the new tests argue about — §61's
+first red run is that, three ways.
+
+This release changes no Kotlin. The change it ships was verified in §61's own pass, and this section
+adds two document edits to it — the header's two version lines and this section — so the brace- and
+comment-nesting scanners that guard the sources have nothing new to read. `scripts/check-doc-figures.sh`
+reports all 159 claims agreeing with the build, which is the same figure §61 recorded: the version lines
+it re-derives moved with the build, and nothing here is a new claim.
+
+### Why this one can be installed over an existing app
+
+The signing identity is unchanged. `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the runner
+before it signs, so this release carries `0c69794b…`, the identity every release from v1.4.0 through
+v1.8.0 was signed with, and an install of any of them upgrades to 1.8.1 normally. The v1.5.0 exception
+§56 describes is unchanged.
+
+### Cutting it
+
+`v1.8.1` is a lightweight tag, the convention v1.7.0 set and v1.8.0 followed, so `git describe
+--exact-match HEAD` will not see it either — `tagged-release.yml` passes `--tags`, and the disagreement
+is in the local read and not in the workflow. The tag is cut inside a CI window, for the reason every
+release here is: Actions minutes are free on a public repository and this one is private, and the first
+flip has to come from outside GitHub because a GitHub-hosted runner is the thing the account cannot
+buy — `scripts/ci-window.sh` is that outside.
