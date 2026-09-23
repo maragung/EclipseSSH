@@ -35,6 +35,35 @@ class ProotRuntimeExecModelTest {
     private fun runtime(): ProotRuntime = ProotRuntime(root(), fakeNativeLibraryDir(), spawner)
 
     /**
+     * A native library directory holding both components, with the exec bit stripped from [on].
+     *
+     * Built fresh here rather than by mutating [fakeNativeLibraryDir]: that fixture is one directory
+     * per JVM, shared by every test that forks, so a mode change made for one test's subject would
+     * be a mode change for every other test in the run. The files are the fixture's kind — real,
+     * present, empty — because what is under test is the *exec* half of the check, and a directory
+     * holding nothing would decide it on existence instead and prove the wrong branch.
+     */
+    private fun nativeLibraryDirWithoutExecBit(on: String): String {
+        // Registered before the files it holds: the JVM deletes registered paths in reverse order,
+        // so the directory is removed last, after it is empty.
+        val dir = Files.createTempDirectory("native-no-exec-bit").toFile().apply { deleteOnExit() }
+        for (name in listOf("libproot.so", "libproot-loader.so")) {
+            val executable = name != on
+            val verb = if (executable) "set" else "clear"
+            val component = File(dir, name)
+            component.writeText("")
+            component.deleteOnExit()
+            component.setExecutable(executable)
+            // The mode is asserted rather than assumed: a filesystem that quietly ignored the bit
+            // would otherwise leave every test below passing for the reason it was written to deny.
+            check(component.canExecute() == executable) {
+                "the test could not $verb the exec bit of ${component.path}"
+            }
+        }
+        return dir.path
+    }
+
+    /**
      * An interactive session — the argv the terminal tab actually forks — is fake root.
      *
      * Asserted on the recorded spawn rather than on `sessionArgv()` alone, so the whole path is
@@ -131,6 +160,58 @@ class ProotRuntimeExecModelTest {
         assertThat(failure!!.message).contains("libproot.so")
         // Nothing was forked: the failure is this app's installation, and it is caught before a
         // child exists to report it as anything else.
+        assertThat(spawner.spawns).isEmpty()
+    }
+
+    /**
+     * A proot binary that is there but not executable is refused exactly the same way.
+     *
+     * The missing case is the loud one — a wrong-ABI split extracts nothing — but the same unusable
+     * userspace is what a half-finished update leaves: the file is present, the kernel answers
+     * `EACCES` at `execve`, and the fork comes up as a pty whose shell reports 126/127 instead of an
+     * app whose own runtime is broken. Only the binary is stripped here, which is what isolates the
+     * exec branch: it is asked first (see [ProotRuntime.missingNativeComponents]), so with the
+     * loader whole the `canExecute` half of the check is the one fact that can put it on the list.
+     */
+    @Test
+    fun `a session refuses to fork when the app's own proot binary is not executable`() {
+        val nativeLib = nativeLibraryDirWithoutExecBit(on = "libproot.so")
+        val runtime = ProotRuntime(root(), nativeLib, spawner)
+
+        // Present, and present as a file: existence is not what this refusal is about.
+        assertThat(File(nativeLib, "libproot.so").isFile).isTrue()
+        assertThat(runtime.missingNativeComponents()).containsExactly("$nativeLib/libproot.so")
+
+        val failure = runCatching { runtime.spawnSession(rows = 24, columns = 80) }.exceptionOrNull()
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.NativeRuntimeMissing::class.java)
+        assertThat(failure!!.message).contains("libproot.so")
+        // Same as the missing case: the child is never created, so nothing can report this as a
+        // shell that failed to start.
+        assertThat(spawner.spawns).isEmpty()
+    }
+
+    /**
+     * The loader's exec bit is asked for too, not only the binary's.
+     *
+     * The two are exec'd as separate files — `PROOT_LOADER` is what the fork hands the kernel, and
+     * proot reaches the rootfs only through it — so a check that stopped at the binary would send a
+     * loader this installation cannot exec into a child that dies inside `execve` with EACCES. Here
+     * the binary is whole and the loader is stripped, so the refusal has to walk past a healthy
+     * first component to name the second — the branch the proot-binary case above cannot reach.
+     */
+    @Test
+    fun `a session refuses to fork when the app's own loader is not executable`() {
+        val nativeLib = nativeLibraryDirWithoutExecBit(on = "libproot-loader.so")
+        val runtime = ProotRuntime(root(), nativeLib, spawner)
+
+        assertThat(runtime.missingNativeComponents())
+            .containsExactly("$nativeLib/libproot-loader.so")
+
+        val failure = runCatching { runtime.spawnSession(rows = 24, columns = 80) }.exceptionOrNull()
+
+        assertThat(failure).isInstanceOf(UserspaceFailure.NativeRuntimeMissing::class.java)
+        assertThat(failure!!.message).contains("libproot-loader.so")
         assertThat(spawner.spawns).isEmpty()
     }
 }

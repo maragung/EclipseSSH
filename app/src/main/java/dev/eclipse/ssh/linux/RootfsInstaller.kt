@@ -928,10 +928,12 @@ class RootfsInstaller(
      * Puts a readable package database back into the installed rootfs, and answers where it came
      * from — or null when there was nothing to do.
      *
-     * The deadlock this exists for: `var/lib/dpkg` is a preserved member, so no repair writes it —
-     * and every repair of anything else begins with `dpkg --configure -a`, which reads exactly that
-     * file and refuses to run when it is absent, truncated or unparseable. A userspace in that state
-     * fails every rung identically, and a ladder that cannot see why would burn a full rebuild on it.
+     * The deadlock this exists for: `var/lib/dpkg` is a preserved member, so nothing else in the app
+     * writes it — and every repair of anything else begins with `dpkg --configure -a`, which reads
+     * exactly that file and refuses to run when it is absent, truncated or unparseable. A userspace
+     * in that state fails every rung identically, and a ladder that cannot see why would burn a full
+     * rebuild on it. This rung is the exception that breaks the deadlock, and the paragraph below
+     * argues it rather than leaving it to be inferred from the write.
      *
      * Three sources, cheapest and least destructive first:
      *
@@ -1569,7 +1571,27 @@ class RootfsInstaller(
             "var/cache/apt/archives/lock",
         )
 
-        /** The guest's own temporary trees, which the archive ships and no repair writes. */
+        /**
+         * The guest's own temporary trees, which the archive ships and no *other* repair writes —
+         * [ensureGuestTemp] is the exception, and the reason both of them are here.
+         *
+         * Every one of these is a preserved member, so the archive's overlay skips it and the
+         * file-level restore refuses it: a `tmp` that is a file, or a `run` that points somewhere
+         * else, survives every repair there is. That is the whole case for the rung.
+         *
+         * `var/tmp` is deliberately **not** in this list, and it is the one omission worth writing
+         * down so it reads as a decision rather than as an oversight. It is the same kind of tree and
+         * a `var/tmp` that is a *file* is repaired by nothing — [reclaimSpace] only empties a real
+         * directory, and a rebuild cannot help, because the member is preserved. What keeps it out is
+         * what repairing it would cost: this list is repaired by deleting each entry and remaking it
+         * from the archive's modes, which for `tmp` and `run` throws away nothing (the first is
+         * erased on every boot by convention, the second is a run-time tree), while `var/tmp` is the
+         * one temp tree whose contents are meant to outlive a reboot — so a real but unwritable
+         * `var/tmp` full of the user's files would lose them to a chmod's worth of repair. Making it
+         * safe means either teaching [ensureGuestTemp] to restore modes in place for this one entry,
+         * or accepting that deletion, and neither is a change to make without a report of the failure
+         * it would fix: every other entry here answers a fault traced to a concrete code path.
+         */
         private val GUEST_TEMP_DIRS = listOf("tmp", "run")
 
         /** The file [isWritableDirectory] creates and removes; never left behind. */

@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §62, *Releasing 1.8.1*; the newest of them that releases a version is §62, *Releasing 1.8.1*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §63, *The Repair plan, audited against the tree that shipped it*; the newest of them that releases a version is §62, *Releasing 1.8.1*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -6262,6 +6262,16 @@ every network rung fail the same way and at once:
   or from the pinned archive, and with no source at all the rung stops the ladder with
   `PackageDatabaseUnreadable` and names the honest exit: uninstall with files kept, then install.
 
+**Corrected in §63: the last clause above was wrong when it was written.** No source at all does *not*
+stop the ladder. `PackageDatabaseUnreadable`'s verdict is that a rebuild *can* fix it, so rung D records
+the failure and the ladder carries on into the rungs below it, ending in the reinstall the type's own
+sentence already promises the user — *"Repair rebuilds Ubuntu from the archive, which removes the
+packages installed on top of it; your own files are kept"*. The uninstall-then-install wording was the
+design's, not the shipped type's, and `git show v1.7.0:` confirms both halves of that: the verdict table
+then had the same `else -> true` fall-through, and the sentence already promised a rebuild. The
+behaviour is deliberate and argued where the verdict is written; only this paragraph was wrong, and
+§63 is where the arithmetic of the two routes is set out.
+
 Four failures stopped being reported as something else. `StepTimedOut` was declared and never
 constructed, so a merely-slow connection spent a reinstall that timed out identically; exits above
 128 were read as "the Linux runtime (proot) failed to start", which for 137 is the low-memory killer
@@ -6985,4 +6995,110 @@ every byte. The claim this release exists to make — break a userspace, press R
 
 **The AAB has not been to Play.** It is built, JAR-signed and attached to the release; its acceptance
 by Google is a thing this repository cannot observe.
+
+
+## 63. The Repair plan, audited against the tree that shipped it
+
+The plan for *making Repair able to fix every failure the Ubuntu userspace can present* was written on
+the morning of 2026-09-22, and its implementation landed the same morning as `8038ac7` — PR #155,
+released as 1.7.0, described in §59 and extended by §61. None of that changes here. What this section is
+is the second question, the one a plan cannot answer about itself: is each thing it promised actually in
+the tree, and which of its sentences now describe something that was later rewritten?
+
+**All eight of its gaps are closed.** Read one at a time against the code, with what answers each:
+
+| The gap the plan named | What answers it |
+| --- | --- |
+| A session that dies mid-flight leaves the manager `Running`, so the card offers nothing to press | `LinuxSessionRegistry.liveCountExcept` (`:83`) and `LinuxUserspaceManager.noteSessionEnded` (`:954`), reached from the session-ending collector at `MainViewModel.kt:2163` — and only for a local host |
+| A stale package lock makes every rung refuse identically, in about a second | `RootfsInstaller.clearStalePackageLocks` (`:452`), which answers with two lists — the locks *removed* and the locks *held* — proving the difference by taking the fcntl lock rather than by reading a file's name |
+| A corrupt `/var/lib/dpkg/status` is unfixable by construction | `RootfsInstaller.restorePackageDatabase` (`:964`): dpkg's own `status-old` first, then the SHA256-verified pinned archive, then a typed refusal |
+| Regenerable apt state is given up only when the disk looked short | the ladder's own rung, `LinuxUserspaceManager.clearAptState` (`:578`), gated on the failed step's own evidence instead of on free space |
+| `StepTimedOut` was declared and never constructed | two construction sites (`UbuntuDistributionManager.kt:638` and `:1065`, for `UPDATE_PACKAGES_STEP` and `INSTALL_BASE_PACKAGES_STEP`) and a verdict of *not rebuildable*, so a slow connection no longer spends a reinstall that times out identically |
+| Exit 137 was read as "the Linux runtime (proot) failed to start" | `KilledBySignal` (`UserspaceFailure.kt:405`), which splits 126/127/128 from everything above them and names signal 9 as the low-memory killer |
+| A missing native loader made every rung fail identically | `NativeRuntimeMissing`, from `ProotRuntime.requireNativeRuntime` (`:172`), which checks both components for existence *and* the exec bit before the app's only fork |
+| `prepareWorkspace` threw its `mkdirs()` results away | `RootfsInstaller.ensureGuestTemp` (`:1097`), one implementation called from the rung and from the pipeline |
+
+Two of the eight were overtaken by later work, so the table's right-hand column is sometimes the newer
+answer rather than the plan's. The plan asked rung L to clear apt's trees on the way past; §61 records
+why that was wrong — it re-downloaded the index and every package the user had, on *every* press — and
+the clear now lives below the setup run, in a rung whose evidence is that run's own failure. And the
+plan asked for an unreadable package database to be *refused*; the type that shipped rebuilds instead,
+for the reason the correction in §59 now gives.
+
+### What looking found that the plan did not name
+
+**The verdict rule was not enforced.** `aRebuildCouldFix` ended in `else -> true`, so the arithmetic that
+decides whether the ladder spends thirty megabytes and a base-system rewrite was, for any failure type
+not named above it, a default. The seven types that fell through were classified correctly and were
+enumerated in a comment — but a comment is not a check, and an eighteenth type would have joined the
+sealed class already answering "rebuildable". The `when` now names all seven, which makes the compiler
+ask: adding a type to `UserspaceFailure` stops this function compiling until its verdict is written
+down. No behaviour changed, and the rule is now the one the plan said it wanted — every type with its
+own arm.
+
+**Two KDoc sentences had been false since 1.7.0.** Both said `var/lib/dpkg` is a preserved member and so
+nothing is written in place and "a rebuild is the only route left" — while the rung the same work
+introduced writes exactly that one file in place, and says so further down its own doc, calling itself
+*"the one deliberate exception to the preserved-member rule"*. `git show v1.7.0:` shows both sentences
+present on the day 1.7.0 shipped, so this is not drift: it is a claim that was wrong when written, in
+the doc of the type the user is shown *and* in the doc of the method that does the writing. Both are
+corrected to say what the rung does and why the exception exists.
+
+**§59's paragraph on the package database was wrong in the same way, and is now corrected there.** It
+says the type "stops the ladder" and "names the honest exit: uninstall with files kept, then install".
+No source at all does not stop the ladder — the verdict is rebuildable, and the sentence the user reads
+promises a rebuild. §59 carries the correction and a pointer here.
+
+**One ambiguity was left standing on purpose, and is now written down where the decision lives.**
+`ProotLaunchFailed` with exit `-1` is what a runtime smoke command that blows its budget produces, and
+the verdict table classes it as rebuildable — so the ladder may spend a rebuild on a runtime that never
+answered an `echo`. It is genuinely ambiguous, and the two readings want opposite answers: proot heard
+from not at all is either a device that is wedged, where the rebuild is thirty megabytes that hang
+identically, or a file inside the rootfs that hangs the guest's own shell, where only a rebuild reaches
+it. Nothing this app can ask tells the two apart, so the cost is bounded by the ladder's shape instead —
+the rungs between the smoke step and the rebuild are file-level and cheap — and that reasoning now sits
+in the verdict table rather than in an `else` nobody chose.
+
+**`var/tmp` stays out of the guest temp list, and that is a decision** — it was not obvious, and it is
+the one place where "repair it" and "cost the user nothing" pull apart. A `var/tmp` that is a *file* is
+repaired by nothing: `reclaimSpace` empties only a real directory, and a rebuild cannot help, because the
+member is preserved. Closing it means adding it to `GUEST_TEMP_DIRS`, whose repair is delete-then-remake
+— free for `tmp` and `run`, and not free for the one temp tree whose contents are meant to outlive a
+reboot, where a real but unwritable directory full of the user's files would lose them to a `chmod`'s
+worth of repair. The alternative is teaching `ensureGuestTemp` to restore modes in place for that entry
+alone. Both are larger than the fault, which — unlike every other entry in that list — has no report
+behind it; the KDoc now says so, so the next reader finds a decision rather than an omission.
+
+### The tests the plan asked for that nobody wrote
+
+Three implemented items had no test of their own. `liveCountExcept` was covered only through the
+manager, so nothing pinned the property its own doc spends fifteen lines on — that it excludes the named
+session *by key*, because the registry evicts a session from its own coroutine and "count minus one" is
+wrong for half the window in which the question is asked; the test now asserts the same answer with the
+named session still registered and again after it has been evicted, which a `sessionCount() - 1` body
+fails. The health probe's two new fields had tests that the fields were populated, but none for the
+sentences they produce and none for the property that makes a probe a probe rather than a repair: it now
+asserts the exact `describe()` text and that the lock file is still on disk, unchanged, afterwards. And
+the native runtime's exec-bit branch — a component that exists but cannot be executed, which is what a
+half-updated app or a wrong-ABI split looks like — was covered only for the *missing* case; it now has a
+test for each component, built in a private directory because the shared fixture is a `by lazy`
+singleton that every other forking test in the JVM uses.
+
+Three gaps remain open, named here rather than left to be found. The `MainViewModel` call site and its
+`isLocalHost` gate are not tested together, so a change that let the hook fire for an SSH host would be
+caught by nothing. The base-packages `StepTimedOut` construction has no test, though the
+update-packages one does. And nothing drives a 137 end-to-end through `UbuntuDistributionManager` into
+`KilledBySignal`; the classifier is unit-tested and the path is not.
+
+### What has run, and what has not
+
+The linux suites are 248 tests, 0 failures, 0 errors, run here with the pinned JDK, `--offline`,
+`--no-daemon` and a single worker — five of those tests are this section's — and
+`scripts/check-doc-figures.sh` recounts the whole JVM suite at 2,019 methods across 177 files, which is
+the figure the README now carries.
+
+**No phone has pressed Repair, and §62's sentence about that is unchanged.** No emulator can run on this
+host (no KVM) and CI is billing-blocked, so the claim the plan itself ends on — break a userspace, press
+Repair, watch it repair *without* re-downloading the base system — is still a device check, in the
+plan's own words: *"the end-to-end path ... is a device check."*
 
