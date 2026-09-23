@@ -117,20 +117,35 @@ class UbuntuDistributionManager(
      * success, because the state machine only marks the userspace installed once everything below
      * (including [healthProbe]) has passed.
      *
-     * Every step now comes from the pinned Ubuntu archive, reached through [aptUpdate]'s ladder, so
-     * there is no step whose failure is tolerable: the two that were (a Node.js install from
-     * NodeSource and two npm globals) are gone with the toolchain they brought, and [SetupReport]
-     * carries warnings for the two softer things that remain inside a step — a base package apt
-     * would only install on its own, and sudo.
+     * The steps up to and including the base packages come from the pinned Ubuntu archive, reached
+     * through [aptUpdate]'s ladder, and none of them is tolerable: [SetupReport] carries warnings
+     * for the two softer things inside a step — a base package apt would only install on its own,
+     * and sudo — but a step itself either completes or throws.
+     *
+     * [SetupStep.INSTALL_EXTRA_PACKAGES] is the exception, and it is the reason it is a step of its
+     * own. It is the only part of the pipeline whose failure is *always* a warning: it reaches the
+     * npm registry as well as the archive, it runs only because the user asked for it, and the
+     * userspace underneath it is already complete when it starts. The decision it reverses — the
+     * 2026-09-18 one that removed the NodeSource install and its two npm globals so that no step
+     * could depend on a registry outside the archive — is reversed *for the user's own selection
+     * only*: with nothing ticked, this step does not exist, and the property the removal bought
+     * ("a deb.nodesource.com outage cannot decide whether Ubuntu installed") still holds for every
+     * install that did not ask otherwise.
      *
      * @param onStep invoked as each step begins, for the install screen's progress display
      * @param onProgress invoked with the newest output line of the long-running commands, so a
      *   slow-but-alive apt is visibly alive instead of looking wedged behind a step label
+     * @param extras the optional packages the user ticked on the install dialog. Empty — which is
+     *   every call but the install's own, and the default — means the step does not run at all and
+     *   the pipeline is exactly the pipeline it was before the checkboxes existed. A non-empty
+     *   selection adds one step after the base packages, and a failure inside it is a warning: the
+     *   base system installed, and the extras are on top of a userspace that is already whole.
      * @return the warnings collected along the way (empty on a fully clean install)
      */
     suspend fun setup(
         onStep: suspend (SetupStep) -> Unit = {},
         onProgress: (String) -> Unit = {},
+        extras: List<OptionalPackage> = emptyList(),
     ): SetupReport {
         val warnings = mutableListOf<String>()
         requireOnline("starting setup")
@@ -185,6 +200,16 @@ class UbuntuDistributionManager(
         // guest. Both are soft for the same reason — a userspace with a short PATH is one where
         // `apt` and `dpkg` complain about the sbin directories, not one that failed to install.
         configureGuestPath(warnings)
+        // The one step that may not run: an empty selection emits no step at all, so a user who
+        // ticked nothing watches the same pipeline — and reads the same percentages — as before
+        // the checkboxes existed. Placed after the PATH files rather than before them because a
+        // package that ships a program into /usr/games or /sbin is exactly what those files exist
+        // for, and a user who ticks "Python 3" should find `python` on their PATH in the very
+        // first terminal the install opens.
+        if (OptionalPackages.resolve(extras).isNotEmpty()) {
+            onStep(SetupStep.INSTALL_EXTRA_PACKAGES)
+            installExtraPackages(extras, onProgress, warnings)
+        }
         onStep(SetupStep.VERIFY)
         return SetupReport(warnings.toList())
     }
@@ -469,20 +494,31 @@ class UbuntuDistributionManager(
      * archive: left alone, every rung would fetch the failing primary alongside the mirror under
      * test and the ladder could never succeed. All of them go, because every list in
      * `sources.list.d` is a shipped one — the app's own entry lives in `sources.list` itself (see
-     * [writeSourcesList]) — so there is no entry here to make an exception for.
+     * [writeSourcesList]) — with one exception, which [disableShippedAptLists] names.
      */
     private fun configureAptSources() {
         disableShippedAptLists()
         writeSourcesList(primaryArchiveUrl(distro))
     }
 
+    /**
+     * Renames every apt source in `sources.list.d` that the *rootfs* shipped, keeping ours.
+     *
+     * The exception is [NODESOURCE_LIST_FILE], and it exists because this method runs on every
+     * setup — including every Repair — long after the install that wrote it. Retiring it would
+     * leave the user with the archive's Node.js and a source line that no longer exists, so a
+     * later `apt-get upgrade` would silently move them *backwards* to the version the extras step
+     * deliberately upgraded past. The file is ours by construction: nothing else in this app writes
+     * a list there, and the name is a constant of this class rather than anything read off disk.
+     */
     private fun disableShippedAptLists() {
         val dir = File(rootfs, "etc/apt/sources.list.d")
         val shipped = dir.listFiles() ?: return
         for (file in shipped) {
             val name = file.name
             val aptList = name.endsWith(".list") || name.endsWith(".sources")
-            if (aptList && !name.endsWith(".disabled")) {
+            val ours = name == NODESOURCE_LIST_FILE
+            if (aptList && !ours && !name.endsWith(".disabled")) {
                 if (file.renameTo(File(dir, "$name.disabled"))) {
                     diagnostics.record(
                         UserspaceDiagnosticCategory.APT,
@@ -1075,6 +1111,230 @@ class UbuntuDistributionManager(
                         ?: "") +
                     " (" + dpkgState + ")",
             )
+        }
+    }
+
+    /**
+     * The packages the user ticked on the install dialog — the one step of the pipeline that may
+     * not run, and the one whose failures never stop an install.
+     *
+     * Three things happen here, in the only order that works. The apt half lands first, from the
+     * pinned archive and through the same ladder the base packages use, because Node.js itself comes
+     * from there. Node.js is then *measured* rather than assumed: the npm tools below cannot run on
+     * the 12.22 that jammy's archive carries, so [ensureRunnableNode] upgrades it from NodeSource
+     * when the archive's is too old, and says so when even that does not land. Only then are the npm
+     * globals installed, one command each.
+     *
+     * Everything here is a warning on failure, and the reason is the shape of the promise: the base
+     * system is on disk and verified before this method is entered, so the userspace is whole
+     * whether or not a single byte of this lands. Turning "cmake did not install" into "Ubuntu
+     * failed to install" would send the user back through a 30 MB download to fix a package they can
+     * add themselves in one apt command, and would make the install's success depend on npm's
+     * registry — the dependency the base pipeline was deliberately built to avoid.
+     *
+     * That promise is why this step carries no offline gate, alone in the pipeline. Every other
+     * network phase refuses before it starts ([requireOnline]), because a base package that cannot
+     * be fetched means the userspace is not what the install claims it is — but here the userspace
+     * is already complete, and a connection that drops at this instant is the one case where the
+     * gate's own refusal is the worse outcome: a failed install, a redownload, and the same two
+     * lines in a terminal. A dropped connection is instead a warning naming what did not install,
+     * which is exactly what apt and npm say for themselves.
+     */
+    private suspend fun installExtraPackages(
+        extras: List<OptionalPackage>,
+        onProgress: (String) -> Unit,
+        warnings: MutableList<String>,
+    ) {
+        val wanted = OptionalPackages.resolve(extras)
+        installExtraAptPackages(OptionalPackages.aptPackages(wanted), onProgress, warnings)
+        val globals = OptionalPackages.npmGlobals(wanted)
+        if (globals.isEmpty()) return
+        // The globals are skipped wholesale when Node.js itself is not usable: every one of them
+        // would otherwise fail with the same npm error, three warnings that say one thing, and the
+        // sentence the user needs — that the tools are missing because their runtime is — would be
+        // the one no line contains.
+        if (!ensureRunnableNode(wanted, onProgress, warnings)) {
+            warnings += "the npm tools (${globals.joinToString(", ")}) were skipped: " +
+                "they need a working Node.js"
+            return
+        }
+        installNpmGlobals(globals, onProgress, warnings)
+    }
+
+    /**
+     * The apt half of the extras, in one command, with the same two retries the base packages get
+     * and the same per-package fallback — but a different ending: what fails here is named in a
+     * warning, never thrown.
+     *
+     * The fallback is worth its commands for the reason it is for the base set, and more so: this
+     * list is four times longer and mixes sets with different dependencies (a compiler, a Python,
+     * a toolchain of fourteen utilities), so one unavailable package would otherwise cost the
+     * whole selection. Its results are grouped by what apt said before they become warnings — a
+     * full disk refuses twenty packages with one sentence, and twenty copies of it in the
+     * "installed with warnings" row is one fact written twenty times.
+     */
+    private suspend fun installExtraAptPackages(
+        packages: List<String>,
+        onProgress: (String) -> Unit,
+        warnings: MutableList<String>,
+    ) {
+        if (packages.isEmpty()) return
+        val command = "apt-get install -y --no-install-recommends ${packages.joinToString(" ")}"
+        val first = runSetupCommand(command, INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        if (first != null && first.exitCode == 0) return
+        val retry = runSetupCommand("$command --fix-missing", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+        if (retry != null && retry.exitCode == 0) {
+            warnings += "the extra packages needed a --fix-missing retry to install"
+            return
+        }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            "bulk extra-package install failed",
+            detail = failureReason(first?.outputText() ?: retry?.outputText())
+                ?: failureTail(first?.outputText() ?: retry?.outputText(), lines = 2),
+            exitCode = first?.exitCode ?: retry?.exitCode,
+        )
+        val refusals = mutableListOf<Pair<String, ProotCommandResult?>>()
+        for (pkg in packages) {
+            val result =
+                runSetupCommand("apt-get install -y --no-install-recommends $pkg", INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+            if (result == null || result.exitCode != 0) refusals += pkg to result
+        }
+        if (refusals.isEmpty()) return
+        refusals
+            .groupBy { failureReason(it.second?.outputText()) ?: "no output before the timeout" }
+            .forEach { (reason, group) ->
+                val names = group.joinToString(", ") { it.first }
+                warnings += "these extra packages were not installed, $names: $reason"
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "extra packages refused one by one",
+                    detail = "$reason | ${group.size}/${packages.size} refused: $names",
+                    exitCode = group.first().second?.exitCode,
+                )
+            }
+    }
+
+    /**
+     * Whether a Node.js the npm globals can actually run on is in place, upgrading it from
+     * NodeSource when the archive's is too old to be one.
+     *
+     * The measurement is the point. Ubuntu's own `nodejs` is 12.22.9 on jammy and 18.19.1 on noble,
+     * while [MODERN_NODE_MAJOR] is what the tools on that dialog document — so on both of the
+     * releases this app offers the archive's Node.js would install cleanly, report success, and
+     * leave the user with a `cline` that refuses to start. A version read back from the guest is
+     * the only thing that can tell those two outcomes apart, and it is why this is a step rather
+     * than a package list.
+     *
+     * NodeSource is reached only when the measurement says it is needed — never for the plain
+     * "Node.js and npm" case on a release whose archive is already new enough — it is one pinned
+     * major series, and every failure inside it degrades to a warning that leaves the archive's
+     * Node.js installed and working. The key URL was fetched and confirmed live on 2026-09-23.
+     *
+     * @return whether Node.js is new enough now; false only when nothing usable is in place
+     */
+    private suspend fun ensureRunnableNode(
+        wanted: List<OptionalPackage>,
+        onProgress: (String) -> Unit,
+        warnings: MutableList<String>,
+    ): Boolean {
+        val needsModern = OptionalPackages.needsModernNode(wanted)
+        val installed = nodeMajorVersion(onProgress)
+        when {
+            installed == null -> {
+                warnings += "Node.js is not installed, so nothing that needs it was installed"
+                return false
+            }
+            !needsModern || installed >= MODERN_NODE_MAJOR -> {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "node.js version",
+                    detail = "major=$installed, modern required=$needsModern",
+                )
+                return true
+            }
+        }
+        diagnostics.record(
+            UserspaceDiagnosticCategory.APT,
+            "node.js too old for the selected tools",
+            detail = "archive major=$installed, needed=$MODERN_NODE_MAJOR",
+        )
+        // One command, because every part of it is a precondition of the next: the key has to be on
+        // disk before it can be dearmoured, the keyring has to exist before the source can be
+        // declared signed-by it, and the source has to be in place before apt can install from it.
+        // `gnupg` comes from the pinned archive — the one package this route adds that is not part
+        // of the selection — because the base rootfs has no `gpg` and `gpg --dearmor` is how a
+        // binary keyring is written without the deprecated `apt-key`.
+        val upgrade = runSetupCommand(
+            "apt-get install -y --no-install-recommends gnupg && " +
+                "curl -fsSL $NODESOURCE_KEY_URL -o $NODESOURCE_KEY_FILE && " +
+                "gpg --dearmor -o $NODESOURCE_KEYRING $NODESOURCE_KEY_FILE && " +
+                "echo 'deb [signed-by=$NODESOURCE_KEYRING] $NODESOURCE_REPO $NODESOURCE_SUITE main' " +
+                "> /etc/apt/sources.list.d/$NODESOURCE_LIST_FILE && " +
+                "apt-get update $NODESOURCE_SCOPED_UPDATE_FLAGS && " +
+                "apt-get install -y --no-install-recommends nodejs",
+            NODESOURCE_TIMEOUT_MS,
+            lineTracker(onProgress),
+        )
+        val after = nodeMajorVersion(onProgress)
+        return when {
+            after != null && after >= MODERN_NODE_MAJOR -> {
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "node.js upgraded from nodesource",
+                    detail = "major=$after",
+                    exitCode = upgrade?.exitCode,
+                )
+                true
+            }
+            // The archive's Node.js is still installed and working, so this is a warning about the
+            // tools rather than about the environment — and the sentence names the version the user
+            // has, because "the tools did not install" and "your Node.js is 18" are the same fact.
+            else -> {
+                warnings += "Node.js is still version " +
+                    "${after ?: installed} and the npm tools need $MODERN_NODE_MAJOR or newer" +
+                    (failureTail(upgrade?.outputText(), lines = 1)?.let { ": $it" } ?: "")
+                false
+            }
+        }
+    }
+
+    /** `node --version`'s major, or null when the command does not answer or names no version. */
+    private suspend fun nodeMajorVersion(onProgress: (String) -> Unit): Int? {
+        val result = runSetupCommand(NODE_VERSION_COMMAND, NODE_VERSION_TIMEOUT_MS, lineTracker(onProgress))
+        if (result == null || result.exitCode != 0) return null
+        return NODE_VERSION.find(result.outputText())?.groupValues?.get(1)?.toIntOrNull()
+    }
+
+    /**
+     * The npm globals, one `npm install -g` each, every failure a warning that names the tool.
+     *
+     * One command per tool rather than one command for all of them, deliberately: they are three
+     * unrelated packages from three publishers, and a single command would make the newest
+     * publisher's typo decide whether the other two landed. Each gets the whole budget, because a
+     * prebuilt binary over a phone connection is minutes and the alternative — a shared timeout —
+     * would cut off whichever tool happened to be last in the list.
+     */
+    private suspend fun installNpmGlobals(
+        globals: List<String>,
+        onProgress: (String) -> Unit,
+        warnings: MutableList<String>,
+    ) {
+        for (tool in globals) {
+            val result =
+                runSetupCommand("npm install -g $tool", NPM_INSTALL_TIMEOUT_MS, lineTracker(onProgress))
+            if (result == null || result.exitCode != 0) {
+                warnings +=
+                    "npm package '$tool' was not installed" +
+                        (failureTail(result?.outputText(), lines = 1)
+                            ?.let { ": $it" } ?: ": the install timed out")
+                diagnostics.record(
+                    UserspaceDiagnosticCategory.APT,
+                    "npm global refused",
+                    detail = tool,
+                    exitCode = result?.exitCode,
+                )
+            }
         }
     }
 
@@ -1733,6 +1993,77 @@ class UbuntuDistributionManager(
         private const val APT_UPDATE_ATTEMPT_TIMEOUT_MS = 10 * 60_000L
         private const val INSTALL_TIMEOUT_MS = 45 * 60_000L
 
+        /**
+         * One npm global. The same fifteen minutes the pre-1.2 toolchain gave it, and for the same
+         * reason: the package is a thin wrapper around a prebuilt binary that npm then fetches from
+         * the registry, so the command is a download rather than a build — minutes on a phone
+         * connection, and nothing like the base packages' forty-five.
+         */
+        private const val NPM_INSTALL_TIMEOUT_MS = 15 * 60_000L
+
+        /**
+         * The whole NodeSource route in one budget: the `gnupg` install, the key, the source line,
+         * a scoped `apt-get update` and the `nodejs` install. Generous for the same reason
+         * [INSTALL_TIMEOUT_MS] is — a Node.js package is ~30 MB — and separate from it because a
+         * route that hangs here must not eat the budget of the extras that already installed.
+         */
+        private const val NODESOURCE_TIMEOUT_MS = 20 * 60_000L
+
+        /** `node --version` is a version print; a runner that needs a minute for it is not one. */
+        private const val NODE_VERSION_TIMEOUT_MS = 60_000L
+
+        /**
+         * The Node.js major the npm tools on the install dialog document as their floor. Cline's
+         * own documentation states 20 explicitly ("Node.js 20 or higher. Node.js 22 is
+         * recommended"), which is also above what any Ubuntu release this app offers carries in
+         * its archive — 12.22.9 on jammy, 18.19.1 on noble — so this number is the difference
+         * between a checkbox that installs a tool and one that installs its runtime.
+         */
+        private const val MODERN_NODE_MAJOR = 20
+
+        /**
+         * `node --version` prints `v24.4.1` on a line of its own; the major is the only part this
+         * needs.
+         *
+         * Anchored to the start of a line, which is not decoration: the command runs under
+         * `bash --login`, so its output can carry the profile scripts' own lines ahead of the
+         * version, and an unanchored `\d+\.\d+` would take `22.04` out of a banner that happens to
+         * name the release. A major read off the wrong line is worse than no reading at all — it
+         * would decide, silently, whether NodeSource is reached.
+         */
+        private val NODE_VERSION = Regex("""(?m)^\s*v?(\d+)\.\d+""")
+        private const val NODE_VERSION_COMMAND = "node --version"
+
+        /** NodeSource's signing key, fetched over TLS and dearmoured into [NODESOURCE_KEYRING]. */
+        private const val NODESOURCE_KEY_URL = "https://deb.nodesource.com/gpgkey/nodesource.gpg.key"
+
+        /** Where the fetched key waits before `gpg --dearmor` reads it. */
+        private const val NODESOURCE_KEY_FILE = "/tmp/nodesource.gpg.key"
+
+        /** The binary keyring apt reads the source line's `signed-by` against. */
+        private const val NODESOURCE_KEYRING = "/usr/share/keyrings/nodesource.gpg"
+
+        /** The apt source this app writes, and the one file in `sources.list.d` that is ours. */
+        private const val NODESOURCE_LIST_FILE = "nodesource.list"
+
+        /** One pinned major series; a bump is a deliberate change, not drift. */
+        private const val NODESOURCE_REPO = "https://deb.nodesource.com/node_24.x"
+
+        /** NodeSource's one suite for every distribution it supports. */
+        private const val NODESOURCE_SUITE = "nodistro"
+
+        /**
+         * The scoped update that reads [NODESOURCE_LIST_FILE] and nothing else.
+         *
+         * Scoped for the reason every rung of [aptUpdate] is: the unscoped update belongs to the
+         * ladder, which decides which archive this userspace uses. A second unscoped update here
+         * would re-test every source and could fail on the archive the ladder just proved — taking
+         * the Node.js install down with a failure that has nothing to do with Node.js.
+         */
+        private const val NODESOURCE_SCOPED_UPDATE_FLAGS =
+            "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/$NODESOURCE_LIST_FILE " +
+                "-o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0"
+
         /** The mirror feed must answer quickly or not participate at all. */
         // HttpURLConnection's timeouts are Int milliseconds, so the constant stays Int even though
         // every other timeout in this class is a Long.
@@ -1989,7 +2320,15 @@ internal fun sourcesListContent(distro: LinuxDistro, baseUri: String): String = 
     append("deb $baseUri ${distro.release}-security $COMPONENTS\n")
 }
 
-/** The named steps of [UbuntuDistributionManager.setup], in order, for the install screen. */
+/**
+ * The named steps of [UbuntuDistributionManager.setup], in order, for the install screen.
+ *
+ * [INSTALL_EXTRA_PACKAGES] is the one step a run may not traverse at all: it exists only for the
+ * packages the user ticked on the install dialog, so a plain install emits it never — see
+ * [UbuntuDistributionManager.setup]'s `extras`. It is declared here, between the base packages and
+ * the verification, because that is where it runs when it does run, and a step's position in this
+ * enum is what [LinuxInstallProgress] reads to place it on the bar.
+ */
 enum class SetupStep {
     REGISTER_USER,
     PREPARE_WORKSPACE,
@@ -1997,6 +2336,7 @@ enum class SetupStep {
     CONFIGURE_APT,
     UPDATE_PACKAGES,
     INSTALL_BASE_PACKAGES,
+    INSTALL_EXTRA_PACKAGES,
     VERIFY,
 }
 

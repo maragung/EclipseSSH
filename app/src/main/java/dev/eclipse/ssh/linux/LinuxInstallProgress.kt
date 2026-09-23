@@ -54,7 +54,8 @@ object LinuxInstallProgress {
      * them: download, verify, extract, setup, health.
      *
      * The setup phase's share is the largest because it is the longest by a wide margin — a package
-     * list update and then seven packages unpacked by dpkg over the network. The download is next
+     * list update and then the packages unpacked by dpkg over the network, twelve of them in the
+     * base set and twenty-seven more if the user ticked every box. The download is next
      * and is the reason the figure moves at all on a slow connection. Verification is a hash over
      * the 30 MB that just arrived, which is under a second, and the health check is a handful of
      * short commands.
@@ -66,21 +67,30 @@ object LinuxInstallProgress {
 
     /**
      * The share of the *setup* phase each [SetupStep] owns. The first four edit a file each and are
-     * effectively instant; `UPDATE_PACKAGES` and `INSTALL_BASE_PACKAGES` are the pipeline's real
-     * cost; `VERIFY` runs `apt-get check` over the database.
+     * effectively instant; `UPDATE_PACKAGES`, `INSTALL_BASE_PACKAGES` and `INSTALL_EXTRA_PACKAGES`
+     * are the pipeline's real cost; `VERIFY` runs `apt-get check` over the database.
      *
      * The order is [SetupStep]'s own declaration order, which is the order the pipeline emits them
      * in — [setupFraction] walks the enum, and the exhaustive `when` below is what makes a new step
      * a compile error here rather than a silently unweighted one.
+     *
+     * `INSTALL_EXTRA_PACKAGES`'s share is the one that can be spent on a step that never runs: it
+     * takes the weight its package count deserves (twenty-seven packages at most, against the base
+     * set's twelve, and npm globals on top) whether or not the user ticked anything. A run that
+     * skips it does not
+     * lose a fifth of the bar — the shares are cumulative positions inside the phase, so the next
+     * step's percentage simply follows the previous one's, which is what "this step is not
+     * happening" should look like.
      */
     private fun setupWeight(step: SetupStep): Float = when (step) {
         SetupStep.REGISTER_USER -> 0.02f
         SetupStep.PREPARE_WORKSPACE -> 0.03f
         SetupStep.CONFIGURE_DNS -> 0.02f
         SetupStep.CONFIGURE_APT -> 0.03f
-        SetupStep.UPDATE_PACKAGES -> 0.35f
-        SetupStep.INSTALL_BASE_PACKAGES -> 0.45f
-        SetupStep.VERIFY -> 0.10f
+        SetupStep.UPDATE_PACKAGES -> 0.28f
+        SetupStep.INSTALL_BASE_PACKAGES -> 0.36f
+        SetupStep.INSTALL_EXTRA_PACKAGES -> 0.19f
+        SetupStep.VERIFY -> 0.07f
     }
 
     /**

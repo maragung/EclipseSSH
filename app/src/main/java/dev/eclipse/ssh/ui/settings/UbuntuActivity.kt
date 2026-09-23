@@ -15,7 +15,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Article
 import androidx.compose.material.icons.filled.ArrowDownward
@@ -32,6 +35,7 @@ import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -44,12 +48,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -62,6 +68,8 @@ import dev.eclipse.ssh.data.settings.SettingsRepository
 import dev.eclipse.ssh.feature.vault.VaultUnlockGate
 import dev.eclipse.ssh.linux.LinuxInstallStep
 import dev.eclipse.ssh.linux.LinuxUserspaceState
+import dev.eclipse.ssh.linux.OptionalPackage
+import dev.eclipse.ssh.linux.OptionalPackages
 import dev.eclipse.ssh.linux.RootfsTransferState
 import dev.eclipse.ssh.linux.SetupStep
 import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
@@ -120,6 +128,13 @@ import kotlinx.coroutines.withContext
  * about to do and are two lines of prose each, and the third is a reading surface opened over the row
  * that changes with the state underneath it. `confirmImport` joins them for the same reason, with the
  * heaviest question of the three: it replaces a userspace that is already working.
+ *
+ * The install dialog is the one that grew past two lines, and it grew in place rather than into a
+ * screen of its own: the preinstall checkboxes are part of the same question ("install this, and
+ * what else with it?"), they are meaningless without it, and a separate screen would have to either
+ * ask the question twice or answer it with a state the dialog then has to read back. What it costs
+ * is height, and that is what [rememberDialogBodyMaxHeight] and a scroll are for — see
+ * [PreinstallPicker].
  */
 @AndroidEntryPoint
 class UbuntuActivity : SettingsDestinationActivity() {
@@ -158,6 +173,23 @@ class UbuntuActivity : SettingsDestinationActivity() {
         var confirmInstall by remember { mutableStateOf(false) }
         var confirmUninstall by remember { mutableStateOf(false) }
         var showInstallLog by remember { mutableStateOf(false) }
+
+        /**
+         * The preinstall ticks, held as the entries' own names rather than as the entries.
+         *
+         * `rememberSaveable` because the dialog outlives a rotation, and a rotation that silently
+         * dropped the user's ticks would hand them an install without the packages they chose — the
+         * one thing on this screen that is a decision rather than a state. Names, not the enum
+         * values, because a `List<String>` is what the saved-state registry saves without a custom
+         * saver; [OptionalPackage.entries] puts them back in declaration order either way.
+         *
+         * Never persisted beyond the dialog, and deliberately: what the user ticked describes *this*
+         * install, and a `Repair` months later must not re-download a toolchain nobody re-asked for.
+         */
+        var extraIds by rememberSaveable { mutableStateOf(listOf<String>()) }
+        val selectedExtras = remember(extraIds) {
+            OptionalPackage.entries.filter { it.name in extraIds }
+        }
         val context = LocalContext.current
         val scope = rememberCoroutineScope()
         val report = LocalSettingsReport.current
@@ -550,23 +582,40 @@ class UbuntuActivity : SettingsDestinationActivity() {
                 onDismissRequest = { confirmInstall = false },
                 title = { Text("Install ${distroTitle(ui)}?") },
                 text = {
-                    Text(
-                        "A verified ${distroTitle(ui)} root filesystem (~30 MB) is downloaded and its " +
-                            "base packages — bash, apt, git, curl, wget and an SSH client — are " +
-                            "installed through apt itself, which needs a few hundred MB over your " +
-                            "network. Anything else you want (Python, Node.js, an editor) is one " +
-                            "apt-get install away in the terminal. Inside it you are root over your " +
-                            "own files and nothing else, and the workspace at " +
-                            "/home/ubuntu/workspace survives Stop and Restart." +
-                            if (ui.hasPendingWorkspaceBackup) {
-                                " Your saved workspace is restored after the install."
-                            } else {
-                                ""
-                            },
-                    )
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        // Capped and scrollable for the reason the log dialog is: the body is a
+                        // paragraph plus seven checkboxes with two lines each, which is taller than
+                        // a phone's dialog can show. A body that grew past the screen would put the
+                        // Install button out of reach of the very control that asked the question.
+                        modifier = Modifier
+                            .heightIn(max = rememberDialogBodyMaxHeight(0.60f))
+                            .verticalScroll(rememberScrollState()),
+                    ) {
+                        Text(
+                            "A verified ${distroTitle(ui)} root filesystem (~30 MB) is downloaded and " +
+                                "its base packages — bash, apt, git, curl, wget and an SSH client — " +
+                                "are installed through apt itself, which needs a few hundred MB over " +
+                                "your network. Anything else you want is one apt-get install away in " +
+                                "the terminal, or tick it below and this install adds it for you. " +
+                                "Inside it you are root over your own files and nothing else, and the " +
+                                "workspace at /home/ubuntu/workspace survives Stop and Restart." +
+                                if (ui.hasPendingWorkspaceBackup) {
+                                    " Your saved workspace is restored after the install."
+                                } else {
+                                    ""
+                                },
+                        )
+                        PreinstallPicker(
+                            selectedIds = extraIds,
+                            onSelectionChange = { extraIds = it },
+                        )
+                    }
                 },
                 confirmButton = {
-                    TextButton(onClick = { confirmInstall = false; linuxUserspace.install() }) { Text("Install") }
+                    TextButton(
+                        onClick = { confirmInstall = false; linuxUserspace.install(selectedExtras) },
+                    ) { Text("Install") }
                 },
                 dismissButton = { TextButton(onClick = { confirmInstall = false }) { Text("Cancel") } },
             )
@@ -792,7 +841,102 @@ private fun InstallLogDialog(
     )
 }
 
-/** The distro's display name, or a neutral title on a device where none is supported. */
+/**
+ * The preinstall checkboxes on the install dialog: what the user asked for beyond the base system.
+ *
+ * One row per [OptionalPackage], each with its own two lines — the label the user recognises and
+ * the packages that make it true — because the whole value of this list is that the user does not
+ * have to know that "Python 3" means four packages and a `python` symlink.
+ *
+ * The row is the control, not the box: the whole row toggles, and the `Checkbox` inside it is
+ * drawn with a null callback so a screen reader meets one labelled control rather than a checkbox
+ * and a label that are two targets for one decision.
+ *
+ * [selectedIds] crosses the dialog's boundary as strings — see the caller's own note — and comes
+ * back the same way, in the order the user ticked; nothing here depends on that order, and nothing
+ * downstream does either. The dependency line at the bottom is the one thing a tick can cause that
+ * is invisible on the row itself: the coding agents need Node.js, so ticking one of them installs
+ * it whether or not its own box is ticked, and saying so here is cheaper than explaining it after
+ * the install.
+ */
+@Composable
+private fun PreinstallPicker(
+    selectedIds: List<String>,
+    onSelectionChange: (List<String>) -> Unit,
+) {
+    val selected = OptionalPackage.entries.filter { it.name in selectedIds }
+    val implied = OptionalPackages.implied(selected)
+    val allSelected = selected.size == OptionalPackage.entries.size
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Preinstall (optional)",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(
+                onClick = {
+                    onSelectionChange(
+                        if (allSelected) emptyList() else OptionalPackage.entries.map { it.name },
+                    )
+                },
+                // Named for what it does to the selection rather than for its own label: "All" and
+                // "None" are the same control in two states, and a screen reader hears a bare "All"
+                // with no way to tell which list it applies to.
+                modifier = Modifier.semantics {
+                    contentDescription =
+                        if (allSelected) "Clear the preinstall selection" else "Select every preinstall package"
+                },
+            ) { Text(if (allSelected) "None" else "All") }
+        }
+        Text(
+            "Installed after the base system, from the same Ubuntu archive. The coding agents come " +
+                "from npm's registry instead, so they need Node.js and a working connection, and one " +
+                "that does not install is reported as a warning rather than failing the install.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OptionalPackage.entries.forEach { entry ->
+            val checked = entry in selected
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .toggleable(
+                        value = checked,
+                        role = Role.Checkbox,
+                        onValueChange = { ticked ->
+                            onSelectionChange(
+                                if (ticked) selectedIds + entry.name else selectedIds - entry.name,
+                            )
+                        },
+                    ),
+            ) {
+                Checkbox(checked = checked, onCheckedChange = null)
+                Column(Modifier.padding(start = 8.dp)) {
+                    Text(entry.label, style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        entry.summary,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        if (implied.isNotEmpty()) {
+            Text(
+                "Also installed, because it is what they run on: " +
+                    implied.joinToString(", ") { it.label } + ".",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/**
+ * The distro's display name, or a neutral title on a device where none is supported.
+ */
 private fun distroTitle(ui: LinuxUserspaceUiState): String =
     ui.distro?.displayName ?: "Ubuntu"
 
@@ -823,6 +967,7 @@ private fun describeSetupStep(step: SetupStep, detail: String?): String {
         SetupStep.CONFIGURE_APT -> "Configuring package sources"
         SetupStep.UPDATE_PACKAGES -> "Updating package lists"
         SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
+        SetupStep.INSTALL_EXTRA_PACKAGES -> "Installing the extra packages"
         SetupStep.VERIFY -> "Verifying"
     }
     // The newest command output beside the step's label: a slow-but-alive `apt-get update` shows

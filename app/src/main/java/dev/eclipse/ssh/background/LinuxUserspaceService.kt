@@ -264,6 +264,7 @@ class LinuxUserspaceService : LifecycleService() {
             SetupStep.CONFIGURE_APT -> "configuring package sources"
             SetupStep.UPDATE_PACKAGES -> "updating package lists"
             SetupStep.INSTALL_BASE_PACKAGES -> "installing the base packages"
+            SetupStep.INSTALL_EXTRA_PACKAGES -> "installing the extra packages"
             SetupStep.VERIFY -> "verifying"
         }
         // The newest command output beside the label — the notification's one line of proof that

@@ -14,6 +14,7 @@ the app's sandbox, with no VM, no root and no ISO.
 1. [Architecture](#architecture)
 2. [The rootfs source](#the-rootfs-source)
 3. [The install process](#the-install-process)
+   - [Preinstalling apps](#preinstalling-apps)
    - [The percentage](#the-percentage)
 4. [The runtime model](#the-runtime-model)
 5. [ABI support](#abi-support)
@@ -110,18 +111,68 @@ health check passes — "installed" and "works" are the same fact:
      `ports.ubuntu.com/ubuntu-ports`,
    - `apt-get update`, then the base packages through apt itself — `apt-utils`,
      `bash-completion`, `ca-certificates`, `cron`, `curl`, `git`, `htop`, `openssh-client`,
-     `sudo`, `unzip`, `wget`, `zip`. That list is the whole of what the install adds: a shell and
-     the package manager, the TLS roots and fetch tools to use it with, and the handful of small
-     utilities (an archive pair, a process viewer, cron) that recipes written for a real Ubuntu
-     box assume are already present. It stays deliberately short: Python, Node.js, an editor and
-     a compiler are the user's own call, one `apt-get install` away inside the terminal, so the
-     install stays small, fast and away from registries outside the pinned Ubuntu archive. One
-     caveat stated plainly — `cron` is installed but nothing starts it: this userspace has no
-     init, so a crontab fires only if the user starts the daemon themselves.
+     `sudo`, `unzip`, `wget`, `zip`. That list is a shell and the package manager, the TLS roots
+     and fetch tools to use it with, and the handful of small utilities (an archive pair, a
+     process viewer, cron) that recipes written for a real Ubuntu box assume are already present.
+     On an install where nothing was ticked it is the whole of what the install adds, and the
+     install stays small, fast and away from registries outside the pinned Ubuntu archive. What
+     the user ticks in the install dialog is added on top of it, in the step after this one —
+     [Preinstalling apps](#preinstalling-apps). One caveat stated plainly — `cron` is installed but
+     nothing starts it: this userspace has no init, so a crontab fires only if the user starts the
+     daemon themselves.
 5. **Health check** — a shell runs and prints a marker, `whoami` answers `root`, DNS resolves,
    `apt-get check` passes. Only then does the state machine reach Stopped.
 6. **Workspace restore** — if a previous keep-workspace uninstall parked a snapshot, it is
    restored into the fresh rootfs before the first shell opens.
+
+### Preinstalling apps
+
+The install dialog carries a checkbox list above its Install button, and **nothing is ticked by
+default**. That default is load-bearing rather than a matter of taste: an empty selection is not a
+step that runs and does nothing, it is a step that is never emitted — `setup()` does not call
+`onStep(INSTALL_EXTRA_PACKAGES)` at all — so a plain install runs the same commands, and reports the
+same percentages, as it did before the list existed. The catalogue is
+[`OptionalPackage`](../app/src/main/java/dev/eclipse/ssh/linux/OptionalPackages.kt):
+
+| Entry | What it installs |
+|---|---|
+| Node.js and npm | the archive's `nodejs` and `npm`, upgraded from NodeSource when the archive's is older than 20 (below) |
+| Python 3 | `python3`, `pip`, `venv`, the headers, and `python-is-python3` |
+| Build tools | `build-essential` (make, gcc, g++), `cmake`, `pkg-config`, `autoconf`, `automake`, `libtool` |
+| Terminal utilities | `ripgrep`, `fd-find`, `jq`, `tree`, `tmux`, `vim`, `nano`, `rsync`, `less`, `man-db`, `lsof`, `strace`, `dnsutils`, `net-tools` |
+| opencode | the opencode coding agent, an npm global (`opencode-ai`), so it pulls in Node.js |
+| cline | the Cline coding agent, an npm global — the one that documents Node.js 20 as its floor |
+| Kilo Code CLI | Kilo Code, an npm global from `@kilocode/cli`, run as `kilo` |
+
+The three agents declare Node.js as a dependency, so ticking one ticked Node.js with it — the dialog
+says which, in a line under the list, before the install rather than after it. `OptionalPackages`
+folds those in transitively and hands back the entries in declaration order; an entry may only name
+entries declared above it (a test asserts it), which is what makes that order an install order
+rather than an accident of the walk.
+
+Two properties are worth stating on their own:
+
+- **The archive first, NodeSource only on evidence.** No pinned Ubuntu archive carries a Node.js the
+  agents accept — jammy has 12.22.9, noble 18.19.1 — so the step does not guess: it installs the
+  archive's `nodejs` and `npm`, runs `node --version`, and reaches NodeSource only when the major it
+  read is below 20. A selection that asked for nothing but the archive's own Node never talks to a
+  host outside the pin. The `nodesource.list` it then writes is the one apt source a later setup may
+  not retire: the pipeline disables every list the base image shipped under `sources.list.d/`, and a
+  Repair that swept this one up with them would silently walk the user back to the old Node.
+- **Nothing here can fail an install.** Every package and every npm global is attempted, and whatever
+  refuses becomes a warning on the report — apt's own words, with every package it named, grouped by
+  the reason so that one broken dependency is one sentence rather than twenty-seven. A registry that
+  is down, or an npm global whose build needs a compiler, leaves a working Ubuntu userspace missing
+  one tool. It does not rebuild a base system that was never in question. This step is also the one
+  network phase with no offline gate of its own, for the same reason: every other phase refuses
+  before it starts, because a base package it cannot fetch means the userspace is not what the
+  install claims — but here the userspace is already whole, so a connection that drops is a warning
+  about the tool rather than a failed install.
+
+Repair passes no extras: a repair is there to put a userspace back the way it was, and the way it was
+is whatever the last install — which knows what was ticked — made it. The step also has a share of
+the setup phase's progress bar whether or not it runs; [The percentage](#the-percentage) explains why
+skipping it does not cost the bar a fifth of its length.
 
 ### The percentage
 
@@ -430,7 +481,7 @@ rungs exist for.
 | Free space | Empties apt's package cache, its lists, the binary index caches, `/tmp` and `/var/tmp`, rotated logs, a download fragment, and a `rootfs.old` parked by a crashed swap — and only when a rootfs is in place. Runs whenever the free space is short or unknown. If that still leaves too little for the repair to run at all, the kept archive goes last | Nothing the user owns: every byte is one apt regenerates. The archive costs one download later, which is why it goes only against a reading that says the disk is short — and never when there is no rootfs to repair, since the install is about to need those same bytes |
 | Clear local state | The damage an interrupted package operation leaves on disk, and the one class of failure every other rung used to fail identically on: package-manager locks **that nothing holds** are removed, and the guest's own directories are put back — `/tmp` and `/run` recreated where they are missing or are a file or a link, the workspace the user deleted recreated, a workspace that is a symlink replaced by a real directory. It only puts the rootfs back into a state the pipeline can work in; the pipeline itself runs once, in the rung below | Nothing the user owns: a stale lock is a file the kernel already released, nothing here is downloaded, and nothing apt has fetched is thrown away |
 | Restore the package database | `var/lib/dpkg/status` — the one file no other rung may write, because the whole directory is a preserved member and every rung needs what is in it. When it does not read as a dpkg database (a killed `dpkg` leaves half a record) it is parked as `status.broken` and replaced from dpkg's own previous generation, or — with no `status-old` to hand — out of the pinned archive | Nothing when dpkg's own copy is the source: it is the same database one write ago, so nothing has to be reinstalled. The archive's copy is the base system's records and nothing else, so packages the user installed read as not-installed while their files stay on disk; reinstalling them with apt restores the record. A database no source can supply stops the ladder instead (`PackageDatabaseUnreadable`) — the honest exit is uninstall with *keep my files*, then install |
-| Set up again | The setup pipeline again: `apt-get update`, the dpkg prologue (which restores any of dpkg's own programs that are really gone, out of the pinned archive), the base packages | Time — and no download: the prologue's restores read the archive the install kept on disk |
+| Set up again | The setup pipeline again: `apt-get update`, the dpkg prologue (which restores any of dpkg's own programs that are really gone, out of the pinned archive), the base packages — and never the [preinstalled extras](#preinstalling-apps), which a repair does not carry: they are either on disk already or the user's own to add, and neither is a repair's business | Time — and no download: the prologue's restores read the archive the install kept on disk |
 | Clear apt's own state | The one rung whose evidence is the failure that came *before* it, which is why it sits below the setup run rather than above it. apt's `lists` and the packages already downloaded are given up only when that run failed over them: apt naming its own bookkeeping (`Hash Sum mismatch`, `unable to parse package file`, a merge list it will not read) or the host seeing the shape of it (a `lists/partial` with anything in it, an index file of zero bytes). A failure that names neither leaves both trees exactly where they are, and the ladder moves on to the rungs below | The lists cost one `apt-get update` to rebuild, and with them gone that update is a full re-index — `main restricted universe multiverse` over three suites, tens of megabytes. The downloaded packages cost every byte apt has to fetch again, so they go only when apt said the bytes themselves were wrong. Then the setup pipeline runs again |
 | Restore what the archive says is missing | One pass over the pinned tarball comparing presence, kind and the executable bit against the rootfs, then the absent members written back | Nothing: the members come from the archive the install already fetched and verified and that is now kept on disk |
 | Rewrite the base system | Every member the pinned archive carries, written over whatever the rootfs holds at that name — the repair for damage no file-level scan can name (a library replaced by something that does not load) | The base system's own bytes, written from the archive on disk; installed packages stay installed |

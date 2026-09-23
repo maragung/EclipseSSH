@@ -173,6 +173,7 @@ STEP_SUBTITLES = (
     "Configuring package sources",
     "Updating package lists",
     "Installing the base packages",
+    "Installing the extra packages",
     "Running the health check",
 )
 

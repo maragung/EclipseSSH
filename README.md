@@ -39,8 +39,9 @@ RFB or RDP is driven from the app that already holds its credentials.
 — installed into the app's own sandbox and run under proot: no VM, no rooted device, no ISO, and a
 local shell that is the same terminal channel an SSH one is. That shell is proot's fake root, which
 is what lets `apt install` unpack packages and `su` change identity without the device ever being
-rooted. Anything past the base (Python, Node.js, an editor, a compiler) is one `apt-get install`
-away inside the terminal. Its tree is browsable too: while the userspace is running, **Ubuntu on
+rooted. Anything past the base — Python, Node.js, the build tools, an editor, the coding agents — is
+a checkbox on the install dialog, and one `apt-get install` away inside the terminal for anything
+that list does not carry. Its tree is browsable too: while the userspace is running, **Ubuntu on
 this device** appears in the Files tab as a session of its own, so the workspace is edited, renamed,
 copied in and out and searched the way a host's files are — with guest paths in every row, never the
 sandbox's. The whole userspace is portable: **Export** writes it — the base system, everything `apt`
@@ -211,7 +212,7 @@ is 28).
 
 ## Tests
 
-The suite is 2,019 JVM/Robolectric test methods in 177 test files and contacts nothing off the
+The suite is 2,034 JVM/Robolectric test methods in 178 test files and contacts nothing off the
 machine: the SSH and SFTP integration tests start a real Apache MINA SSHD server on a loopback port
 inside the test JVM, and a second class dials a real OpenSSH `sshd` that the `test` job starts on
 loopback first (`tools/local-sshd.sh`, because interop bugs live in the gap an in-JVM server cannot

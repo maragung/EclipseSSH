@@ -23,6 +23,7 @@ import dev.eclipse.ssh.linux.LinuxDistro
 import dev.eclipse.ssh.linux.LinuxUserspaceManager
 import dev.eclipse.ssh.linux.LinuxUserspaceState
 import dev.eclipse.ssh.linux.LinuxUserspaceState.NotInstalled
+import dev.eclipse.ssh.linux.OptionalPackage
 import dev.eclipse.ssh.linux.RootfsTransferState
 import dev.eclipse.ssh.linux.UserspaceDiagnosticEvent
 import java.io.IOException
@@ -317,8 +318,16 @@ class LinuxUserspaceController @Inject constructor(
      */
     fun selectDistro(distroId: String): Boolean = graphProvider.selectDistro(distroId)
 
-    /** Installs the userspace from scratch: download, verify, extract, set up, verify health. */
-    fun install() = act("Install") { _installWarnings.value = it.install().warnings }
+    /**
+     * Installs the userspace from scratch: download, verify, extract, set up, verify health.
+     *
+     * [extras] are the optional packages the install dialog's checkboxes hold — see
+     * [OptionalPackage]. Passed through rather than stored, because they describe *this* install
+     * and not the userspace: they are what the user asked for at the moment they asked, and a
+     * controller field holding them would arm a later Repair with a selection nobody re-confirmed.
+     */
+    fun install(extras: List<OptionalPackage> = emptyList()) =
+        act("Install") { _installWarnings.value = it.install(extras).warnings }
 
     /** Starts the userspace: verifies health, then holds it open for terminal sessions. */
     fun start() = act("Start") { it.start() }
