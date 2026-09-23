@@ -231,12 +231,17 @@ class UbuntuE2eVerificationTest {
     @Test
     fun sessionRunsAsRoot() {
         assumeWritePhase()
-        val whoami = sessionSucceeds("whoami").trim()
-        check(whoami == "root") {
-            "ACCOUNT stage: whoami is '$whoami', expected 'root' - without uid 0 the shell cannot " +
-                "install packages or su to anything"
+        // The answer line, not the whole capture — the same reading the app's health probe makes,
+        // asserted here so the two cannot drift apart. proot writes its teardown notes to this same
+        // pty *after* the command has answered, and a captured transcript read whole is why a
+        // correctly-root session was once reported as "not root".
+        val whoami = sessionSucceeds("whoami")
+        val account = whoami.answerLine()
+        check(account == "root") {
+            "ACCOUNT stage: whoami is '$account', expected 'root' - without uid 0 the shell cannot " +
+                "install packages or su to anything. Capture was: ${whoami.take(500)}"
         }
-        val uid = sessionSucceeds("id -u").trim()
+        val uid = sessionSucceeds("id -u").answerLine()
         check(uid == "0") { "ACCOUNT stage: id -u is '$uid', expected 0" }
     }
 
@@ -274,11 +279,11 @@ class UbuntuE2eVerificationTest {
     @Test
     fun suReachesTheTargetAccount() {
         assumeWritePhase()
-        val asRoot = sessionSucceeds("su root -c 'id -u'").trim()
+        val asRoot = sessionSucceeds("su root -c 'id -u'").answerLine()
         check(asRoot == "0") { "SU stage: 'su root -c id -u' answered '$asRoot', expected 0" }
         // And the way back down to the account that owns every file, which is the only other
         // identity this rootfs has: the app's own uid, registered as `ubuntu`.
-        val asUbuntu = sessionSucceeds("su ubuntu -c 'whoami'").trim()
+        val asUbuntu = sessionSucceeds("su ubuntu -c 'whoami'").answerLine()
         check(asUbuntu == "ubuntu") {
             "SU stage: 'su ubuntu -c whoami' answered '$asUbuntu', expected 'ubuntu'"
         }
@@ -287,7 +292,7 @@ class UbuntuE2eVerificationTest {
     @Test
     fun workingDirectoryIsTheUbuntuHome() {
         assumeWritePhase()
-        val pwd = sessionSucceeds("pwd").trim()
+        val pwd = sessionSucceeds("pwd").answerLine()
         check(pwd == "/home/ubuntu") { "WORKDIR stage: pwd is '$pwd', expected /home/ubuntu" }
     }
 

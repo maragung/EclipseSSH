@@ -1,0 +1,149 @@
+remove a symlink without chmod in the temp cleanup
+
+0005 reaches the loader through a symbolic link named after the program
+being executed, in a private temporary directory
+("$PROOT_TMP_DIR/exec-<pid>-XXXXXX"), because AT_EXECFN is the path as
+*given* to execve(2).  When that directory is removed, clean_temp_cwd()
+(src/proot/src/path/temp.c) chmods every entry 0700 before unlinking it
+-- and chmod(2) follows a symbolic link.  The link's target is
+PROOT_LOADER: a file the platform allows to be execve(2)'d, which is
+not the same as a file the app may chmod(2).  On Android the loader
+lives in the native library directory, where execve(2) is permitted and
+chmod(2) is not, so every launch of every program printed five lines:
+
+    proot warning: cant chmod 'bash': Permission denied
+    proot warning: cant chmod 'run-parts': Permission denied
+    proot warning: cant chmod 'locale-check': Permission denied
+    proot warning: cant chmod 'whoami': Permission denied
+    proot error: cant remove '/data/data/dev.eclipse.ssh/files/linux/tmp/exec-8254-bervFx': Directory not empty
+
+The `continue` on the failed chmod skips the unlink() below it, so the
+directory is left still holding the links and the rmdir(2) that follows
+fails ENOTEMPTY.  The four warnings are the four programs whose links
+the session had made; the leak is one directory per proot process --
+every session, every setup step, every health probe -- and nothing ever
+removes it, because it is named after a pid that will not run again.
+
+The rule the fix restores is the plain one: a failed chmod is not a
+reason to skip an unlink.  A symbolic link has no mode of its own on
+Linux -- chmod(2) follows it, so what it would change is the file the
+link names, which for a loader link is a file this process was never
+allowed to change.  unlink(2) asks the containing directory for
+permission instead, and that directory is this process' own.  So an
+entry that is a link is unlinked as a link, and never chmod'ed.
+
+Links are recognized by d_type where the filesystem fills it in, and
+by lstat(2) where it does not (DT_UNKNOWN), so a link on a filesystem
+that leaves d_type empty does not leak identically.  The recursion test
+is left as `entry->d_type == DT_DIR`, which is already false for
+DT_LNK: a link to a directory is unlinked rather than entered.
+
+Evidence, x86_64 Linux, the pinned fork + this patch set, the pinned
+amd64 26.04 rootfs.  The reproducing trick is to point PROOT_LOADER at
+a root-owned file this user may not chmod (0755 root => EPERM; Android
+refuses with EACCES, and either way the call fails and the entry is
+skipped).  That is also why 0005's own host evidence never saw this:
+the host's libproot-loader.so is owned by the user running proot, so
+the chmod succeeds there and nothing leaks.  The loader is therefore
+not a working loader in this proof and the guest process dies, which is
+the `vpid 1: terminated with signal 11` line and is expected; the lines
+that matter are the two below it.
+
+    $ T=/tmp/leak; mkdir -p $T; cd /tmp
+    $ PROOT_TMP_DIR=$T PROOT_LOADER=/usr/bin/true proot-before -r rootfs-amd64 -0 /usr/bin/true
+    proot info: vpid 1: terminated with signal 11
+    proot warning: cant chmod 'true': Operation not permitted
+    proot error: cant remove '/tmp/leak/exec-3779996-GypsGV': Directory not empty
+    $ find $T -mindepth 1
+    /tmp/leak/exec-3779996-GypsGV
+    /tmp/leak/exec-3779996-GypsGV/true       # -> /usr/bin/true
+
+    $ PROOT_TMP_DIR=$T PROOT_LOADER=/usr/bin/true proot-after -r rootfs-amd64 -0 /usr/bin/true
+    proot info: vpid 1: terminated with signal 11
+    $ find $T -mindepth 1        # nothing: neither warning, and no leftover
+
+`before` and `after` are the same pristine extract of the pinned fork
+with 0001..0005 applied, differing only by this patch, and are built on
+the host with the fork's own GNUmakefile:
+
+    $ cd src/proot/src && make clean
+    $ CPPFLAGS="-I/tmp/proothost/work/config \
+        -I/tmp/proothost/talloc-2.4.2 \
+        -I/tmp/proothost/talloc-2.4.2/lib/replace \
+        -I/tmp/proothost/work -I/tmp/proothost/shim" \
+      LDFLAGS="-L/tmp/proothost/work" GIT=true make -j2
+
+The include paths are the talloc 2.4.2 source, the config.h and
+libtalloc.a built from it (both under /tmp/proothost/work), and a
+linux/ashmem.h this glibc host's headers lack.  An android build
+passes the same two variables into the same makefile; the flags it
+uses are in linux/build.gradle.kts.
+
+What this does not fix, and should not be read as fixing: a proot that
+is SIGKILLed still leaves its whole temp directory behind, because the
+directory is removed by talloc destructors and a killed process runs
+none.  The app reclaims those by name.  This patch is about the
+directories a proot that exits normally leaves.
+
+Nor does it change the treatment of a *real* directory that a
+filesystem reports as DT_UNKNOWN: the recursion test still asks for
+DT_DIR, so such a directory falls through to unlink(2), fails EISDIR
+and warns.  That is pre-existing upstream behaviour, it is not what
+this app hits (links are the only entries an "exec" directory holds),
+and it is deliberately out of scope here.
+
+Not upstreamed: no write access to oonid/pr; applied by
+fetchLinuxSource in linux/build.gradle.kts (stacks on 0005).
+--- a/src/proot/src/path/temp.c
++++ b/src/proot/src/path/temp.c
+@@ -96,6 +96,7 @@
+ 
+ 	while (1) {
+ 		struct dirent *entry;
++		int is_link;
+ 
+ 		errno = 0;
+ 		entry = readdir(dir);
+@@ -106,11 +107,37 @@
+ 		    || strcmp(entry->d_name, "..") == 0)
+ 			continue;
+ 
+-		status = chmod(entry->d_name, 0700);
+-		if (status < 0) {
+-			note(NULL, WARNING, SYSTEM, "cant chmod '%s'", entry->d_name);
+-			nb_errors++;
+-			continue;
++		/* A symbolic link's own mode is meaningless on Linux:
++		 * chmod(2) follows the link, so what it would change is
++		 * the file the link names, not the link itself.  For the
++		 * loader links an "exec" directory holds, that file lies
++		 * at a path this process is allowed to execve(2) but not
++		 * to chmod(2), so the call fails and -- before this test
++		 * existed -- the entry was left behind.  unlink(2) asks
++		 * the containing directory for permission instead, and
++		 * this process made that directory.  So a link is
++		 * unlinked and never chmod'ed, and a chmod that would
++		 * fail is no reason to skip the unlink.  */
++		if (entry->d_type == DT_LNK)
++			is_link = 1;
++		else if (entry->d_type == DT_UNKNOWN) {
++			struct stat entry_stat;
++
++			/* A filesystem that does not fill in d_type
++			 * would leak the same way.  */
++			status = lstat(entry->d_name, &entry_stat);
++			is_link = (status == 0 && S_ISLNK(entry_stat.st_mode));
++		}
++		else
++			is_link = 0;
++
++		if (!is_link) {
++			status = chmod(entry->d_name, 0700);
++			if (status < 0) {
++				note(NULL, WARNING, SYSTEM, "cant chmod '%s'", entry->d_name);
++				nb_errors++;
++				continue;
++			}
+ 		}
+ 
+ 		if (entry->d_type == DT_DIR) {

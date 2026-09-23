@@ -29,13 +29,13 @@ targetSdk 29+ fixes, pinned to an exact commit in `linux/build.gradle.kts`:
   (LGPL-3.0, SHA256-verified by the build)
 
 **Corresponding source**: the two tarballs above, at the versions and hashes
-pinned in `linux/build.gradle.kts`, **together with the five patches in
+pinned in `linux/build.gradle.kts`, **together with the six patches in
 `linux/proot-patches/`**. The tarballs are inputs, not the whole source:
-`fetchLinuxSource` extracts the fork, applies `0001`–`0005` in filename order,
+`fetchLinuxSource` extracts the fork, applies `0001`–`0006` in filename order,
 and only then does the module compile — so `libproot.so` is built from the fork
 *as patched*, and for a GPL-2.0 binary those patches are part of the
 corresponding source. Checking out this repository and running the `:linux`
-build downloads the fork, hash-verifies it, applies those five patches and
+build downloads the fork, hash-verifies it, applies those six patches and
 compiles exactly those bytes. (The build records what it applied in a
 `.patches-applied` fingerprint over every patch name and hash, so a tree that
 was built from different patches cannot pass as this one.)

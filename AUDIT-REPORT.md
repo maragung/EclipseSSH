@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §65, *Releasing 1.9.0*; the newest of them that releases a version is §65, *Releasing 1.9.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §66, *A proot that exited cleanly leaked a directory each launch, and the probe read proot's own words as the answer*; the newest of them that releases a version is §65, *Releasing 1.9.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7401,3 +7401,161 @@ repair` is `skipped`, which is its normal state on a release event.
 
 So the paragraph above stands with one correction: this release's `x86_64` split has now been run on a
 device at two API levels. The `arm64-v8a` split still has not been, and nothing here installs it.
+
+---
+
+## 66. A proot that exited cleanly leaked a directory each launch, and the probe read proot's own words as the answer
+
+The report was a phone's Health check, pasted whole:
+
+> Health check / the session runs as 'root / proot warning: cant chmod 'bash': Permission denied (+
+> run-parts, locale-check, whoami) / proot error: cant remove
+> '/data/data/dev.eclipse.ssh/files/linux/tmp/exec-8254-bervFx': Directory not empty' / instead of
+> 'root', an interrupted package operation left its lock behind (var/lib/dpkg/lock,
+> var/lib/dpkg/lock-frontend) - Repair clears it
+
+**Two of the three complaints are one bug, and the app's own proot patch made it. The third is a correct
+diagnosis the ladder already acts on.**
+
+The lock sentence is `HealthReport.describe()`'s own, the file is a stale lock a killed `apt` left, and
+rung L has cleared those since §61 — nothing about it changes here. It reads as a defect only because the
+transcript ran it together with the line above it, which *is* one: a userspace that answered `root` and
+had nothing else wrong with it was reported as **not** root, in a sentence quoting proot's own four
+warnings back at the user, and `healthy` withheld the host card over it.
+
+### The leak, and why the host never saw it
+
+proot patch `0005` — the one that lets the guest's loader be executed under the program's own name —
+reaches the loader through a **symbolic link named after the program**, in a private directory of its
+own: `get_loader_exec_path()` → `create_temp_directory(NULL, "exec")` →
+`$PROOT_TMP_DIR/exec-<pid>-XXXXXX`. The link's target is `<nativeLibraryDir>/libproot-loader.so`, and
+that is a path the platform allows the app to `execve(2)` and not to `chmod(2)` — which is the whole
+reason the loader lives there.
+
+At exit, `clean_temp_cwd()` (`src/proot/src/path/temp.c`, entered from `remove_temp_directory2()`) chmods
+every entry `0700` *before* unlinking it, so that an entry which is not removable as it stands becomes
+removable. `chmod(2)` follows a symlink, so the call landed on the loader, the platform refused it, and
+the code did what its own error path says:
+
+```c
+status = chmod(entry->d_name, 0700);
+if (status < 0) {
+	note(NULL, WARNING, SYSTEM, "cant chmod '%s'", entry->d_name);
+	nb_errors++;
+	continue;                      /* ← the unlink below never runs */
+}
+...
+	status = unlink(entry->d_name);    /* skipped for every entry that failed */
+```
+
+The `rmdir(2)` that follows therefore found the directory still holding its links and answered
+`ENOTEMPTY`: `proot error: cant remove '…/tmp/exec-8254-bervFx': Directory not empty`. **One directory
+per proot process** — every session, every setup step, every health probe — with four warning lines and
+one error line per launch, for ever: the directory is named after a pid that will not run again, and
+nothing was looking for it.
+
+**Why two releases shipped without this being seen is the more useful half of the finding.** On the host,
+`libproot-loader.so` is owned by the user running proot, the chmod *succeeds*, the unlink runs, and
+nothing leaks — which is exactly what `0005`'s own evidence recorded. The bug needs a loader the process
+may not chmod, and that is a fact about Android's native library directory and about nothing on a
+developer machine. It is reachable there deliberately, and that is how `0006` was proven rather than
+argued: point `PROOT_LOADER` at a root-owned file (`/usr/bin/true`), and the alias symlink fails its
+chmod with `EPERM`, the same `continue` skips the same `unlink`, and the same two messages appear over
+the same leaked `exec-*` directory — `cant chmod 'true': Operation not permitted` and
+`cant remove '/tmp/leak/exec-3779996-GypsGV': Directory not empty`. Android answers `EACCES` where the
+host answers `EPERM`; either way the call fails and the entry is skipped.
+
+### The same leak, read through the probe
+
+`healthProbe()` took the capture whole: `val account = whoami?.outputText()?.trim()`. `outputText()` is
+documented as stdout **and stderr** interleaved on one pty, proot's diagnostics and the command's answer
+share it, and proot writes *last* — at teardown, after the command has already answered. So the "account
+name" was `root` followed by proot's five lines; `accountCorrect = account == ROOT_ACCOUNT` was false;
+and `describe()` pasted the whole blob into `the session runs as '…' instead of 'root'`. `account` was
+also the only pty-derived field in that report not passed through `stripEscapes`, and no test fed the
+probe a contaminated capture — which is why the suite never saw it either.
+
+### What changed
+
+**The patch.** `linux/proot-patches/0006-remove-a-symlink-without-chmod-in-the-temp-cleanup.patch`
+unlinks a link instead of chmod'ing it, and keeps the chmod for everything else:
+
+```c
+if (entry->d_type == DT_LNK)            is_link = 1;
+else if (entry->d_type == DT_UNKNOWN) { lstat(entry->d_name, &st); is_link = S_ISLNK(st.st_mode); }
+else                                    is_link = 0;
+
+if (!is_link) { status = chmod(entry->d_name, 0700); if (status < 0) { …unchanged… } }
+if (!is_link && entry->d_type == DT_DIR) { …recurse and rmdir, as before… }
+else                                     { status = unlink(entry->d_name); }
+```
+
+The rule it restores is the plain one: **a chmod that fails is not a reason to skip an unlink.** A link's
+own mode is meaningless on Linux — `chmod(2)` follows the link, so the call was never about the link at
+all — while `unlink(2)` asks the *containing* directory, which is this process's own and is where the
+permission that matters lives. The `!is_link` on the recursion branch matters for the same reason in the
+other direction: `d_type` is `DT_LNK` for a symlink *to a directory*, but `DT_UNKNOWN` on a filesystem
+that does not fill it in, and the old code would then `chdir` into the link and empty its target. The
+`lstat` arm exists for exactly that filesystem; a *real* directory reported as `DT_UNKNOWN` is left as it
+was upstream, and the patch's preamble says so rather than pretending the case is handled.
+
+**The reading.** `UserspaceDiagnostics.answerLine()` is now the one place "what did this command answer"
+is decided: strip the pty's escapes, drop the lines matching `PROOT_ERROR` — the regex
+`UserspaceFailure` already used to recognise proot's own text inside an `apt` failure, promoted to
+`internal` for this second reader — and take the **last** line left. Last and not first, because the
+noise that comes *before* an answer is the ordinary kind (every one of these commands runs through
+`bash --login`, and a login profile may print a banner), while proot's diagnostics arrive *after* it.
+`healthProbe` reads `account` through it, and so do the five places in `UbuntuE2eVerificationTest` that
+compared a whole capture against a literal.
+
+**The litter already on disk.** `RuntimeStorageManager.sweepOrphanTempDirs()` deletes the entries under
+`tmp/` that match proot's own naming — `<prefix>-<pid>-<six>`, from its `create_temp_name`, which is
+where the `exec-8254-bervFx` shape comes from — **only when `/proc/<pid>` is gone**: the pid is in the
+name proot itself chose, so liveness here is a fact rather than a guess, and a live session's directory
+can never be swept. It also takes `.probe-*` files older than an hour, which are `ensureReady`'s own and
+survive only a killed call. Deletion goes through `TarSafety.deleteTreeNoFollow`, the primitive that
+never follows a symlink, because a symlink is precisely what is in there. It is called from two places:
+`LinuxUserspaceManager.start()`, which is the sweep a *healthy* userspace gets — such a one is never
+offered Repair — and rung L, which reports what it cleared (*cleared 3 leftover proot scratch directories
+from launches that are over*) and records it in the diagnostics ring.
+
+### Decisions worth stating
+
+**No new `HealthReport` field, and no gating on the residue.** After `0006` nothing accumulates; what
+remains is empty directories that stop nothing. `healthy`'s stated bar is the userspace being unable to
+do the one thing it exists for, and gating the host card on harmless residue would recreate exactly the
+false alarm this change removes. The visible half is the repair's own sentence.
+
+**Not from `ensureReady()`.** That method's contract is "the directories exist and `tmp` is writable", it
+sits on the path of every spawn including the health probe's own, and a sweep there would be a side
+effect of a method whose `Result` is about storage being usable — and would erase the state before
+anything could report it.
+
+**The sweep has no injectable liveness predicate, contrary to the plan it was written from.** The plan
+called for one, so that a test could plant a dead pid. The tests do better without it: they *find* a pid
+nothing runs by scanning `/proc` for a hole (`TestPids.nothingRuns`) and use this JVM's own pid for the
+live case, so the predicate under test is the production one — a single `File("/proc/$pid").exists()` —
+rather than a lambda the test also wrote. That is the deviation, and it is the reason the tests can fail
+for a real reason rather than for the reason the test author chose.
+
+### What is verified, and what is not
+
+Verified here: the patch applies cleanly to a fresh extract of the pinned fork in `0001`–`0006` filename
+order (`patch -p1 --batch --forward`, no offsets and no fuzz), the tree it produces compiles, and the
+host before/after above — the leak reproduced through a loader the process may not chmod, and gone with
+`0006` applied. The JVM suites and the re-derived document figures run in CI.
+
+The regression test was checked for being what it claims rather than for being green: `account` was put
+back to `whoami?.outputText()?.trim()` and the class re-run, and it failed *alone* — 64 tests, 1 failure,
+the assertion's own message being the device transcript, `expected: root / but was: root` followed by the
+four `proot warning:` lines and the `proot error: cant remove …` line, verbatim. The fix was restored and
+the class re-run green. A test added for a bug it cannot reproduce is a test that will not catch the bug
+coming back.
+
+**Not verifiable here, and worth saying plainly: the real Android path** — SELinux answering `EACCES`
+rather than the host's `EPERM` — and the device health row. The check that closes the loop is a device
+run after a release: launch Ubuntu, confirm the five lines are gone, that the probe reports healthy, and
+that `files/linux/tmp` stops growing `exec-*` directories.
+
+**And this does not reach a device by itself.** Half the fix is native, so it ships in a new APK; cutting
+the release is the separate step that puts it on the phone.

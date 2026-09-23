@@ -1407,6 +1407,40 @@ class UbuntuDistributionManagerTest {
     }
 
     @Test
+    fun `a whoami capture carrying proot's own teardown lines still reports root`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("eclipse-uid=") ->
+                    0 to "eclipse-uid=0\neclipse-path=${UbuntuDistributionManager.LINUX_PATH}\n"
+                command == "echo eclipse-probe-ok" -> 0 to "eclipse-probe-ok\n"
+                // A device's own capture, verbatim: the answer first, then what proot wrote to that
+                // same pty while it tore itself down. Read whole, all six lines are "the account".
+                command == "whoami" -> 0 to
+                    "root\n" +
+                    "proot warning: cant chmod 'bash': Permission denied\n" +
+                    "proot warning: cant chmod 'run-parts': Permission denied\n" +
+                    "proot warning: cant chmod 'locale-check': Permission denied\n" +
+                    "proot warning: cant chmod 'whoami': Permission denied\n" +
+                    "proot error: cant remove " +
+                    "'/data/data/dev.eclipse.ssh/files/linux/tmp/exec-8254-bervFx': " +
+                    "Directory not empty\n"
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.healthProbe()
+
+        // The regression this test exists for, in the user's own words: a userspace that answered
+        // `root` and had nothing else wrong was reported as not root, with proot's four warnings
+        // quoted back inside the sentence, and the host card withheld over it.
+        assertThat(report.account).isEqualTo("root")
+        assertThat(report.accountCorrect).isTrue()
+        assertThat(report.healthy).isTrue()
+        assertThat(report.describe()).isEqualTo("healthy")
+    }
+
+    @Test
     fun `a temporary directory nothing can write to and a stale lock are reported, and both gate`() = runTest {
         val fixture = TestTarballs.writeRootfsFixture(
             Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),

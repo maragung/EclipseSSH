@@ -191,6 +191,11 @@ class LinuxUserspaceManager(
         // Same storage-before-proot rule as install(): the health probe spawns proot, and a tmp
         // directory that cannot be written to is the failure this names early.
         storage.requireReady()
+        // Before any spawn of this run, proot's own scratch directories from launches that are
+        // over: one leaked per launch until proot patch 0006, so a userspace in use for months has
+        // thousands of them. This is the sweep a *healthy* userspace gets — such a one is never
+        // offered Repair, whose rung L clears the same litter and reports how much it cleared.
+        storage.sweepOrphanTempDirs()
         val current = _state.value
         check(current is LinuxUserspaceState.Stopped || current is LinuxUserspaceState.NeedsRepair) {
             "Start is only possible from Stopped or Needs Repair, not $current"
@@ -475,9 +480,9 @@ class LinuxUserspaceManager(
     }
 
     /**
-     * Rung L — the repairs that need nothing but the rootfs: the package locks an interrupted run
-     * left behind, the apt-owned state the next update rebuilds, and the guest directories that
-     * nothing else puts back.
+     * Rung L — the repairs that need nothing but what is already on disk: the package locks an
+     * interrupted run left behind, the apt-owned state the next update rebuilds, the guest
+     * directories that nothing else puts back, and proot's own leftover scratch directories.
      *
      * Each part answers a failure the ladder could otherwise not see. The locks are a *marker* a
      * killed dpkg leaves on disk while the kernel has already dropped the lock itself, so every
@@ -487,7 +492,11 @@ class LinuxUserspaceManager(
      * and `run` are preserved members that no rung writes and no archive overlay replaces, and the
      * setup pipeline's own attempt to create them — `prepareWorkspace` — throws its result away, so
      * a `tmp` that is a *file* and a workspace that is not a real directory both survived every
-     * repair there was, silently.
+     * repair there was, silently. The scratch directories are not the rootfs' at all — proot's
+     * `PROOT_TMP_DIR` is `files/linux/tmp`, beside it — and until patch 0006 an ordinary exit left
+     * one behind per launch, four `proot warning:` lines with it: see
+     * [RuntimeStorageManager.sweepOrphanTempDirs] for the leak and for what makes clearing them
+     * safe.
      *
      * What is deliberately *not* here is apt's own state. This rung used to empty the package cache
      * and the index lists on every repair, whether or not either had anything to do with the failure
@@ -528,6 +537,22 @@ class LinuxUserspaceManager(
             changed = true
             warnings += "recreated the guest's temporary directories: " +
                 temp.joinToString(", ") { "/$it" }
+        }
+
+        val scratch = storage.sweepOrphanTempDirs()
+        if (scratch > 0) {
+            changed = true
+            warnings += if (scratch == 1) {
+                "cleared 1 leftover proot scratch directory from a launch that is over"
+            } else {
+                "cleared $scratch leftover proot scratch directories from launches that are over"
+            }
+            diagnostics.record(
+                UserspaceDiagnosticCategory.PROOT,
+                "cleared leftover proot scratch directories",
+                detail = "removed $scratch under ${storage.tmpDir.name}/, made by processes that " +
+                    "are gone",
+            )
         }
 
         if (workspace.ensureExists()) {

@@ -461,6 +461,30 @@ class LinuxUserspaceManagerTest {
     }
 
     @Test
+    fun `scratch directories a gone proot left are cleared by a repair, and it says how many`() = runTest {
+        val harness = newHarness()
+        harness.manager.install()
+        // One directory per launch: what a proot that exits normally left behind before patch 0006,
+        // holding the loader link its teardown could not remove. The pid is one nothing here runs,
+        // which is the whole of what makes it litter rather than a live session's.
+        val gone = TestPids.nothingRuns()
+        val leaked = File(harness.runtime.tmpDir, "exec-$gone-bervFx").apply { mkdirs() }
+        File(leaked, "bash").writeText("")
+        val downloadsBeforeRepair = harness.downloads
+
+        val report = harness.manager.repair()
+
+        assertThat(harness.manager.state.value).isEqualTo(LinuxUserspaceState.Stopped)
+        assertThat(leaked.exists()).isFalse()
+        assertThat(report.warnings.joinToString("\n"))
+            .contains("cleared 1 leftover proot scratch directory")
+        assertThat(harness.distribution.diagnostics.export())
+            .contains("cleared leftover proot scratch directories")
+        // Local, and therefore free: the litter cost the user no network at all.
+        assertThat(harness.downloads).isEqualTo(downloadsBeforeRepair)
+    }
+
+    @Test
     fun `a setup run that fails over apt's own lists gives them up and runs the pipeline again`() = runTest {
         val harness = newHarness()
         harness.manager.install()
