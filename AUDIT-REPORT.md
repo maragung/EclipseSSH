@@ -6758,8 +6758,10 @@ minor for the opposite pair of reasons: a new Settings row, and a number that st
 
 ### What it carries
 
-The app tree is `0a28357` — #162 merged into `main`, and nothing else — with the version bump and this
-section on top. The change is §61 in full, and its three sentences are these.
+The app tree `v1.8.1` carries is `bdd09ba` — the merge commit of #163, whose tree is identical to the
+branch tip `aaba6a9` it merged (`2b378e44…` both, verified below) — and that tree is `0a28357`, #162
+merged into `main`, plus the version bump and this section. Nothing else. The change is §61 in full,
+and its three sentences are these.
 
 **The install keeps the archive it verified.** `moveIntoPlace` used to delete the 34 MB tarball once the
 rootfs was in place. Every rung at or below *restore missing files* writes base bytes out of exactly
@@ -6821,9 +6823,166 @@ v1.8.0 was signed with, and an install of any of them upgrades to 1.8.1 normally
 
 ### Cutting it
 
-`v1.8.1` is a lightweight tag, the convention v1.7.0 set and v1.8.0 followed, so `git describe
---exact-match HEAD` will not see it either — `tagged-release.yml` passes `--tags`, and the disagreement
-is in the local read and not in the workflow. The tag is cut inside a CI window, for the reason every
-release here is: Actions minutes are free on a public repository and this one is private, and the first
-flip has to come from outside GitHub because a GitHub-hosted runner is the thing the account cannot
-buy — `scripts/ci-window.sh` is that outside.
+**Every push before the window was dead on arrival.** The branch's own push — `aaba6a9` at 23:26:15Z —
+started `ci.yml` as run `35797403365` and `instrumentation.yml` as run `35797403147`, and every job in
+both that was not skipped ended the same way: `steps=0`, an empty `runner_name`, and this annotation on
+the check run, quoted rather than paraphrased:
+
+> The job was not started because recent account payments have failed or your spending limit needs to
+> be increased. Please check the 'Billing & plans' section in your settings
+
+That is the signature §60 and §61 both record, and it is why this release needed a window at all:
+`v1.8.1` cannot be built anywhere else. The checkout's own keystore is the 2026-08-15 regeneration
+(`a75a6fc4…`), and a release signed with it installs on a fresh device while refusing to install over
+anything — the exact failure `tagged-release.yml`'s signer step exists to catch. The canonical key
+(`0c69794b…`) lives only in `RELEASE_KEYSTORE_BASE64`, which only a runner can read.
+
+So the window was opened the way §60 opened one: by hand, from outside GitHub, with the deadline
+recorded **before** the visibility flipped. `CI_WINDOW_DEADLINE` was set to `2026-09-23T03:30:00Z` and
+then `private=false` was sent, so a crash between the two would leave a public repository the cron
+watchdog knows to close rather than one nobody has a record of. The rule was re-applied inside it and
+the read-back is the evidence, not the `PUT` that answered `200`: `/branches/main/protection` returned
+`strict=true`, `enforce_admins=true`, `required_approving_review_count=0` and the seven contexts by
+name. The window was closed at 01:57Z by `scripts/ci-window.sh close`, which verifies the result rather
+than assuming it — *"verified: maragung/EclipseSSH is private again"*, and the deadline variable deleted
+with it.
+
+The rule bound the merge it was applied for. At 00:23Z, with four contexts still pending, `gh pr merge
+163 --merge` was refused outright — *"Pull request maragung/EclipseSSH#163 is not mergeable: the base
+branch policy prohibits the merge"* — and `gh` offered two ways past it, `--auto` and `--admin`. Neither
+was taken: `--admin` exists to defeat the rule, and `enforce_admins: true` is the setting that makes the
+rule mean something on a one-account repository. The merge at 00:52:13Z was made with no flag at all,
+because by then the gate was green.
+
+### The verification
+
+The release branch ran both workflows twice — once as a dispatch, once as the push-event run re-run —
+and the second pair is the one GitHub shows a pull request:
+
+| Run | Job | Result |
+| --- | --- | --- |
+| `ci.yml` `35797403365` (push, re-run) | Documentation figures | success, 6s |
+| | FreeRDP native (4 ABIs) | success, 11m22s |
+| | Lint (release variant) | success, 12m34s |
+| | Unit and integration tests | success, 18m38s |
+| | APKs, AAB and signatures | success, 26m28s |
+| | Boot the built APKs (crash-on-open gate) | success, 3m0s |
+| | Long idle stress test | skipped — the run did not ask for it |
+| | Close the CI window | skipped |
+| `instrumentation.yml` `35797403147` (push, re-run) | connectedAndroidTest | success, 15m21s |
+
+The dispatch pair is the same work a second time — `ci.yml` `35797483114` and `instrumentation.yml`
+`35797485306` — and it differs in exactly one row: its `Close the CI window` job *ran* and failed, in
+3s, because the window it would close was open. That red is by design and it is the reason a `ci.yml`
+run that starts while the window is open ends `failure` as a whole; it is not a required context
+precisely because a job whose purpose is to be absent most of the time can never be a gate.
+
+**A dispatched check suite is invisible to the pull request, and that cost this release an hour.**
+The dispatch runs were green in full — all six `ci.yml` contexts and `connectedAndroidTest` — and
+`gh pr checks 163` still read the *push*-event runs: *Documentation figures* `fail`, *FreeRDP native*
+`fail`, *connectedAndroidTest* `fail`, everything else `skipping`. A `workflow_dispatch` run's check
+suite is not associated with the pull request, so the merge gate never saw it, and `mergeable_state`
+stayed `blocked` with `mergeable: true`. What fixes it is `gh run rerun` on the push-event run: a
+re-run keeps the check-run IDs and therefore the association, which an empty commit or a fresh
+dispatch does not. Both were re-run at 00:11Z and both settled green. The general rule is the one this
+repository keeps re-learning in a new place: **read the checks the platform is reading, not the ones
+that are passing.**
+
+Before the tag, the four suites that own the repair ladder — `LinuxUserspaceManagerTest`,
+`RootfsInstallerTest`, `RootfsRepairTest`, `RootfsLocalRepairTest` — were run locally on this host
+under `nice -n 10 taskset -c 0-1 ./gradlew :app:testDebugUnitTest --offline --no-daemon`, on this
+branch: **61 tests, 0 failures**, in 1m1s. `scripts/check-doc-figures.sh` reports all 159 claims
+agreeing with the build.
+
+### The tag, the draft, and what was checked before it went out
+
+`v1.8.1` is a lightweight tag on `bdd09ba` — the merge commit of #163, whose parents are `0a28357` and
+`aaba6a9` — which is the convention v1.7.0 set and v1.8.0 followed. `git cat-file -t v1.8.1` says
+`commit`, and `git describe --tags --exact-match HEAD` says `v1.8.1`; on a tag this shape the local
+read needs `--tags` and `tagged-release.yml` passes it.
+
+`Tagged release` run `35803936707` built from it and was green in 24m19s, all 23 steps, including the
+two that matter most here: *Verify the build is from a clean tag*, and *Verify which key signed the
+release* — the step that runs `testing/verify-release-signer.sh` against `0c69794b…` so that "a key
+signed this" cannot stand in for "the key signed this". The draft it left, release `394225821` created
+at 00:52:12Z, held all seven assets:
+
+| Asset | Bytes |
+| --- | --- |
+| `app-arm64-v8a-release.apk` | 19,608,526 |
+| `app-armeabi-v7a-release.apk` | 18,700,480 |
+| `app-x86-release.apk` | 18,997,319 |
+| `app-x86_64-release.apk` | 19,372,495 |
+| `app-universal-release.apk` | 32,430,174 |
+| `app-release.aab` | 49,634,593 |
+| `SHA256SUMS.txt` | 567 |
+
+Three checks were run against the draft before anything was published. Two assets were downloaded
+through the API and hashed: `app-x86_64-release.apk` and `app-arm64-v8a-release.apk` both read `OK`
+against the sums `SHA256SUMS.txt` carries — the bytes served are the bytes CI built. The APKs' own
+bytes were read for the two facts a checksum cannot prove, with a checker this host can run because it
+parses the v2 signature block and the binary-XML manifest rather than shelling out to `apksigner`
+(there is no SDK here). That checker was **calibrated against the previous release first**: pointed at
+the published `v1.8.0` asset it reports `versionCode=39 versionName=1.8.0` and signer `0c69794b…`,
+which is what §60's validation report independently recorded for that file. Pointed at this draft it
+reports `versionCode=40 versionName=1.8.1` and the same `0c69794b…` on both the x86_64 and the
+arm64-v8a split. Only then was the release published, at 01:18:18Z.
+
+### The release's own validation, green this time
+
+`android-release-test.yml` run `35805740375` was dispatched by the publish at 01:18:19Z, and unlike
+§60's it ended **success** as a whole — this is the first release here whose validation run has no
+billing-dead tail, because the window was still open while it ran. `Resolve the target` 4s,
+`Release APK on API 35` 17m18s, `Release APK on API 30` 20m34s, `Release gate` 4s, `Autonomous repair`
+skipped — skipped, not failed, which is `failure()` behaving as designed for once.
+
+Both legs' reports read `PASS`: **49 tests ran, 0 failed**, the crash scan clean, on
+`bdd09ba32804fe8ddd3ec09a92defc9b459afff2`. Each leg downloaded `app-x86_64-release.apk` from the
+release — the published asset, not a fresh build — and `release-validation.json` names
+`versionCode 40`, `versionName 1.8.1`, the signer `0c69794b…`, and the APK's own SHA-256 as
+`0f7c1ee5fd01c244c2b8ca76cdb0fe09076c3ef7a8821e42a3dc022a5e4e7e87` over 19,372,495 bytes. That sum is
+the one `SHA256SUMS.txt` carries for that file and the one the bytes downloaded here hash to, so the
+chain is complete: what CI built, what the release serves, what the device installed, and what the
+tests ran against are the same bytes.
+
+### The one red that was not the change
+
+The merge commit's own push started `ci.yml`, `instrumentation.yml` and `Release build` on `main`.
+`ci.yml` `35803907701` was green on every real job — documentation, native, lint, the JVM suite, the
+assemble and the boot gate, all `success` — and red as a whole on the closer, which is the by-design
+row above. `Release build` `35803907561` built and signed successfully, and its closer was red the same
+way.
+
+`instrumentation.yml` `35803907410` is the one that needs a paragraph. Attempt 1 failed, and the
+failure is a flake with the same name and the same shape as §60's:
+`ReleaseChaosJourneyTest.theAddHostFormSurvivesARotation` raised
+`ComposeTimeoutException: Condition still not satisfied after 10000 ms` from
+`awaitForeground(ReleaseChaosJourneyTest.kt:110)`, at the cancel step — the same ten-second wait for an
+activity to resume, in the same file §41 left the same class of failure in.
+
+What settles it is not the exception's text but the arithmetic, exactly as §60 argued. The XML reads
+`tests=49 failures=17`. Sixteen of the seventeen are `UbuntuE2eVerificationTest`'s arg-gated
+`AssumptionViolatedException`s — `onlyInsideTheE2ePipeline(UbuntuE2eVerificationTest.kt:71)` — which
+AGP writes as `failure` while the job concludes `success`; every green XML in this repository contains
+those same sixteen. Seventeen minus sixteen is one real failure. And the tree it happened on is
+**identical to a tree that passed twice**: `git rev-parse aaba6a9^{tree} bdd09ba^{tree}` prints
+`2b378e449af47caea690e041e6dfb5eec7b78903` for both, because merging an up-to-date branch adds no
+content, and `connectedAndroidTest` was green on `aaba6a9` in both of the release branch's runs. Attempt
+2 — `gh run rerun --failed`, same run, same tree — was green in 14m58s. The wait was not lengthened, for
+the reason §41 gives: inflating a timeout hides the hang it exists to catch.
+
+### What has not run, and what this release does not claim
+
+**No arm64 device has run this release.** The two validation legs install the `x86_64` split on
+emulators, and that split's bytes are the ones every check above names. The `arm64-v8a` split — the
+ABI most phones actually run — was verified here by signature and manifest metadata and by its presence
+in the draft's sums, and nothing more. Nothing in this repository installs it.
+
+**The repair fix has still not been pressed on a device.** That is §61's own sentence and this release
+does not change it: what is verified is the ladder's logic against fakes that record every command and
+every byte. The claim this release exists to make — break a userspace, press Repair, watch it repair
+*without* downloading the base system — is one a phone has to answer, and no phone has.
+
+**The AAB has not been to Play.** It is built, JAR-signed and attached to the release; its acceptance
+by Google is a thing this repository cannot observe.
+
