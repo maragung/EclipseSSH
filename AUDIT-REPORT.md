@@ -7185,8 +7185,11 @@ only in the check-run annotation, quoted rather than paraphrased because it is t
 > The job was not started because recent account payments have failed or your spending limit needs to
 > be increased. Please check the 'Billing & plans' section in your settings
 
-`v1.8.2`'s tag push starts `tagged-release.yml`, and with the window closed that run dies this way —
-exactly as §60, §61 and §62 each record, and for the same reason. The window is what fixed it for
+`v1.8.2`'s tag push has now started that run, and it died this way. `Tagged release` run `35816847488`,
+created at 04:04:31Z from the tag, holds one job — *Build, sign, and publish* — and that job ran no
+steps, on no runner (`runner_name` empty), and was already over at 04:04:33Z. Those two seconds are the
+whole of what this account can do with a push right now, and they are the same two seconds §60, §61 and
+§62 each record. The window is what fixed it for
 v1.8.1: the repository is flipped public by hand, from
 outside GitHub, because a hosted runner is precisely what the account cannot buy, and minutes are free
 on a public repository. `scripts/ci-window.sh open --yes` is the command; its own header is the argument
@@ -7202,7 +7205,8 @@ a **draft** release with the five APKs, the AAB and their checksums. Publishing 
 deliberate second step, which is what `tagged-release.yml` forces by creating the release as a draft
 "regardless of tag shape", so that a tag alone cannot publish a green build nobody has looked at.
 
-**What this section does not record, because it has not happened:** the run id, the step timings, the
+**What this section does not record, because it has not happened:** the build's own run id, its step
+timings, the
 seven asset sizes and their sums, and the two read-backs §62 describes — an asset downloaded through the
 API and hashed against `SHA256SUMS.txt`, and the APK's own bytes parsed for `versionCode=41`,
 `versionName=1.8.2` and the signer. §62 was finished the same way, a section at a time, and this one
