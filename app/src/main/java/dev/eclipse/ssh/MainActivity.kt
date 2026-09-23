@@ -5471,6 +5471,7 @@ private fun describeSetupStep(step: SetupStep, detail: String?): String {
         SetupStep.CONFIGURE_APT -> "Configuring package sources"
         SetupStep.UPDATE_PACKAGES -> "Updating package lists"
         SetupStep.INSTALL_BASE_PACKAGES -> "Installing the base packages"
+        SetupStep.INSTALL_EXTRA_PACKAGES -> "Installing the extra packages"
         SetupStep.VERIFY -> "Verifying"
     }
     // The newest command output beside the step's label: a slow-but-alive `apt-get update` shows

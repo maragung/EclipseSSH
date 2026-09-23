@@ -108,11 +108,16 @@ class LinuxUserspaceManager(
      * failed restore is a warning, not a failed install: the user still has Ubuntu, and the backup
      * file is left in place for another attempt.
      *
+     * @param extras the optional packages ticked on the install dialog, installed after the base
+     *   system and before the health check — see [UbuntuDistributionManager.setup]'s own parameter.
+     *   Defaulted rather than required because every caller but the dialog means "the base system
+     *   only", which is what an empty list is; a failure among them is a warning on the report, so
+     *   it cannot turn a working userspace into a failed install.
      * @return the setup report's warnings (plus any restore warning)
      * @throws IllegalStateException from any state but NotInstalled/NeedsRepair
      * @throws IOException on any download, verification, extraction or health-check failure
      */
-    suspend fun install(): SetupReport = transition.withLock {
+    suspend fun install(extras: List<OptionalPackage> = emptyList()): SetupReport = transition.withLock {
         // Storage before anything: every proot spawn this install leads to needs PROOT_TMP_DIR to
         // exist and be writable, and failing that here — by name — beats failing it five minutes
         // in as proot's "Permission denied".
@@ -152,7 +157,7 @@ class LinuxUserspaceManager(
                 // setup, where it surfaces as a missing-file error that reads like corruption.
                 check(installer.isExtracted()) { "the extracted rootfs is incomplete - there is nothing to set up" }
                 storage.updateInstallLockPhase("setup")
-                val report = setUpAndVerify(plan, "Ubuntu installed but failed its health check")
+                val report = setUpAndVerify(plan, "Ubuntu installed but failed its health check", extras)
 
                 writeInstalledState()
                 val warnings = (extractionWarnings + report.warnings).toMutableList()
@@ -1120,11 +1125,20 @@ class LinuxUserspaceManager(
      *
      * @param healthFailure the start of the message a failing health check is reported with; the
      *   probe's own [HealthReport.describe] completes it
+     * @param extras the optional packages this run installs beyond the base system. Passed through
+     *   from [install] and empty everywhere else — a repair restores what is broken, and the extras
+     *   are not broken: they are either on disk already, or the user's own to add. Repairing a
+     *   userspace must not re-download a toolchain on a metered connection because a *previous*
+     *   install was told to.
      * @throws IllegalStateException when the health check fails — the install is not done until the
      *   environment has been proven usable, and a report that says otherwise would be the exact
      *   "it installed" / "it works" conflation the pipeline exists to refuse
      */
-    private suspend fun setUpAndVerify(plan: InstallPlan, healthFailure: String): SetupReport {
+    private suspend fun setUpAndVerify(
+        plan: InstallPlan,
+        healthFailure: String,
+        extras: List<OptionalPackage> = emptyList(),
+    ): SetupReport {
         // The step the progress line belongs to: onStep and onProgress arrive as separate callbacks,
         // and the emitted state must carry both. The within-step fraction is the *highest* apt has
         // reported for the current step, never the latest: apt redraws its bar many times a second
@@ -1151,6 +1165,7 @@ class LinuxUserspaceManager(
                     plan,
                 )
             },
+            extras = extras,
         )
         storage.updateInstallLockPhase("health")
         _state.value = LinuxUserspaceState.Installing(LinuxInstallStep.VerifyingHealth, plan)

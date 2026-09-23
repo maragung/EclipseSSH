@@ -28,9 +28,12 @@ import org.junit.Test
  * ladder at all.
  *
  * The install's contents are pinned here too: one apt command naming the twelve base packages, all
- * of them from the archive the ladder picked — the NodeSource entry and the npm globals that used
- * to follow it are gone with the curated toolchain (a product decision, 2026-09-18), so no step in
- * the setup path reaches a third-party registry any more.
+ * of them from the archive the ladder picked, and — separately — the packages the install dialog's
+ * checkboxes can add. The 2026-09-18 decision this file used to record (no NodeSource entry, no npm
+ * globals, no step reaching a registry outside the archive) still holds for every install that
+ * ticked nothing, which is what the "and nothing else" test below pins; what the checkboxes add is
+ * a step that exists only for a user who asked for it, and whose failures are warnings rather than
+ * a failed install.
  */
 class UbuntuDistributionManagerTest {
 
@@ -832,11 +835,229 @@ class UbuntuDistributionManagerTest {
             "apt-get install -y --no-install-recommends " +
                 "apt-utils bash-completion ca-certificates cron curl git htop openssh-client sudo unzip wget zip",
         )
-        // And no third-party registry in the path: the NodeSource entry and the two npm globals
-        // that used to be here are gone with the curated toolchain, so a `deb.nodesource.com`
-        // outage can no longer decide whether "Ubuntu" installed.
+        // And no third-party registry in the path, because nothing was ticked on the dialog: the
+        // NodeSource route and the npm globals exist only for an install that asked for them, so a
+        // `deb.nodesource.com` outage still cannot decide whether "Ubuntu" installed.
         assertThat(commands.none { "nodesource" in it || it.startsWith("npm install") }).isTrue()
         assertThat(commands.none { "python3" in it || "pnpm" in it || "opencode" in it }).isTrue()
+    }
+
+    // ------------------------------------------------------------------ the preinstall checkboxes
+
+    /**
+     * A tick is the only thing that starts the extras step, and no tick means the step is not even
+     * announced: the percentage the user watches must not include a step that holds no work.
+     */
+    @Test
+    fun `an unticked install neither runs nor announces the extras step`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        val steps = mutableListOf<SetupStep>()
+
+        harness.distribution.setup(onStep = { steps += it })
+
+        assertThat(steps).contains(SetupStep.INSTALL_BASE_PACKAGES)
+        assertThat(steps).doesNotContain(SetupStep.INSTALL_EXTRA_PACKAGES)
+        assertThat(harness.scripted.commands.any { it.startsWith("npm ") }).isFalse()
+    }
+
+    /**
+     * The whole path for one ticked agent: its packages from the archive, its runtime measured, and
+     * itself from npm — with the archive's Node.js accepted when it is new enough, which is the
+     * branch that must not reach NodeSource at all.
+     */
+    @Test
+    fun `a ticked agent installs its packages and its npm global`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command == "node --version") 0 to "v24.4.1\n" else baseline(command)
+        }
+        val steps = mutableListOf<SetupStep>()
+
+        val report = harness.distribution.setup(
+            onStep = { steps += it },
+            extras = listOf(OptionalPackage.OPENCODE),
+        )
+
+        assertThat(steps).contains(SetupStep.INSTALL_EXTRA_PACKAGES)
+        assertThat(harness.scripted.commands)
+            .contains("apt-get install -y --no-install-recommends nodejs npm")
+        assertThat(harness.scripted.commands).contains("npm install -g opencode-ai")
+        // A Node.js that is already new enough is not upgraded: the third-party repository is not
+        // touched when the pinned archive has done the job.
+        assertThat(harness.scripted.commands.any { "nodesource" in it }).isFalse()
+        assertThat(report.warnings).isEmpty()
+    }
+
+    @Test
+    fun `an archive node too old for the ticked tools is upgraded from nodesource`() = runTest {
+        val harness = Harness(distro(arch = "arm64", release = "noble"))
+        var versionCalls = 0
+        harness.scripted.respond = { command ->
+            when {
+                // Noble's archive carries 18.19.1 — the measurement that has to be taken, because a
+                // `npm install -g cline` under it would report success over a tool that will not run.
+                command == "node --version" -> {
+                    versionCalls++
+                    if (versionCalls == 1) 0 to "v18.19.1\n" else 0 to "v24.4.1\n"
+                }
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup(extras = listOf(OptionalPackage.CLINE))
+
+        val upgrade = harness.scripted.commands.firstOrNull { "nodesource" in it }
+        assertThat(upgrade).isNotNull()
+        // One command, because each link is a precondition of the next: key, keyring, source line,
+        // then an update scoped to that line — never the ladder's own unscoped update.
+        assertThat(upgrade).contains("gpg --dearmor")
+        assertThat(upgrade).contains("sources.list.d/nodesource.list")
+        assertThat(upgrade).contains("-o Dir::Etc::sourceparts=/dev/null")
+        // The global is installed only after the upgrade, never before it.
+        val commands = harness.scripted.commands
+        assertThat(commands.indexOfFirst { "nodesource" in it })
+            .isLessThan(commands.indexOf("npm install -g cline"))
+        assertThat(report.warnings).isEmpty()
+    }
+
+    /**
+     * The version is read off the version's own line. The command runs under `bash --login`, so
+     * anything the profile scripts print arrives ahead of it — and `Ubuntu 22.04.5` is a major this
+     * code would otherwise have believed, on a guest whose Node.js is really 18.
+     */
+    @Test
+    fun `a banner line does not stand in for the node version`() = runTest {
+        val harness = Harness(distro(arch = "arm64", release = "jammy"))
+        var versionCalls = 0
+        harness.scripted.respond = { command ->
+            when {
+                command == "node --version" -> {
+                    versionCalls++
+                    if (versionCalls == 1) 0 to "Ubuntu 22.04.5 LTS\nv18.19.1\n" else 0 to "v24.4.1\n"
+                }
+                else -> baseline(command)
+            }
+        }
+
+        harness.distribution.setup(extras = listOf(OptionalPackage.CLINE))
+
+        // Read off the banner, 22 clears the tools' floor and this install would have reported
+        // success over a `cline` that cannot run on the 18 underneath it.
+        assertThat(harness.scripted.commands.any { "nodesource" in it }).isTrue()
+    }
+
+    @Test
+    fun `an npm global that refuses is a warning, never a failed install`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            when {
+                command == "node --version" -> 0 to "v24.4.1\n"
+                command.startsWith("npm install -g cline") -> 100 to "npm ERR! 404 Not Found - cline\n"
+                else -> baseline(command)
+            }
+        }
+
+        // Reaching the assertions at all is half the claim: setup() neither threw nor left the
+        // install unfinished over a package the user can add themselves.
+        val report = harness.distribution.setup(extras = listOf(OptionalPackage.CLINE))
+
+        val refusals = report.warnings.filter { it.contains("npm package 'cline'") }
+        assertThat(refusals).hasSize(1)
+        assertThat(refusals.first()).contains("404 Not Found")
+    }
+
+    /**
+     * A disk that is full refuses twenty packages with one sentence, and twenty copies of that
+     * sentence in the "installed with warnings" row is one fact written twenty times — so the
+     * warnings are grouped by what apt said, exactly as the base step's diagnostics are.
+     */
+    @Test
+    fun `extras that will not install are one warning per reason, naming every package`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            when {
+                command.startsWith("apt-get install -y --no-install-recommends ") &&
+                    !command.startsWith(BASE_PACKAGES_COMMAND) ->
+                    100 to "E: You don't have enough free space in /var/cache/apt/archives/.\n"
+                else -> baseline(command)
+            }
+        }
+
+        val report = harness.distribution.setup(extras = listOf(OptionalPackage.BUILD_TOOLS))
+
+        val grouped = report.warnings.filter { it.contains("these extra packages were not installed") }
+        assertThat(grouped).hasSize(1)
+        assertThat(grouped.first()).contains("build-essential")
+        assertThat(grouped.first()).contains("libtool")
+        assertThat(grouped.first()).contains("free space")
+        // The install itself stands: only the extras were lost.
+        assertThat(harness.distribution.isConfigured()).isTrue()
+    }
+
+    /**
+     * The one network phase in the pipeline with no offline gate of its own, and the reason it has
+     * none: the base system is already on disk when it starts. A hard gate here would answer a
+     * connection that dropped at this instant by failing an install whose every other byte landed —
+     * a 30 MB redownload to re-fetch a package the user can add in one apt command. The refusal is
+     * instead apt's own, written into the report as a warning.
+     */
+    @Test
+    fun `a connection that drops before the extras costs the tools, not the install`() = runTest {
+        var online = true
+        val harness = Harness(distro(arch = "arm64"), networkOnline = { online })
+        harness.scripted.respond = { command ->
+            when {
+                // The connection drops once the base system is installed — the latest point at
+                // which the userspace is complete and the extras have not begun.
+                command.startsWith(BASE_PACKAGES_COMMAND) -> {
+                    online = false
+                    baseline(command)
+                }
+                // apt and npm as they answer with no route out.
+                !online && (command.contains("apt-get install") || command.startsWith("npm ")) ->
+                    100 to "E: Failed to fetch http://ports.ubuntu.com/ubuntu-ports/... " +
+                        "Temporary failure resolving 'ports.ubuntu.com'\n"
+                else -> baseline(command)
+            }
+        }
+        val steps = mutableListOf<SetupStep>()
+
+        val report = harness.distribution.setup(
+            onStep = { steps += it },
+            extras = listOf(OptionalPackage.CLINE),
+        )
+
+        // Reaching this line is the claim: `setup()` returned a report rather than throwing the
+        // offline failure the other network phases would have thrown here, and it got to the end of
+        // the pipeline — the base system it had already installed is what the install reports on.
+        assertThat(steps.last()).isEqualTo(SetupStep.VERIFY)
+        assertThat(report.warnings.any { it.contains("nodejs") }).isTrue()
+        assertThat(harness.scripted.commands.any { it.startsWith("npm install") }).isFalse()
+        assertThat(harness.distribution.isConfigured()).isTrue()
+    }
+
+    /**
+     * The NodeSource source line is the one apt list in `sources.list.d` the app wrote itself, and
+     * every setup — every Repair included — retires what it finds there. Retiring this one would
+     * leave the user with the archive's Node.js and no source to upgrade from, so a later
+     * `apt-get upgrade` would walk them backwards past the version this step installed.
+     */
+    @Test
+    fun `a later setup keeps the nodesource line and retires the shipped ones`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        val dir = File(harness.runtime.rootfsDir, "etc/apt/sources.list.d")
+        dir.mkdirs()
+        File(dir, "ubuntu.sources").writeText("Types: deb\n")
+        File(dir, "nodesource.list").writeText(
+            "deb [signed-by=/usr/share/keyrings/nodesource.gpg] " +
+                "https://deb.nodesource.com/node_24.x nodistro main\n",
+        )
+
+        harness.distribution.setup()
+
+        assertThat(File(dir, "nodesource.list").isFile).isTrue()
+        assertThat(File(dir, "ubuntu.sources").isFile).isFalse()
+        assertThat(File(dir, "ubuntu.sources.disabled").isFile).isTrue()
     }
 
     @Test
@@ -1600,6 +1821,17 @@ class UbuntuDistributionManagerTest {
         )
 
     private companion object {
+        /**
+         * The base set's one bulk apt command, spelled out rather than rebuilt from the manager's
+         * own list: the extras tests have to let this one through to reach the step under test, and
+         * a helper that read the constant out of the class would follow it wherever it went — which
+         * is the one thing a test asserting "this command and no other" must not do.
+         */
+        const val BASE_PACKAGES_COMMAND =
+            "apt-get install -y --no-install-recommends " +
+                "apt-utils bash-completion ca-certificates cron curl git htop openssh-client " +
+                "sudo unzip wget zip"
+
         /**
          * How long a wedged read parks before releasing. Bounded so the test terminates on this
          * branch, where the runtime's read loop cannot be cancelled; long enough that the rung's
