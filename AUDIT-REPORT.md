@@ -7118,13 +7118,14 @@ allowed to do, and a repository that ships only when behaviour moves would never
 
 ### What it carries
 
-The app tree `v1.8.2` carries is #166's merge commit — whose tree is identical to the branch tip
-`a16aa3f` it merged, since a release branch cut from `main` and merged back adds no content to it, the
-same shape §62 recorded for #163 — and that tree is `a40aa82`, the merge commit of #165, plus the
-version bump and this section. `git log v1.8.1..main` is four commits and
-no more, which is two pull requests: #164 — `116d7b9` ("Finish §62 with what the release actually did",
-which touched only `AUDIT-REPORT.md`) and its merge `60de87c` — and #165, whose commits are `80bfc66`
-and the merge `a40aa82` above. Nothing else has landed between the two tags.
+`v1.8.2` is the merge commit of #166, `a0f5931`, and its tree is `ea27e458` — #166's own branch tip
+`7a0e684` exactly, because the branch was cut from `main` at `a40aa82` and merged back, so the merge
+adds no content of its own; that is the shape §62 recorded for #163. `7a0e684` is a single commit
+whose parent is `a40aa82`: the version bump and this section, on top of #165's merge. `git log
+v1.8.1..v1.8.2` is six commits and no more, which is three pull requests: #164 — `116d7b9` ("Finish §62
+with what the release actually did", which touched only `AUDIT-REPORT.md`) and its merge `60de87c`;
+#165 — `80bfc66` and its merge `a40aa82`; and #166 — `7a0e684` and its own merge `a0f5931`, the commit
+the tag points at. Nothing else has landed between the two tags.
 
 ### The one code change, and why it cannot change what a user sees
 
@@ -7169,15 +7170,20 @@ every changed file before the push, four `/*` openers against four `*/` closers,
 The signing identity is unchanged. `tagged-release.yml` writes `RELEASE_KEYSTORE_BASE64` onto the runner
 before it signs, so this release carries `0c69794b…`, the identity every release from v1.4.0 through
 v1.8.1 was signed with, and an install of any of them upgrades to 1.8.2 normally. The v1.5.0 exception
-§56 describes is unchanged. **That identity has not been read back yet** — the read-back is the APK's
-own bytes, and it happens when a runner has built them; §62 shows what that check consists of
-(`testing/verify-release-signer.sh`, and this host's own manifest parse calibrated against the previous
-release first). Until the build below has run, this paragraph is what the workflow is configured to do
-rather than what an artifact was observed to carry.
+§56 describes is unchanged. **That identity has been read back, and it holds.** The five release APKs
+were downloaded from the published release and their own bytes parsed on this host by
+`testing/verify-release-artifact.py`: every one reads `versionCode=41`, `versionName=1.8.2` and signer
+`0c69794b7934452bdf1b2f1f345314e13b86ef43f0d17bec9ff260dd30a443be`. The checker is stdlib-only — it
+walks the APK Signing Block to the v2 certificate and the binary-XML manifest for the version, the
+method §62 describes — and it was calibrated against v1.8.1 before it was trusted: that release reads
+`40 / 1.8.1` and the same digest through the same code path. The AAB was checked by a third tool that
+knows nothing of any constant here — `keytool -printcert` on `META-INF/ECLIPSE-.RSA` prints
+`SHA256: 0C:69:79:4B:…:30:A4:43:BE`, serial `d6f3a0731b886293`, subject `CN=EclipseSSH, O=Eclipse,
+C=ID`, the same key and the same serial as v1.8.1's.
 
 ### Cutting it, and where it stands
 
-**No runner has built this yet, and the account cannot start one.** `maragung` is a personal account
+**No runner had built this when this section was written, and the account cannot start one.** `maragung` is a personal account
 and this repository is private, so Actions minutes are billed, and every job the account tries to start
 is refused before its first step — `steps=0`, an empty `runner_name`, about two seconds, and the reason
 only in the check-run annotation, quoted rather than paraphrased because it is the whole diagnosis:
@@ -7185,7 +7191,7 @@ only in the check-run annotation, quoted rather than paraphrased because it is t
 > The job was not started because recent account payments have failed or your spending limit needs to
 > be increased. Please check the 'Billing & plans' section in your settings
 
-`v1.8.2`'s tag push has now started that run, and it died this way. `Tagged release` run `35816847488`,
+`v1.8.2`'s tag push started that run, and it died this way. `Tagged release` run `35816847488`,
 created at 04:04:31Z from the tag, holds one job — *Build, sign, and publish* — and that job ran no
 steps, on no runner (`runner_name` empty), and was already over at 04:04:33Z. Those two seconds are the
 whole of what this account can do with a push right now, and they are the same two seconds §60, §61 and
@@ -7196,19 +7202,59 @@ on a public repository. `scripts/ci-window.sh open --yes` is the command; its ow
 for why the `--yes` is a person's to type, since what making this repository public costs is its entire
 history, to everyone, permanently, and forks and third-party archives copy it within minutes.
 
-**So the release sequence is: this commit, then the tag, then the window.** The bump and this section
-land on `main` first, and the tag is created on that merge commit. The tag is lightweight, the convention
-`v1.7.0` set and `v1.8.0` and `v1.8.1` followed; a lightweight tag is a commit, so `git cat-file -t
-v1.8.2` says `commit` and the local `git describe` needs `--tags`. Then the window opens, and its run
-builds from the tag, asserts `git describe --exact-match` lands on it, verifies the signature, and leaves
-a **draft** release with the five APKs, the AAB and their checksums. Publishing that draft is a
-deliberate second step, which is what `tagged-release.yml` forces by creating the release as a draft
-"regardless of tag shape", so that a tag alone cannot publish a green build nobody has looked at.
+**So the release sequence was: this commit, then the tag, then the window.** The bump and this section
+landed on `main` first, and the tag was created on that merge commit. The tag is lightweight, the
+convention `v1.7.0` set and `v1.8.0` and `v1.8.1` followed; a lightweight tag is a commit, so `git
+cat-file -t v1.8.2` says `commit` and the local `git describe` needs `--tags`. Then the window opened,
+and the run built from the tag, asserted `git describe --exact-match` landed on it, verified the
+signature, and left a **draft** release with the five APKs, the AAB and their checksums. Publishing
+that draft was a deliberate second step, which is what `tagged-release.yml` forces by creating the
+release as a draft "regardless of tag shape", so that a tag alone cannot publish a green build nobody
+has looked at.
 
-**What this section does not record, because it has not happened:** the build's own run id, its step
-timings, the
-seven asset sizes and their sums, and the two read-backs §62 describes — an asset downloaded through the
-API and hashed against `SHA256SUMS.txt`, and the APK's own bytes parsed for `versionCode=41`,
-`versionName=1.8.2` and the signer. §62 was finished the same way, a section at a time, and this one
-will be finished the same way: the release record is written before the release so that the release is
-the thing that has to agree with it.
+**What this section records now that it has happened.** The window was opened, and the run the tag's
+push had started — `35816847488`, created 04:04:31Z — was *rerun* rather than replaced, so attempt 1's
+two seconds and attempt 2's build share one run id. Attempt 2's single job, *Build, sign, and publish*,
+ran on a runner from 04:08:31Z to 04:23:17Z — **14m46s**, all thirty of its steps `success`, and
+13m05s of that is the one step that bundles the AAB and then assembles the per-ABI APKs. The job's
+*Create the GitHub release* step ran from 04:23:02Z to 04:23:12Z, and the release was published at
+04:24:44Z. (The release object's own `created_at` reads 04:04:08Z, twenty-three seconds *before* the tag
+push that started the run — that field tracks the tag, not the draft: a query at 04:16:01Z, while the
+build was still assembling, found no draft at all, and v1.8.1 shows the same shape, `created_at`
+00:52:12Z against a create step at 01:16:48Z.)
+
+Its seven assets, at the sizes the API reports:
+
+| asset | bytes |
+| --- | ---: |
+| `app-arm64-v8a-release.apk` | 19,608,534 |
+| `app-armeabi-v7a-release.apk` | 18,700,456 |
+| `app-release.aab` | 49,634,669 |
+| `app-universal-release.apk` | 32,430,110 |
+| `app-x86-release.apk` | 18,997,299 |
+| `app-x86_64-release.apk` | 19,372,523 |
+| `SHA256SUMS.txt` | 567 |
+
+That is 158,744,158 bytes in total. All six artifacts were then downloaded back through the API and
+hashed: `sha256sum -c SHA256SUMS.txt` answers `OK` six times and exits 0, so the bytes the release
+serves are the bytes CI hashed. Against v1.8.1's six the sizes moved by +8, −24, +76, −64, −20 and +28
+bytes — a version bump's worth, not a behaviour change's, which would move them by kilobytes. The two
+read-backs §62 describes were then run, and both are recorded above in *Why this one can be installed
+over an existing app*: the five APKs' own bytes read `41 / 1.8.2 / 0c69794b…`, and the AAB's signature
+was read by `keytool`, which knows nothing of any constant this repository holds.
+
+**What this release still does not claim.** No arm64 device has run it. The two validation legs install
+the `x86_64` split on emulators, and that split is the one every check above names; the `arm64-v8a`
+split — the ABI most phones actually run — is verified by signature, by manifest identity and by its
+presence in the sums, and by nothing else. Nothing in this repository installs it. The AAB has still not
+been to Play. And the read-back is a reading of files rather than of a device: it says the artifact is
+the right artifact, signed by the right key, which is what an upgrade needs; it does not say that a
+phone has accepted one.
+
+**Two lines in this section were wrong when the tag was cut.** It named `a16aa3f` as the branch tip
+#166 merged — a superseded commit no ref points at, `git branch -a --contains a16aa3f` being empty; the
+tip that merged is `7a0e684`, and the two differ only in this file's §64, seventy seconds apart on the
+same parent. It also called `git log v1.8.1..main` four commits, where the honest range is
+`v1.8.1..v1.8.2` and that range is six. Both are corrected above. The tag's own copy of this file
+carries the uncorrected lines, since a tag cannot be edited to follow; the release body does not,
+because the notes step prints this section's heading rather than its prose.
