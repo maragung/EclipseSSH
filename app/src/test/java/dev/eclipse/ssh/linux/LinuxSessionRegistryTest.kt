@@ -113,6 +113,41 @@ class LinuxSessionRegistryTest {
     }
 
     @Test
+    fun `the live count of other sessions excludes the named one by key, evicted or not`() {
+        val registry = newRegistry()
+        val judged = FakeTerminalChannel()
+
+        registry.register("local-1", judged)
+
+        // The session being judged is the only one registered, so nothing is left to speak for
+        // the userspace and the question answers no.
+        assertThat(registry.liveCountExcept("local-1")).isEqualTo(0)
+
+        val sibling = FakeTerminalChannel()
+        registry.register("local-2", sibling)
+
+        // Two sessions are counted, and the answer is 1: the judged session is excluded by name,
+        // and the sibling is the proof that one bad ending says nothing about the userspace.
+        assertThat(registry.sessionCount.value).isEqualTo(2)
+        val whileJudgedIsStillRegistered = registry.liveCountExcept("local-1")
+        assertThat(whileJudgedIsStillRegistered).isEqualTo(1)
+
+        // The caller is the collector reporting the ending, and the registry evicts the session
+        // from its own supervisor coroutine — two threads with nothing ordering them — so the
+        // named session may or may not still be in the table when the count is asked. Here it is
+        // gone, and the answer must not have moved: this is an exclusion by key, and the same
+        // question read as the count with one subtracted would now answer 0, which is the very
+        // "no other session survives" claim this method exists not to make.
+        judged.end(SessionEnd.ShellEnded(status = 0, signal = null))
+        assertThat(registry.channelFor("local-1")).isNull()
+        assertThat(registry.sessionCount.value).isEqualTo(1)
+
+        val afterJudgedWasEvicted = registry.liveCountExcept("local-1")
+        assertThat(afterJudgedWasEvicted).isEqualTo(whileJudgedIsStillRegistered)
+        assertThat(afterJudgedWasEvicted).isEqualTo(1)
+    }
+
+    @Test
     fun `the earlier name still addresses the renamed registry`() {
         // The deprecated typealias exists so the graph provider and the manager keep compiling at
         // the central merge; this pins that the two names are one type, not two.

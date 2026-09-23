@@ -223,9 +223,17 @@ sealed class UserspaceFailure(
      * from the pin, and a userspace nobody can run is worse than a rebuilt one. The price is real —
      * the packages installed on top of the base system go with it, though the user's own files do
      * not, because the workspace is parked and put back around a rebuild — so the sentence says so
-     * rather than letting it be discovered. Nothing here is written in place: `var/lib/dpkg` is a
-     * preserved member (see [RootfsInstaller.isPreservedMember]), which is why an in-place repair of
-     * it cannot exist and a rebuild is the only route left.
+     * rather than letting it be discovered.
+     *
+     * This type is what says the *in-place* repair has already failed, and that is why it is reached
+     * so late. `var/lib/dpkg` is a preserved member, but its `status` file is the one deliberate
+     * exception to that rule — argued where it is written, in
+     * [RootfsInstaller.restorePackageDatabase] — because a userspace whose package database cannot be
+     * read has no repair path at all: `dpkg --configure -a`, the pass every other rung begins with,
+     * cannot start without it. dpkg's own `status-old` and the archive's copy are both tried there
+     * first, so arriving here means neither was any use, and the rebuild is genuinely what is left.
+     * [RootfsInstaller.isPreservedMember] is why that rung had to argue an exception rather than a
+     * reason the write never happens.
      */
     class PackageDatabaseUnreadable(
         detail: String? = null,

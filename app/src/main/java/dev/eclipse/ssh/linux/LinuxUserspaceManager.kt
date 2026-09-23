@@ -808,16 +808,39 @@ class LinuxUserspaceManager(
             // A device that cannot fork another pty: the rebuild forks them too.
             is UserspaceFailure.TooManyTerminals,
             -> false
-            // ProotLaunchFailed and PackageDbBroken are inside the rootfs' side of the line:
-            // exit 127 is a program that is not there, and a broken package database is what
-            // `dpkg --configure -a` exists for. Both are what the deeper rungs repair. So are the
-            // rungs' own new types — a held package lock (rung L clears it), a hash-mismatched
-            // index (rung L clears the state it lives in), a database that could not be restored in
-            // place (rung D's own last resort is the rebuild, and the archive's copy of the database
-            // is no worse than the archive's copy of everything else), a dpkg subprocess that
-            // failed, and a guest temp directory: the rebuild re-extracts the whole tree, and that
-            // is what puts all five back.
-            else -> true
+            // Everything below is on the rootfs' side of the line — the failures the deeper rungs
+            // are for. Each is named rather than swept up by an `else`, and that is the point: the
+            // rule this function exists to keep is that *every* type has a verdict, and an `else`
+            // would let the eighteenth failure type join the sealed class and become "rebuildable"
+            // without anyone deciding that it was. That is the one mistake here that costs a user
+            // thirty megabytes and a rewrite of a base system that was never broken, so the compiler
+            // is made to ask the question instead. Adding a type to [UserspaceFailure] stops this
+            // `when` compiling until its verdict is written down here.
+            //
+            // ProotLaunchFailed: exit 126/127/128 is the launcher's own answer — a program that is
+            // not there — and putting a program back is what the deeper rungs do. A *hung* smoke
+            // command arrives as the same type with exit -1, and it stays on this side deliberately:
+            // proot heard from not at all is ambiguous between a device that is wedged (where the
+            // rebuild is thirty megabytes that hang identically) and a file in the rootfs that hangs
+            // the guest's own shell (where only a rebuild reaches it), and nothing this app can ask
+            // tells the two apart. What bounds the cost is the ladder's shape rather than this line:
+            // the rungs between here and the rebuild are file-level and cheap, so the expensive
+            // answer is only reached by a rootfs that has already failed all of them.
+            is UserspaceFailure.ProotLaunchFailed,
+            // A broken package database is what `dpkg --configure -a` exists for.
+            is UserspaceFailure.PackageDbBroken,
+            // Rung L clears the lock, and a lock is a file in the rootfs like any other.
+            is UserspaceFailure.PackageLocksHeld,
+            // Rung L clears the state the bad index lives in; nothing outside the rootfs is at fault.
+            is UserspaceFailure.IndexHashMismatch,
+            // Rung D's own last resort is the rebuild, and the archive's copy of the database is no
+            // worse than the archive's copy of everything else.
+            is UserspaceFailure.PackageDatabaseUnreadable,
+            // A dpkg subprocess failing is the package's own script, which the repair pass re-runs.
+            is UserspaceFailure.DpkgSubprocessFailed,
+            // The rebuild re-extracts the whole tree, and that is what puts the directory back.
+            is UserspaceFailure.GuestTmpUnwritable,
+            -> true
         }
     }
 

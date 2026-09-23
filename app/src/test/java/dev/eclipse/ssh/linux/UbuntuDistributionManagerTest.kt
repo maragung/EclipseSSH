@@ -1235,6 +1235,106 @@ class UbuntuDistributionManagerTest {
         assertThat(report.describe()).contains("Repair clears it")
     }
 
+    // ------------------------------------------------------------------ what only the host can see
+
+    @Test
+    fun `a tmp that is a file is reported unhealthy, and the sentence names the directory`() = runTest {
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        // An installer is what makes these two fields answerable at all: they are asked of the guest's
+        // own filesystem, on the host, so a manager built without one reports neither — the honest
+        // answer for a caller that cannot look, and a different test.
+        val harness = Harness(distro(arch = "arm64"), pinnedTarball = fixture)
+        harness.scripted.respond = { command ->
+            when {
+                // Every field a shell can answer passes, so the one fault planted below is the whole
+                // of the report and the sentence is its own words.
+                command.contains("eclipse-uid=") ->
+                    0 to "eclipse-uid=0\neclipse-path=${UbuntuDistributionManager.LINUX_PATH}\n"
+                command == "echo eclipse-probe-ok" -> 0 to "eclipse-probe-ok\n"
+                command == "whoami" -> 0 to "root\n"
+                else -> baseline(command)
+            }
+        }
+        // Both directories are made here, because a missing one is itself a fault this probe reports:
+        // a fixture without them would have two faults, and the sentence below would be about the
+        // fixture rather than about the damage.
+        val rootfs = harness.runtime.rootfsDir
+        File(rootfs, "tmp").mkdirs()
+        File(rootfs, "run").mkdirs()
+
+        // The premise, on the very userspace this test then damages: real temporary directories are
+        // healthy, and both fields behind that verdict are empty rather than merely ungating.
+        val healthy = harness.distribution.healthProbe()
+        assertThat(healthy.healthy).isTrue()
+        assertThat(healthy.unusableTempDirs).isEmpty()
+        assertThat(healthy.staleLocks).isEmpty()
+        assertThat(healthy.describe()).isEqualTo("healthy")
+
+        // A tool that wrote a `touch` where the directory was. To the probe that is the same answer
+        // as a missing one: not the directory the guest named, so nothing can be written through it.
+        File(rootfs, "tmp").deleteRecursively()
+        File(rootfs, "tmp").writeText("not a directory\n")
+
+        val report = harness.distribution.healthProbe()
+
+        assertThat(report.unusableTempDirs).containsExactly("tmp")
+        // The other field is untouched, so the sentence is this fault's alone — and it names the
+        // guest's `/tmp`, not the archive's relative `tmp`, because the reader is looking at their own
+        // terminal where `/tmp` is the path.
+        assertThat(report.staleLocks).isEmpty()
+        assertThat(report.healthy).isFalse()
+        assertThat(report.describe())
+            .isEqualTo("Ubuntu's temporary directories cannot be written to (/tmp)")
+    }
+
+    @Test
+    fun `a stale package lock is reported unhealthy, and the probe leaves the file on disk`() = runTest {
+        val fixture = TestTarballs.writeRootfsFixture(
+            Files.createTempDirectory("linux-fixture").toFile().resolve("rootfs.tar.gz"),
+        )
+        val harness = Harness(distro(arch = "arm64"), pinnedTarball = fixture)
+        harness.scripted.respond = { command ->
+            when {
+                command.contains("eclipse-uid=") ->
+                    0 to "eclipse-uid=0\neclipse-path=${UbuntuDistributionManager.LINUX_PATH}\n"
+                command == "echo eclipse-probe-ok" -> 0 to "eclipse-probe-ok\n"
+                command == "whoami" -> 0 to "root\n"
+                else -> baseline(command)
+            }
+        }
+        // Both temporary directories are real, so that the lock is the only fault the report has to
+        // name and the sentence below is not a list of two.
+        val rootfs = harness.runtime.rootfsDir
+        File(rootfs, "tmp").mkdirs()
+        File(rootfs, "run").mkdirs()
+        // The file a killed apt leaves behind: nothing holds it — the kernel dropped the lock with the
+        // process — and the bytes written here are what proves the probe did not rewrite or clear it.
+        val lock = File(rootfs, "var/lib/dpkg/lock-frontend")
+        lock.parentFile?.mkdirs()
+        lock.writeText("pid 4151 held this\n")
+
+        val report = harness.distribution.healthProbe()
+
+        assertThat(report.staleLocks).containsExactly("var/lib/dpkg/lock-frontend")
+        assertThat(report.unusableTempDirs).isEmpty()
+        assertThat(report.healthy).isFalse()
+        // The sentence names the lock in the guest's own relative spelling, as apt prints it, and says
+        // what the way out is — this is the one of the two faults Repair clears by itself.
+        assertThat(report.describe())
+            .isEqualTo(
+                "an interrupted package operation left its lock behind (var/lib/dpkg/lock-frontend)" +
+                    " - Repair clears it",
+            )
+        // Reported, never repaired: the probe is the question and the local rung is the answer, which
+        // is the whole reason the two are separate code paths. A file that had been swept would be one
+        // fewer thing for Repair to do, and a health check that did the repairing could not be run at
+        // any moment without changing what it was run on.
+        assertThat(lock.isFile).isTrue()
+        assertThat(lock.readText()).isEqualTo("pid 4151 held this\n")
+    }
+
     @Test
     fun `a ladder that times out on every archive is named a timeout, not a mirror failure`() = runTest {
         // Every rung wedges: a pty read that produces nothing and ends nothing, which is what an
