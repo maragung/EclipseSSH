@@ -183,7 +183,7 @@ jobs:
         # from this SDK regardless of how the APK was obtained. The NDK and
         # platforms are needed only by the build, but keeping one package
         # list mirrors the release pipeline exactly - one recipe, not two.
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           cmdline-tools-version: '11479570'
           packages: >-
@@ -512,7 +512,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Download every matrix report
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           pattern: universal-test-api*
           path: reports
@@ -593,7 +593,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download the run evidence
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v6.0.0
         with:
           pattern: universal-test-api*
           path: run-artifacts
