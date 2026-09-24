@@ -106,7 +106,7 @@ jobs:
           check-latest: false
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # cmdline-tools 13.0 is the LTS line that ships platform-tools and
           # supports platforms;android-37.0 + build-tools;36.0.0.
@@ -250,7 +250,7 @@ jobs:
           check-latest: false
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # cmdline-tools 13.0 is the LTS line that ships platform-tools and
           # supports platforms;android-37.0 + build-tools;36.0.0.
@@ -357,7 +357,7 @@ jobs:
           check-latest: false
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # cmdline-tools 13.0 is the LTS line that ships platform-tools and
           # supports platforms;android-37.0 + build-tools;36.0.0.
@@ -494,7 +494,7 @@ jobs:
           check-latest: false
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # cmdline-tools 13.0 is the LTS line that ships platform-tools and
           # supports platforms;android-37.0 + build-tools;36.0.0.
@@ -835,7 +835,7 @@ jobs:
 
     steps:
       - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # Same cmdline-tools pin as the build jobs. No NDK and no Gradle
           # here: this job only boots an emulator and installs prebuilt APKs,
@@ -1043,7 +1043,7 @@ jobs:
           check-latest: false
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           # Same NDK pin the verify job installs: the stress job's build runs
           # :freerdp:buildFreerdpNative like every other build, and that task
