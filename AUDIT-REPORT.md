@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §67, *Releasing 1.10.0*; the newest of them that releases a version is §67, *Releasing 1.10.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §68, *An eighth checkbox installs from a vendor's own script, and the pipe the vendor documents is not the command that runs*; the newest of them that releases a version is §67, *Releasing 1.10.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7653,3 +7653,189 @@ emulator is `x86_64`, so it is the `x86_64` split that ran at both API levels. A
 is untouched by any of this: the five `proot` lines, the leaked `exec-*` directory, and the health row
 that misread them were reported from a real Android device, and their absence has to be seen on one.
 Nothing in this section sees it.
+
+---
+
+## 68. An eighth checkbox installs from a vendor's own script, and the pipe the vendor documents is not the command that runs
+
+The preinstall list the dialog has carried since §65 held seven extras, and every one of them installed
+one of two ways: an apt package out of the pinned Ubuntu archive, or an npm global once a usable Node.js
+had been proven. The eighth — Claude Code CLI — is neither. Anthropic publishes no `.deb` and no package
+on npm; what it publishes is a shell script at `https://claude.ai/install.sh`, documented as
+`curl -fsSL <url> | bash`. **This adds a third install mechanism to a design that had exactly two**, and
+most of the work is in keeping that third one inside the promises the other two already make: nothing is
+installed that the user did not tick, every failure is a warning rather than a failed install, and every
+label on the list stays checkable against what actually happened.
+
+### The third source, and the one line of ordering it costs
+
+`VendorInstaller` is a value type above the enum (`OptionalPackages.kt:178`) — `url`, `supportedArches`,
+`command` — rather than three more fields on `OptionalPackage`, because the address and the architectures
+are two facts about one *script*: a URL read without knowing which CPUs it has a build for is how a device
+gets offered an install that cannot finish, and the vendor's own answer to a CPU it does not ship for is
+to exit. The entry is `CLAUDE_CODE` (`OptionalPackages.kt:149`), declared last, after `KILO`, because
+declaration order is install order (`docs/linux-userspace.md:151-153`, and `OptionalPackagesTest` pins the
+half of it a test can see) and this mechanism runs last: a declaration that jumped the queue would make
+that documented sentence a half-truth for no gain.
+
+`OptionalPackages.runsOn(entry, ubuntuArch)` (`OptionalPackages.kt:249`) is one pure predicate, asked by
+both halves — the dialog, which draws an unsupported row disabled, and the pipeline, which skips it with a
+warning — so a row cannot look tickable where the pipeline would refuse. The `all` over an empty list is
+the whole of the apt and npm case, and it is load-bearing rather than incidental: a package list carries
+no architecture of its own, because it comes from the archive already pinned for this device's, so an
+entry that names no vendor installer is installable everywhere. A test pins that, so nobody "fixes" it
+into a `false`.
+
+In the manager, `installExtraVendorPackages` (`UbuntuDistributionManager.kt:1374`) is the step.
+`installExtraPackages` (`:1150`) ended in `if (globals.isEmpty()) return`; a Claude-only selection has no
+apt packages and no npm globals, so it would have hit that return, and the guard became a block around the
+npm half. The new call is **outside** that block on purpose: a vendor installer needs no Node.js,
+`ensureRunnableNode` can spend twenty minutes and can return false, and a `claude` that did not install
+because an unrelated Node.js was 18 would be a warning naming the wrong fact — the failure this file's
+comments keep arguing against. It also runs inside `INSTALL_EXTRA_PACKAGES` rather than as a step of its
+own: a new `SetupStep` would move every percentage on the install screen and need a new arm in three
+`describeSetupStep` sites (`UbuntuActivity`, `MainActivity`, `LinuxUserspaceService`).
+
+The step walks resolved *entries* rather than addresses, because the warnings name `entry.label`, and it
+dedups by `installer.url` keeping the first. That is not bookkeeping: fetching a package twice is
+wasteful, while running a side-effecting script twice is a visible and different kind of fault, and it
+must not be possible.
+
+### Why the command is not the pipe the vendor documents
+
+```kotlin
+    private fun vendorInstallCommand(url: String): String =
+        "curl -fsSL $url -o $VENDOR_INSTALL_SCRIPT && bash $VENDOR_INSTALL_SCRIPT"
+```
+
+`VENDOR_INSTALL_SCRIPT` is `/tmp/eclipse-vendor-install.sh` — the guest's own `/tmp`, which
+`prepareWorkspace` (`:413`) creates and the next attempt truncates, so a script that half-arrived can
+never be the one the next run executes.
+
+The vendor's line is a pipeline, and this is not it. **A pipeline's status is its last command's**, so a
+curl that 404'd (exit 22) or could not resolve the name (exit 6) leaves `bash` reading an empty stdin and
+exiting **0**: at the only place the pipeline looks, a dead host and a finished install are the same
+result. `set -o pipefail` repairs that and is still not the shape used here, because it leaves the other
+half of the fault standing — a connection that drops mid-body hands `bash` a **truncated script to start
+executing** before curl's own status is known. `&&` is the whole difference: the script runs only after
+curl has read every byte and exited 0, and it costs one file in the guest's own `/tmp`. That is a strictly
+safer way to run the vendor's own installer, not a reimplementation of it.
+
+`bash`, named, not `sh`: the script uses `=~` and `BASH_REMATCH`, and Ubuntu's `/bin/sh` is dash. There is
+no pipeline left in the string, so no `set -o pipefail` belongs in it either.
+
+### The read-back: the exit status is the script's word, the command is the measurement
+
+After an installer exits 0 the step does not take its word for it. It asks a login shell for the command
+through `runSessionCommand` (`:1612`), which runs `runtime.sessionArgv` with `runtime.baseEnv` — the exact
+pair a terminal tab is spawned with, which is the only environment where the question means anything —
+and reads the answer by the marker idiom `LOGIN_PROBE_COMMAND` (`:1982`) already established:
+`vendorProbeCommand` (`:1651`) echoes `VENDOR_ON_PATH_MARKER` when `command -v` finds the command and
+stays silent when it does not, so absence is read as the negative it is rather than parsed out of a path
+the caller does not care about. A successful install with nothing to run is a warning:
+
+```
+Claude Code CLI reported a successful install, but no claude command was found in a login shell
+```
+
+The reason to spend a second command on this is the distinction `ensureRunnableNode` already draws when it
+runs `node --version` rather than trusting that `apt-get install nodejs` meant a Node.js the tools can
+run: **a script's exit status is its own word for what it did, and the command it leaves behind is the
+measurement.** A user told "installed" who then finds no `claude` in their terminal has been misled by
+this app rather than by the vendor, and the probe exists so that this app is the one that says so.
+
+Two things follow, and both are decisions rather than omissions.
+
+- **`claude` is deliberately not added to `LOGIN_PROBE_PROGRAMS`** (`:1969`). That list is what
+  `healthProbe` asks a login shell for as *essential*, and a missing name there means a broken userspace
+  — that is what the health row is for. A userspace without an optional extra is healthy, so an unticked
+  or failed Claude Code install must not be able to turn the health check red.
+- **The probe is not a guarantee, and the warning is not an accusation.** The launcher's location is
+  chosen by the downloaded binary's own `install` subcommand, which is not visible in the bootstrap
+  script the app can read, so the sentence states what was observed — no `claude` command was found —
+  rather than what it implies. If a device shows the launcher landing out of a terminal's reach, the
+  honest fix is a line where a session's profile is sourced, not a special case for one command.
+
+### The architecture the vendor does not ship for
+
+The row is offered on **every** device, and the two halves answer a 32-bit ARM userspace separately. The
+pipeline knows before anything is fetched — the architecture comes from the device's ABI
+(`LinuxDistroCatalog.kt:197`, `armeabi-v7a` → `armhf`) — and skips the installer with a warning naming the
+fact:
+
+```
+Claude Code CLI was not installed: its installer ships amd64 and arm64 builds, and this userspace is armhf
+```
+
+The dialog's half is the courtesy: `unsupportedExtraIds` in the composable body (`UbuntuActivity.kt:206`)
+feeds `PreinstallPicker`'s `unsupportedIds` (`:893`), the row keeps its place with `enabled = supported`
+on both the `toggleable` and the `Checkbox`, and a third line under its summary reads *Not installable
+here: no build for this device's architecture.* The **All** button and the all-selected test both walk the
+selectable entries (`:901`) rather than every entry, or the button would tick a row the pipeline is going
+to skip. The paragraph above the list said the coding agents come from npm's registry, which is now false
+for one row, so it was reworded to name all three sources. The dialog decides this from `ui.distro` with a
+safe call, and that is required rather than defensive: the non-null `distro` the section below binds is
+scoped to the `SettingsSection` lambda, while the dialog sits in the composable body where `ui.distro` is
+still a `LinuxDistro?`.
+
+Two alternatives were rejected, and both for reasons the screen's own comments already state.
+
+- **Hiding the row.** The picker's header says *Preinstall (optional)* and the screen's own comment
+  (`UbuntuActivity.kt:300`) says an unsupported device "should not look like a feature that went
+  missing". A row that vanishes is a list lying about its contents, and it leaves the user unable to tell
+  a feature that does not exist from a device that cannot have it.
+- **Letting it fail raw.** The vendor's script does answer this question, by exiting with *Unsupported
+  architecture* — but it answers after a download has been spent, and in the vendor's words, where the
+  app's own sentence names the architecture that is the reason and can say it before the install starts.
+
+### The trust story, stated as it is
+
+The installer is always `latest` and there is nothing to pin: the vendor's script takes no version, and
+the app could pin one only by reimplementing the script. It verifies SHA-256 against a manifest fetched
+from the same origin, which is **integrity, not authenticity** — there is no signature, and an origin able
+to serve a hostile script is able to serve the manifest that matches it. That is a weaker guarantee than
+the rootfs pin, whose bytes are checked against a hash this repository holds, and it is exactly why this
+mechanism is opt-in, offered only for a row the user ticked themselves, and can only ever be a warning.
+
+What a hostile script could reach is worth naming with the same plainness: the guest's `-0` is a pretence
+and the process still carries the app's uid, so a script that went wrong lands on the app's own data —
+the userspace, the sessions and the configuration under `files/`, not the rest of the phone. Nothing here
+widens that boundary, and nothing here should be read as having widened it.
+
+The diagnostics record one of three facts per installer — `vendor installer refused`, `vendor installer
+skipped`, `vendor installer not on path` — under the `APT` category, matching `installExtraAptPackages`
+(`:1193`) and `installNpmGlobals` (`:1335`), because this step has one category for its third-party reach.
+`DOWNLOAD` was considered and declined: the enum's own KDoc assigns download to `RootfsInstaller`, so the
+manager reaching for it would falsify that sentence. The timeouts are separate constants for the reason
+every route here has its own: `VENDOR_INSTALL_TIMEOUT_MS` is twenty minutes, the shape of a fetch followed
+by real install work rather than a single npm package, and `VENDOR_PROBE_TIMEOUT_MS` is sixty seconds,
+because a `command -v` either answers or it does not.
+
+### What is not claimed
+
+**Nothing in this repository has ever run a vendor install script inside the guest.** The eight tests
+added with this change — four in `OptionalPackagesTest`, four in `UbuntuDistributionManagerTest` — drive a
+scripted guest, and that is the whole of what is verified. They assert that the exact `curl … && bash …`
+string is the command the guest was handed; that the read-back ran through the session argv and env rather
+than the pipeline's own apt-tuned one; that an installer exiting 22 is one warning and an otherwise
+working install, with no probe after it, because one failure is one fact; that an `armhf` userspace
+fetches nothing at all; and that an installer exiting 0 having left no command behind is the warning
+quoted above.
+
+**The extras dialog itself is covered by no suite.** The Robolectric class for that screen asserts exactly
+one branch, and it is the unsupported one — a JVM host matches no Ubuntu architecture, so the screen
+renders its one-row, no-button form and the preinstall dialog is unreachable from a test at all. The
+instrumentation suite's one Linux class drives the pipeline rather than the dialog, and
+`connectedAndroidTest` cannot run on the development host, where the absence of KVM means a guest kills
+`system_server` before the suite starts. The dialog's own half of the architecture decision is therefore
+argued from the source rather than observed.
+
+**The check that closes the loop is a device's, and it is one sentence of work: tick Claude Code CLI, let
+the install finish, and confirm `claude --version` answers in a terminal.** Two things are worth knowing
+before it is run. The launcher is placed by the downloaded binary rather than by the bootstrap script this
+app can read, so it may land where a terminal's login shell cannot see it, and in that case the read-back
+reports it as a warning rather than hiding it — that is the behaviour, not a defect to be worked around
+here. And the row is offered everywhere, so an `armhf` userspace shows it disabled with the reason under
+it: the same decision the pipeline makes, made early enough to read. This section records a mechanism
+that has been reasoned about, wired and tested against a scripted guest; it does not record one that has
+been seen to install anything.

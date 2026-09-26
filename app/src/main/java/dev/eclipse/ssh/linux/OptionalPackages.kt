@@ -17,12 +17,17 @@ package dev.eclipse.ssh.linux
  * name, and `nodejs` without `npm` is a Node.js that cannot install anything. The labels the user
  * named are all here, and [summary] is the line that names their packages back.
  *
- * ## The two registries, and why they are allowed here
+ * ## The three sources, and why they are allowed here
  *
  * [aptPackages] come from the pinned Ubuntu archive — the same one the base install uses, reached
  * through the same verified ladder. [npmGlobals] do not: they come from npm's registry, which is a
  * third party, and that is why they are only ever reached for an entry the user ticked themselves.
- * The install's promise ("this device now has Ubuntu") must not depend on a registry outside the
+ * [vendorInstallers] are a third party twice over: the tool's own maker publishes a shell script, and
+ * ticking the box runs it inside the guest. It is the weakest of the three links, and the docs say so
+ * — fetched over https, and checksummed by its own author against a manifest from the same origin,
+ * which is integrity rather than authenticity: there is no signature, and no version to pin.
+ *
+ * The install's promise ("this device now has Ubuntu") must not depend on a source outside the
  * archive, and with this list it does not: every extra is a *warning* when it fails, never a failed
  * install, and a device whose extras did not land is one whose base system is still whole.
  *
@@ -53,6 +58,16 @@ enum class OptionalPackage(
      * modern Node" is answered once, by the resolution, instead of by three entries agreeing.
      */
     val needsModernNode: Boolean = false,
+    /**
+     * Vendor installers: scripts the tool's own maker publishes, fetched and run inside the guest. A
+     * third source beside [aptPackages] and [npmGlobals], and reached on the same terms — only for an
+     * entry the user ticked, and never able to fail an install.
+     *
+     * A list rather than a single installer because the pipeline folds a selection's mechanisms the
+     * same way it folds its packages, and because running a script is *visible* in a way fetching a
+     * package is not: two entries naming one address must not run it twice.
+     */
+    val vendorInstallers: List<VendorInstaller> = emptyList(),
 ) {
     NODE(
         label = "Node.js and npm",
@@ -130,7 +145,44 @@ enum class OptionalPackage(
         npmGlobals = listOf("@kilocode/cli"),
         requires = listOf(NODE),
     ),
+
+    CLAUDE_CODE(
+        label = "Claude Code CLI",
+        summary = "the Claude Code CLI, run as the claude command · installed by Anthropic's own " +
+            "installer, which ships amd64 and arm64 builds and none for 32-bit ARM",
+        vendorInstallers = listOf(
+            VendorInstaller(
+                url = "https://claude.ai/install.sh",
+                supportedArches = listOf("amd64", "arm64"),
+                command = "claude",
+            ),
+        ),
+    ),
 }
+
+/**
+ * One vendor's own installer: a shell script the tool's maker publishes at a stable address, which the
+ * install fetches inside the guest and runs.
+ *
+ * [url] and [supportedArches] are one object rather than two fields because they are two facts about
+ * the same *script* rather than about the entry: a URL read without knowing which CPUs it has a build
+ * for is how a device gets offered an install that cannot finish, and the vendor's own answer to a CPU
+ * it does not ship for is to exit. [command] is what makes the tick checkable after the fact — the
+ * script's exit status is its own word for what it did, while the command it leaves behind is the
+ * measurement, the same distinction [UbuntuDistributionManager] draws when it runs `node --version`
+ * rather than trusting that `apt-get install nodejs` meant a Node.js the tools can run.
+ *
+ * [supportedArches] is never empty: an empty list would mean "nobody decided" rather than "everywhere",
+ * and a test pins that.
+ */
+data class VendorInstaller(
+    /** The vendor's own documented address. The install fetches this and nothing else from there. */
+    val url: String,
+    /** The Ubuntu architectures the vendor ships a build for, in the catalogue's own spelling. */
+    val supportedArches: List<String>,
+    /** The command the installer leaves behind, read back with `command -v` once it reports success. */
+    val command: String,
+)
 
 /**
  * The [OptionalPackage] list as the install pipeline consumes it: what a selection actually means
@@ -181,4 +233,19 @@ object OptionalPackages {
     /** Whether the selection needs a Node.js newer than the one the archive may carry. */
     fun needsModernNode(selected: Collection<OptionalPackage>): Boolean =
         resolve(selected).any { it.needsModernNode }
+
+    /**
+     * Whether every mechanism [entry] names has something to run on [ubuntuArch].
+     *
+     * `all` over an empty list is the whole of the apt and npm case, and it is load-bearing rather
+     * than incidental: a package list carries no architecture of its own — it comes from the archive
+     * already pinned for the architecture this device has — so an entry that names no vendor installer
+     * is installable everywhere, and stays so as architectures come and go.
+     *
+     * Asked by both the dialog, which draws an unsupported row disabled, and the pipeline, which skips
+     * it with a warning naming the architecture, so a row cannot look tickable where the pipeline would
+     * refuse. The pipeline is the authority; this exists so the dialog can say so first.
+     */
+    fun runsOn(entry: OptionalPackage, ubuntuArch: String): Boolean =
+        entry.vendorInstallers.all { ubuntuArch in it.supportedArches }
 }

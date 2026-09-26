@@ -190,6 +190,26 @@ class UbuntuActivity : SettingsDestinationActivity() {
         val selectedExtras = remember(extraIds) {
             OptionalPackage.entries.filter { it.name in extraIds }
         }
+        /**
+         * The entries this device's architecture cannot install, by name — the dialog's half of the
+         * same decision the pipeline makes for itself. An entry whose installer ships no build for
+         * this CPU is drawn disabled with the reason under it, so the user is not offered an install
+         * that cannot finish and the warning at the end of a long install is not the first they hear
+         * of it.
+         *
+         * `ui.distro` is nullable *here* even though the section below returns on a null one: this is
+         * the composable's body, and the non-null `distro` that guard binds is scoped to the
+         * `SettingsSection` lambda rather than to this. Null means no state has loaded yet, and an
+         * empty set is the honest answer — the Install button that opens the picker cannot exist
+         * without a distro either.
+         */
+        val unsupportedExtraIds = remember(ui.distro) {
+            ui.distro?.ubuntuArch?.let { arch ->
+                OptionalPackage.entries.filterNot { OptionalPackages.runsOn(it, arch) }
+                    .map { it.name }
+                    .toSet()
+            } ?: emptySet()
+        }
         val context = LocalContext.current
         val scope = rememberCoroutineScope()
         val report = LocalSettingsReport.current
@@ -585,9 +605,9 @@ class UbuntuActivity : SettingsDestinationActivity() {
                     Column(
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                         // Capped and scrollable for the reason the log dialog is: the body is a
-                        // paragraph plus seven checkboxes with two lines each, which is taller than
-                        // a phone's dialog can show. A body that grew past the screen would put the
-                        // Install button out of reach of the very control that asked the question.
+                        // paragraph plus one checkbox per entry with two lines each, which is taller
+                        // than a phone's dialog can show. A body that grew past the screen would put
+                        // the Install button out of reach of the very control that asked the question.
                         modifier = Modifier
                             .heightIn(max = rememberDialogBodyMaxHeight(0.60f))
                             .verticalScroll(rememberScrollState()),
@@ -608,6 +628,7 @@ class UbuntuActivity : SettingsDestinationActivity() {
                         )
                         PreinstallPicker(
                             selectedIds = extraIds,
+                            unsupportedIds = unsupportedExtraIds,
                             onSelectionChange = { extraIds = it },
                         )
                     }
@@ -846,11 +867,18 @@ private fun InstallLogDialog(
  *
  * One row per [OptionalPackage], each with its own two lines — the label the user recognises and
  * the packages that make it true — because the whole value of this list is that the user does not
- * have to know that "Python 3" means four packages and a `python` symlink.
+ * have to know that "Python 3" means four packages and a `python` symlink. A row this device cannot
+ * install gets a third line saying so, and no others do.
  *
  * The row is the control, not the box: the whole row toggles, and the `Checkbox` inside it is
  * drawn with a null callback so a screen reader meets one labelled control rather than a checkbox
  * and a label that are two targets for one decision.
+ *
+ * [unsupportedIds] is this dialog's half of a decision the pipeline makes for itself: an entry whose
+ * installer ships no build for this device's CPU is drawn disabled, with the reason, rather than
+ * offered and then skipped. The pipeline is still the authority — it decides the same question from
+ * the architecture it is actually installing, and says so in a warning — and this exists only so the
+ * user hears it before the install rather than after it.
  *
  * [selectedIds] crosses the dialog's boundary as strings — see the caller's own note — and comes
  * back the same way, in the order the user ticked; nothing here depends on that order, and nothing
@@ -862,11 +890,16 @@ private fun InstallLogDialog(
 @Composable
 private fun PreinstallPicker(
     selectedIds: List<String>,
+    unsupportedIds: Set<String>,
     onSelectionChange: (List<String>) -> Unit,
 ) {
     val selected = OptionalPackage.entries.filter { it.name in selectedIds }
     val implied = OptionalPackages.implied(selected)
-    val allSelected = selected.size == OptionalPackage.entries.size
+    // The rows a tick can actually act on. "All" and the all-selected test both walk this rather than
+    // every entry, or the button would tick a row the pipeline is going to skip — a control whose
+    // whole meaning is "everything" cannot include something it knows will not install.
+    val selectable = OptionalPackage.entries.filterNot { it.name in unsupportedIds }
+    val allSelected = selectable.all { it.name in selectedIds }
     Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -877,7 +910,7 @@ private fun PreinstallPicker(
             TextButton(
                 onClick = {
                     onSelectionChange(
-                        if (allSelected) emptyList() else OptionalPackage.entries.map { it.name },
+                        if (allSelected) emptyList() else selectable.map { it.name },
                     )
                 },
                 // Named for what it does to the selection rather than for its own label: "All" and
@@ -890,20 +923,24 @@ private fun PreinstallPicker(
             ) { Text(if (allSelected) "None" else "All") }
         }
         Text(
-            "Installed after the base system, from the same Ubuntu archive. The coding agents come " +
-                "from npm's registry instead, so they need Node.js and a working connection, and one " +
-                "that does not install is reported as a warning rather than failing the install.",
+            "Installed after the base system, most of them from the same Ubuntu archive. The npm " +
+                "agents come from npm's registry and need Node.js; the Claude Code CLI comes from its " +
+                "maker's own installer. What reaches outside the archive needs a working connection, " +
+                "and one that does not install is reported as a warning rather than failing the " +
+                "install.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         OptionalPackage.entries.forEach { entry ->
-            val checked = entry in selected
+            val supported = entry.name !in unsupportedIds
+            val checked = supported && entry in selected
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
                     .toggleable(
                         value = checked,
+                        enabled = supported,
                         role = Role.Checkbox,
                         onValueChange = { ticked ->
                             onSelectionChange(
@@ -912,7 +949,7 @@ private fun PreinstallPicker(
                         },
                     ),
             ) {
-                Checkbox(checked = checked, onCheckedChange = null)
+                Checkbox(checked = checked, onCheckedChange = null, enabled = supported)
                 Column(Modifier.padding(start = 8.dp)) {
                     Text(entry.label, style = MaterialTheme.typography.bodyMedium)
                     Text(
@@ -920,6 +957,16 @@ private fun PreinstallPicker(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    // The row stays rather than disappearing: this list's header says it is optional,
+                    // not exhaustive, and a checkbox that vanishes reads as a feature that went away.
+                    // The reason is the thing the user cannot get anywhere else on this screen.
+                    if (!supported) {
+                        Text(
+                            "Not installable here: no build for this device's architecture.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
