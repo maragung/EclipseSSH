@@ -642,7 +642,19 @@ private fun DrawScope.drawFrame(
             val cell = line[column]
             var end = column + 1
             while (end < lastColumn && line[end].style == cell.style) end++
-            val text = buildString(end - column) { for (index in column until end) append(line[index].value) }
+            // A cell's ink is its base plus whatever zero-width characters were put on it, so a run is
+            // built from the clusters and not from the bases. Appending the marks here is what lets the
+            // font do the joining: the bundled face carries the combining marks at zero advance, so a
+            // mark rides on the base's cell and the run still measures one cell per cell. Skipping them
+            // would silently drop every accent and every zero-width joiner from what is drawn - and,
+            // since a run is measured as a whole, it would also shift the ink of every glyph after the
+            // one that lost its mark.
+            val text = buildString(end - column) {
+                for (index in column until end) {
+                    append(line[index].value)
+                    append(line[index].combining)
+                }
+            }
             // Relative to the row, not to the line: a wrapped continuation is drawn from the left margin.
             val left = (column - visual.from) * cellWidth
             val runWidth = (end - column) * cellWidth

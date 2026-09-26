@@ -79,6 +79,11 @@ data class TerminalSelection(
         /**
          * The selection covering the word under [column] in [text], or null if that cell is blank.
          *
+         * [text] is one character per cell - [terminalCellText] is what makes it so - because [column]
+         * is a column: a line the user reads has a cell carrying a combining mark contributing its
+         * whole cluster, and every character after such a cell would then sit one place to the left of
+         * the cell that was tapped.
+         *
          * Long-press-to-select-word is not a convenience on a phone, it is the only usable way in.
          * A finger covers roughly three cells at a readable font size, so asking someone to place a
          * character-precise selection boundary by touch does not work; what they actually want almost

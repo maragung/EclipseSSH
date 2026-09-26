@@ -5,7 +5,7 @@ The per-section figures below are snapshots of the pass that wrote them and are 
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §69, *Releasing 1.11.0*, which is also the newest of them that releases a version — and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §70, *A zero-width character spent a cell, and that is what left characters standing after a program erased them*, which is not a release section; §69, *Releasing 1.11.0*, remains the newest of them that releases a version — and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7947,3 +7947,216 @@ was read back as `private` with `CI_WINDOW_DEADLINE` cleared. That close does no
 it deletes it, so `main` is guarded by discipline rather than by the platform until the next window opens.
 This record is what landed in that state: it was merged with no required check behind it, and said so,
 rather than letting the merge imply a gate that was not there.
+
+---
+
+## 70. A zero-width character spent a cell, and that is what left characters standing after a program erased them
+
+The report, from a phone, over SSH:
+
+> terminal ada bug ternyata, kadang di samping kiri 2 karakter sebelumnya tidak hilang dan jadi terbaca
+> aneh ketika sudah tertimpa teks baru, perbaiki
+
+*"There is a terminal bug after all: sometimes the 2 characters to the left do not disappear, and read
+strangely once new text has been printed over them. Fix it."* The trigger he named was **a line rewritten
+in place** — a shell prompt, a progress bar, a spinner. He reported no wide characters and no emoji, and he
+had not tried forcing a full redraw.
+
+**Every UTF-16 code unit was given exactly one cell, and the cursor advanced one column for it, with no
+width test anywhere in `app/src/main`.** So a character the program on the other end of the pty counts as
+*zero* columns made this buffer's `cursorColumn` run **ahead** of the program's — and `cursorColumn` is what
+the write, the erase and the cursor-position reply are all measured from. The program's `ESC [ K` therefore
+began one cell too far to the right, and the cells it believed it had cleared were still on the grid.
+
+### The direction of the drift is the diagnosis
+
+`put` did the same thing for every character: one cell written at the cursor, one column advanced.
+
+| what the program sent | its columns | this buffer's cells | this buffer's cursor | cells left standing |
+|---|---|---|---|---|
+| a zero-width character | 0 | 1 | **ahead** | **to the left** ← the report |
+| an East Asian Wide or Fullwidth character | 2 | 1 | behind | to the right |
+| the two halves of an emoji | 2 | 2 | level | none |
+
+Only one of the three puts anything to the *left*: the buffer being ahead, which only a zero-width
+character makes it. A wide character is the case a reader reaches for first, and it is a real defect — but
+it is on the wrong side to explain this report, and the report does not describe it.
+
+The population is not exotic either. What reaches an ordinary shell:
+
+- **U+FE0F**, the emoji variation selector — in every `⚠️` and `❤️` any tool prints, and in many prompt
+  themes;
+- **U+200D**, the zero-width joiner — in every composed emoji;
+- **U+FEFF**, a byte-order mark — which `cat` of a file written on Windows puts at the head of a line;
+- **combining marks** — a decomposed accent, which is what a name written on a system that decomposes them
+  carries.
+
+Two of those in one line is two cells of drift, which is the count the report names.
+
+### Why the renderer could not have been the cause
+
+Worth stating, because it is the argument that kept this a bug fix rather than a rendering project.
+
+The only erase at the drawing level is one `Modifier.background`, and `drawFrame` re-runs every row and
+every column of the frame on every revision: there is no dirty range, no committed-character count and no
+partial repaint — a `revision: Long` and the `remember` key on it are the whole of the change tracking. So
+a blank cell paints nothing, and **a character visible on screen is a character the current `frame.lines`
+still holds**. The residue was in the buffer, not in the drawing.
+
+The renderer does have a defect of its own — `drawText` places a whole style run from the font's own
+advances, so only the run's first glyph is guaranteed to sit on a cell boundary — and it is deliberately not
+part of this change. It misplaces ink; it cannot put a character into the buffer that the program believes it
+erased.
+
+### What changed
+
+| file | change |
+|---|---|
+| `terminal/TerminalWidth.kt` (**new**) | `terminalCharWidth(codePoint)`: 0, 1 or 2, plus the range tables and the note on which convention they follow. Also `terminalCellText`, the same rule read the other way |
+| `terminal/AnsiTerminalBuffer.kt` | `TerminalCell.combining`; `feedLocked` walks code points so an astral mark is one character; `put` became `putCodePoint` / `putUnit` / `attachCombining`; `plainText` and `textIn` write the cluster; `terminalPaintedWidth` unchanged, with the reason written down |
+| `ui/terminal/TerminalView.kt` | the run builder appends the cluster to its base: a mark must be shaped with the character it belongs to, or the run loses ink and measures wrong |
+| `MainActivity.kt` | `MainUiState.terminalLine` runs the transcript through `terminalCellText`, so the column long-press selection is addressed in indexes it |
+| `terminal/TerminalSelection.kt` | `wordAt`'s contract written down: its `text` is one character per cell, which is what `terminalCellText` makes it |
+
+A zero-width character is now attached to the cell before it and the cursor does not move, which is what the
+program on the other side counted.
+
+### Decisions worth stating
+
+**Ambiguous is 1, never 2.** The reference is glibc's `wcwidth`, because that is what `readline`, `ncurses`
+and every shell on the far side are using. The East Asian convention that widens "ambiguous" characters is a
+*different* convention, and following it would widen every box-drawing glyph `ncurses` draws a dialog with,
+every block and shade, and the private-use range a powerline prompt is built from — breaking every
+full-screen program and every themed prompt, silently. The existing
+`plainText matches the straightforward rendering` case, whose `sandi-üñïçø∂é` holds two Ambiguous
+characters, is the test that would have caught it.
+
+**Zero-width is the reference's own list, and the category rule is kept behind it as a safety net.** Marks
+arriving by `Character.getType` was the first version of this table and it is not enough, because that
+answers with the *platform's* Unicode and the platform is a phone. The JVM this repository's tests run on
+reports 147 code points as unassigned that the reference counts as zero-width — Arabic and Indic vowel
+signs, mostly — and every one of them would have silently spent a cell. The list is explicit instead, and
+the category rule survives only to catch a mark newer than the list. Two marks are the same problem in the
+other direction and are named: U+1734 HANUNOO SIGN PAMUDPOD and U+1171E AHOM CONSONANT SIGN MEDIAL RA are
+marks the reference counts as **one** column. The `FORMAT` category is *not* taken wholesale either, since
+it also holds U+00AD SOFT HYPHEN and the Arabic number signs, which are one column wide everywhere.
+
+**A mark with nothing under it is dropped rather than carried.** At column zero there is no cell to its left,
+and a cell holding a blank is one the program counted as a space, not as a base. The buffer keeps no "last
+cell written", and inventing one would put the accent on whatever happened to be there. Dropping it costs
+nothing in the column arithmetic, which is the point — and it is what keeps `terminalPaintedWidth` correct
+with no change at all, since a mark on a blank base would be invisible ink outside the painted extent.
+
+**`lastPrinted` is not updated by a mark.** `CSI b` repeats "the last character printed"; repeating an accent
+instead of the character under it would be a new way to be wrong.
+
+**The `2` arm of the table is written and tested as data, and nothing acts on it.** A wide character still
+occupies one cell and can still be drawn over its neighbour. Acting on it needs a continuation cell and every
+erase, insert, delete and resize to treat the pair as a unit — the invariant being *a continuation is set at
+`i` if and only if `i — 1` holds a width-2 base* — and that is a separate change with its own defects to
+answer for. The KDoc says plainly that the `2` arm is not a claim that CJK is right.
+
+**The plan named the wrong reader as the fifth, and missed the sixth.** It expected
+`TerminalLayout.splitsWord` to have to read the cluster; it does not, because both of its operands are
+`value`, which is always the base, and no mark can change a base's classification — so the code was left
+alone, which is the check that this change stayed small. What the plan *missed* is the long-press path:
+`MainUiState.terminalLine` hands `TerminalSelection.wordAt` a **column**, and once `plainText` writes
+clusters a column no longer indexes it. The first fix for that was a `cellText(line)` method on the buffer,
+which turned out to be unreachable — there is no path from the terminal screen to the buffer, and the
+plumbing would have been a parameter threaded through three composables, the exact failure this repository's
+own KDoc warns about. It was deleted for the pure `terminalCellText(text)`, applied at the one place that
+already has the text in hand. One changed function, one new parameter nowhere.
+
+**One case is out of reach, and a test holds it rather than a comment.** A mark whose surrogate pair is
+split across two reads — U+E0100–U+E01EF, the variation-selector supplement — cannot be recognised: a lone
+high surrogate says nothing about being a mark, and both halves take a cell. Joining them would mean holding
+a high surrogate until the next read, which is state this printer does not keep. The test pins the
+limitation, because giving a lone surrogate width zero would be wrong for every non-mark astral character,
+which is the far more common case. A pair that is *not* zero-width is joined only when it is seen whole, so
+the path every emoji already took is byte-identical to before.
+
+### The tables are the reference's own answers, and the first version was not
+
+The first version of `TerminalWidth.kt` was written by hand from Unicode block assignments, and it was wrong
+in ways only the reference could show. The check that found them was a direct sweep — for every code point,
+compare this table's answer with `wcwidth` on the host, which is glibc, the same function `readline`,
+`ncurses` and every shell on the far side call. It reported **9,012 contradicting code points in 118 runs**,
+and they were three kinds of mistake:
+
+- **A run the hand list missed.** U+2066–U+2069, the directional isolates; U+061C, the Arabic letter mark;
+  U+D7B0–U+D7FB, the conjoining Hangul letters of the second Jamo block; U+1D173–U+1D17A, the musical format
+  marks. The format and Jamo tables are not block-shaped, so a list written from block assignments misses
+  whatever is not a block.
+- **A code point the hand list over-claimed.** U+3164 HANGUL FILLER, two columns here and zero to the
+  reference: it sits inside a run of wide Hangul letters, and it is a filler.
+- **A bound one code point out.** U+4DC0, the first of the Yijing hexagrams, narrow here and two columns to
+  the reference. The block lies between two ideograph blocks and looks narrow for that reason alone.
+
+The first of the three is the arm that is acted on, so those code points each spent a cell — the defect this
+whole section is about, in the table that was meant to fix it. The other two are on the `2` arm, which
+nothing acts on yet; they are wrong data that would have become wrong behaviour the day something did. That
+is the argument for the file's present form: both tables are a run-length encoding of the reference's own
+output rather than a reading of the standard, and every boundary in them is a boundary where the reference's
+answer changes, so an off-by-one is a transcription error and not a judgement call. The `2` arm is the
+visible cost — 18 hand-written ranges became 131 generated ones — and it is worth paying for a table whose
+whole purpose is agreement with a program on the other side.
+
+Worth keeping in mind for anything else in this repository that encodes a standard: **Unicode purity is not
+the same as agreement.** A table built by reading the standard agrees with the standard. The program at the
+other end of the pty is not reading the standard; it is calling `wcwidth`.
+
+### What is verified, and what is not
+
+- **The invariant, in 10 new tests** in `AnsiTerminalBufferTest`: after every chunk of a stream mixing
+  ordinary and zero-width characters, the cursor column is the column the program counted — the expected
+  values counted by hand, because a test that derives them from `terminalCharWidth` would agree with the code
+  under test for free. Plus the reported bug end to end at the buffer level (`abcdefgh`, carriage return, a
+  line with a mark in it, `ESC [ K`, more text: the second line must land on the cells the program addressed,
+  with nothing standing to its left), the same for U+FE0F, U+200D, U+FEFF and a combining accent, the
+  pending-wrap ordering, a mark dropped at column zero and on a blank, the cluster in `plainText` and
+  `textIn`, `CSI b` repeating the base, and the split-pair limitation.
+- **17 new tests** in `TerminalWidthTest` for the table, and every number in them is `wcwidth`'s rather
+  than this file's: braille at 1, the Ambiguous set at 1, the format characters that are *not* zero-width
+  at 1 and the astral marks at 0; both marks the reference counts as one column; a mark that is unassigned
+  on the JVM and zero-width to the reference, which is the test the explicit list exists for; the rule for
+  code points the reference has no answer for at all; the shape of the table at the boundaries a reader
+  would doubt; and then all 440 boundary probes of both tables — every run's two endpoints and the code
+  point on either side, so that a run one code point too long or too short cannot pass. That last one is
+  written out rather than derived, because a test that read the table it tests would agree with it for free.
+- **The existing 2,049 JVM tests are unchanged and none of them needed editing**, which is the second check
+  that this stayed small — of every code point whose width this table changed, no other test in the
+  repository names one. One existing test *was* edited on purpose: `plainText matches the straightforward
+  rendering` compares `plainText` against the expression it replaced, so its reference had to learn the
+  cluster too or it would have stopped being an oracle. The suite is now 2,076 methods in 179 files.
+- `scripts/check-doc-figures.sh` re-derives the counts in this file and the README — 160 claims, all
+  agreeing.
+- **The suites run in CI, not on this host** (nothing is built here), so the compile and the run are the CI
+  run this section ships with.
+
+**Not verified here, and the two things that would settle it.** No device was involved in this pass, so the
+exact appearance on a phone was not reproduced — what is established is the invariant whose violation produces
+it. Two experiments close that gap, and the second needs no build:
+
+1. **On a device**, print a longer line, return the carriage, print a shorter line containing a zero-width
+   character, erase to the end of the line, and print once more:
+
+   ```
+   printf 'abcdefgh\r' ; printf 'x\ufe0fy\033[K' ; printf 'z\n'
+   ```
+
+   With the same line width and a terminal that counts U+FE0F as no column, this reads `xyz` and the old tail
+   is gone. Where the drift is live it reads `x`, a gap, `y` and `z`, with the erase having started a cell too
+   far right. **The order matters and is the point**: a carriage return *before* the mark re-syncs both sides,
+   so a reproduction has to put the mark and the erase after the same absolute move. The two natural sources
+   are a prompt carrying an emoji — `PS1` with `⚠️` in it is enough — and a progress bar that reads a file's
+   name. A braille spinner alone will not show it: U+2800-U+28FF take one column on both sides, which is what
+   `TerminalWidthTest` pins.
+2. **Force a full redraw** — rotate the device, or `clear` and reprint. A buffer divergence re-syncs under
+   absolute addressing and the residue goes away; a rendering shift is recomputed from the same cells every
+   frame and persists. This separates this change from the renderer's own advance defect, and it is the
+   experiment to run first if the artifact survives the fix.
+
+**A session log replays offline, and is the measurement rather than the argument.** The app records the raw
+decoded stream (`feature/terminallog/SessionLog.kt`), so a session where the artifact was seen can be
+replayed into a fresh `AnsiTerminalBuffer` and asked whether it holds characters the program had erased. That
+is the step to ask for if this does not cure it.
