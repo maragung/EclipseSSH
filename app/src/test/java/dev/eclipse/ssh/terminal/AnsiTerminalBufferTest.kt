@@ -997,9 +997,9 @@ class AnsiTerminalBufferTest {
             buffer.feed("abcdefgh\r" + "x" + mark + "y" + "$E[K" + "z")
 
             val line = buffer.snapshot().lines.first()
-            assertWithMessage("U+%04X".format(mark.code)).that(line[0].combining).isEqualTo(mark)
-            assertWithMessage("U+%04X".format(mark.code)).that(line[1].value).isEqualTo('y')
-            assertWithMessage("U+%04X".format(mark.code)).that(line[2].value).isEqualTo('z')
+            assertWithMessage("U+%04X".format(mark[0].code)).that(line[0].combining).isEqualTo(mark)
+            assertWithMessage("U+%04X".format(mark[0].code)).that(line[1].value).isEqualTo('y')
+            assertWithMessage("U+%04X".format(mark[0].code)).that(line[2].value).isEqualTo('z')
         }
     }
 
