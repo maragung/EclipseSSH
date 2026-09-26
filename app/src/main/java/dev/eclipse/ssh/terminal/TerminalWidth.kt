@@ -113,7 +113,11 @@ private fun isZeroWidth(codePoint: Int): Boolean {
     // them. This is the arm a decomposed `e` and `U+0301` arrives through. Taken by category because
     // there is no nonspacing mark any terminal counts as one column wide.
     val type = Character.getType(codePoint)
-    if (type == Character.NON_SPACING_MARK || type == Character.ENCLOSING_MARK) return true
+    // Each constant is widened because Java declares these categories as `byte`, and `Int == Byte` is
+    // not a comparison Kotlin will compile.
+    if (type == Character.NON_SPACING_MARK.toInt() || type == Character.ENCLOSING_MARK.toInt()) {
+        return true
+    }
     // The zero-width space and the directional marks around it, the line and paragraph separators, the
     // directional embeddings and overrides, the word joiner and the invisible operators, and a
     // byte-order mark. The format characters the reference calls zero-width that a program is at all
