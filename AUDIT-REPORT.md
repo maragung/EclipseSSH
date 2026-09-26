@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 44 / versionName 1.11.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 45 / versionName 1.12.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §70, *A zero-width character spent a cell, and that is what left characters standing after a program erased them*, which is not a release section; §69, *Releasing 1.11.0*, remains the newest of them that releases a version — and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §71, *Releasing 1.12.0*, which is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -8191,3 +8191,79 @@ The fix expanded every singleton into `X..X`. No boundary moved: the code-point 
 the file are identical to the pre-fix ones for all four lists — 1997, 410, 122237 and 2 code points. That
 same class of error is why the standalone compile is now part of how a pure file is verified here: it was
 the missing check, and the thirteen-minute CI cycle it cost is what it buys back.
+
+---
+
+## 71. Releasing 1.12.0
+
+1.11.0 added an eighth checkbox to the Ubuntu install dialog. 1.12.0 repairs what a phone reported in the
+terminal: a zero-width character was spending a cell, which ran the buffer's cursor ahead of the program's
+own arithmetic, so that program's erase began one cell too far right and left characters standing to the
+left of the text which overprinted them. §70 is the whole of the change; this section is the release.
+
+Three pull requests stand between the two tags and only one of them is the fix. **#178** finishes §69 with
+what the 1.11.0 validation run actually did — documentation only. **#179** is the fix, `4b91065` through
+`40468d2`, merged as `b275985`. **#180** records it as §70 — documentation only again. `git log
+v1.11.0..main` is ten commits, which is exactly those three and their merges: the version the report names
+at its head is the one this section releases, and nothing else has landed.
+
+### Why this is a minor release and not a patch
+
+The rule §41, §56 and §67 set, and §69 applied: **a patch number is honest when the artifact a user
+installs behaves as its predecessor's does.** This one cannot pass that test, and the reason for that is
+the entire point of the change. A device that installs 1.12.0 over 1.11.0 renders a line rewritten in place
+differently from its predecessor: a prompt, a progress bar or a spinner carrying one of U+FE0F, U+200D,
+U+FEFF or a combining mark leaves its residue under 1.11.0 and does not under 1.12.0, because the buffer's
+cursor column — the column the erase and the cursor-position reply are both measured from — is what moved.
+§67 is the precedent this follows rather than an exception to it: a *repair* was a minor release there too,
+for the same reason, that what the artifact does on a device changes. `versionCode` moves 44 → 45 and
+`versionName` 1.11.0 → 1.12.0.
+
+Nothing native changes here. Unlike §67, where proot's patch `0006` was compiled into `libproot.so`, no
+`linux/proot-patches/` file and no `freerdp/` source moves, so the binaries a device runs are the ones
+1.11.0 shipped, and `docs/THIRD-PARTY.md`'s corresponding-source paragraph is unchanged with them. What
+differs is Kotlin in the APK's dex.
+
+### What a device gains
+
+- **A line rewritten in place stops leaving characters behind it.** The drift was one cell per zero-width
+  character and it accumulated for the life of the line, so the residue was as wide as the line had been
+  unlucky. Both the reported shape — up to two stale characters to the left — and the wider ones are gone,
+  because the erase now begins where the program aimed it.
+- **The characters that cause it are ordinary, which is why this was reachable at all.** U+FE0F is in every
+  `⚠️` and `❤️` any tool prints; U+200D is in every composed emoji; U+FEFF is what `cat` of a
+  Windows-written file puts at the head of a line; and a combining mark is what a filename written on macOS
+  carries. A terminal that gives each of these a cell disagrees with the program on the other end of the
+  pty about where the cursor is.
+- **A mark is drawn on the character it belongs to.** The run builder feeds a cell's cluster to the shaper,
+  so `e` + U+0301 is shaped as one glyph rather than as an `e` followed by an orphaned accent.
+- **Long-press column selection is addressed in the same indexes as the cells**, so a selection boundary
+  lands where the column it names is drawn.
+
+### What is not claimed
+
+- **A wide character still occupies one cell.** The `2` arm of the width table is written and tested as
+  data and nothing acts on it yet, so a CJK, fullwidth or emoji character can still overprint its
+  neighbour. That is the residue on the *right* of new text, which is not what was reported and not what
+  this release fixes; it needs a continuation cell and every erase, insert, delete and resize taught to
+  treat a pair as a unit. §70 names it Change 2 and it is a separate change with its own defects to answer
+  for.
+- **The renderer's own advance defect is untouched.** A style run is placed from the font's own advances,
+  so a glyph whose advance is not one cell displaces the rest of its run. It misplaces ink; it cannot leave
+  a character the program believes it erased, so it is not this defect — §70 names it Change 3.
+- **No device was involved, here or in CI.** The exact pixels of the reported artifact were never
+  reproduced, and the JVM suites cannot see a screen. §70 carries the two experiments that close that gap:
+  a device command that reproduces the drift deliberately, and a forced full redraw that separates a buffer
+  divergence from a rendering shift. **If the artifact survives this build, that experiment says which
+  change is talking** — the forced redraw re-syncs a buffer divergence and cannot correct a rendering
+  shift.
+- **The fix was verified in CI and outside Gradle, not on a phone.** The seven required contexts were green
+  at the merge; the emulator legs of `Android release test` are the closest this repository gets to a
+  device, and they install and launch the artifact rather than reading a terminal.
+
+### The artifacts
+
+Built and signed by `tagged-release.yml` from the `v1.12.0` tag: the universal APK, the four per-ABI splits
+(`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`), the AAB, and the `SHA256SUMS.txt` over them. The signing
+identity is unchanged from the releases before it — `0c69794b…`, the key the CI secret holds — so this
+build installs over 1.11.0 and every earlier release normally.
