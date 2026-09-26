@@ -87,7 +87,28 @@ data class TerminalStyle(
     val hidden: Boolean = false,
 )
 
-data class TerminalCell(val value: Char = ' ', val style: TerminalStyle = TerminalStyle())
+/**
+ * One cell of the grid: the character it shows, the style it shows it in, and whatever zero-width
+ * characters belong on top of it.
+ *
+ * [value] is the cell's base and is always exactly one `Char`, so a line is an array of characters
+ * that can be indexed by a column. That is what the whole emulator is built on, and it is why the
+ * width table's other arm is not acted on yet - see [terminalCharWidth]. [combining] holds the code
+ * points that take no column of their own and belong to the character before them: an `e` followed by
+ * U+0301 is one cell in two code points, and the zero-width joiner in a composed emoji is another.
+ * They are stored here rather than in cells of their own because a cell *is* a column, and the program
+ * on the far side of the pty does not count them as one - which is the bug this field exists to fix.
+ *
+ * Everything that draws or copies a cell reads [value] plus [combining]. Everything that addresses a
+ * cell by column reads [value] alone and needs no part of [combining], because a mark always sits on
+ * a base: the base is what decides whether a cell is a word character or a painted one, so those two
+ * tests are unchanged by a mark, and no cell ever holds a mark without a base under it.
+ */
+data class TerminalCell(
+    val value: Char = ' ',
+    val style: TerminalStyle = TerminalStyle(),
+    val combining: String = "",
+)
 
 data class TerminalSnapshot(
     val lines: List<List<TerminalCell>>,
@@ -346,7 +367,34 @@ class AnsiTerminalBuffer(
 
     @Synchronized
     private fun feedLocked(value: String): List<String> {
-        value.forEach(::consume)
+        var index = 0
+        while (index < value.length) {
+            val char = value[index]
+            // A variation selector from the supplement block (U+E0100-U+E01EF) is astral *and*
+            // zero-width, so it has to reach [putCodePoint] as one character or it spends two cells on
+            // a character the far side counts as none - the exact defect this walk exists for. Only a
+            // pair the width table calls zero-width is joined: an astral character of any other width
+            // already occupies the two cells the far side counts two columns for, so pairing it here
+            // would change how the printer has always stored it without moving anything.
+            //
+            // Joined only in the normal state, too. The escape states are an ASCII grammar in which a
+            // surrogate is noise, and pairing one there would swallow the byte after it.
+            if (escapeState == EscapeState.NORMAL && Character.isHighSurrogate(char) &&
+                index + 1 < value.length && Character.isLowSurrogate(value[index + 1])
+            ) {
+                val pair = Character.toCodePoint(char, value[index + 1])
+                if (terminalCharWidth(pair) == 0) {
+                    // Straight to the printer rather than through [consume]. In the normal state the
+                    // only thing `consume` would do with it is hand it to the printer, and the printer
+                    // is the one place that can take a character that is two `Char`s long.
+                    putCodePoint(pair)
+                    index += 2
+                    continue
+                }
+            }
+            consume(char)
+            index++
+        }
         if (pendingReplies.isEmpty()) return emptyList()
         val replies = pendingReplies.toList()
         pendingReplies.clear()
@@ -539,7 +587,13 @@ class AnsiTerminalBuffer(
             val to = if (index == endLine) toColumn.coerceIn(0, line.size) else line.size
             if (index > startLine) out.append('\n')
             val lineStart = out.length
-            for (column in from until to) out.append(line[column].value)
+            for (column in from until to) {
+                val cell = line[column]
+                out.append(cell.value)
+                // A mark is part of the character the user selected, not a cell of its own: an accent
+                // dropped here is an accent dropped from what they paste.
+                out.append(cell.combining)
+            }
             var lineEnd = out.length
             while (lineEnd > lineStart && out[lineEnd - 1] == ' ') lineEnd--
             out.setLength(lineEnd)
@@ -568,7 +622,12 @@ class AnsiTerminalBuffer(
             // Right-trim this line only, never back past the separator: the same scope
             // joinToString gave each line's own trimEnd().
             val lineStart = out.length
-            line.forEach { out.append(it.value) }
+            line.forEach { cell ->
+                out.append(cell.value)
+                // The same cluster [textIn] writes, for the same reason: this is the text a person
+                // reads, and the reason the two have to agree is spelled out above.
+                out.append(cell.combining)
+            }
             var lineEnd = out.length
             while (lineEnd > lineStart && out[lineEnd - 1].isWhitespace()) lineEnd--
             out.setLength(lineEnd)
@@ -1027,7 +1086,54 @@ class AnsiTerminalBuffer(
         escapeState = EscapeState.NORMAL
     }
 
-    private fun put(char: Char) {
+    private fun put(char: Char) = putCodePoint(char.code)
+
+    /**
+     * Prints one character - one code point, which may be a surrogate pair - at the cursor.
+     *
+     * The zero-width arm comes first, and it is first for two separate reasons.
+     *
+     * It is the fix. A character the far side counts as no column must spend no cell here either, and
+     * advancing for it is what puts this buffer's cursor one cell to the right of the program's. The
+     * cursor column is what every later erase, move and cursor-position reply is measured from, so a
+     * program whose `ESC [ K` starts one cell too far right leaves the cells to the left of it
+     * standing - characters the user can still see after the program believes it erased them. The
+     * character belongs on the cell before it instead.
+     *
+     * And it has to come *before* the pending wrap. A mark that arrives while a wrap is armed belongs
+     * to the character that armed it, which is the cell the cursor is still standing on - the wrap is
+     * exactly the state in which the cursor did not advance past it. Letting the mark consume the wrap
+     * would put the *next* real character on the row below and break the line where the program did
+     * not break it.
+     */
+    private fun putCodePoint(codePoint: Int) {
+        if (terminalCharWidth(codePoint) == 0) {
+            attachCombining(codePoint)
+            return
+        }
+        // An astral character the width table does not call zero-width is written as the two code units
+        // it is made of, one per cell. That is what this printer has always done with them, and it is
+        // what keeps a composed emoji drawing as a single glyph: the renderer joins the cells of a
+        // style run before it measures them, so the two halves are shaped together even though they
+        // are stored apart. Two cells is also the right count for the emoji the far side counts two
+        // columns for. A *narrow* astral character - a mathematical alphanumeric, say - still gets two
+        // where the far side counts one, which is a defect this change neither fixes nor worsens.
+        if (codePoint > Char.MAX_VALUE.code) {
+            val pair = Character.toChars(codePoint)
+            putUnit(pair[0])
+            putUnit(pair[1])
+            return
+        }
+        putUnit(codePoint.toChar())
+    }
+
+    /**
+     * Writes one cell - one `Char`, one column - and moves the cursor past it.
+     *
+     * The single-character path, and the only one that consults the DEC graphics set: a character that
+     * took a cell before [terminalCharWidth] existed still takes it in exactly the same way.
+     */
+    private fun putUnit(char: Char) {
         if (wrapPending) {
             if (autoWrap) {
                 cursorColumn = 0
@@ -1047,6 +1153,34 @@ class AnsiTerminalBuffer(
         }
         lastPrinted = glyph
         if (cursorColumn >= columns - 1) wrapPending = true else cursorColumn++
+        revision++
+    }
+
+    /**
+     * Puts a zero-width character on the cell it belongs to, without moving the cursor.
+     *
+     * "The cell it belongs to" is the one the last printed character landed on. That is the cell under
+     * the cursor while a wrap is armed, and the one before it otherwise: [putUnit] leaves the cursor
+     * where it is when a character fills the last column, so a mark arriving after that has to look at
+     * the cursor's own column rather than behind it.
+     *
+     * A mark with nothing under it is dropped rather than carried somewhere it does not belong. At
+     * column zero there is no cell to its left at all, and a cell holding a blank is one the far side
+     * counted as a space rather than as a base for it. This buffer also keeps no "last cell written"
+     * that could reach back to the previous row, and inventing one would put the accent on whatever
+     * happened to be there. Dropping it costs nothing in the column arithmetic, which is the point of
+     * the change: a zero-width character moves the cursor on neither side of the pty.
+     *
+     * Deliberately does not touch [lastPrinted]. `CSI b` repeats "the last character printed", and
+     * repeating an accent instead of the character under it would be a new way to be wrong.
+     */
+    private fun attachCombining(codePoint: Int) {
+        val column = if (wrapPending) cursorColumn else cursorColumn - 1
+        val line = lines[cursorRow]
+        if (column !in line.indices) return
+        val cell = line[column]
+        if (cell.value == ' ') return
+        line[column] = cell.copy(combining = cell.combining + String(Character.toChars(codePoint)))
         revision++
     }
 
@@ -1413,6 +1547,10 @@ class AnsiTerminalBuffer(
  *
  * Scanned backwards because the answer is near the end: most of a terminal row is the run of blanks
  * after the text.
+ *
+ * A cell's base is the whole test, and nothing here has to look at [TerminalCell.combining]: a
+ * zero-width character is only ever put on a cell that already holds a base, so a cell carrying one is
+ * painted or blank exactly as its base is, and the pan extent is unchanged by it.
  */
 internal fun terminalPaintedWidth(line: List<TerminalCell>): Int {
     var index = line.size

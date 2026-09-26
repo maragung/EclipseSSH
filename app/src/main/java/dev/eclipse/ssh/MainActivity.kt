@@ -309,6 +309,7 @@ import dev.eclipse.ssh.terminal.TerminalFrame
 import dev.eclipse.ssh.terminal.TerminalKey
 import dev.eclipse.ssh.terminal.TerminalSelection
 import dev.eclipse.ssh.terminal.TerminalViewport
+import dev.eclipse.ssh.terminal.terminalCellText
 import dev.eclipse.ssh.ui.terminal.KeyBarPrefsCodec
 import dev.eclipse.ssh.ui.terminal.TerminalInputBridge
 import dev.eclipse.ssh.ui.terminal.TerminalKeyRow
@@ -3775,15 +3776,22 @@ private fun ConfirmCloseSessionDialog(
 }
 
 /**
- * The text of buffer line [line], read out of the plain-text transcript.
+ * The characters of buffer line [line], one per cell, so that [TerminalSelection.wordAt]'s column
+ * indexes them directly.
  *
  * Long-press word selection needs the characters around the tap, and the frame only holds the
  * viewport. The transcript is the whole buffer in the same line order, so indexing it gives the line
  * even when the tap landed on scrollback. Out of range returns empty, which selects nothing.
+ *
+ * [terminalCellText] rather than the transcript line itself, and that is the whole point of this being
+ * a function rather than one line at the call site: the transcript is the text a person reads, so a
+ * cell carrying a combining mark or a zero-width joiner contributes its whole cluster there, and every
+ * character after such a cell then sits one place to the left of the cell the user actually tapped. The
+ * selection that comes back is addressed in cells, so the string it is found in has to be too.
  */
 private fun MainUiState.terminalLine(sessionKey: String, line: Int): String {
     val text = terminalOutput[sessionKey] ?: return ""
-    return text.lineSequence().elementAtOrNull(line).orEmpty()
+    return terminalCellText(text.lineSequence().elementAtOrNull(line).orEmpty())
 }
 
 /**

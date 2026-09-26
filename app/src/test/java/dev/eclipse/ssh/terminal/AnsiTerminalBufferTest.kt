@@ -7,8 +7,14 @@ import org.junit.Test
 /** ESC, spelled out so the sequences below stay readable and copy-pasteable. */
 private const val E = "\u001B"
 
-/** What one drawn row reads as, trailing blanks dropped the way the renderer drops them. */
-private fun List<TerminalCell>.text(): String = joinToString("") { it.value.toString() }.trimEnd()
+/**
+ * What one drawn row reads as, trailing blanks dropped the way the renderer drops them.
+ *
+ * A mark is part of the character its cell draws, so it belongs in what the row reads as - the same
+ * string [AnsiTerminalBuffer.plainText] gives for that row.
+ */
+private fun List<TerminalCell>.text(): String =
+    joinToString("") { it.value.toString() + it.combining }.trimEnd()
 
 class AnsiTerminalBufferTest {
     @Test
@@ -393,7 +399,9 @@ class AnsiTerminalBufferTest {
     @Test
     fun `plainText matches the straightforward rendering`() {
         fun reference(snapshot: TerminalSnapshot): String = snapshot.lines
-            .joinToString("\n") { line -> line.joinToString("") { it.value.toString() }.trimEnd() }
+            .joinToString("\n") { line ->
+                line.joinToString("") { it.value.toString() + it.combining }.trimEnd()
+            }
             .trimEnd()
 
         val cases = mapOf(
@@ -412,6 +420,9 @@ class AnsiTerminalBufferTest {
             "more lines than the screen has rows" to (1..12).joinToString("\n") { "line $it" },
             "a line of nothing but spaces" to "   \nafter",
             "tabs and non-latin text" to "kolom\tnilai\nsandi-üñïçø∂é",
+            // A cell whose character is two code points: the mark is part of the line, so a rendering
+            // that dropped it would be dropping ink the user can see.
+            "a decomposed accent" to "cafe\u0301 x",
             "styling around the text" to "$E[1;31mbold red$E[0m plain",
             // Cursor addressing leaves untouched cells as spaces mid-line.
             "cursor addressing that leaves gaps" to "$E[2;5Hmid$E[4;1Hlow",
@@ -889,5 +900,250 @@ class AnsiTerminalBufferTest {
 
         buffer.feed("\r$E[K" + "short")
         assertThat(buffer.snapshot().lines.first().text()).isEqualTo("short")
+    }
+
+    // --- Zero-width characters: the cursor has to stay in the program's coordinate system ---
+
+    /**
+     * The invariant the whole change is about: after every chunk, this buffer's column is the column the
+     * program on the other end of the pty believes the cursor is on.
+     *
+     * That agreement is the only thing that makes an erase land where the program meant it to. Every
+     * relative move the program sends - `ESC [ C`, `ESC [ D`, and the `ESC [ K` that redraws a line - is
+     * measured from a column it counted itself, so a column this buffer counted differently is a write or
+     * an erase one cell away from where it was aimed, silently: a wrong column is a legal column.
+     *
+     * The expected values are **counted by hand** rather than computed with [terminalCharWidth], which
+     * would make the test agree with the code under test for free. They are what the far side's `wcwidth`
+     * gives. None of them reaches the sixtieth column, so no wrap intervenes and the arithmetic stays
+     * additive.
+     */
+    @Test
+    fun `the cursor column is the column the program counted`() {
+        val buffer = AnsiTerminalBuffer(columns = 60, rows = 5)
+        // An escape sequence in a failure message would be invisible and a surrogate half unprintable, so
+        // the chunk is named the way the source spells it.
+        fun shown(chunk: String): String = chunk.replace(E, "<ESC>").map { char ->
+            if (char.code in 0xD800..0xDFFF) "\\u%04X".format(char.code) else char.toString()
+        }.joinToString("")
+
+        val stream = listOf(
+            "deploy " to 7,            // seven columns
+            "\u2764\uFE0F" to 8,       // a heart is one column; the variation selector after it is none
+            " done" to 13,             // five more
+            "\r" to 0,                 // an absolute move, which re-syncs both sides
+            "cafe\u0301 " to 5,        // four letters, an accent that takes no column, then a space
+            "$E[32mok$E[0m" to 7,      // styling moves no column
+            "\uD83D\uDE00" to 9,       // an emoji: two code units, two columns, which is what the far side counts
+            "\uDB40\uDD01" to 9,       // a variation selector from the supplement: two code units, no column
+            " fin" to 13,              // four more
+        )
+
+        stream.forEach { (chunk, expected) ->
+            buffer.feed(chunk)
+            assertWithMessage("after chunk %s", shown(chunk))
+                .that(buffer.frame().cursorColumn)
+                .isEqualTo(expected)
+        }
+    }
+
+    /**
+     * The reported bug at the buffer level: a mark must not move the text that follows it.
+     *
+     * A program that rewrites a line in place - a prompt, a progress bar, a spinner - prints the new text
+     * and then erases to the end of the line, or erases and then prints. Both depend on the erase starting
+     * where the program thinks the cursor is. Let a mark spend a cell of its own and this buffer's cursor
+     * is one cell too far right, so the erase starts one cell too far right, and the cell the program
+     * meant to clear is still standing when the new text lands beside it.
+     *
+     * Asserted on the cells, not on [AnsiTerminalBuffer.plainText]: the two differ only in which cell
+     * holds the mark, and the whole defect is that the text after it sits on the wrong ones.
+     */
+    @Test
+    fun `a mark in a rewritten line leaves nothing standing to its left`() {
+        val buffer = AnsiTerminalBuffer(columns = 20, rows = 4)
+
+        buffer.feed("abcdefgh\r")   // an older, longer line
+        buffer.feed("x\uFE0Fy")     // the new one, with a mark in it
+        buffer.feed("$E[K")         // erase from where the program's cursor is
+        buffer.feed("z")
+
+        val line = buffer.snapshot().lines.first()
+        assertThat(line[0].value).isEqualTo('x')
+        assertThat(line[0].combining).isEqualTo("\uFE0F")
+        assertWithMessage("the mark spent a cell, so the rest of the line moved right of where it belongs")
+            .that(line[1].value)
+            .isEqualTo('y')
+        assertThat(line[2].value).isEqualTo('z')
+        // None of the old line survives, and neither does anything the erase covered.
+        assertThat(line.drop(3).map { it.value }.joinToString("").trimEnd()).isEmpty()
+        // The two sides agree on where the cursor ended, which is what made the erase land correctly.
+        assertThat(buffer.frame().cursorColumn).isEqualTo(3)
+    }
+
+    /**
+     * The same statement for each way a zero-width character actually reaches a shell.
+     *
+     * A variation selector from an emoji in a prompt, a zero-width joiner from a composed one, a
+     * byte-order mark at the head of a file `cat` is reading, and a combining accent from a name
+     * written on a system that decomposes them. All four have to leave the rest of the line on the cells
+     * the program put it on.
+     */
+    @Test
+    fun `every kind of zero-width character leaves the line where the program put it`() {
+        listOf("\uFE0F", "\u200D", "\uFEFF", "\u0301").forEach { mark ->
+            val buffer = AnsiTerminalBuffer(columns = 20, rows = 4)
+
+            buffer.feed("abcdefgh\r" + "x" + mark + "y" + "$E[K" + "z")
+
+            val line = buffer.snapshot().lines.first()
+            assertWithMessage("U+%04X".format(mark.code)).that(line[0].combining).isEqualTo(mark)
+            assertWithMessage("U+%04X".format(mark.code)).that(line[1].value).isEqualTo('y')
+            assertWithMessage("U+%04X".format(mark.code)).that(line[2].value).isEqualTo('z')
+        }
+    }
+
+    @Test
+    fun `a mark sits on the cell before it and spends none of its own`() {
+        val buffer = AnsiTerminalBuffer(columns = 10, rows = 3)
+
+        buffer.feed("e\u0301")
+
+        val line = buffer.snapshot().lines.first()
+        assertThat(line[0].value).isEqualTo('e')
+        assertThat(line[0].combining).isEqualTo("\u0301")
+        assertThat(line[1].value).isEqualTo(' ')
+        assertThat(buffer.frame().cursorColumn).isEqualTo(1)
+    }
+
+    /**
+     * The ordering trap, and the reason the width test comes before the pending wrap in `putCodePoint`.
+     *
+     * When a character fills the last column the wrap is armed but not taken: the cursor is still standing
+     * on the cell that character is on, and it is that cell a mark arriving next belongs to. A mark that
+     * consumed the wrap instead would break the line where the program did not break it, and would put the
+     * mark itself on the row below.
+     */
+    @Test
+    fun `a mark after the last column belongs to the character that armed the wrap`() {
+        val buffer = AnsiTerminalBuffer(columns = 4, rows = 3)
+
+        buffer.feed("abcd\u0301")
+
+        val first = buffer.snapshot().lines[0]
+        assertWithMessage("the mark was carried onto the next row")
+            .that(first[3].combining)
+            .isEqualTo("\u0301")
+        assertThat(first.map { it.value }.joinToString("")).isEqualTo("abcd")
+
+        // The next character takes the wrap exactly as it would have without the mark.
+        buffer.feed("e")
+        assertThat(buffer.snapshot().lines[1][0].value).isEqualTo('e')
+    }
+
+    /**
+     * A mark with nothing under it is dropped, in both of the ways that happens.
+     *
+     * At column zero there is no cell to its left at all; on a cell the program filled with a space there
+     * is no character for it to belong to. Dropping it costs nothing in the column arithmetic, which is
+     * the point of the change - and inventing a home for it would put the accent on whatever happened to
+     * be there, a row up or a whole screen away.
+     */
+    @Test
+    fun `a mark with nothing under it is dropped, not carried`() {
+        val atColumnZero = AnsiTerminalBuffer(columns = 10, rows = 3)
+        atColumnZero.feed("\u0301")
+        assertThat(atColumnZero.snapshot().lines.first()[0].combining).isEmpty()
+        assertThat(atColumnZero.frame().cursorColumn).isEqualTo(0)
+
+        val onABlank = AnsiTerminalBuffer(columns = 10, rows = 3)
+        onABlank.feed(" \u0301")
+        assertThat(onABlank.snapshot().lines.first()[0].combining).isEmpty()
+        assertThat(onABlank.frame().cursorColumn).isEqualTo(1)
+    }
+
+    /**
+     * The two readings of the same line, and the reason [terminalCellText] exists.
+     *
+     * [AnsiTerminalBuffer.plainText] is what a person reads and what the clipboard gets, so a cell whose
+     * character is two code points contributes both. A *column* indexes the other string - the one with
+     * one character per cell - which is what long-press selection is handed. The last assertion is the
+     * one that makes the conversion exact rather than approximate: the two agree on how many cells the
+     * line occupies.
+     */
+    @Test
+    fun `plainText keeps a mark with its character, and terminalCellText splits the two`() {
+        val buffer = AnsiTerminalBuffer(columns = 20, rows = 3)
+
+        buffer.feed("cafe\u0301 x")
+
+        assertThat(buffer.plainText()).isEqualTo("cafe\u0301 x")
+        assertThat(terminalCellText(buffer.plainText())).isEqualTo("cafe x")
+        assertThat(terminalCellText(buffer.plainText()).length)
+            .isEqualTo(terminalPaintedWidth(buffer.snapshot().lines.first()))
+    }
+
+    @Test
+    fun `a copy keeps the mark, and CSI b repeats the base`() {
+        val buffer = AnsiTerminalBuffer(columns = 20, rows = 3)
+
+        buffer.feed("e\u0301x")
+        assertThat(buffer.textIn(0, 0, 0, 3)).isEqualTo("e\u0301x")
+
+        // REP repeats "the last character printed". A mark is part of that character and not one of its
+        // own, so what repeats is the base: repeating the accent would be a new way to be wrong.
+        val repeated = AnsiTerminalBuffer(columns = 20, rows = 3)
+        repeated.feed("e\u0301$E[3b")
+
+        val line = repeated.snapshot().lines.first()
+        assertThat(line.take(4).map { it.value }.joinToString("")).isEqualTo("eeee")
+        assertThat(line[0].combining).isEqualTo("\u0301")
+        assertThat(line.drop(1).map { it.combining }.joinToString("")).isEmpty()
+    }
+
+    /**
+     * A pair split across two reads still draws one emoji, because both halves take a cell either way.
+     *
+     * The pty hands a session arbitrary chunks, so a surrogate pair can arrive in halves. The width walk
+     * only joins a pair it can see whole, and on its own each half is one character wide - which is
+     * exactly what the joined path spends for the two of them.
+     */
+    @Test
+    fun `a surrogate pair split across two reads still draws the same cells`() {
+        val joined = AnsiTerminalBuffer(columns = 10, rows = 3)
+        val split = AnsiTerminalBuffer(columns = 10, rows = 3)
+
+        joined.feed("\uD83D\uDE00")
+        split.feed("\uD83D")
+        split.feed("\uDE00")
+
+        assertThat(split.snapshot().lines.first().map { it.value })
+            .isEqualTo(joined.snapshot().lines.first().map { it.value })
+        assertThat(split.frame().cursorColumn).isEqualTo(2)
+    }
+
+    /**
+     * The one case the change cannot reach, pinned so that it is known rather than discovered.
+     *
+     * U+E0101 is a mark, but when its two code units arrive in separate reads neither one says so: a lone
+     * high surrogate is a character like any other, and there is nothing in it that announces a mark. The
+     * joined form spends no column; the split one spends two. Recognising it would mean holding a high
+     * surrogate until the next read arrives, which is state this printer does not keep - and it is the
+     * same shape as a partial escape sequence, which the parser does keep state for.
+     *
+     * Held here rather than fixed, and the assertion is on the limitation itself: giving a lone surrogate
+     * width zero would be wrong for every non-mark astral character, which is the far more common case.
+     */
+    @Test
+    fun `a mark whose pair is split across reads cannot be recognised, and takes a cell`() {
+        val joined = AnsiTerminalBuffer(columns = 10, rows = 3)
+        val split = AnsiTerminalBuffer(columns = 10, rows = 3)
+
+        joined.feed("x\uDB40\uDD01")
+        split.feed("x\uDB40")
+        split.feed("\uDD01")
+
+        assertThat(joined.frame().cursorColumn).isEqualTo(1)
+        assertThat(split.frame().cursorColumn).isEqualTo(3)
     }
 }
