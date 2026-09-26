@@ -1,11 +1,11 @@
 # EclipseSSH — audit, fixes and verification
 
-`dev.eclipse.ssh` · versionCode 43 / versionName 1.10.0 · minSdk 28, targetSdk 35, compileSdk 37
+`dev.eclipse.ssh` · versionCode 44 / versionName 1.11.0 · minSdk 28, targetSdk 35, compileSdk 37
 The per-section figures below are snapshots of the pass that wrote them and are left as they were; this line is the current state.
 Where those snapshots call `lintRelease` clean, read §16.2: the warnings were real, four of them are declined on purpose and explained there, and the rest are dependency-freshness advisories that only a networked lint run can see. §16.2's "0 errors and 51 warnings" is that pass's figure, not a current one, and no lint count is re-derivable from this repository or from a CI run: `lintReportRelease` prints only the paths of the two reports it writes into `app/build/reports/`, and the `lint` job uploads nothing. The current count is whatever `./gradlew lintRelease` writes into `app/build/reports/` today — which is the one figure this block does not carry, because it is the one figure nothing here can re-derive.
 Kotlin 2.4.20 · AGP 9.4.1 · Gradle 9.7.1 · JDK 17 (CI pins Temurin 17.0.13) · Compose BOM 2026.09.00 · Hilt 2.60.1 · KSP 2.3.12 · Room 2.8.5 · Apache MINA SSHD 2.19.0 · BouncyCastle 1.86
 Every figure in this block is re-derivable rather than remembered: the SDK levels and the two version names are `app/build.gradle.kts`, the rest of the toolchain is `gradle/libs.versions.toml`, and the Gradle version is `gradle/wrapper/gradle-wrapper.properties`. A line in this block that disagrees with those files is the line that is wrong. `scripts/check-doc-figures.sh` re-derives them — this block, the README's counts, the `AboutLicenses` list, the workflow names the documents cite — and runs as the `docs` job of `ci.yml`, so a disagreement fails CI instead of standing until someone reads it again.
-The numbered sections end at §68, *An eighth checkbox installs from a vendor's own script, and the pipe the vendor documents is not the command that runs*; the newest of them that releases a version is §67, *Releasing 1.10.0*, and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
+The numbered sections end at §69, *Releasing 1.11.0*, which is also the newest of them that releases a version — and that is the version this file's header names. §1–§36 are a record of the passes that wrote them, and the narrative was not carried forward through 1.1.5–1.1.17 — so a reader looking for 1.1.12's crash-on-open will not find it below, and should not read §36's figures as current; what happened in that gap is recorded by the git history, the GitHub release bodies and the suites themselves rather than by a section here. The same goes for the symbols and line numbers a section names: they are the ones that existed when it was written, and a composable or a test file that has since been renamed or deleted is a rename, not an error in the report. §31.2's `FilesSessionSwitcher` and `FileBrowserHostTest` are the worked example — both were real, and both were replaced by `SessionChip` in `app/src/main/java/dev/eclipse/ssh/ui/files/FilesExplorerUi.kt` when the explorer was rebuilt on the shared provider abstraction. Grep the tree before trusting a name from these sections; the figures in the header block are the part that is checked.
 
 ---
 
@@ -7839,3 +7839,66 @@ here. And the row is offered everywhere, so an `armhf` userspace shows it disabl
 it: the same decision the pipeline makes, made early enough to read. This section records a mechanism
 that has been reasoned about, wired and tested against a scripted guest; it does not record one that has
 been seen to install anything.
+
+---
+
+## 69. Releasing 1.11.0
+
+1.10.0 repaired what a phone's Health check found in proot. 1.11.0 adds rather than repairs: the Ubuntu
+install dialog's preinstall list gains an eighth checkbox, **Claude Code CLI**, installed by the vendor's
+own script instead of by either of the two mechanisms the other seven use. §68 is the whole of the change;
+this section is the release.
+
+### Why this is a minor release and not a patch
+
+The rule §41 and §56 both set, and §67 applied: **a patch number is honest when the artifact a user
+installs behaves as its predecessor's does.** This one does not pass that test, and the reason needs no
+APK to see. A device that installs 1.11.0 over 1.10.0 is offered a row its predecessor did not offer, and
+ticking that row reaches a third-party host this app had never contacted; what the install dialog offers
+is part of what the artifact does. `versionCode` moves 43 → 44 and `versionName` 1.10.0 → 1.11.0.
+
+Nothing native changes here, so unlike §67 the binary a device runs is the one 1.10.0 shipped: no
+`linux/proot-patches/` change, and `docs/THIRD-PARTY.md`'s corresponding-source paragraph is unchanged
+with it.
+
+### What a device gains
+
+- **An eighth row in the preinstall list**, labelled `Claude Code CLI`, whose summary names the command it
+  leaves behind and the architectures its installer ships — so the tick is checkable in a terminal and the
+  limit is readable before the install starts.
+- **A row that is never a surprise on 32-bit ARM.** No build is published for `armhf`, so the pipeline
+  skips the fetch and says which architecture it is, and the dialog draws that row disabled with the reason
+  under it rather than hiding it — a row that vanished would be a list lying about its contents.
+- **A warning, never a failed install.** The third mechanism is bound by the promise the other two already
+  make: an extra that fails is one line of warning and an install that still succeeds.
+
+### What is not claimed
+
+**Nothing in this repository has ever run a vendor install script inside the guest.** The tests drive a
+scripted guest and that is the whole of what is verified. The extras dialog itself is covered by no suite,
+because a JVM host maps to no Ubuntu architecture, so the check that closes the loop is a device's: tick
+Claude Code CLI, let the install finish, and confirm `claude --version` answers in a terminal. If the
+launcher lands where a login shell cannot see it, the read-back reports that as a warning — that is the
+behaviour, not a defect worked around here.
+
+The installer is also unpinned `latest`, and its SHA-256 is checked against a manifest from the same origin:
+**integrity, not authenticity.** That is weaker than the rootfs pin, whose bytes are checked against a hash
+this repository holds, and it is exactly why the entry is opt-in and warning-only.
+
+### The artifacts
+
+Built and signed by `tagged-release.yml` from the `v1.11.0` tag: the universal APK, the four per-ABI splits
+(`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`), the AAB, and the `SHA256SUMS.txt` over them. The signing
+identity is unchanged from the releases before it — `0c69794b…`, the key the CI secret holds — so this build
+installs over 1.10.0 and every earlier release normally.
+
+### The order this release keeps
+
+The one §65 paid to learn and §67 followed: `tagged-release.yml` builds the artifact, and
+`android-release-test.yml` is the only thing in this repository that *installs* one — it fires on
+`release: published`. So the draft is verified, published **while the CI window is open**, and the window is
+closed only once `Android release test` has settled. Never the other way round.
+
+The run record for this release is not in this section yet. §67's was written into the report after its
+window closed, and this one takes the same route: the build's run, the artifact readings and the device
+check are added here once they exist rather than predicted now.
