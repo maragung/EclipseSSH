@@ -47,6 +47,9 @@ class OptionalPackagesTest {
         assertThat(OptionalPackages.needsModernNode(setOf(OptionalPackage.PYTHON))).isFalse()
         assertThat(OptionalPackages.needsModernNode(setOf(OptionalPackage.BUILD_TOOLS))).isFalse()
         assertThat(OptionalPackages.needsModernNode(setOf(OptionalPackage.TERMINAL_TOOLS))).isFalse()
+        // And the entry that reaches its maker's own installer rather than a registry must not drag
+        // the twenty-minute NodeSource route in with it: it needs no Node.js at all.
+        assertThat(OptionalPackages.needsModernNode(setOf(OptionalPackage.CLAUDE_CODE))).isFalse()
     }
 
     @Test
@@ -63,7 +66,16 @@ class OptionalPackagesTest {
     @Test
     fun `every entry installs something, and each names itself once`() {
         for (entry in OptionalPackages.all) {
-            assertThat(entry.aptPackages.isNotEmpty() || entry.npmGlobals.isNotEmpty()).isTrue()
+            // Three ways to install something rather than two, and an entry that named none of them
+            // would be a checkbox that does nothing — which is why this asks for any of the three
+            // rather than for an apt package. An entry reaching a vendor installer has no apt
+            // package and no npm global, and inventing one to satisfy this would be the tail wagging
+            // the dog.
+            assertThat(
+                entry.aptPackages.isNotEmpty() ||
+                    entry.npmGlobals.isNotEmpty() ||
+                    entry.vendorInstallers.isNotEmpty(),
+            ).isTrue()
             assertThat(entry.label).isNotEmpty()
             assertThat(entry.summary).isNotEmpty()
         }
@@ -84,7 +96,70 @@ class OptionalPackagesTest {
         // name `nodejs`, and apt would be asked for it twice in one command.
         assertThat(apt).containsNoDuplicates()
         assertThat(npm).containsNoDuplicates()
+        // And the installer addresses. Fetching one twice is merely wasteful, but a script that runs
+        // twice is visible in a way a package install is not, so a repeated address is the stronger
+        // fault of the three.
+        assertThat(OptionalPackages.all.flatMap { it.vendorInstallers }.map { it.url })
+            .containsNoDuplicates()
         assertThat(OptionalPackages.implied(all)).isEmpty()
+    }
+
+    @Test
+    fun `the claude entry installs through anthropic's own installer`() {
+        val installer = OptionalPackage.CLAUDE_CODE.vendorInstallers.single()
+
+        assertThat(installer.url).isEqualTo("https://claude.ai/install.sh")
+        assertThat(installer.command).isEqualTo("claude")
+        // The two the vendor's script accepts and no others — anything else makes it exit rather than
+        // install something wrong, which is why the entry has to declare them rather than assume them.
+        assertThat(installer.supportedArches).containsExactly("amd64", "arm64")
+    }
+
+    @Test
+    fun `the claude entry asks for nothing but its own installer`() {
+        val only = setOf(OptionalPackage.CLAUDE_CODE)
+
+        assertThat(OptionalPackages.aptPackages(only)).isEmpty()
+        assertThat(OptionalPackages.npmGlobals(only)).isEmpty()
+        // No `requires`, so nothing is pulled in and the dialog draws no "also installs" line: one
+        // script, and no Node.js anywhere near it.
+        assertThat(OptionalPackages.resolve(only)).containsExactly(OptionalPackage.CLAUDE_CODE)
+        assertThat(OptionalPackages.implied(only)).isEmpty()
+        assertThat(OptionalPackages.needsModernNode(only)).isFalse()
+    }
+
+    @Test
+    fun `a vendor installer is offered only on the architectures it ships`() {
+        assertThat(OptionalPackages.runsOn(OptionalPackage.CLAUDE_CODE, "armhf")).isFalse()
+        assertThat(OptionalPackages.runsOn(OptionalPackage.CLAUDE_CODE, "amd64")).isTrue()
+        assertThat(OptionalPackages.runsOn(OptionalPackage.CLAUDE_CODE, "arm64")).isTrue()
+        // Everything that reaches no vendor installer is installable everywhere, and `all` over an
+        // empty list is what makes that a rule rather than a fact about which entries happen to
+        // exist: a package list carries no architecture of its own, because it comes from the archive
+        // already pinned for this device's. Pinned here so nobody "fixes" it into a false.
+        for (entry in OptionalPackages.all.filter { it.vendorInstallers.isEmpty() }) {
+            for (arch in listOf("amd64", "arm64", "armhf")) {
+                assertThat(OptionalPackages.runsOn(entry, arch)).isTrue()
+            }
+        }
+    }
+
+    @Test
+    fun `every vendor installer is https, names its architectures and the command it leaves`() {
+        val installers = OptionalPackages.all.flatMap { it.vendorInstallers }
+
+        assertThat(installers).isNotEmpty()
+        for (installer in installers) {
+            // A script fetched in the clear and then run as root is the one thing here that cannot be
+            // walked back after the fact.
+            assertThat(installer.url).startsWith("https://")
+            // Never empty, because an empty list would mean "nobody decided" rather than "everywhere".
+            assertThat(installer.supportedArches).isNotEmpty()
+            assertThat(installer.supportedArches).containsNoDuplicates()
+            // What the read-back asks a login shell for; without it a successful install is
+            // unverifiable and the probe has nothing to look up.
+            assertThat(installer.command).isNotEmpty()
+        }
     }
 
     @Test

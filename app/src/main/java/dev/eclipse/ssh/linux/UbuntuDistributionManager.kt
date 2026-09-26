@@ -138,8 +138,9 @@ class UbuntuDistributionManager(
      * @param extras the optional packages the user ticked on the install dialog. Empty — which is
      *   every call but the install's own, and the default — means the step does not run at all and
      *   the pipeline is exactly the pipeline it was before the checkboxes existed. A non-empty
-     *   selection adds one step after the base packages, and a failure inside it is a warning: the
-     *   base system installed, and the extras are on top of a userspace that is already whole.
+     *   selection adds one step after the base packages, which may reach apt, npm's registry and a
+     *   tool's own installer in turn, and a failure inside it is a warning: the base system installed,
+     *   and the extras are on top of a userspace that is already whole.
      * @return the warnings collected along the way (empty on a fully clean install)
      */
     suspend fun setup(
@@ -1121,12 +1122,15 @@ class UbuntuDistributionManager(
      * The packages the user ticked on the install dialog — the one step of the pipeline that may
      * not run, and the one whose failures never stop an install.
      *
-     * Three things happen here, in the only order that works. The apt half lands first, from the
+     * Four things happen here, in the only order that works. The apt half lands first, from the
      * pinned archive and through the same ladder the base packages use, because Node.js itself comes
      * from there. Node.js is then *measured* rather than assumed: the npm tools below cannot run on
      * the 12.22 that jammy's archive carries, so [ensureRunnableNode] upgrades it from NodeSource
      * when the archive's is too old, and says so when even that does not land. Only then are the npm
-     * globals installed, one command each.
+     * globals installed, one command each — and only then, last of all,
+     * [installExtraVendorPackages] runs a tool's own installer for the entries that name one. That
+     * last step is deliberately outside the Node.js branch above: it needs no Node.js, so a runtime
+     * that will not work must not be able to skip it.
      *
      * Everything here is a warning on failure, and the reason is the shape of the promise: the base
      * system is on disk and verified before this method is entered, so the userspace is whole
@@ -1151,17 +1155,27 @@ class UbuntuDistributionManager(
         val wanted = OptionalPackages.resolve(extras)
         installExtraAptPackages(OptionalPackages.aptPackages(wanted), onProgress, warnings)
         val globals = OptionalPackages.npmGlobals(wanted)
-        if (globals.isEmpty()) return
-        // The globals are skipped wholesale when Node.js itself is not usable: every one of them
-        // would otherwise fail with the same npm error, three warnings that say one thing, and the
-        // sentence the user needs — that the tools are missing because their runtime is — would be
-        // the one no line contains.
-        if (!ensureRunnableNode(wanted, onProgress, warnings)) {
-            warnings += "the npm tools (${globals.joinToString(", ")}) were skipped: " +
-                "they need a working Node.js"
-            return
+        if (globals.isNotEmpty()) {
+            // The globals are skipped wholesale when Node.js itself is not usable: every one of them
+            // would otherwise fail with the same npm error, three warnings that say one thing, and the
+            // sentence the user needs — that the tools are missing because their runtime is — would be
+            // the one no line contains.
+            if (!ensureRunnableNode(wanted, onProgress, warnings)) {
+                warnings += "the npm tools (${globals.joinToString(", ")}) were skipped: " +
+                    "they need a working Node.js"
+            } else {
+                installNpmGlobals(globals, onProgress, warnings)
+            }
         }
-        installNpmGlobals(globals, onProgress, warnings)
+        // Last, and outside the npm block rather than before it. A vendor installer needs no Node.js,
+        // so a runtime that will not work must not be able to skip it — which is why this is not
+        // inside the `if`. After the globals rather than before them because a resolved selection is
+        // in declaration order, that order is an install order (the docs say so, and a test pins the
+        // half of it a test can see), and the entry that names an installer is declared last: a
+        // mechanism that jumped the queue would make that sentence a half-truth, and nothing is gained
+        // by jumping it — the script touches $HOME and needs only curl and sha256sum, neither of which
+        // apt or npm is holding.
+        installExtraVendorPackages(wanted, onProgress, warnings)
     }
 
     /**
@@ -1337,6 +1351,76 @@ class UbuntuDistributionManager(
                     detail = tool,
                     exitCode = result?.exitCode,
                 )
+            }
+        }
+    }
+
+    /**
+     * The entries whose tool ships its own installer: fetched over https and run inside the guest, one
+     * at a time, with every outcome a warning like the two mechanisms beside it.
+     *
+     * Three things per installer, and only the middle one is the install — the other two are the
+     * *measurement*. The architecture gate answers before anything is fetched, because the vendor's own
+     * script would answer it too, with a download already spent, and this app can say it in the user's
+     * terms instead. The read-back answers after the script claims success, because a script's exit
+     * status is its own word for what it did and the command it leaves behind is the fact: a user told
+     * "installed" who then finds no `claude` in their terminal has been misled by this app rather than
+     * by the vendor.
+     *
+     * Deduplicated by URL rather than by entry. Running a script is visible in a way fetching a package
+     * is not, so two entries naming one installer must run it once — and the entry is what the warnings
+     * name, which is the only reason this walks entries instead of addresses.
+     */
+    private suspend fun installExtraVendorPackages(
+        wanted: List<OptionalPackage>,
+        onProgress: (String) -> Unit,
+        warnings: MutableList<String>,
+    ) {
+        val seen = mutableSetOf<String>()
+        for (entry in wanted) {
+            for (installer in entry.vendorInstallers) {
+                if (!seen.add(installer.url)) continue
+                if (distro.ubuntuArch !in installer.supportedArches) {
+                    warnings += "${entry.label} was not installed: its installer ships " +
+                        "${installer.supportedArches.joinToString(" and ")} builds, and this " +
+                        "userspace is ${distro.ubuntuArch}"
+                    diagnostics.record(
+                        UserspaceDiagnosticCategory.APT,
+                        "vendor installer skipped",
+                        detail = "${installer.url} | arch=${distro.ubuntuArch}, " +
+                            "supported=${installer.supportedArches.joinToString("/")}",
+                    )
+                    continue
+                }
+                val result = runSetupCommand(
+                    vendorInstallCommand(installer.url),
+                    VENDOR_INSTALL_TIMEOUT_MS,
+                    lineTracker(onProgress),
+                )
+                if (result == null || result.exitCode != 0) {
+                    warnings += "${entry.label} was not installed" +
+                        (failureTail(result?.outputText(), lines = 1)
+                            ?.let { ": $it" } ?: ": the install timed out")
+                    diagnostics.record(
+                        UserspaceDiagnosticCategory.APT,
+                        "vendor installer refused",
+                        detail = "${installer.url} | " +
+                            (failureTail(result?.outputText(), lines = 2)
+                                ?: "no output before the timeout"),
+                        exitCode = result?.exitCode,
+                    )
+                    continue
+                }
+                if (!vendorCommandIsRunnable(installer.command)) {
+                    warnings += "${entry.label} reported a successful install, but no " +
+                        "${installer.command} command was found in a login shell"
+                    diagnostics.record(
+                        UserspaceDiagnosticCategory.APT,
+                        "vendor installer not on path",
+                        detail = "${installer.url} | a login shell could not resolve " +
+                            "${installer.command} after the installer exited 0",
+                    )
+                }
             }
         }
     }
@@ -1527,6 +1611,45 @@ class UbuntuDistributionManager(
      */
     private suspend fun runSessionCommand(command: String, timeoutMs: Long): ProotCommandResult? =
         runtime.runCommand(runtime.sessionArgv(command), env = runtime.baseEnv(), timeoutMs = timeoutMs)
+
+    /**
+     * A vendor's installer as the one command the guest runs: fetch it whole, then — only if every
+     * byte arrived — run it.
+     *
+     * `curl -fsSL <url> | bash` is the shape the vendors document, and it reports *success* when the
+     * download does not arrive. A pipeline's status is its last command's, so a curl that 404'd (exit
+     * 22) or could not resolve the name (exit 6) leaves `bash` reading an empty stdin and exiting 0, and
+     * a dead host becomes indistinguishable from a finished install at the only place the pipeline
+     * looks. `set -o pipefail` repairs that and still is not the shape used here, because it leaves the
+     * other half of the fault in place: a connection that drops mid-body hands `bash` a *truncated
+     * script to start executing* while curl's exit status is not yet known. `&&` is the whole
+     * difference — the script runs only after curl has read every byte and exited 0 — and it costs one
+     * path in the guest's own /tmp, which [prepareWorkspace] creates and the next attempt truncates.
+     *
+     * `bash`, named, not `sh`: these scripts use `=~` and `BASH_REMATCH`, and Ubuntu's `/bin/sh` is
+     * dash. No `set -o pipefail` belongs here either — there is no pipeline left to guard.
+     */
+    private fun vendorInstallCommand(url: String): String =
+        "curl -fsSL $url -o $VENDOR_INSTALL_SCRIPT && bash $VENDOR_INSTALL_SCRIPT"
+
+    /**
+     * Whether the command an installer claims to have left behind is one a login shell can actually
+     * find — asked through [runSessionCommand], so the answer is the one a terminal gives rather than
+     * the one this pipeline's own apt-tuned environment would.
+     *
+     * The marker rather than the exit status, following [LOGIN_PROBE_COMMAND]: `command -v` prints a
+     * path when it succeeds, and a probe that read its output would be parsing a path it does not care
+     * about. Absence is not an echo, so a shell that cannot find the command reports it by staying
+     * silent and the caller reads that as the negative it is.
+     */
+    private suspend fun vendorCommandIsRunnable(command: String): Boolean {
+        val result = runSessionCommand(vendorProbeCommand(command), VENDOR_PROBE_TIMEOUT_MS)
+        return result != null && result.exitCode == 0 &&
+            result.outputText().contains(VENDOR_ON_PATH_MARKER)
+    }
+
+    private fun vendorProbeCommand(command: String): String =
+        "command -v $command >/dev/null 2>&1 && echo $VENDOR_ON_PATH_MARKER"
 
     /**
      * Records the tail of the proot fork's blocked-syscall log ([ProotRuntime] points
@@ -2014,6 +2137,31 @@ class UbuntuDistributionManager(
 
         /** `node --version` is a version print; a runner that needs a minute for it is not one. */
         private const val NODE_VERSION_TIMEOUT_MS = 60_000L
+
+        /**
+         * One vendor installer, whole: the script, then whatever release archive the script fetches.
+         * That is [NODESOURCE_TIMEOUT_MS]'s shape — a fetch followed by real install work — rather than
+         * [NPM_INSTALL_TIMEOUT_MS]'s single package, so it gets the former's budget; and it is its own
+         * constant for the reason every route here is, so a script that hangs cannot eat the budget of
+         * the entries after it.
+         */
+        private const val VENDOR_INSTALL_TIMEOUT_MS = 20 * 60_000L
+
+        /**
+         * The read-back after a vendor installer: a `command -v` either answers or it does not, so this
+         * mirrors [NODE_VERSION_TIMEOUT_MS] rather than the install budgets.
+         */
+        private const val VENDOR_PROBE_TIMEOUT_MS = 60_000L
+
+        /**
+         * Where a vendor's installer is staged inside the guest before it runs. The guest's own /tmp,
+         * which [prepareWorkspace] creates; each attempt truncates it, so a script that half-arrived
+         * can never be the one the next run executes.
+         */
+        private const val VENDOR_INSTALL_SCRIPT = "/tmp/eclipse-vendor-install.sh"
+
+        /** What [vendorProbeCommand] echoes when a login shell can find the command it asks about. */
+        private const val VENDOR_ON_PATH_MARKER = "eclipse-vendor-on-path"
 
         /**
          * The Node.js major the npm tools on the install dialog document as their floor. Cline's

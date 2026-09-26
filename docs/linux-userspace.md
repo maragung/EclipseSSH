@@ -143,14 +143,16 @@ same percentages, as it did before the list existed. The catalogue is
 | opencode | the opencode coding agent, an npm global (`opencode-ai`), so it pulls in Node.js |
 | cline | the Cline coding agent, an npm global — the one that documents Node.js 20 as its floor |
 | Kilo Code CLI | Kilo Code, an npm global from `@kilocode/cli`, run as `kilo` |
+| Claude Code CLI | the Claude Code CLI, run as `claude` — not from the archive or npm but from Anthropic's own installer at `claude.ai/install.sh`, so it carries that installer's architectures: amd64 and arm64 only |
 
-The three agents declare Node.js as a dependency, so ticking one ticked Node.js with it — the dialog
-says which, in a line under the list, before the install rather than after it. `OptionalPackages`
-folds those in transitively and hands back the entries in declaration order; an entry may only name
-entries declared above it (a test asserts it), which is what makes that order an install order
-rather than an accident of the walk.
+The three npm agents declare Node.js as a dependency, so ticking one ticked Node.js with it — the dialog
+says which, in a line under the list, before the install rather than after it. Claude Code CLI is the
+entry that reaches neither the archive nor npm: its maker's own script installs it, and it needs nothing
+else on this list. `OptionalPackages` folds the dependencies in transitively and hands back the entries
+in declaration order; an entry may only name entries declared above it (a test asserts it), which is
+what makes that order an install order rather than an accident of the walk.
 
-Two properties are worth stating on their own:
+Three properties are worth stating on their own:
 
 - **The archive first, NodeSource only on evidence.** No pinned Ubuntu archive carries a Node.js the
   agents accept — jammy has 12.22.9, noble 18.19.1 — so the step does not guess: it installs the
@@ -159,9 +161,28 @@ Two properties are worth stating on their own:
   host outside the pin. The `nodesource.list` it then writes is the one apt source a later setup may
   not retire: the pipeline disables every list the base image shipped under `sources.list.d/`, and a
   Repair that swept this one up with them would silently walk the user back to the old Node.
-- **Nothing here can fail an install.** Every package and every npm global is attempted, and whatever
-  refuses becomes a warning on the report — apt's own words, with every package it named, grouped by
-  the reason so that one broken dependency is one sentence rather than twenty-seven. A registry that
+- **A vendor's own script is the weakest link here, and is treated as one.** Claude Code CLI is in no
+  archive and on no registry: its maker publishes an installer at `claude.ai/install.sh`, and ticking
+  that box fetches it and runs it inside the guest. Four things follow. It is https, and it is fetched
+  *whole* before it runs — `curl … -o … && bash …` rather than the `curl … | bash` the vendor
+  documents, because a pipeline's status is its last command's, so a 404 would leave `bash` reading an
+  empty script and exiting 0 and report a dead host as a finished install. The checksum it verifies is
+  its own author's, against a manifest from the same origin — integrity, not authenticity: no
+  signature, and no version to pin. That is a weaker guarantee than the rootfs pin, which is why it is
+  offered only for a row the user ticked and can only ever be a warning. Everything it installs lands
+  under `$HOME`, which the app pins to `/home/ubuntu`, and the step reads back afterwards whether a
+  *login shell* can find the command — a `command -v` through the same argv and environment a terminal
+  tab is spawned with — so an install that worked but is invisible to a terminal is a warning naming
+  that, rather than silence. The read-back deliberately names no path of its own: where the vendor's
+  launcher lands is the downloaded binary's decision, not something this app can assert. And it is the
+  one row not offered everywhere: the installer ships amd64 and arm64 builds and exits on anything
+  else, so on a 32-bit ARM userspace the checkbox is drawn disabled with the reason under it, and the
+  pipeline skips it before fetching anything. (Running `sudo curl … | bash` in a terminal yourself
+  would fare worse still: the script refuses when it is root *and* `SUDO_USER` is set.)
+- **Nothing here can fail an install.** Every package, every npm global and every vendor installer is
+  attempted, and whatever refuses becomes a warning on the report — apt's own words, with every
+  package it named, grouped by the reason so that one broken dependency is one sentence rather than
+  twenty-seven. A registry that
   is down, or an npm global whose build needs a compiler, leaves a working Ubuntu userspace missing
   one tool. It does not rebuild a base system that was never in question. This step is also the one
   network phase with no offline gate of its own, for the same reason: every other phase refuses

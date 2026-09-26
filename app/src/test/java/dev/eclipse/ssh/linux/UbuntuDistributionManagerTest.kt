@@ -840,6 +840,10 @@ class UbuntuDistributionManagerTest {
         // `deb.nodesource.com` outage still cannot decide whether "Ubuntu" installed.
         assertThat(commands.none { "nodesource" in it || it.startsWith("npm install") }).isTrue()
         assertThat(commands.none { "python3" in it || "pnpm" in it || "opencode" in it }).isTrue()
+        // Nor a vendor's own installer. The empty-selection promise now covers a third source, so it
+        // is asserted over the third one too: an unticked install fetches exactly one thing from
+        // outside the archive, and that is the rootfs it is installing.
+        assertThat(commands.none { "claude.ai" in it || "vendor-install" in it }).isTrue()
     }
 
     // ------------------------------------------------------------------ the preinstall checkboxes
@@ -964,6 +968,118 @@ class UbuntuDistributionManagerTest {
         val refusals = report.warnings.filter { it.contains("npm package 'cline'") }
         assertThat(refusals).hasSize(1)
         assertThat(refusals.first()).contains("404 Not Found")
+    }
+
+    /**
+     * The whole path for the one entry that is neither an apt package nor an npm global: a script
+     * fetched over https, run, and then *measured* — the read-back is the half that matters, because a
+     * script's exit status is its own word for what it did.
+     */
+    @Test
+    fun `a ticked claude entry runs its maker's installer and reaches no registry`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command.startsWith("command -v claude")) 0 to "eclipse-vendor-on-path\n"
+            else baseline(command)
+        }
+        val steps = mutableListOf<SetupStep>()
+
+        val report = harness.distribution.setup(
+            onStep = { steps += it },
+            extras = listOf(OptionalPackage.CLAUDE_CODE),
+        )
+
+        // The command verbatim: the whole script is fetched first, and run only once every byte of it
+        // has arrived. A `curl … | bash` here would report success on a 404.
+        assertThat(harness.scripted.commands).contains(
+            "curl -fsSL https://claude.ai/install.sh -o /tmp/eclipse-vendor-install.sh && " +
+                "bash /tmp/eclipse-vendor-install.sh",
+        )
+        // Nothing from the archive, and nothing from npm. `node --version` is the tell for the
+        // NodeSource route — it is only ever run to decide whether that route is needed — so its
+        // absence is this entry needing no Node.js at all, not merely not upgrading one.
+        assertThat(harness.scripted.commands.none { "nodesource" in it }).isTrue()
+        assertThat(harness.scripted.commands.none { it.startsWith("npm ") }).isTrue()
+        assertThat(harness.scripted.commands.none { it == "node --version" }).isTrue()
+        assertThat(steps).contains(SetupStep.INSTALL_EXTRA_PACKAGES)
+        assertThat(report.warnings).isEmpty()
+
+        // The read-back asks the *session* shell rather than the pipeline's, which is the only
+        // question worth asking — whether the user will find the command they were just told they
+        // have. `setupEnv`'s two apt knobs and its PATH prefix are the tell for which env this ran in.
+        val probe = harness.scripted.spawns.single { it.argv.last().startsWith("command -v claude") }
+        assertThat(probe.envp).doesNotContain("LC_ALL=C")
+        assertThat(probe.envp).doesNotContain("DEBIAN_FRONTEND=noninteractive")
+        assertThat(probe.envp.any { it.startsWith("PATH=/home/ubuntu/.local/bin:") }).isFalse()
+    }
+
+    @Test
+    fun `a vendor installer that refuses is a warning, never a failed install`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+        harness.scripted.respond = { command ->
+            if (command.startsWith("curl -fsSL https://claude.ai/install.sh")) {
+                22 to "curl: (22) The requested URL returned error: 404\n"
+            } else {
+                baseline(command)
+            }
+        }
+
+        // Reaching the assertions at all is half the claim, as it is for the npm global above.
+        val report = harness.distribution.setup(extras = listOf(OptionalPackage.CLAUDE_CODE))
+
+        val refusals = report.warnings.filter { it.contains("Claude Code CLI") }
+        assertThat(refusals).hasSize(1)
+        assertThat(refusals.first()).contains("404")
+        assertThat(harness.distribution.isConfigured()).isTrue()
+        assertThat(harness.distribution.diagnostics.export()).contains("vendor installer refused")
+        assertThat(harness.distribution.diagnostics.export()).contains("exit=22")
+        // One failure, one fact: an installer that never ran is not also asked whether it left a
+        // command behind.
+        assertThat(harness.scripted.commands.none { it.startsWith("command -v claude") }).isTrue()
+    }
+
+    /**
+     * The entry is offered on every device and the pipeline refuses it where the vendor ships no
+     * build — before anything is fetched, and in this app's own words rather than the vendor's. The
+     * dialog greys the same row out for the same reason; this is the half that is authoritative.
+     */
+    @Test
+    fun `the claude entry is skipped where its installer has no build, naming the architecture`() =
+        runTest {
+            val harness = Harness(distro(arch = "armhf"))
+
+            val report = harness.distribution.setup(extras = listOf(OptionalPackage.CLAUDE_CODE))
+
+            val skips = report.warnings.filter { it.contains("Claude Code CLI") }
+            assertThat(skips).hasSize(1)
+            assertThat(skips.first()).contains("armhf")
+            assertThat(skips.first()).contains("arm64")
+            // Nothing was fetched, which is the whole reason the architectures are declared on the
+            // entry rather than discovered from the script's own refusal.
+            assertThat(harness.scripted.commands.none { "claude.ai" in it }).isTrue()
+            assertThat(harness.distribution.isConfigured()).isTrue()
+            assertThat(harness.distribution.diagnostics.export()).contains("vendor installer skipped")
+        }
+
+    /**
+     * The measured-not-assumed half. The baseline answers everything with an empty success, so the
+     * installer "succeeds" and the read-back finds nothing — the shape of a script that installed
+     * somewhere a shell cannot see. A user told "installed" who then finds no `claude` in their
+     * terminal has been misled by this app rather than by the vendor, so the disagreement is a
+     * warning rather than silence.
+     */
+    @Test
+    fun `an installer that reports success but leaves no command is a warning`() = runTest {
+        val harness = Harness(distro(arch = "arm64"))
+
+        val report = harness.distribution.setup(extras = listOf(OptionalPackage.CLAUDE_CODE))
+
+        val warnings = report.warnings.filter { it.contains("Claude Code CLI") }
+        assertThat(warnings).hasSize(1)
+        assertThat(warnings.first()).contains("reported a successful install")
+        assertThat(warnings.first()).contains("no claude command")
+        assertThat(harness.distribution.isConfigured()).isTrue()
+        assertThat(harness.distribution.diagnostics.export()).contains("vendor installer not on path")
     }
 
     /**
