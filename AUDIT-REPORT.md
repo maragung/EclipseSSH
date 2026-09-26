@@ -8031,14 +8031,15 @@ full-screen program and every themed prompt, silently. The existing
 `plainText matches the straightforward rendering` case, whose `sandi-üñïçø∂é` holds two Ambiguous
 characters, is the test that would have caught it.
 
-**Zero-width is taken from the character's category, and the format characters are named one by one.** Marks
-come from `Character.getType`, because a modern `wcwidth` is generated from Unicode's own categories and
-there is no nonspacing mark any terminal counts as one column. The `FORMAT` category is *not* taken
-wholesale: it also holds U+00AD SOFT HYPHEN and the Arabic number signs, which are one column wide
-everywhere. The first attempt wrote the named ranges *behind* a `if (type != FORMAT) return false` guard,
-which quietly made U+2028 and U+2029 — the line and paragraph separators, which the reference counts as
-taking no column — unreachable, since their category is not `FORMAT`. The boundary test found it; the guard
-is gone and the ranges are the authority.
+**Zero-width is the reference's own list, and the category rule is kept behind it as a safety net.** Marks
+arriving by `Character.getType` was the first version of this table and it is not enough, because that
+answers with the *platform's* Unicode and the platform is a phone. The JVM this repository's tests run on
+reports 147 code points as unassigned that the reference counts as zero-width — Arabic and Indic vowel
+signs, mostly — and every one of them would have silently spent a cell. The list is explicit instead, and
+the category rule survives only to catch a mark newer than the list. Two marks are the same problem in the
+other direction and are named: U+1734 HANUNOO SIGN PAMUDPOD and U+1171E AHOM CONSONANT SIGN MEDIAL RA are
+marks the reference counts as **one** column. The `FORMAT` category is *not* taken wholesale either, since
+it also holds U+00AD SOFT HYPHEN and the Arabic number signs, which are one column wide everywhere.
 
 **A mark with nothing under it is dropped rather than carried.** At column zero there is no cell to its left,
 and a cell holding a blank is one the program counted as a space, not as a base. The buffer keeps no "last
@@ -8074,6 +8075,36 @@ limitation, because giving a lone surrogate width zero would be wrong for every 
 which is the far more common case. A pair that is *not* zero-width is joined only when it is seen whole, so
 the path every emoji already took is byte-identical to before.
 
+### The tables are the reference's own answers, and the first version was not
+
+The first version of `TerminalWidth.kt` was written by hand from Unicode block assignments, and it was wrong
+in ways only the reference could show. The check that found them was a direct sweep — for every code point,
+compare this table's answer with `wcwidth` on the host, which is glibc, the same function `readline`,
+`ncurses` and every shell on the far side call. It reported **9,012 contradicting code points in 118 runs**,
+and they were three kinds of mistake:
+
+- **A run the hand list missed.** U+2066–U+2069, the directional isolates; U+061C, the Arabic letter mark;
+  U+D7B0–U+D7FB, the conjoining Hangul letters of the second Jamo block; U+1D173–U+1D17A, the musical format
+  marks. The format and Jamo tables are not block-shaped, so a list written from block assignments misses
+  whatever is not a block.
+- **A code point the hand list over-claimed.** U+3164 HANGUL FILLER, two columns here and zero to the
+  reference: it sits inside a run of wide Hangul letters, and it is a filler.
+- **A bound one code point out.** U+4DC0, the first of the Yijing hexagrams, narrow here and two columns to
+  the reference. The block lies between two ideograph blocks and looks narrow for that reason alone.
+
+The first of the three is the arm that is acted on, so those code points each spent a cell — the defect this
+whole section is about, in the table that was meant to fix it. The other two are on the `2` arm, which
+nothing acts on yet; they are wrong data that would have become wrong behaviour the day something did. That
+is the argument for the file's present form: both tables are a run-length encoding of the reference's own
+output rather than a reading of the standard, and every boundary in them is a boundary where the reference's
+answer changes, so an off-by-one is a transcription error and not a judgement call. The `2` arm is the
+visible cost — 18 hand-written ranges became 131 generated ones — and it is worth paying for a table whose
+whole purpose is agreement with a program on the other side.
+
+Worth keeping in mind for anything else in this repository that encodes a standard: **Unicode purity is not
+the same as agreement.** A table built by reading the standard agrees with the standard. The program at the
+other end of the pty is not reading the standard; it is calling `wcwidth`.
+
 ### What is verified, and what is not
 
 - **The invariant, in 10 new tests** in `AnsiTerminalBufferTest`: after every chunk of a stream mixing
@@ -8084,12 +8115,19 @@ the path every emoji already took is byte-identical to before.
   with nothing standing to its left), the same for U+FE0F, U+200D, U+FEFF and a combining accent, the
   pending-wrap ordering, a mark dropped at column zero and on a blank, the cluster in `plainText` and
   `textIn`, `CSI b` repeating the base, and the split-pair limitation.
-- **13 new tests** in `TerminalWidthTest` for the table: every range boundary on both sides, braille at 1,
-  the Ambiguous set at 1, the format characters that are *not* zero-width at 1, and the astral marks at 0.
+- **17 new tests** in `TerminalWidthTest` for the table, and every number in them is `wcwidth`'s rather
+  than this file's: braille at 1, the Ambiguous set at 1, the format characters that are *not* zero-width
+  at 1 and the astral marks at 0; both marks the reference counts as one column; a mark that is unassigned
+  on the JVM and zero-width to the reference, which is the test the explicit list exists for; the rule for
+  code points the reference has no answer for at all; the shape of the table at the boundaries a reader
+  would doubt; and then all 440 boundary probes of both tables — every run's two endpoints and the code
+  point on either side, so that a run one code point too long or too short cannot pass. That last one is
+  written out rather than derived, because a test that read the table it tests would agree with it for free.
 - **The existing 2,049 JVM tests are unchanged and none of them needed editing**, which is the second check
-  that this stayed small. One existing test *was* edited on purpose: `plainText matches the straightforward
+  that this stayed small — of every code point whose width this table changed, no other test in the
+  repository names one. One existing test *was* edited on purpose: `plainText matches the straightforward
   rendering` compares `plainText` against the expression it replaced, so its reference had to learn the
-  cluster too or it would have stopped being an oracle.
+  cluster too or it would have stopped being an oracle. The suite is now 2,076 methods in 179 files.
 - `scripts/check-doc-figures.sh` re-derives the counts in this file and the README — 160 claims, all
   agreeing.
 - **The suites run in CI, not on this host** (nothing is built here), so the compile and the run are the CI
