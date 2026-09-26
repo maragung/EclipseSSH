@@ -7892,13 +7892,58 @@ Built and signed by `tagged-release.yml` from the `v1.11.0` tag: the universal A
 identity is unchanged from the releases before it — `0c69794b…`, the key the CI secret holds — so this build
 installs over 1.10.0 and every earlier release normally.
 
-### The order this release keeps
+### What the validation run did, and the order this release kept
 
-The one §65 paid to learn and §67 followed: `tagged-release.yml` builds the artifact, and
+The order is the one §65 paid to learn and §67 followed: `tagged-release.yml` builds the artifact, and
 `android-release-test.yml` is the only thing in this repository that *installs* one — it fires on
-`release: published`. So the draft is verified, published **while the CI window is open**, and the window is
-closed only once `Android release test` has settled. Never the other way round.
+`release: published`. So the draft was verified, published **while the CI window was open**, and the window
+was closed only once `Android release test` had settled. Never the other way round.
 
-The run record for this release is not in this section yet. §67's was written into the report after its
-window closed, and this one takes the same route: the build's run, the artifact readings and the device
-check are added here once they exist rather than predicted now.
+**The build.** `Tagged release` run 36230389794, 08:38:38Z to 08:55:03Z, its single `Build, sign, and
+publish` job green with all thirty of its steps run and none failed — including `Verify the build is from a
+clean tag`, which is the step that makes the tag rather than a working tree the thing that was built.
+
+**The artifacts, read out of the files rather than off the log.** `testing/verify-release-artifact.py` was
+first run against a *published* asset whose values were already known — `v1.10.0`'s `arm64-v8a` split, which
+it read as `43 / 1.10.0 / 0c69794b…` — because a checker that has never disagreed with reality is not
+evidence. It was then run against all five APKs the draft held, and each read `versionCode 44`,
+`versionName 1.11.0`, signer `0c69794b…`. That is §69's own sentence about the signing identity, checked
+rather than asserted. Recomputing the six digests in `SHA256SUMS.txt` matched all six, and the four splits
+each carry exactly their own ABI while the universal carries all four.
+
+**The device check.** `Android release test` 36231318450 was created 08:57:20Z, two seconds after the
+publish, and settled green at 09:18:48Z. Both legs — `Release APK on API 30` and `Release APK on API 35` —
+report `Ran: 49, Failed: 0`, and both `crash-report.json` files read `status: clean, signatureMatches: 0`.
+`Release gate` passed and each leg's `Final Recommendation` is `RELEASE`. `Autonomous repair` is `skipped`,
+which is its normal state on a release event.
+
+**The cross-check worth stating plainly.** The resolve job's `release-validation.json` records
+`sha256 4a500ae4…`, `bytes 19395171` for the asset the emulator installed. That is the same file, by the
+same hash, that this repository's checker read by hand here *and* that the release's own `SHA256SUMS.txt`
+lists for the `x86_64` split — so versionCode, versionName and signer were each read twice by two
+independent methods and agreed, and the APK on the emulator is the published artifact rather than a rebuild.
+That last part is the whole reason this workflow exists.
+
+**How the window was opened, because it is not how the script does it.** `ci-window.sh open` dispatches one
+workflow and closes the window when that run settles, which cannot span a branch, a pull request, seven
+required checks, a merge, a tag and a publish. This window was therefore opened by hand at 07:59:00Z: the
+deadline was recorded in `CI_WINDOW_DEADLINE` *before* the flip, so a crash between the two would leave a
+public repository the watchdog knows to close rather than one nobody has a record of. Branch protection was
+re-applied by hand afterwards, as `docs/branch-protection.md` says it must be — and the read-back, not the
+`PUT`'s status, was the evidence: seven contexts, `strict: true`, `enforce_admins: true`. It bound: with the
+checks still running, PR #177 read `mergeStateStatus: blocked`.
+
+**The window that closed before this one was opened.** A window opened earlier in the session was still
+public when the release branch was pushed, and it closed at 07:56:47Z — by design rather than by a reap:
+the run it was watching settled red, the `EXIT` trap fired, and the script verified the flip. Its lifetime
+is the dispatched run's, which is not the same thing as the work's. PR #177's checks had started two
+minutes before that, so the reopen at 07:59:00Z is what gave `Lint`, `Unit and integration tests`,
+`APKs, AAB and signatures` and the boot gate their runners — none of the four had been created yet, because
+`ci.yml` gates them all behind `native`. The boot gate is the check that was billed and refused on PR #176;
+on this run it passed on a real runner.
+
+**The window was closed at 09:19:04Z**, after the device check had settled and not before, and `visibility`
+was read back as `private` with `CI_WINDOW_DEADLINE` cleared. That close does not suspend branch protection;
+it deletes it, so `main` is guarded by discipline rather than by the platform until the next window opens.
+This record is what landed in that state: it was merged with no required check behind it, and said so,
+rather than letting the merge imply a gate that was not there.
