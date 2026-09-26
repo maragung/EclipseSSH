@@ -8130,8 +8130,11 @@ other end of the pty is not reading the standard; it is calling `wcwidth`.
   cluster too or it would have stopped being an oracle. The suite is now 2,076 methods in 179 files.
 - `scripts/check-doc-figures.sh` re-derives the counts in this file and the README — 160 claims, all
   agreeing.
-- **The suites run in CI, not on this host** (nothing is built here), so the compile and the run are the CI
-  run this section ships with.
+- **The compile and the run were checked here first, and then in CI.** The file type-checks standalone
+  against the cached `kotlin-compiler-embeddable` — 2.4.20, the version `gradle/libs.versions.toml`
+  names — in about two seconds, and `TerminalWidthTest` runs under `JUnitCore` in a tenth of one: 17 green
+  before the push. The CI run recorded at the end of this section is the authority; this is the cheap
+  check that should have come first, and the subsection below says what it cost that it did not.
 
 **Not verified here, and the two things that would settle it.** No device was involved in this pass, so the
 exact appearance on a phone was not reproduced — what is established is the invariant whose violation produces
@@ -8160,3 +8163,31 @@ it. Two experiments close that gap, and the second needs no build:
 decoded stream (`feature/terminallog/SessionLog.kt`), so a session where the artifact was seen can be
 replayed into a fresh `AnsiTerminalBuffer` and asked whether it holds characters the program had erased. That
 is the step to ask for if this does not cure it.
+
+### The run this section ships with
+
+Everything above was verified twice — once on this host and outside Gradle, once in CI on commit
+`40468d22ce1e742305338c9a210471bc788e35c8`, merged to `main` as
+`b27598505acefcef63c219a72f7381e23ce201fd`. All seven contexts branch protection requires were green:
+`Documentation figures`, `FreeRDP native (4 ABIs)`, `Unit and integration tests`, `Lint (release variant)`,
+`APKs, AAB and signatures`, `Boot the built APKs (crash-on-open gate)` and `connectedAndroidTest`. Two
+checks were not: `Long idle stress test` is skipped unless an argument asks for it, and `Close the CI
+window` is red by design on every run started while the window is open, because the token that closes it
+is deliberately not available to a run. That is why GitHub reported the pull request as `unstable` rather
+than `clean` while every required context was green — **`unstable` at a merge gate means a non-required
+check failed, not a required one**, and the two states are worth telling apart before reading either as a
+verdict.
+
+**The first push of this work was red, and how it failed is the part worth keeping.** `cad2718` carried a
+Kotlin *type* error, not a test failure: `ZERO_WIDTH_MARKS` mixed ranges with 119 bare `Int`s, so `listOf`
+inferred `List<Comparable<*>>` and `codePoint in it` had no applicable `contains`. The compiler said
+"receiver type mismatch", which names the receiver when the element types are what is wrong. It surfaced
+in the Instrumentation job under a step called **"Pre-grant the notification permission"** — that job runs
+`:app:installDebug` first, the install compiles before the step does anything, and `Run
+connectedAndroidTest` was therefore *skipped*: the failure wore the name of an unrelated permission and no
+test ran at all. The unit-test and assemble jobs failed on the same error.
+
+The fix expanded every singleton into `X..X`. No boundary moved: the code-point sets parsed back out of
+the file are identical to the pre-fix ones for all four lists — 1997, 410, 122237 and 2 code points. That
+same class of error is why the standalone compile is now part of how a pure file is verified here: it was
+the missing check, and the thirteen-minute CI cycle it cost is what it buys back.
