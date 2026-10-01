@@ -5,13 +5,13 @@ ksp = "2.3.12"
 hilt = "2.60.1"
 room = "2.8.5"
 composeBom = "2026.09.00"
-navigation = "2.10.1"
+navigation = "2.10.2"
 lifecycle = "2.8.7"
-work = "2.10.0"
+work = "2.12.0"
 hiltExt = "1.4.0"
 datastore = "1.1.4"
 coroutines = "1.11.0"
-sshd = "2.19.0"
+sshd = "2.20.0"
 # The full Bouncy Castle provider EclipseApp installs over the platform's stripped copy -
 # see EclipseApp.replacePlatformBouncyCastle. Same version the release lockfile resolves
 # for vernacular-vnc's transitive pull; declared explicitly because the swap is a
@@ -22,7 +22,7 @@ bouncycastle = "1.86"
 # f39cbe2 is the revision whose RFB handshake, pixel format and thread model the
 # VNC engine in dev.eclipse.ssh.vnc was written and tested against.
 vernacular-vnc = "f39cbe28538a94ee70113ce0909a2e40b1bfe8f1"
-slf4j = "2.0.19"
+slf4j = "2.0.20"
 eddsa = "0.3.0"
 biometric = "1.1.0"
 documentfile = "1.1.0"
@@ -42,7 +42,7 @@ kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutine
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 
 # --- AndroidX core ---
-androidx-core-ktx = { module = "androidx.core:core-ktx", version = "1.19.0" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version = "1.19.1" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version = "1.10.1" }
 androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
 androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
