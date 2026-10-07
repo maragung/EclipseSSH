@@ -81,9 +81,30 @@ in_scope_re='^androidx\.(core|lifecycle|room|activity|collection|savedstate|comp
 out_of_scope_re='^androidx\.test\.|^androidx\.compose\.ui\.test\.|^kotlin\.test\.|^kotlinx\.coroutines\.test\.|^org\.junit\.|^com\.google\.common\.|^junit\.|^android\.|^java\.|^javax\.|^dalvik\.|^org\.hamcrest\.|^org\.mockito\.|^okhttp3\.|^okio\.'
 
 # Matched with grep rather than `case`, so these stay the EREs they are written as: a case pattern is
-# a glob, where the `(a|b)` above would be a literal paren and match nothing.
+# a glob, where the `(a|b)` above would be a literal paren and match nothing. Both callers pass a
+# single short name, so the pipeline below cannot outlive its reader and `printf` cannot be killed
+# mid-write; `has_line` is what the lists use, for that reason.
 out_of_scope() { printf '%s\n' "$1" | grep -qE "$out_of_scope_re"; }
 in_scope() { printf '%s\n' "$1" | grep -qE "$in_scope_re"; }
+
+# Whether the newline-separated list in $1 carries $2 as a whole line - `grep -qxF`'s question, asked
+# without a pipe.
+#
+# The pipeline is the obvious spelling and it is not the same check. `grep -q` exits the moment it
+# matches, while `printf` still has kilobytes to write; the write then fails with SIGPIPE, and
+# `pipefail` reports that 141 as the pipeline's status, so a name the list *does* carry is reported as
+# missing. Release CI run 37587054967 failed this step on `androidx.compose.ui.semantics.SemanticsActions`,
+# which the keep file carries on line 384, four minutes after the same tree passed the same step on the
+# pull request; the step's own output carries the giveaway, `printf: write error: Broken pipe`. The
+# lists here are ~38 kB, which is what puts the race in reach - a name found early leaves the most
+# left to write. `case` on a delimited string asks the same question with no second process and
+# nothing to signal.
+has_line() {
+  case $'\n'"$1"$'\n' in
+    *$'\n'"$2"$'\n'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 while IFS= read -r import_name; do
   out_of_scope "$import_name" && continue
@@ -98,13 +119,13 @@ while IFS= read -r import_name; do
   last="${import_name##*.}"
   case "$last" in
     [A-Z]*)
-      if ! printf '%s\n' "$kept" | grep -qxF "$import_name"; then
+      if ! has_line "$kept" "$import_name"; then
         fail "$import_name is referenced by the instrumentation sources but not kept, and it ships in the release APK's minified dex - R8 may rename or remove it. Add: -keep class $import_name { *; }"
       fi
       ;;
     *)
       package="${import_name%.*}"
-      if ! printf '%s\n' "$kept_packages" | grep -qxF "$package"; then
+      if ! has_line "$kept_packages" "$package"; then
         fail "$import_name is a top-level function or property from $package, whose classes all ship in the release APK's minified dex, and no class in that package is kept. Keep the facade that owns it."
       fi
       ;;
@@ -166,8 +187,8 @@ while IFS= read -r nested_ref; do
     # here only because the keep file carries the outer class by hand.
     in_scope "$outer" || continue
     nested_checked=$((nested_checked + 1))
-    if ! printf '%s\n' "$kept" | grep -qxF "$outer\$$nested" &&
-      ! printf '%s\n' "$kept" | grep -qxF "$outer.$nested"; then
+    if ! has_line "$kept" "$outer\$$nested" &&
+      ! has_line "$kept" "$outer.$nested"; then
       fail "the instrumentation sources reach $outer.$nested, and $outer is kept while its nested class is not - R8 may rename or remove it. Add: -keep class $outer\$$nested { *; }"
     fi
   done <<< "$owners"

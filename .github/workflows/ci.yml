@@ -601,6 +601,13 @@ jobs:
         # that compiles those sources.
         run: scripts/check-instrumentation-keeps.sh
 
+      - name: Test the keep-list checker against its own cases
+        # The checker is a guard, so a run of it that passes for a reason of its own retires the
+        # question it exists to ask. Run 37587054967 was exactly that: `printf ... | grep -qxF` lost
+        # the writer to SIGPIPE and reported a kept class as missing. The test's padded-keep-list case
+        # fails on that spelling every time.
+        run: scripts/check-instrumentation-keeps.test.sh
+
       - name: Verify the dependency lockfile is up to date
         # This job's first Gradle step, on purpose. `app/gradle.lockfile` records the
         # *resolved* version of every coordinate on releaseRuntimeClasspath, and a lock
