@@ -382,6 +382,11 @@
 -keep class androidx.compose.ui.semantics.ProgressBarRangeInfo { *; }
 -keep class androidx.compose.ui.semantics.ScrollAxisRange { *; }
 -keep class androidx.compose.ui.semantics.SemanticsActions { *; }
+# The key the rotation journey now activates the form's Cancel through. `{ *; }` on
+# the outer class covers its fields and methods, not the types declared inside it -
+# the same shape as WindowInsetsCompat$Type in the last block of this file. The
+# keep-list check named this rule in CI run 37581818596.
+-keep class androidx.compose.ui.semantics.SemanticsActions$OnClick { *; }
 -keep class androidx.compose.ui.semantics.SemanticsConfiguration { *; }
 -keep class androidx.compose.ui.semantics.SemanticsConfigurationKt { *; }
 -keep class androidx.compose.ui.semantics.SemanticsNode { *; }
