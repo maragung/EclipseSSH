@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.view.inputmethod.InputMethodManager
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
@@ -14,6 +15,7 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextInput
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -121,17 +123,13 @@ class ReleaseChaosJourneyTest {
     /**
      * The keyboard the text input above left up, put away and waited out.
      *
-     * The form's two buttons sit at the end of a scrollable body, so Cancel is reached by
-     * [performScrollTo], which scrolls it into a viewport the keyboard is still resizing.
-     * `performClick` injects at the node's bounds *as it read them*: on a loaded emulator drawing
-     * three frames a second — run 36359890174's logcat shows 344 ms frames all the way through this
-     * wait — the inset animation is still in flight seconds after the tap, so the tap lands where
-     * the row used to be, on the keyboard, and the form never finishes. The failure then surfaces
-     * one call later, in [awaitForeground], as the window that did not come back.
-     *
-     * Waiting for the inset to reach zero is what makes the click's target stop moving. The rule's
-     * own teardown is not a substitute: it launches its empty activity only after the wait has
-     * already expired.
+     * The keyboard resizes the body this form's two buttons sit at the end of, and the resize is
+     * animated — run 36359890174's logcat shows the emulator drawing 344 ms frames all the way
+     * through this wait — so the window is still moving seconds after the input stops. Nothing
+     * below is aimed at a row any more, since Cancel is activated by its semantics action rather
+     * than by a tap, so this now only settles the window before the form closes and the workspace
+     * behind it is asserted. The rule's own teardown is not a substitute: it launches its empty
+     * activity only after the wait has already expired.
      */
     private fun hideSoftKeyboard() {
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -296,11 +294,19 @@ class ReleaseChaosJourneyTest {
         // The half that fails if the window was recreated behind the user's back.
         compose.onNodeWithText("Rotated").assertIsDisplayed()
 
-        // The keyboard is up from that text input, and the form's button row is at the end of the
-        // body it is resizing: put it away and wait for the layout to stop moving before aiming at
-        // Cancel, or the tap is injected against bounds the row has already left.
+        // The keyboard is up from that text input and the form's body is still settling: put it away
+        // before touching the form at all.
         hideSoftKeyboard()
-        compose.onNode(hasText("Cancel") and hasClickAction()).performScrollTo().performClick()
+        // Cancel is activated through its semantics action, not a synthesized tap. A tap is injected
+        // at the centre of the bounds the semantics tree last reported, and those can lag the window
+        // by a frame. Run 37574675175 lost the whole wait below to exactly that — the form sat in the
+        // foreground for all ten seconds and only the instrumentation's own teardown ever finished
+        // it, where the green run of the same commit had the tap land and the workspace back 160 ms
+        // later. The action runs the button's own onClick, so what this asserts — that Cancel closes
+        // the form — is unchanged; what is no longer covered is that a finger aimed at the middle of
+        // the row reaches it.
+        compose.onNode(hasText("Cancel") and hasClickAction())
+            .performSemanticsAction(SemanticsActions.OnClick)
         // Cancel finishes this window. The workspace behind it comes back asynchronously, and an
         // assertion that does not wait for it is an assertion about whichever window is in front.
         awaitForeground(MainActivity::class.java)
