@@ -1,6 +1,6 @@
 [versions]
-agp = "9.4.1"
-kotlin = "2.4.20"
+agp = "9.5.0"
+kotlin = "2.4.21"
 ksp = "2.3.12"
 hilt = "2.60.1"
 room = "2.8.5"
@@ -9,9 +9,9 @@ navigation = "2.10.2"
 lifecycle = "2.8.7"
 work = "2.12.0"
 hiltExt = "1.4.0"
-datastore = "1.1.4"
+datastore = "1.3.0"
 coroutines = "1.11.0"
-sshd = "2.20.0"
+sshd = "2.20.1"
 # The full Bouncy Castle provider EclipseApp installs over the platform's stripped copy -
 # see EclipseApp.replacePlatformBouncyCastle. Same version the release lockfile resolves
 # for vernacular-vnc's transitive pull; declared explicitly because the swap is a
